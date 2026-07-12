@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+saltator-core = { path = "crates/saltator-core" }
+saltator-cluster = { path = "crates/saltator-cluster" }
+saltator-shard = { path = "crates/saltator-shard" }
+saltator-store = { path = "crates/saltator-store" }
+saltator-roomserver = { path = "crates/saltator-roomserver" }
+saltator-userserver = { path = "crates/saltator-userserver" }
+saltator-cs-api = { path = "crates/saltator-cs-api" }
+saltator-federation = { path = "crates/saltator-federation" }
+saltator-media = { path = "crates/saltator-media" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+rocksdb = "0.23"
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"

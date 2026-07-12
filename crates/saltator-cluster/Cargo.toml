@@ -1,0 +1,26 @@
+[package]
+name = "saltator-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+saltator-store.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+postcard.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+openraft.workspace = true
+tonic.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

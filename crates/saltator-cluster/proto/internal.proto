@@ -1,0 +1,42 @@
+// Internal RPC (spec.md §8).
+//
+// Envelopes are proto (field-number evolution carries N/N+1 rolling
+// upgrades); payloads are versioned postcard bytes since both ends are
+// always Saltator. Raft messages for ALL groups multiplex over these RPCs,
+// discriminated by `group` (0 = metadata group, else shard id).
+//
+// Connection classes (control vs bulk) are separate channels established by
+// the dialer; bulk-only services (checkpoint transfer, blob replication)
+// will be added here in M4 and must only be served on the bulk channel.
+
+syntax = "proto3";
+package saltator.internal.v1;
+
+message RaftPayload {
+  uint64 group = 1;
+  // postcard-encoded openraft request/response, versioned by `codec_version`.
+  uint32 codec_version = 2;
+  bytes payload = 3;
+}
+
+service RaftService {
+  rpc AppendEntries(RaftPayload) returns (RaftPayload);
+  rpc Vote(RaftPayload) returns (RaftPayload);
+  rpc InstallSnapshot(RaftPayload) returns (RaftPayload);
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint64 node_id = 1;
+  string server_name = 2;
+  string version = 3;
+  // Metadata-group view.
+  bool initialized = 4;
+  optional uint64 leader = 5;
+  uint64 last_applied = 6;
+}
+
+service ControlService {
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
