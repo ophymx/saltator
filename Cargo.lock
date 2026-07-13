@@ -1932,9 +1932,11 @@ dependencies = [
  "base64",
  "bytes",
  "form_urlencoded",
+ "getrandom 0.4.3",
  "indexmap 2.14.0",
  "js_int",
  "percent-encoding",
+ "rand 0.10.2",
  "regex",
  "ruma-identifiers-validation",
  "ruma-macros",
@@ -1945,6 +1947,7 @@ dependencies = [
  "time",
  "tracing",
  "url",
+ "uuid",
  "web-time",
  "wildmatch",
  "zeroize",
@@ -2050,7 +2053,10 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "ruma",
  "saltator-cluster",
+ "saltator-roomserver",
+ "saltator-shard",
  "saltator-store",
  "serde",
  "tokio",
@@ -2068,6 +2074,7 @@ dependencies = [
  "postcard",
  "prost",
  "protoc-bin-vendored",
+ "saltator-shard",
  "saltator-store",
  "serde",
  "tempfile",
@@ -2103,10 +2110,36 @@ version = "0.0.1"
 [[package]]
 name = "saltator-roomserver"
 version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "openraft",
+ "postcard",
+ "ruma",
+ "saltator-core",
+ "saltator-shard",
+ "saltator-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "saltator-shard"
 version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "openraft",
+ "postcard",
+ "saltator-store",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "saltator-store"
@@ -2859,6 +2892,7 @@ version = "1.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]

@@ -146,6 +146,12 @@ pub fn check_auth_events<E: Event>(
     event: &E,
     entries: &[AuthEntry<'_, E>],
 ) -> AuthResult {
+    // Rule 1 precedes the auth_events rules: m.room.create is
+    // self-authorising and carries no auth_events. Any entry it does carry
+    // still fails 3.2 below (the selection set is empty), but the
+    // create-entry-required rule (v11 2.4) must not apply to it.
+    let is_create = event.event_type() == "m.room.create";
+
     let allowed = auth_types_for_event(
         version,
         event.event_type(),
@@ -196,8 +202,9 @@ pub fn check_auth_events<E: Event>(
         have_create |= key.0 == "m.room.create";
     }
 
-    // v11 2.4: an m.room.create entry is required.
-    if version.create_event_in_auth_events() && !have_create {
+    // v11 2.4: an m.room.create entry is required (except on the create
+    // event itself).
+    if version.create_event_in_auth_events() && !have_create && !is_create {
         return reject("auth_events.create", "no m.room.create in auth_events");
     }
     Ok(())

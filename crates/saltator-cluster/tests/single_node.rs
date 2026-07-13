@@ -18,7 +18,7 @@ async fn single_node_bootstrap_persist_restart() {
     // --- first life: bootstrap, write ---
     {
         let engine = Arc::new(RocksEngine::open(&db_path).unwrap());
-        let meta = MetadataHandle::start(1, engine, Some("127.0.0.1:17400".into()))
+        let meta = MetadataHandle::start(1, engine, Some("127.0.0.1:17400".into()), None)
             .await
             .unwrap();
         let leader = meta.wait_for_leader(Duration::from_secs(10)).await.unwrap();
@@ -45,7 +45,7 @@ async fn single_node_bootstrap_persist_restart() {
         let engine = Arc::new(RocksEngine::open(&db_path).unwrap());
         // bootstrap_addr = None: if recovery failed, there is no leader and
         // wait_for_leader below would time out.
-        let meta = MetadataHandle::start(1, engine, None).await.unwrap();
+        let meta = MetadataHandle::start(1, engine, None, None).await.unwrap();
         let leader = meta.wait_for_leader(Duration::from_secs(10)).await.unwrap();
         assert_eq!(leader, 1);
 
@@ -72,7 +72,7 @@ async fn single_node_bootstrap_persist_restart() {
     // Must detect the initialized group and recover, not re-initialize.
     {
         let engine = Arc::new(RocksEngine::open(&db_path).unwrap());
-        let meta = MetadataHandle::start(1, engine, Some("127.0.0.1:17400".into()))
+        let meta = MetadataHandle::start(1, engine, Some("127.0.0.1:17400".into()), None)
             .await
             .unwrap();
         let leader = meta.wait_for_leader(Duration::from_secs(10)).await.unwrap();

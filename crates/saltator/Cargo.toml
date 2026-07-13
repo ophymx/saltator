@@ -11,7 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 saltator-cluster.workspace = true
+saltator-roomserver.workspace = true
+saltator-shard.workspace = true
 saltator-store.workspace = true
+
+ruma.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true

@@ -1,12 +1,12 @@
 //! Cluster plane: the metadata Raft group, node lifecycle, and the internal
 //! RPC surface (spec.md §4, §8).
 //!
-//! M0 scope: single-node bootstrap of the metadata group over the local KV
-//! engine, plus the gRPC skeleton the multi-node path (M4) will fill out.
+//! The metadata group runs on the generic shard runtime as shard `Meta/0`
+//! with [`MetaApp`] as its state machine; this crate owns the typed
+//! command surface and the gRPC transport that all shard groups share.
 
 pub mod network;
 pub mod rpc;
-pub mod storage;
 pub mod types;
 
 pub mod proto {
@@ -17,12 +17,13 @@ pub mod proto {
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::{BasicNode, Config as RaftConfig, Raft};
+use saltator_shard::{ApplyCtx, ShardApp, ShardHandle, ShardId, ShardRegistry, APP_TABLE_MIN};
+use saltator_store::{KvEngine, Result as StoreResult, StoreError};
 
-use saltator_store::KvEngine;
+use types::{MetaCommand, MetaResponse, NodeId};
 
-use storage::{MetaLogStore, MetaStateMachine};
-use types::{MetaCommand, MetaResponse, NodeId, TypeConfig};
+/// The metadata KV table (the group's only app table).
+const T_KV: u8 = APP_TABLE_MIN;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterError {
@@ -30,20 +31,53 @@ pub enum ClusterError {
     Raft(String),
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("codec error: {0}")]
+    Codec(String),
 }
 
 type Result<T> = std::result::Result<T, ClusterError>;
 
-fn raft_err(e: impl std::fmt::Display) -> ClusterError {
-    ClusterError::Raft(e.to_string())
+impl From<saltator_shard::ShardError> for ClusterError {
+    fn from(e: saltator_shard::ShardError) -> Self {
+        use saltator_shard::ShardError as E;
+        match e {
+            E::Raft(m) => ClusterError::Raft(m),
+            E::Storage(m) => ClusterError::Storage(m),
+            E::Codec(m) => ClusterError::Codec(m),
+        }
+    }
+}
+
+/// The metadata group's command interpreter: a linearizable KV store.
+pub struct MetaApp;
+
+impl ShardApp for MetaApp {
+    fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>> {
+        // A committed command that fails to decode means log corruption or
+        // a broken upgrade — fatal, not skippable.
+        let cmd: MetaCommand = postcard::from_bytes(command)
+            .map_err(|e| StoreError::Engine(format!("meta command decode: {e}")))?;
+        let previous = match cmd {
+            MetaCommand::Set { key, value } => {
+                let prev = ctx.get(T_KV, key.as_bytes())?;
+                ctx.put(T_KV, key.as_bytes(), value);
+                prev
+            }
+            MetaCommand::Delete { key } => {
+                let prev = ctx.get(T_KV, key.as_bytes())?;
+                ctx.delete(T_KV, key.as_bytes());
+                prev
+            }
+        };
+        postcard::to_stdvec(&MetaResponse { previous })
+            .map_err(|e| StoreError::Engine(format!("meta response encode: {e}")))
+    }
 }
 
 /// Handle to the running metadata group on this node.
 #[derive(Clone)]
 pub struct MetadataHandle {
-    node_id: NodeId,
-    raft: Raft<TypeConfig>,
-    sm: MetaStateMachine,
+    inner: ShardHandle,
 }
 
 impl MetadataHandle {
@@ -58,103 +92,67 @@ impl MetadataHandle {
         node_id: NodeId,
         engine: Arc<dyn KvEngine>,
         bootstrap_addr: Option<String>,
+        registry: Option<&ShardRegistry>,
     ) -> Result<Self> {
-        let config = RaftConfig {
-            cluster_name: "saltator-meta".to_string(),
-            heartbeat_interval: 500,
-            election_timeout_min: 1500,
-            election_timeout_max: 3000,
-            ..Default::default()
-        };
-        let config = Arc::new(config.validate().map_err(raft_err)?);
-
-        let log_store = MetaLogStore::new(engine.clone());
-        let sm = MetaStateMachine::new(engine.clone());
-
-        let raft = Raft::new(
+        let inner = ShardHandle::start(
+            ShardId::METADATA,
             node_id,
-            config,
-            network::GrpcRaftNetworkFactory,
-            log_store,
-            sm.clone(),
+            engine,
+            Arc::new(MetaApp),
+            network::GrpcRaftNetworkFactory::new(ShardId::METADATA),
+            bootstrap_addr,
+            registry,
         )
-        .await
-        .map_err(raft_err)?;
-
-        let handle = Self { node_id, raft, sm };
-
-        if !handle.is_initialized().await? {
-            if let Some(addr) = bootstrap_addr {
-                tracing::info!(node_id, %addr, "bootstrapping metadata group (single voter)");
-                let members = std::collections::BTreeMap::from([(node_id, BasicNode::new(addr))]);
-                handle.raft.initialize(members).await.map_err(raft_err)?;
-            } else {
-                tracing::info!(node_id, "metadata group not initialized; awaiting join");
-            }
-        } else {
-            tracing::info!(node_id, "metadata group recovered from disk");
-        }
-
-        Ok(handle)
+        .await?;
+        Ok(Self { inner })
     }
 
     pub fn node_id(&self) -> NodeId {
-        self.node_id
+        self.inner.node_id()
     }
 
-    pub fn raft(&self) -> &Raft<TypeConfig> {
-        &self.raft
-    }
-
-    async fn is_initialized(&self) -> Result<bool> {
-        // Queries raft state directly; the metrics watch is not guaranteed
-        // to reflect recovered membership this early after Raft::new.
-        self.raft.is_initialized().await.map_err(raft_err)
+    pub fn raft(&self) -> &openraft::Raft<types::TypeConfig> {
+        self.inner.raft()
     }
 
     /// Wait until this node has a leader (itself, single-node).
     pub async fn wait_for_leader(&self, timeout: Duration) -> Result<NodeId> {
-        let metrics = self
-            .raft
-            .wait(Some(timeout))
-            .metrics(|m| m.current_leader.is_some(), "leader elected")
-            .await
-            .map_err(raft_err)?;
-        Ok(metrics.current_leader.expect("leader present per wait"))
+        Ok(self.inner.wait_for_leader(timeout).await?)
     }
 
     /// Linearizable write through the metadata group.
     pub async fn write(&self, cmd: MetaCommand) -> Result<MetaResponse> {
-        let resp = self.raft.client_write(cmd).await.map_err(raft_err)?;
-        Ok(resp.data)
+        let command = postcard::to_stdvec(&cmd).map_err(|e| ClusterError::Codec(e.to_string()))?;
+        let resp = self.inner.propose(command).await?;
+        postcard::from_bytes(&resp).map_err(|e| ClusterError::Codec(e.to_string()))
     }
 
     /// Linearizable read: confirm leadership/lease, then read applied state.
     pub async fn read(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.raft.ensure_linearizable().await.map_err(raft_err)?;
-        self.sm
-            .get(key)
+        self.inner.ensure_linearizable().await?;
+        self.inner
+            .read_ctx()
+            .get(T_KV, key.as_bytes())
             .map_err(|e| ClusterError::Storage(e.to_string()))
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        self.raft
-            .shutdown()
-            .await
-            .map_err(|e| raft_err(format!("{e:?}")))
+        Ok(self.inner.shutdown().await?)
     }
 }
 
 /// Serve the internal gRPC surface (control channel) until `shutdown`
-/// resolves. mTLS wiring lands with multi-node (M4); M0 binds plaintext on
-/// the internal listener.
+/// resolves. Incoming Raft messages route to any shard group registered in
+/// `registry`. mTLS wiring lands with multi-node (M4); until then this
+/// binds plaintext on the internal listener.
 pub async fn serve_internal(
     handle: MetadataHandle,
+    registry: ShardRegistry,
     server_name: String,
     listen: std::net::SocketAddr,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let svc = rpc::InternalRpc::new(handle, server_name);
+    let svc = rpc::InternalRpc::new(handle, registry, server_name);
     let svc = Arc::new(svc);
 
     tonic::transport::Server::builder()

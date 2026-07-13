@@ -6,3 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+saltator-store.workspace = true
+
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+openraft.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+anyhow.workspace = true

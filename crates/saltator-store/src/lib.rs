@@ -55,6 +55,24 @@ impl WriteBatch {
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
+
+    /// Staged-overlay lookup: what would `key` read as if this batch were
+    /// applied? Outer `None` = the batch says nothing about `key`; inner
+    /// `None` = the batch deletes it. Linear in batch size — meant for the
+    /// small per-apply batches of the shard runtime, not bulk use.
+    pub fn staged(&self, key: &[u8]) -> Option<Option<&[u8]>> {
+        for op in self.ops.iter().rev() {
+            match op {
+                BatchOp::Put(k, v) if k.as_slice() == key => return Some(Some(v.as_slice())),
+                BatchOp::Delete(k) if k.as_slice() == key => return Some(None),
+                BatchOp::DeleteRange(s, e) if s.as_slice() <= key && key < e.as_slice() => {
+                    return Some(None)
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 /// Narrow, engine-agnostic KV interface. All methods are synchronous; async
@@ -104,6 +122,17 @@ pub fn key(ks: Keyspace, shard: u16, table: u8, k: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `[start, end)` bounds covering every key of `shard` (all tables).
+/// Whole-shard operations (checkpoint transfer, drop) are range ops.
+pub fn shard_bounds(ks: Keyspace, shard: u16) -> (Vec<u8>, Vec<u8>) {
+    let start = vec![ks as u8, (shard >> 8) as u8, shard as u8];
+    let end = match shard.checked_add(1) {
+        Some(next) => vec![ks as u8, (next >> 8) as u8, next as u8],
+        None => vec![ks as u8 + 1],
+    };
+    (start, end)
+}
+
 /// `[start, end)` bounds covering every key of `table` in `shard`.
 pub fn table_bounds(ks: Keyspace, shard: u16, table: u8) -> (Vec<u8>, Vec<u8>) {
     let start = key(ks, shard, table, &[]);
@@ -131,6 +160,18 @@ mod tests {
         let b = key(Keyspace::Room, 1, 1, b"a");
         let c = key(Keyspace::Room, 2, 0, b"a");
         assert!(a < b && b < c);
+    }
+
+    #[test]
+    fn shard_bounds_cover_all_tables_of_one_shard() {
+        let (start, end) = shard_bounds(Keyspace::Room, 7);
+        assert!(key(Keyspace::Room, 7, 0, b"") >= start);
+        assert!(key(Keyspace::Room, 7, u8::MAX, &[0xff; 32]) < end);
+        assert!(key(Keyspace::Room, 8, 0, b"") >= end);
+        // u16::MAX shard falls back to bumping the keyspace byte.
+        let (_, end) = shard_bounds(Keyspace::Room, u16::MAX);
+        assert!(key(Keyspace::Room, u16::MAX, u8::MAX, &[0xff; 32]) < end);
+        assert!(key(Keyspace::User, 0, 0, b"") >= end);
     }
 
     #[test]

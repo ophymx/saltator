@@ -13,19 +13,34 @@ use openraft::raft::{
 use serde::{Deserialize, Serialize};
 use tonic::transport::Channel;
 
+use saltator_shard::ShardId;
+
 use crate::proto::raft_service_client::RaftServiceClient;
 use crate::proto::RaftPayload;
 use crate::types::{Node, NodeId, TypeConfig, CODEC_VERSION};
 
-pub const METADATA_GROUP: u64 = 0;
+pub const METADATA_GROUP: u64 = ShardId::METADATA.group();
 
-pub struct GrpcRaftNetworkFactory;
+/// One factory per shard group; `group` tags every outgoing envelope so
+/// the receiving node can route to the right Raft instance.
+pub struct GrpcRaftNetworkFactory {
+    group: u64,
+}
+
+impl GrpcRaftNetworkFactory {
+    pub fn new(shard: ShardId) -> Self {
+        Self {
+            group: shard.group(),
+        }
+    }
+}
 
 impl RaftNetworkFactory<TypeConfig> for GrpcRaftNetworkFactory {
     type Network = GrpcRaftConnection;
 
     async fn new_client(&mut self, target: NodeId, node: &Node) -> Self::Network {
         GrpcRaftConnection {
+            group: self.group,
             target,
             addr: node.addr.clone(),
             client: None,
@@ -34,6 +49,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcRaftNetworkFactory {
 }
 
 pub struct GrpcRaftConnection {
+    group: u64,
     target: NodeId,
     addr: String,
     client: Option<RaftServiceClient<Channel>>,
@@ -51,9 +67,9 @@ impl GrpcRaftConnection {
     }
 }
 
-fn to_payload<T: Serialize>(req: &T) -> Result<RaftPayload, NetworkError> {
+fn to_payload<T: Serialize>(group: u64, req: &T) -> Result<RaftPayload, NetworkError> {
     Ok(RaftPayload {
-        group: METADATA_GROUP,
+        group,
         codec_version: CODEC_VERSION,
         payload: postcard::to_stdvec(req).map_err(|e| NetworkError::new(&e))?,
     })
@@ -70,7 +86,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftConnection {
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
         tracing::trace!(target = self.target, "append_entries");
-        let payload = to_payload(&rpc).map_err(RPCError::Network)?;
+        let payload = to_payload(self.group, &rpc).map_err(RPCError::Network)?;
         let client = self.client().await.map_err(RPCError::Unreachable)?;
         let resp = client
             .append_entries(payload)
@@ -85,7 +101,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftConnection {
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, Node, RaftError<NodeId>>> {
         tracing::debug!(target = self.target, "vote");
-        let payload = to_payload(&rpc).map_err(RPCError::Network)?;
+        let payload = to_payload(self.group, &rpc).map_err(RPCError::Network)?;
         let client = self.client().await.map_err(RPCError::Unreachable)?;
         let resp = client
             .vote(payload)
@@ -103,7 +119,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftConnection {
         RPCError<NodeId, Node, RaftError<NodeId, InstallSnapshotError>>,
     > {
         tracing::debug!(target = self.target, "install_snapshot");
-        let payload = to_payload(&rpc).map_err(RPCError::Network)?;
+        let payload = to_payload(self.group, &rpc).map_err(RPCError::Network)?;
         let client = self.client().await.map_err(RPCError::Unreachable)?;
         let resp = client
             .install_snapshot(payload)

@@ -4,9 +4,11 @@
 // signatures.
 #![allow(clippy::result_large_err)]
 
+use openraft::Raft;
 use tonic::{Request, Response, Status};
 
-use crate::network::METADATA_GROUP;
+use saltator_shard::{ShardRegistry, TypeConfig};
+
 use crate::proto::control_service_server::ControlService;
 use crate::proto::raft_service_server::RaftService;
 use crate::proto::{RaftPayload, StatusRequest, StatusResponse};
@@ -15,30 +17,31 @@ use crate::MetadataHandle;
 
 pub struct InternalRpc {
     handle: MetadataHandle,
+    registry: ShardRegistry,
     server_name: String,
 }
 
 impl InternalRpc {
-    pub fn new(handle: MetadataHandle, server_name: String) -> Self {
+    pub fn new(handle: MetadataHandle, registry: ShardRegistry, server_name: String) -> Self {
         Self {
             handle,
+            registry,
             server_name,
         }
     }
 
-    fn check_envelope(&self, p: &RaftPayload) -> Result<(), Status> {
+    /// Envelope checks + route to the addressed shard group's Raft
+    /// instance.
+    fn route(&self, p: &RaftPayload) -> Result<Raft<TypeConfig>, Status> {
         if p.codec_version != CODEC_VERSION {
             return Err(Status::failed_precondition(format!(
                 "codec version mismatch: got {}, want {}",
                 p.codec_version, CODEC_VERSION
             )));
         }
-        // Until the generic shard runtime lands (M4), only the metadata
-        // group exists.
-        if p.group != METADATA_GROUP {
-            return Err(Status::not_found(format!("unknown raft group {}", p.group)));
-        }
-        Ok(())
+        self.registry
+            .get(p.group)
+            .ok_or_else(|| Status::not_found(format!("no shard group {} on this node", p.group)))
     }
 }
 
@@ -63,10 +66,8 @@ impl RaftService for InternalRpc {
         request: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
         let p = request.into_inner();
-        self.check_envelope(&p)?;
-        let resp = self
-            .handle
-            .raft()
+        let raft = self.route(&p)?;
+        let resp = raft
             .append_entries(decode(&p)?)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -75,10 +76,8 @@ impl RaftService for InternalRpc {
 
     async fn vote(&self, request: Request<RaftPayload>) -> Result<Response<RaftPayload>, Status> {
         let p = request.into_inner();
-        self.check_envelope(&p)?;
-        let resp = self
-            .handle
-            .raft()
+        let raft = self.route(&p)?;
+        let resp = raft
             .vote(decode(&p)?)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -90,10 +89,8 @@ impl RaftService for InternalRpc {
         request: Request<RaftPayload>,
     ) -> Result<Response<RaftPayload>, Status> {
         let p = request.into_inner();
-        self.check_envelope(&p)?;
-        let resp = self
-            .handle
-            .raft()
+        let raft = self.route(&p)?;
+        let resp = raft
             .install_snapshot(decode(&p)?)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
