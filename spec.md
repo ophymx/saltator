@@ -453,8 +453,16 @@ exposure of existing structure, not a redesign.
   Shard split/merge is out of scope for the foreseeable future; deployments
   that outgrow their shard count migrate via room export/import or cluster
   rebuild.
-- **OQ-6 — Metadata group as key custodian. DEFERRED.** Signing keys in the
-  metadata group (§5.4) stands for now; revisit a sealed-key / per-node
-  unwrap scheme before M3.
+- **OQ-6 — Metadata group as key custodian. RESOLVED for v1 (2026-07-14):
+  shared cluster KEK.** Signing keys stay in the metadata group, encrypted
+  under one cluster-wide KEK (`master.key`), which is an operator-provisioned
+  cluster secret: minted only at fresh bootstrap, copied to each node like a
+  TLS key. At-rest encryption protects offline artifacts (backups, shipped
+  checkpoints) — any node that signs necessarily holds the capability while
+  running, so fancier custodians can't raise that ceiling. Stored key blobs
+  carry a scheme tag and per-version created/expired timestamps (the latter
+  needed for `old_verify_keys` in M3 anyway) so the format forecloses
+  nothing. Custodian design is revisited at M4 alongside the node-join
+  ceremony — per-node sealed unwrap, KMS, or status quo; no decision now.
 - **OQ-7 — Follower-read scaling. DEFERRED (post-v1).** Shard-layer API must
   not preclude it (§4.2, §5.3).

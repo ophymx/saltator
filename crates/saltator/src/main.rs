@@ -89,7 +89,7 @@ async fn rotate(cfg: Config) -> anyhow::Result<()> {
     )
     .await?;
     meta.wait_for_leader(Duration::from_secs(10)).await?;
-    let kek = keys::load_or_generate_kek(&cfg.data_dir.join("master.key"))?;
+    let kek = keys::load_kek(&cfg.data_dir.join("master.key"), false)?;
     let version = keys::rotate_signing_key(&meta, &kek, server_name_of(&cfg)?).await?;
     tracing::info!(version, "signing key rotated");
     meta.shutdown().await?;
@@ -105,6 +105,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION"),
     );
 
+    // Minting a KEK is only legitimate when this start will bootstrap a
+    // cluster; an existing db with no master.key is a provisioning mistake.
+    let fresh_bootstrap = !cfg.data_dir.join("db").exists();
     std::fs::create_dir_all(&cfg.data_dir)?;
     let engine = Arc::new(saltator_store::RocksEngine::open(&cfg.data_dir.join("db"))?);
 
@@ -128,7 +131,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // Event-signing identity: versioned, encrypted at rest in the
     // metadata group (spec.md §5.4, §10).
     let server_name = server_name_of(&cfg)?;
-    let kek = keys::load_or_generate_kek(&cfg.data_dir.join("master.key"))?;
+    let kek = keys::load_kek(&cfg.data_dir.join("master.key"), fresh_bootstrap)?;
     let signer = keys::load_signing_key(&meta, &kek, &cfg.data_dir, server_name.clone()).await?;
 
     let rooms = saltator_roomserver::RoomServer::start(
