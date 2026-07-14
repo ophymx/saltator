@@ -90,6 +90,18 @@ pub trait KvEngine: Send + Sync + 'static {
     /// Ordered scan of `[start, end)`.
     fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
+    /// Ordered scan of `[start, end)` returning at most `limit` entries —
+    /// the first `limit` in key order, or the last `limit` (still returned
+    /// in reverse key order) when `reverse`. For paginated reads over
+    /// large tables where `range` would materialize the world.
+    fn scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
     /// Last entry in `[start, end)`, if any — used for tail lookups
     /// (e.g. last raft log index) without scanning.
     fn last_in_range(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>>;

@@ -171,4 +171,30 @@ impl ReadCtx {
             .map(|(k, v)| (k[prefix..].to_vec(), v))
             .collect())
     }
+
+    /// Bounded scan of a table over app keys `[start, end)` (whole table
+    /// if `end` is empty): at most `limit` entries, from the end of the
+    /// range (in reverse key order) when `reverse`.
+    pub fn scan(
+        &self,
+        table: u8,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        reverse: bool,
+    ) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let start_k = self.key(table, start);
+        let end_k = if end.is_empty() {
+            table_bounds(self.shard.keyspace, self.shard.index, table).1
+        } else {
+            self.key(table, end)
+        };
+        let prefix = start_k.len() - start.len();
+        Ok(self
+            .engine
+            .scan(&start_k, &end_k, limit, reverse)?
+            .into_iter()
+            .map(|(k, v)| (k[prefix..].to_vec(), v))
+            .collect())
+    }
 }

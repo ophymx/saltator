@@ -36,6 +36,7 @@ use tokio::sync::{broadcast, Mutex, OwnedMutexGuard};
 
 use saltator_core::auth::{self, AuthEntry, StateMap};
 use saltator_core::event::{self, EventFormatError, IdentifiedPdu, Pdu};
+use saltator_core::power_levels::RoomPowerLevels;
 use saltator_core::room_version::UnsupportedRoomVersion;
 use saltator_core::state_res::{self, StateIds, StateResError};
 use saltator_core::validation::{self, ValidationError, VerificationError, VerifyOutcome};
@@ -46,8 +47,8 @@ use saltator_store::{Keyspace, KvEngine};
 pub use machine::{RoomApp, RoomStore};
 pub use signer::{ServerSigner, SignError};
 pub use types::{
-    AppendEvent, ChangePayload, Rejected, RoomCommand, RoomMeta, RoomResponse, SeqEntry,
-    StateGroup, StoredEvent, MAX_GROUP_CHAIN,
+    AppendEvent, ChangePayload, ReceiptCmd, ReceiptRecord, Rejected, RoomCommand, RoomMeta,
+    RoomResponse, SeqEntry, StateGroup, StoredEvent, MAX_GROUP_CHAIN,
 };
 
 /// M1 runs a single room shard; the fixed shard count and placement land
@@ -260,6 +261,34 @@ impl RoomServer {
         let (version, room_id, is_create) = self.classify(&raw)?;
         let _guard = self.lock_room(room_id.as_str()).await;
         self.process(raw, version, &room_id, is_create).await
+    }
+
+    /// Record a read receipt (durable; bumps the shard seq so `/sync`
+    /// windows cover it). Returns the receipt's seq — 0 if it was already
+    /// recorded for the same event.
+    pub async fn write_receipt(
+        &self,
+        room_id: &ruma::RoomId,
+        user_id: &UserId,
+        receipt_type: &str,
+        event_id: &EventId,
+        ts: u64,
+    ) -> Result<u64> {
+        let resp = self
+            .propose_cmd(&RoomCommand::Receipt(ReceiptCmd {
+                room_id: room_id.to_string(),
+                user_id: user_id.to_string(),
+                receipt_type: receipt_type.to_owned(),
+                event_id: event_id.to_string(),
+                ts,
+            }))
+            .await?;
+        match resp {
+            RoomResponse::Receipt { seq } => Ok(seq),
+            other => Err(RoomError::Codec(format!(
+                "unexpected response to receipt: {other:?}"
+            ))),
+        }
     }
 
     // -- internals --------------------------------------------------------
@@ -634,6 +663,14 @@ impl RoomServer {
             }
         };
 
+        // Accepted m.room.redaction: decide whether it *applies* to its
+        // target (spec "Redactions": same sender, or redact power level).
+        let redacts = if event.event_type() == "m.room.redaction" {
+            self.redaction_target(&store, room_id, &event, version, &state_before, &fetch)?
+        } else {
+            None
+        };
+
         // -- 5c. persist: one Raft proposal, one deterministic KV batch.
         let cmd = AppendEvent {
             room_id: room_id.to_string(),
@@ -647,8 +684,59 @@ impl RoomServer {
             new_extremities: extremities.into_iter().collect(),
             next_group,
             create_version: is_create.then(|| version.as_str().to_owned()),
+            redacts,
         };
         self.propose(cmd).await
+    }
+
+    /// For an accepted `m.room.redaction`, the target event it may be
+    /// applied to: locally known, same room, and either sent by the
+    /// redaction's sender or redactable at the sender's power level
+    /// (evaluated against the state before the redaction). Unknown targets
+    /// are dropped for now — M3 revisits out-of-order federated
+    /// redactions.
+    fn redaction_target(
+        &self,
+        store: &RoomStore,
+        room_id: &ruma::RoomId,
+        event: &IdentifiedPdu,
+        version: RoomVersion,
+        state_before: &StateIds,
+        fetch: &impl Fn(&EventId) -> Option<IdentifiedPdu>,
+    ) -> Result<Option<String>> {
+        let Some(CanonicalJsonValue::String(target_id)) = event.content().get("redacts") else {
+            return Ok(None);
+        };
+        let Ok(target_id) = OwnedEventId::try_from(target_id.as_str()) else {
+            return Ok(None);
+        };
+        let Some(stored) = store.event(target_id.as_str()).map_err(storage_err)? else {
+            return Ok(None);
+        };
+        if stored.rejected.is_some() {
+            return Ok(None);
+        }
+        let target = parse_stored(target_id.clone(), &stored)?;
+        // v12 create events carry no room_id and are never redactable
+        // through this path.
+        if target.room_id() != Some(room_id) {
+            return Ok(None);
+        }
+        if target.sender() == event.sender() {
+            return Ok(Some(target_id.to_string()));
+        }
+        let create_key = ("m.room.create".to_owned(), String::new());
+        let Some(create) = state_before.get(&create_key).and_then(|id| fetch(id)) else {
+            return Ok(None);
+        };
+        let pl_key = ("m.room.power_levels".to_owned(), String::new());
+        let pl_event = state_before.get(&pl_key).and_then(|id| fetch(id));
+        let pls = RoomPowerLevels::resolve(version, &create, pl_event.as_ref())
+            .map_err(|e| RoomError::Malformed(e.to_string()))?;
+        Ok(pls
+            .user(event.sender())
+            .satisfies(pls.redact)
+            .then(|| target_id.to_string()))
     }
 
     async fn propose_rejected(
@@ -687,16 +775,21 @@ impl RoomServer {
             new_extremities: Vec::new(),
             next_group,
             create_version: None,
+            redacts: None,
         };
         self.propose(cmd).await
     }
 
-    async fn propose(&self, cmd: AppendEvent) -> Result<Outcome> {
-        let bytes = postcard::to_stdvec(&RoomCommand::Append(Box::new(cmd)))
-            .map_err(|e| RoomError::Codec(e.to_string()))?;
+    async fn propose_cmd(&self, cmd: &RoomCommand) -> Result<RoomResponse> {
+        let bytes = postcard::to_stdvec(cmd).map_err(|e| RoomError::Codec(e.to_string()))?;
         let resp = self.handle.propose(bytes).await?;
-        let resp: RoomResponse =
-            postcard::from_bytes(&resp).map_err(|e| RoomError::Codec(e.to_string()))?;
+        postcard::from_bytes(&resp).map_err(|e| RoomError::Codec(e.to_string()))
+    }
+
+    async fn propose(&self, cmd: AppendEvent) -> Result<Outcome> {
+        let resp = self
+            .propose_cmd(&RoomCommand::Append(Box::new(cmd)))
+            .await?;
         let parse_id = |s: String| {
             OwnedEventId::try_from(s).map_err(|e| RoomError::Codec(format!("event id: {e}")))
         };
@@ -712,6 +805,11 @@ impl RoomServer {
             RoomResponse::Duplicate { event_id } => Outcome::Duplicate {
                 event_id: parse_id(event_id)?,
             },
+            RoomResponse::Receipt { .. } => {
+                return Err(RoomError::Codec(
+                    "unexpected receipt response to append".into(),
+                ))
+            }
         })
     }
 

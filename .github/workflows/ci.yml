@@ -24,3 +24,54 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: tests
         run: cargo test --workspace
+
+  complement:
+    name: complement (csapi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build saltator (release)
+        run: cargo build --release -p saltator
+      - name: Build Complement image
+        run: |
+          cp target/release/saltator docker/complement/saltator
+          docker build -t complement-saltator:latest docker/complement
+      - name: Checkout Complement
+        uses: actions/checkout@v4
+        with:
+          repository: matrix-org/complement
+          # Pinned so runs are reproducible; bump deliberately.
+          ref: f002aff99e240c994231a21985546b1c16d4173c
+          path: complement
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: complement/go.sum
+      - name: Run Complement CS suite
+        working-directory: complement
+        env:
+          COMPLEMENT_BASE_IMAGE: complement-saltator:latest
+        # Pass-rate is tracked, not gated (spec.md "Protocol compliance"):
+        # the suite is allowed to have failures while coverage grows, so the
+        # step succeeds unless the harness itself breaks.
+        run: go test -json -timeout 30m ./tests/csapi | tee /tmp/complement.json || true
+      - name: Pass-rate summary
+        run: |
+          pass=$(jq -r 'select(.Action=="pass" and .Test != null) | .Test' /tmp/complement.json | wc -l)
+          fail=$(jq -r 'select(.Action=="fail" and .Test != null) | .Test' /tmp/complement.json | wc -l)
+          skip=$(jq -r 'select(.Action=="skip" and .Test != null) | .Test' /tmp/complement.json | wc -l)
+          total=$((pass + fail))
+          echo "## Complement csapi: ${pass}/${total} passed (${skip} skipped)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Failed tests</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          jq -r 'select(.Action=="fail" and .Test != null) | "- `" + .Test + "`"' /tmp/complement.json >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+          # Zero passes means the image or deployer is broken, not a
+          # protocol gap — fail loudly.
+          if [ "$pass" -eq 0 ]; then
+            echo "no Complement tests passed; deployment is broken" >&2
+            exit 1
+          fi

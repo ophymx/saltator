@@ -20,6 +20,52 @@ pub struct Config {
 
     #[serde(default)]
     pub listeners: Listeners,
+
+    #[serde(default)]
+    pub client: ClientConfig,
+}
+
+/// Client-server API behavior.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {
+    /// Whether `POST /register` is open.
+    #[serde(default = "default_true")]
+    pub registration_enabled: bool,
+    /// Room version for `/createRoom` when the client names none.
+    #[serde(default = "default_room_version")]
+    pub default_room_version: String,
+    /// Media upload cap in bytes.
+    #[serde(default = "default_max_upload")]
+    pub max_upload_size: u64,
+    /// Base URL advertised in `/.well-known/matrix/client`; the
+    /// well-known route is only served when set.
+    #[serde(default)]
+    pub well_known_client: Option<String>,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            registration_enabled: true,
+            default_room_version: default_room_version(),
+            max_upload_size: default_max_upload(),
+            well_known_client: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_room_version() -> String {
+    // The pinned spec's default room version (spec.md §3).
+    "12".to_owned()
+}
+
+fn default_max_upload() -> u64 {
+    50 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +134,12 @@ seeds = []
 internal = "127.0.0.1:7400"
 client = "127.0.0.1:8008"
 federation = "127.0.0.1:8448"
+
+[client]
+registration_enabled = true
+default_room_version = "12"
+max_upload_size = 52428800
+# well_known_client = "https://matrix.example.org"
 "#;
 
 #[cfg(test)]

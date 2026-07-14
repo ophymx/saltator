@@ -11,16 +11,28 @@ path = "src/main.rs"
 
 [dependencies]
 saltator-cluster.workspace = true
+saltator-core.workspace = true
+saltator-cs-api.workspace = true
+saltator-media.workspace = true
 saltator-roomserver.workspace = true
 saltator-shard.workspace = true
 saltator-store.workspace = true
+saltator-userserver.workspace = true
 
 ruma.workspace = true
 
 anyhow.workspace = true
+axum.workspace = true
+chacha20poly1305 = { workspace = true }
 clap.workspace = true
+rand.workspace = true
 serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

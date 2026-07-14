@@ -1,0 +1,409 @@
+//! Profiles, account data, filters, devices, push rules, presence.
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use ruma::api::client::config::{
+    get_global_account_data, get_room_account_data, set_global_account_data, set_room_account_data,
+};
+use ruma::api::client::device::{self, delete_device, get_device, get_devices, update_device};
+use ruma::api::client::filter::{create_filter, get_filter, FilterDefinition};
+use ruma::api::client::presence::{get_presence, set_presence};
+use ruma::api::client::profile::{
+    get_avatar_url, get_display_name, get_profile, set_avatar_url, set_display_name,
+};
+use ruma::api::client::push::get_pushrules_all;
+use ruma::api::client::uiaa::{AuthData, UserIdentifier};
+use ruma::UserId;
+
+use saltator_userserver::Profile;
+
+use crate::error::ApiError;
+use crate::extract::{Ar, Auth, Ra};
+use crate::CsState;
+
+type Result<T> = std::result::Result<T, ApiError>;
+
+fn internal(e: impl std::fmt::Display) -> ApiError {
+    ApiError::internal(e)
+}
+
+// -- profile ----------------------------------------------------------------
+
+fn load_profile(state: &CsState, user_id: &UserId) -> Result<Profile> {
+    // Unknown users must 404 (spec); known users without profile data
+    // yield the empty profile.
+    let store = state.users.store();
+    if store.account(user_id.as_str()).map_err(internal)?.is_none() {
+        return Err(ApiError::not_found("Unknown user"));
+    }
+    Ok(store
+        .profile(user_id.as_str())
+        .map_err(internal)?
+        .unwrap_or_default())
+}
+
+pub async fn get_profile(
+    State(state): State<Arc<CsState>>,
+    Ar(req): Ar<get_profile::v3::Request>,
+) -> Result<Ra<get_profile::v3::Response>> {
+    let profile = load_profile(&state, &req.user_id)?;
+    let mut resp = get_profile::v3::Response::new();
+    if let Some(d) = profile.displayname {
+        resp.set("displayname".to_owned(), d.into());
+    }
+    if let Some(a) = profile.avatar_url {
+        resp.set("avatar_url".to_owned(), a.into());
+    }
+    Ok(Ra(resp))
+}
+
+pub async fn get_displayname(
+    State(state): State<Arc<CsState>>,
+    Ar(req): Ar<get_display_name::v3::Request>,
+) -> Result<Ra<get_display_name::v3::Response>> {
+    let profile = load_profile(&state, &req.user_id)?;
+    Ok(Ra(get_display_name::v3::Response::new(profile.displayname)))
+}
+
+pub async fn set_displayname(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<set_display_name::v3::Request>,
+) -> Result<Ra<set_display_name::v3::Response>> {
+    if req.user_id != auth.user_id {
+        return Err(ApiError::forbidden("Cannot set another user's profile"));
+    }
+    state
+        .users
+        .set_profile(&auth.user_id, Some(req.displayname.clone()), None)
+        .await?;
+    propagate_profile(&state, &auth.user_id).await;
+    Ok(Ra(set_display_name::v3::Response::new()))
+}
+
+pub async fn get_avatar_url(
+    State(state): State<Arc<CsState>>,
+    Ar(req): Ar<get_avatar_url::v3::Request>,
+) -> Result<Ra<get_avatar_url::v3::Response>> {
+    let profile = load_profile(&state, &req.user_id)?;
+    Ok(Ra(get_avatar_url::v3::Response::new(
+        profile.avatar_url.map(Into::into),
+    )))
+}
+
+pub async fn set_avatar_url(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<set_avatar_url::v3::Request>,
+) -> Result<Ra<set_avatar_url::v3::Response>> {
+    if req.user_id != auth.user_id {
+        return Err(ApiError::forbidden("Cannot set another user's profile"));
+    }
+    state
+        .users
+        .set_profile(
+            &auth.user_id,
+            None,
+            Some(req.avatar_url.as_ref().map(|u| u.to_string())),
+        )
+        .await?;
+    propagate_profile(&state, &auth.user_id).await;
+    Ok(Ra(set_avatar_url::v3::Response::new()))
+}
+
+/// Reflect a profile change into the user's joined rooms as updated
+/// `m.room.member` events (best-effort: a rejection in one room does not
+/// fail the profile update).
+async fn propagate_profile(state: &CsState, user_id: &UserId) {
+    let Ok(profile) = state.users.store().profile(user_id.as_str()) else {
+        return;
+    };
+    let profile = profile.unwrap_or_default();
+    let Ok(memberships) = state.users.store().memberships(user_id.as_str()) else {
+        return;
+    };
+    for (room_id, m) in memberships {
+        if m.membership != "join" {
+            continue;
+        }
+        let Ok(room_id) = ruma::OwnedRoomId::try_from(room_id) else {
+            continue;
+        };
+        let mut content = serde_json::json!({ "membership": "join" });
+        if let Some(d) = &profile.displayname {
+            content["displayname"] = d.clone().into();
+        }
+        if let Some(a) = &profile.avatar_url {
+            content["avatar_url"] = a.clone().into();
+        }
+        if let Err(e) = state
+            .rooms
+            .send_state(
+                &room_id,
+                user_id,
+                "m.room.member",
+                user_id.as_str(),
+                content,
+            )
+            .await
+        {
+            tracing::warn!(%room_id, error = %e, "profile propagation failed");
+        }
+    }
+}
+
+// -- account data -----------------------------------------------------------
+
+/// Account-data types clients may not set directly.
+fn check_settable(data_type: &str) -> Result<()> {
+    if matches!(data_type, "m.fully_read" | "m.push_rules") {
+        return Err(ApiError::new(
+            axum::http::StatusCode::METHOD_NOT_ALLOWED,
+            "M_BAD_JSON",
+            format!("{data_type} cannot be set directly"),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn set_global_account_data(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<set_global_account_data::v3::Request>,
+) -> Result<Ra<set_global_account_data::v3::Response>> {
+    if req.user_id != auth.user_id {
+        return Err(ApiError::forbidden("Cannot set another user's data"));
+    }
+    let data_type = req.event_type.to_string();
+    check_settable(&data_type)?;
+    state
+        .users
+        .put_account_data(
+            &auth.user_id,
+            "",
+            &data_type,
+            req.data.json().get().as_bytes().to_vec(),
+        )
+        .await?;
+    Ok(Ra(set_global_account_data::v3::Response::new()))
+}
+
+pub async fn get_global_account_data(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<get_global_account_data::v3::Request>,
+) -> Result<Ra<get_global_account_data::v3::Response>> {
+    if req.user_id != auth.user_id {
+        return Err(ApiError::forbidden("Cannot read another user's data"));
+    }
+    let entry = state
+        .users
+        .store()
+        .account_data(auth.user_id.as_str(), "", &req.event_type.to_string())
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::not_found("No account data of this type"))?;
+    let raw = raw_from_bytes(&entry.json)?;
+    Ok(Ra(get_global_account_data::v3::Response::new(raw)))
+}
+
+pub async fn set_room_account_data(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<set_room_account_data::v3::Request>,
+) -> Result<Ra<set_room_account_data::v3::Response>> {
+    if req.user_id != auth.user_id {
+        return Err(ApiError::forbidden("Cannot set another user's data"));
+    }
+    let data_type = req.event_type.to_string();
+    check_settable(&data_type)?;
+    state
+        .users
+        .put_account_data(
+            &auth.user_id,
+            req.room_id.as_str(),
+            &data_type,
+            req.data.json().get().as_bytes().to_vec(),
+        )
+        .await?;
+    Ok(Ra(set_room_account_data::v3::Response::new()))
+}
+
+pub async fn get_room_account_data(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<get_room_account_data::v3::Request>,
+) -> Result<Ra<get_room_account_data::v3::Response>> {
+    if req.user_id != auth.user_id {
+        return Err(ApiError::forbidden("Cannot read another user's data"));
+    }
+    let entry = state
+        .users
+        .store()
+        .account_data(
+            auth.user_id.as_str(),
+            req.room_id.as_str(),
+            &req.event_type.to_string(),
+        )
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::not_found("No account data of this type"))?;
+    let raw = raw_from_bytes(&entry.json)?;
+    Ok(Ra(get_room_account_data::v3::Response::new(raw)))
+}
+
+fn raw_from_bytes<T>(json: &[u8]) -> Result<ruma::serde::Raw<T>> {
+    serde_json::from_slice::<Box<serde_json::value::RawValue>>(json)
+        .map(ruma::serde::Raw::from_json)
+        .map_err(internal)
+}
+
+// -- filters ------------------------------------------------------------------
+
+pub async fn create_filter(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<create_filter::v3::Request>,
+) -> Result<Ra<create_filter::v3::Response>> {
+    if req.user_id != auth.user_id {
+        return Err(ApiError::forbidden("Cannot create another user's filter"));
+    }
+    let json = serde_json::to_vec(&req.filter).map_err(internal)?;
+    let filter_id = state.users.put_filter(&auth.user_id, json).await?;
+    Ok(Ra(create_filter::v3::Response::new(filter_id)))
+}
+
+pub async fn get_filter(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<get_filter::v3::Request>,
+) -> Result<Ra<get_filter::v3::Response>> {
+    if req.user_id != auth.user_id {
+        return Err(ApiError::forbidden("Cannot read another user's filter"));
+    }
+    let json = state
+        .users
+        .store()
+        .filter(auth.user_id.as_str(), &req.filter_id)
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::not_found("Unknown filter"))?;
+    let filter: FilterDefinition = serde_json::from_slice(&json).map_err(internal)?;
+    Ok(Ra(get_filter::v3::Response::new(filter)))
+}
+
+// -- devices ------------------------------------------------------------------
+
+fn to_ruma_device(device_id: String, d: saltator_userserver::Device) -> device::Device {
+    let mut out = device::Device::new(device_id.into());
+    out.display_name = d.display_name;
+    out
+}
+
+pub async fn get_devices(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    _req: Ar<get_devices::v3::Request>,
+) -> Result<Ra<get_devices::v3::Response>> {
+    let devices = state
+        .users
+        .store()
+        .devices(auth.user_id.as_str())
+        .map_err(internal)?
+        .into_iter()
+        .map(|(id, d)| to_ruma_device(id, d))
+        .collect();
+    Ok(Ra(get_devices::v3::Response::new(devices)))
+}
+
+pub async fn get_device(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<get_device::v3::Request>,
+) -> Result<Ra<get_device::v3::Response>> {
+    let device = state
+        .users
+        .store()
+        .device(auth.user_id.as_str(), req.device_id.as_str())
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::not_found("Unknown device"))?;
+    Ok(Ra(get_device::v3::Response::new(to_ruma_device(
+        req.device_id.to_string(),
+        device,
+    ))))
+}
+
+pub async fn update_device(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<update_device::v3::Request>,
+) -> Result<Ra<update_device::v3::Response>> {
+    state
+        .users
+        .set_device_name(
+            &auth.user_id,
+            req.device_id.as_str(),
+            req.display_name.clone(),
+        )
+        .await?;
+    Ok(Ra(update_device::v3::Response::new()))
+}
+
+pub async fn delete_device(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<delete_device::v3::Request>,
+) -> Result<Ra<delete_device::v3::Response>> {
+    // UIA: a single password stage.
+    let Some(AuthData::Password(pw)) = &req.auth else {
+        return Err(ApiError::uiaa(
+            &[&["m.login.password"]],
+            saltator_userserver::generate_token(),
+        ));
+    };
+    if let UserIdentifier::Matrix(m) = &pw.identifier {
+        let claimed = m.user.trim_start_matches('@');
+        let expected = auth.user_id.as_str().trim_start_matches('@');
+        if claimed != expected && Some(claimed) != expected.split(':').next() {
+            return Err(ApiError::forbidden("Identifier does not match session"));
+        }
+    }
+    if !state
+        .users
+        .verify_user_password(&auth.user_id, &pw.password)
+        .await?
+    {
+        return Err(ApiError::forbidden("Bad password"));
+    }
+    state
+        .users
+        .delete_device(&auth.user_id, req.device_id.as_str())
+        .await?;
+    Ok(Ra(delete_device::v3::Response::new()))
+}
+
+// -- push rules / presence ----------------------------------------------------
+
+pub async fn get_pushrules(
+    auth: Auth,
+    _req: Ar<get_pushrules_all::v3::Request>,
+) -> Ra<get_pushrules_all::v3::Response> {
+    Ra(get_pushrules_all::v3::Response::new(
+        ruma::push::Ruleset::server_default(&auth.user_id),
+    ))
+}
+
+pub async fn set_presence(
+    _auth: Auth,
+    _req: Ar<set_presence::v3::Request>,
+) -> Ra<set_presence::v3::Response> {
+    // Presence is ephemeral and optional; accepted and dropped in M2.
+    Ra(set_presence::v3::Response::new())
+}
+
+pub async fn get_presence(
+    _auth: Auth,
+    _req: Ar<get_presence::v3::Request>,
+) -> Ra<get_presence::v3::Response> {
+    Ra(get_presence::v3::Response::new(
+        ruma::presence::PresenceState::Offline,
+    ))
+}

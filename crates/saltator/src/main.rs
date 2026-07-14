@@ -1,7 +1,8 @@
 //! Saltator: a Matrix homeserver as a self-clustering distributed system.
-//! See spec.md. M0: single-node metadata group + internal RPC skeleton.
+//! See spec.md. M2: single-node with the full client-server surface.
 
 mod config;
+mod keys;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,13 @@ enum Command {
         #[arg(short, long)]
         config: std::path::PathBuf,
     },
+    /// Mint a new signing-key version and make it active. Run while the
+    /// node is stopped.
+    RotateSigningKey {
+        /// Path to the node's TOML config.
+        #[arg(short, long)]
+        config: std::path::PathBuf,
+    },
     /// Print an example configuration file to stdout.
     ExampleConfig,
 }
@@ -38,19 +46,54 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Start { config } => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "info,openraft=warn".into()),
-                )
-                .init();
+            init_tracing();
             let cfg = Config::load(&config)?;
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
                 .block_on(run(cfg))
         }
+        Command::RotateSigningKey { config } => {
+            init_tracing();
+            let cfg = Config::load(&config)?;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(rotate(cfg))
+        }
     }
+}
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,openraft=warn".into()),
+        )
+        .init();
+}
+
+fn server_name_of(cfg: &Config) -> anyhow::Result<ruma::OwnedServerName> {
+    ruma::OwnedServerName::try_from(cfg.server_name.as_str())
+        .map_err(|e| anyhow::anyhow!("server_name is not a valid Matrix server name: {e}"))
+}
+
+async fn rotate(cfg: Config) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let engine = Arc::new(saltator_store::RocksEngine::open(&cfg.data_dir.join("db"))?);
+    let meta = saltator_cluster::MetadataHandle::start(
+        cfg.node.id,
+        engine,
+        Some(cfg.node.advertise.clone()),
+        None,
+    )
+    .await?;
+    meta.wait_for_leader(Duration::from_secs(10)).await?;
+    let kek = keys::load_or_generate_kek(&cfg.data_dir.join("master.key"))?;
+    let version = keys::rotate_signing_key(&meta, &kek, server_name_of(&cfg)?).await?;
+    tracing::info!(version, "signing key rotated");
+    meta.shutdown().await?;
+    Ok(())
 }
 
 async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -66,7 +109,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let engine = Arc::new(saltator_store::RocksEngine::open(&cfg.data_dir.join("db"))?);
 
     // Joining via seeds is M4 (placement controller + add-learner flow);
-    // M0 supports fresh bootstrap and restart-recovery only.
+    // fresh bootstrap and restart-recovery only until then.
     if !cfg.cluster.seeds.is_empty() {
         anyhow::bail!("cluster.seeds is not supported yet (M4); run with empty seeds");
     }
@@ -79,20 +122,19 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         Some(&registry),
     )
     .await?;
-
     let leader = meta.wait_for_leader(Duration::from_secs(10)).await?;
     tracing::info!(leader, "metadata group ready");
 
-    // Event-signing identity: generated on first boot, recovered from the
-    // data dir thereafter.
-    let server_name = ruma::OwnedServerName::try_from(cfg.server_name.as_str())
-        .map_err(|e| anyhow::anyhow!("server_name is not a valid Matrix server name: {e}"))?;
-    let signer = load_or_generate_signer(&cfg.data_dir.join("signing.key"), server_name)?;
+    // Event-signing identity: versioned, encrypted at rest in the
+    // metadata group (spec.md §5.4, §10).
+    let server_name = server_name_of(&cfg)?;
+    let kek = keys::load_or_generate_kek(&cfg.data_dir.join("master.key"))?;
+    let signer = keys::load_signing_key(&meta, &kek, &cfg.data_dir, server_name.clone()).await?;
 
     let rooms = saltator_roomserver::RoomServer::start(
         cfg.node.id,
         engine.clone(),
-        std::sync::Arc::new(signer),
+        Arc::new(signer),
         saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_roomserver::ROOM_SHARD),
         Some(cfg.node.advertise.clone()),
         Some(&registry),
@@ -103,64 +145,93 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         .wait_for_leader(Duration::from_secs(10))
         .await?;
     tracing::info!("room shard ready");
-    tracing::info!(
-        client = %cfg.listeners.client,
-        federation = %cfg.listeners.federation,
-        "client/federation listeners configured; served from M2/M3",
-    );
 
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown signal received");
+    let users = saltator_userserver::UserServer::start(
+        cfg.node.id,
+        engine.clone(),
+        server_name.clone(),
+        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_userserver::USER_SHARD),
+        Some(cfg.node.advertise.clone()),
+        Some(&registry),
+    )
+    .await?;
+    users
+        .shard_handle()
+        .wait_for_leader(Duration::from_secs(10))
+        .await?;
+    tracing::info!("user shard ready");
+
+    let projection = saltator_userserver::spawn_membership_projection(users.clone(), rooms.clone());
+
+    // Client-server API.
+    let default_room_version = saltator_core::RoomVersion::parse(&cfg.client.default_room_version)
+        .map_err(|e| anyhow::anyhow!("client.default_room_version: {e}"))?;
+    let media = saltator_media::MediaStore::open(cfg.data_dir.join("media"))?;
+    let cs_state = saltator_cs_api::CsState::new(
+        users.clone(),
+        rooms.clone(),
+        media,
+        saltator_cs_api::CsConfig {
+            server_name,
+            default_room_version,
+            registration_enabled: cfg.client.registration_enabled,
+            max_upload_size: cfg.client.max_upload_size,
+            well_known_client: cfg.client.well_known_client.clone(),
+        },
+    );
+    let cs_router = saltator_cs_api::router(cs_state);
+    let cs_listener = tokio::net::TcpListener::bind(cfg.listeners.client).await?;
+    tracing::info!(listen = %cfg.listeners.client, "client-server API listening");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut cs_shutdown = shutdown_rx.clone();
+    let cs_task = tokio::spawn(async move {
+        axum::serve(cs_listener, cs_router)
+            .with_graceful_shutdown(async move {
+                let _ = cs_shutdown.wait_for(|stop| *stop).await;
+            })
+            .await
+    });
+
+    let internal_shutdown = {
+        let mut rx = shutdown_rx.clone();
+        async move {
+            let _ = rx.wait_for(|stop| *stop).await;
+        }
     };
+    tokio::spawn(async move {
+        // SIGTERM matters as much as ctrl-c: it's what `docker stop` (and
+        // thus Complement teardown) sends, and as PID 1 in a container the
+        // default disposition would ignore it.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+        tracing::info!("shutdown signal received");
+        let _ = shutdown_tx.send(true);
+    });
 
     tracing::info!(listen = %cfg.listeners.internal, "internal RPC listening");
+    tracing::info!(
+        federation = %cfg.listeners.federation,
+        "federation listener configured; served from M3",
+    );
     saltator_cluster::serve_internal(
         meta.clone(),
         registry.clone(),
         cfg.server_name.clone(),
         cfg.listeners.internal,
-        shutdown,
+        internal_shutdown,
     )
     .await?;
 
+    cs_task.await??;
+    projection.abort();
     rooms.shutdown().await?;
+    users.shutdown().await?;
     meta.shutdown().await?;
     tracing::info!("saltator stopped");
     Ok(())
-}
-
-fn load_or_generate_signer(
-    path: &std::path::Path,
-    server_name: ruma::OwnedServerName,
-) -> anyhow::Result<saltator_roomserver::ServerSigner> {
-    use saltator_roomserver::ServerSigner;
-    // Key versions beyond "0" arrive with key rotation (M2+).
-    const KEY_VERSION: &str = "0";
-
-    if path.exists() {
-        let der = std::fs::read(path)?;
-        return Ok(ServerSigner::from_der(
-            server_name,
-            &der,
-            KEY_VERSION.to_owned(),
-        )?);
-    }
-    let (signer, der) = ServerSigner::generate(server_name, KEY_VERSION.to_owned());
-    write_private(path, &der)?;
-    tracing::info!(path = %path.display(), "generated new ed25519 signing key");
-    Ok(signer)
-}
-
-/// Write key material with owner-only permissions.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)?.write_all(bytes)
 }

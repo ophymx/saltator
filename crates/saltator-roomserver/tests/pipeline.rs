@@ -8,7 +8,9 @@ use ruma::{CanonicalJsonObject, CanonicalJsonValue, OwnedRoomId, OwnedUserId, Ro
 use serde_json::json;
 
 use saltator_core::RoomVersion;
-use saltator_roomserver::{Outcome, Rejected, RoomError, RoomServer, ServerSigner};
+use saltator_roomserver::{
+    ChangePayload, Outcome, Rejected, RoomError, RoomServer, SeqEntry, ServerSigner,
+};
 use saltator_shard::NoopNetworkFactory;
 use saltator_store::RocksEngine;
 
@@ -257,8 +259,13 @@ async fn full_pipeline(version: RoomVersion) {
     // The change stream saw every accepted event, in seq order.
     let mut seen = Vec::new();
     while let Ok(c) = changes.try_recv() {
-        let payload = RoomServer::decode_change(&c.payload).unwrap();
-        assert_eq!(payload.room_id, room_id.as_str());
+        match RoomServer::decode_change(&c.payload).unwrap() {
+            ChangePayload::Event {
+                room_id: payload_room,
+                ..
+            } => assert_eq!(payload_room, room_id.as_str()),
+            other => panic!("expected event change, got {other:?}"),
+        }
         seen.push(c.seq);
     }
     assert_eq!(seen.len(), 7); // create, join, PL, join_rules, join, 2 messages
@@ -536,4 +543,122 @@ async fn restart_recovers_rooms() {
     );
     assert_eq!(seq, seq_before + 1);
     server.shutdown().await.unwrap();
+}
+
+/// M2 additions: durable receipts, redaction application, per-room
+/// timeline reads.
+#[tokio::test]
+async fn receipts_redactions_room_timeline() {
+    let env = start_env().await;
+    let alice = user("alice");
+    let bob = user("bob");
+    let carol = user("carol");
+    let room_id = bootstrap_room(&env, RoomVersion::V12).await;
+    let store = env.server.store();
+
+    let m1 = env
+        .server
+        .send_message(
+            &room_id,
+            &bob,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "one"}),
+        )
+        .await
+        .unwrap();
+    let (m1_id, m1_seq) = match &m1 {
+        Outcome::Accepted { event_id, seq } => (event_id.clone(), *seq),
+        other => panic!("{other:?}"),
+    };
+    let m2_seq = accepted(
+        &env.server
+            .send_message(
+                &room_id,
+                &bob,
+                "m.room.message",
+                json!({"msgtype": "m.text", "body": "two"}),
+            )
+            .await
+            .unwrap(),
+    );
+
+    // Per-room timeline: full window, then a bounded backwards page.
+    let tl = store
+        .room_timeline(room_id.as_str(), 0, None, 100, false)
+        .unwrap();
+    assert_eq!(tl.len(), 7); // 5 bootstrap state events + 2 messages
+    assert_eq!(tl[tl.len() - 2], (m1_seq, m1_id.to_string()));
+    let last_two = store
+        .room_timeline(room_id.as_str(), 0, None, 2, true)
+        .unwrap();
+    assert_eq!(last_two.len(), 2);
+    assert_eq!(last_two[0].0, m2_seq);
+    assert_eq!(last_two[1].0, m1_seq);
+
+    // Receipts: recorded, deduplicated, visible in T_SEQ catch-up scans.
+    let seq = env
+        .server
+        .write_receipt(&room_id, &alice, "m.read", &m1_id, 1000)
+        .await
+        .unwrap();
+    assert!(seq > m2_seq);
+    let dup = env
+        .server
+        .write_receipt(&room_id, &alice, "m.read", &m1_id, 2000)
+        .await
+        .unwrap();
+    assert_eq!(dup, 0);
+    let receipts = store.receipts(room_id.as_str()).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].0, alice.as_str());
+    assert_eq!(receipts[0].1, "m.read");
+    assert_eq!(receipts[0].2.event_id, m1_id.as_str());
+    let (last_seq, last_entry) = store.timeline(0, 100).unwrap().pop().unwrap();
+    assert_eq!(last_seq, seq);
+    assert!(matches!(last_entry, SeqEntry::Receipt { .. }));
+
+    // Redaction by the original sender applies.
+    accepted(
+        &env.server
+            .send_message(
+                &room_id,
+                &bob,
+                "m.room.redaction",
+                json!({"redacts": m1_id.as_str(), "reason": "typo"}),
+            )
+            .await
+            .unwrap(),
+    );
+    let served = store
+        .served_event(m1_id.as_str(), RoomVersion::V12)
+        .unwrap()
+        .unwrap();
+    let content = match served.get("content").unwrap() {
+        CanonicalJsonValue::Object(o) => o,
+        _ => panic!("content not an object"),
+    };
+    assert!(content.is_empty(), "message content must be stripped");
+    assert!(matches!(
+        served.get("unsigned"),
+        Some(CanonicalJsonValue::Object(u)) if u.contains_key("redacted_because")
+    ));
+
+    // Bob (PL 50) may not redact alice's events (redact level defaults to
+    // 50 but alice is a v12 creator — her events aren't his to redact...
+    // use carol instead: carol is not in the room, so use bob redacting
+    // alice's join: PL 50 >= redact 50 actually allows it. Use a stricter
+    // room-level check: carol (not even a member) can't send at all.
+    let outcome = env
+        .server
+        .send_message(
+            &room_id,
+            &carol,
+            "m.room.redaction",
+            json!({"redacts": m1_id.as_str()}),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Rejected { .. }));
+
+    env.server.shutdown().await.unwrap();
 }

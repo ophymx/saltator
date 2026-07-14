@@ -78,6 +78,48 @@ impl KvEngine for RocksEngine {
         Ok(out)
     }
 
+    fn scan(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut ro = ReadOptions::default();
+        let mut out = Vec::new();
+        if reverse {
+            ro.set_iterate_lower_bound(start.to_vec());
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(end, rocksdb::Direction::Reverse), ro);
+            for item in iter {
+                if out.len() >= limit {
+                    break;
+                }
+                let (k, v) = item.map_err(rocks_err)?;
+                // Reverse iteration from `end` may yield `end` itself if it
+                // exists; the bound is exclusive, so skip it.
+                if k.as_ref() >= end {
+                    continue;
+                }
+                out.push((k.into_vec(), v.into_vec()));
+            }
+        } else {
+            ro.set_iterate_upper_bound(end.to_vec());
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(start, rocksdb::Direction::Forward), ro);
+            for item in iter {
+                if out.len() >= limit {
+                    break;
+                }
+                let (k, v) = item.map_err(rocks_err)?;
+                out.push((k.into_vec(), v.into_vec()));
+            }
+        }
+        Ok(out)
+    }
+
     fn last_in_range(&self, start: &[u8], end: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let mut ro = ReadOptions::default();
         ro.set_iterate_lower_bound(start.to_vec());

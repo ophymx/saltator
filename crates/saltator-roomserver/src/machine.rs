@@ -2,12 +2,17 @@
 //! precomputed [`AppendEvent`] commands, plus typed read access to the
 //! applied state.
 
+use ruma::{CanonicalJsonObject, CanonicalJsonValue};
+
+use saltator_core::validation;
+use saltator_core::RoomVersion;
 use saltator_shard::{ApplyCtx, ReadCtx, ShardApp};
 use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
-    AppendEvent, ChangePayload, RoomCommand, RoomMeta, RoomResponse, SeqEntry, StateGroup,
-    StoredEvent, T_EVENT, T_GROUP, T_ROOM, T_SEQ,
+    AppendEvent, ChangePayload, ReceiptCmd, ReceiptRecord, RoomCommand, RoomMeta, RoomResponse,
+    SeqEntry, StateGroup, StoredEvent, T_EVENT, T_GROUP, T_RECEIPT, T_REDACT, T_ROOM, T_ROOM_SEQ,
+    T_SEQ,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -22,13 +27,33 @@ fn dec<T: for<'de> serde::Deserialize<'de>>(what: &str, b: &[u8]) -> StoreResult
     postcard::from_bytes(b).map_err(|e| codec_err(what, e))
 }
 
-/// Key of a state group: `room_id ++ 0x00 ++ group (BE)`. Room IDs cannot
-/// contain NUL, so the prefix is unambiguous.
-pub(crate) fn group_key(room_id: &str, group: u64) -> Vec<u8> {
+/// `room_id ++ 0x00 ++ n (BE)` — key shape shared by `T_GROUP` (n = group
+/// id) and `T_ROOM_SEQ` (n = shard seq). Room IDs cannot contain NUL, so
+/// the prefix is unambiguous.
+pub(crate) fn room_u64_key(room_id: &str, n: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(room_id.len() + 9);
     k.extend_from_slice(room_id.as_bytes());
     k.push(0);
-    k.extend_from_slice(&group.to_be_bytes());
+    k.extend_from_slice(&n.to_be_bytes());
+    k
+}
+
+/// Exclusive upper bound for all `room_u64_key(room_id, _)` keys.
+pub(crate) fn room_u64_end(room_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(room_id.len() + 1);
+    k.extend_from_slice(room_id.as_bytes());
+    k.push(1);
+    k
+}
+
+/// Key of a receipt: `room_id ++ 0x00 ++ user_id ++ 0x00 ++ receipt_type`.
+fn receipt_key(room_id: &str, user_id: &str, receipt_type: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(room_id.len() + user_id.len() + receipt_type.len() + 2);
+    k.extend_from_slice(room_id.as_bytes());
+    k.push(0);
+    k.extend_from_slice(user_id.as_bytes());
+    k.push(0);
+    k.extend_from_slice(receipt_type.as_bytes());
     k
 }
 
@@ -36,10 +61,56 @@ pub struct RoomApp;
 
 impl ShardApp for RoomApp {
     fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>> {
-        let RoomCommand::Append(cmd) = dec::<RoomCommand>("room command decode", command)?;
-        let resp = apply_append(ctx, &cmd)?;
+        let resp = match dec::<RoomCommand>("room command decode", command)? {
+            RoomCommand::Append(cmd) => apply_append(ctx, &cmd)?,
+            RoomCommand::Receipt(cmd) => apply_receipt(ctx, &cmd)?,
+        };
         enc("room response encode", &resp)
     }
+}
+
+fn apply_receipt(ctx: &mut ApplyCtx<'_>, cmd: &ReceiptCmd) -> StoreResult<RoomResponse> {
+    let key = receipt_key(&cmd.room_id, &cmd.user_id, &cmd.receipt_type);
+    // Idempotence: re-acking the same event is a no-op (no seq burn).
+    if let Some(b) = ctx.get(T_RECEIPT, &key)? {
+        let existing: ReceiptRecord = dec("receipt decode", &b)?;
+        if existing.event_id == cmd.event_id {
+            return Ok(RoomResponse::Receipt { seq: 0 });
+        }
+    }
+    let seq = ctx.emit(enc(
+        "change payload encode",
+        &ChangePayload::Receipt {
+            room_id: cmd.room_id.clone(),
+        },
+    )?);
+    ctx.put(
+        T_SEQ,
+        &seq.to_be_bytes(),
+        enc(
+            "seq entry encode",
+            &SeqEntry::Receipt {
+                room_id: cmd.room_id.clone(),
+                user_id: cmd.user_id.clone(),
+                receipt_type: cmd.receipt_type.clone(),
+                event_id: cmd.event_id.clone(),
+                ts: cmd.ts,
+            },
+        )?,
+    );
+    ctx.put(
+        T_RECEIPT,
+        &key,
+        enc(
+            "receipt encode",
+            &ReceiptRecord {
+                event_id: cmd.event_id.clone(),
+                ts: cmd.ts,
+                seq,
+            },
+        )?,
+    );
+    Ok(RoomResponse::Receipt { seq })
 }
 
 fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomResponse> {
@@ -72,7 +143,7 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
         for (id, group) in &cmd.new_groups {
             ctx.put(
                 T_GROUP,
-                &group_key(&cmd.room_id, *id),
+                &room_u64_key(&cmd.room_id, *id),
                 enc("state group encode", group)?,
             );
         }
@@ -95,7 +166,7 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
 
     let seq = ctx.emit(enc(
         "change payload encode",
-        &ChangePayload {
+        &ChangePayload::Event {
             room_id: cmd.room_id.clone(),
             event_id: cmd.event_id.clone(),
         },
@@ -118,17 +189,25 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
         &seq.to_be_bytes(),
         enc(
             "seq entry encode",
-            &SeqEntry {
+            &SeqEntry::Event {
                 room_id: cmd.room_id.clone(),
                 event_id: cmd.event_id.clone(),
             },
         )?,
     );
+    ctx.put(
+        T_ROOM_SEQ,
+        &room_u64_key(&cmd.room_id, seq),
+        cmd.event_id.as_bytes(),
+    );
+    if let Some(target) = &cmd.redacts {
+        ctx.put(T_REDACT, target.as_bytes(), cmd.event_id.as_bytes());
+    }
 
     for (id, group) in &cmd.new_groups {
         ctx.put(
             T_GROUP,
-            &group_key(&cmd.room_id, *id),
+            &room_u64_key(&cmd.room_id, *id),
             enc("state group encode", group)?,
         );
     }
@@ -199,7 +278,7 @@ impl RoomStore {
     }
 
     pub fn group(&self, room_id: &str, group: u64) -> StoreResult<Option<StateGroup>> {
-        match self.read.get(T_GROUP, &group_key(room_id, group))? {
+        match self.read.get(T_GROUP, &room_u64_key(room_id, group))? {
             Some(b) => Ok(Some(dec("state group decode", &b)?)),
             None => Ok(None),
         }
@@ -235,10 +314,7 @@ impl RoomStore {
     pub fn timeline(&self, from: u64, limit: usize) -> StoreResult<Vec<(u64, SeqEntry)>> {
         let start = (from + 1).to_be_bytes();
         let mut out = Vec::new();
-        for (k, v) in self.read.range(T_SEQ, &start, &[])? {
-            if out.len() >= limit {
-                break;
-            }
+        for (k, v) in self.read.scan(T_SEQ, &start, &[], limit, false)? {
             let seq = u64::from_be_bytes(
                 k.as_slice()
                     .try_into()
@@ -247,5 +323,125 @@ impl RoomStore {
             out.push((seq, dec("seq entry decode", &v)?));
         }
         Ok(out)
+    }
+
+    /// One room's accepted events with shard seq in `(after, until]`
+    /// (`until` = end of time when `None`): at most `limit` of them,
+    /// oldest-first — or newest-first from the top of the window when
+    /// `newest_first` (backwards `/messages` pagination).
+    pub fn room_timeline(
+        &self,
+        room_id: &str,
+        after: u64,
+        until: Option<u64>,
+        limit: usize,
+        newest_first: bool,
+    ) -> StoreResult<Vec<(u64, String)>> {
+        let start = room_u64_key(room_id, after.saturating_add(1));
+        let end = match until {
+            Some(u) if u == u64::MAX => room_u64_end(room_id),
+            Some(u) => room_u64_key(room_id, u + 1),
+            None => room_u64_end(room_id),
+        };
+        let mut out = Vec::new();
+        for (k, v) in self
+            .read
+            .scan(T_ROOM_SEQ, &start, &end, limit, newest_first)?
+        {
+            let seq = u64::from_be_bytes(
+                k[k.len() - 8..]
+                    .try_into()
+                    .map_err(|_| StoreError::Engine("room seq key width".into()))?,
+            );
+            let event_id = String::from_utf8(v)
+                .map_err(|_| StoreError::Engine("room seq value not UTF-8".into()))?;
+            out.push((seq, event_id));
+        }
+        Ok(out)
+    }
+
+    /// All receipts of a room: `(user_id, receipt_type, record)`.
+    pub fn receipts(&self, room_id: &str) -> StoreResult<Vec<(String, String, ReceiptRecord)>> {
+        let mut start = room_id.as_bytes().to_vec();
+        start.push(0);
+        let end = room_u64_end(room_id);
+        let mut out = Vec::new();
+        for (k, v) in self.read.range(T_RECEIPT, &start, &end)? {
+            let rest = &k[start.len()..];
+            let sep = rest
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or_else(|| StoreError::Engine("receipt key shape".into()))?;
+            let user_id = String::from_utf8(rest[..sep].to_vec())
+                .map_err(|_| StoreError::Engine("receipt user not UTF-8".into()))?;
+            let receipt_type = String::from_utf8(rest[sep + 1..].to_vec())
+                .map_err(|_| StoreError::Engine("receipt type not UTF-8".into()))?;
+            out.push((user_id, receipt_type, dec("receipt decode", &v)?));
+        }
+        Ok(out)
+    }
+
+    /// The event that redacted `event_id`, if any.
+    pub fn redacted_by(&self, event_id: &str) -> StoreResult<Option<String>> {
+        Ok(match self.read.get(T_REDACT, event_id.as_bytes())? {
+            Some(v) => Some(
+                String::from_utf8(v)
+                    .map_err(|_| StoreError::Engine("redact value not UTF-8".into()))?,
+            ),
+            None => None,
+        })
+    }
+
+    /// An event in its servable form: the stored canonical JSON, with the
+    /// room version's redaction algorithm applied (and
+    /// `unsigned.redacted_because` set) if the event has been redacted.
+    /// Rejected events are not served.
+    pub fn served_event(
+        &self,
+        event_id: &str,
+        version: RoomVersion,
+    ) -> StoreResult<Option<CanonicalJsonObject>> {
+        let Some(stored) = self.event(event_id)? else {
+            return Ok(None);
+        };
+        if stored.rejected.is_some() {
+            return Ok(None);
+        }
+        let mut raw = parse_raw(&stored.raw)?;
+        if let Some(redactor_id) = self.redacted_by(event_id)? {
+            if let Some(redactor) = self.event(&redactor_id)? {
+                raw = validation::redact(&raw, version)
+                    .map_err(|e| StoreError::Engine(format!("redact: {e}")))?;
+                let because = parse_raw(&redactor.raw)?;
+                let unsigned = match raw.get_mut("unsigned") {
+                    Some(CanonicalJsonValue::Object(o)) => o,
+                    _ => {
+                        raw.insert(
+                            "unsigned".into(),
+                            CanonicalJsonValue::Object(CanonicalJsonObject::new()),
+                        );
+                        match raw.get_mut("unsigned") {
+                            Some(CanonicalJsonValue::Object(o)) => o,
+                            _ => unreachable!("just inserted"),
+                        }
+                    }
+                };
+                unsigned.insert(
+                    "redacted_because".into(),
+                    CanonicalJsonValue::Object(because),
+                );
+            }
+        }
+        Ok(Some(raw))
+    }
+}
+
+fn parse_raw(raw: &[u8]) -> StoreResult<CanonicalJsonObject> {
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|e| StoreError::Engine(format!("event json: {e}")))?;
+    match CanonicalJsonValue::try_from(value) {
+        Ok(CanonicalJsonValue::Object(o)) => Ok(o),
+        Ok(_) => Err(StoreError::Engine("stored event not an object".into())),
+        Err(e) => Err(StoreError::Engine(format!("stored event: {e}"))),
     }
 }

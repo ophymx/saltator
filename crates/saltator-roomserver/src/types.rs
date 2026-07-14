@@ -18,6 +18,14 @@ pub const T_SEQ: u8 = APP_TABLE_MIN + 1;
 pub const T_GROUP: u8 = APP_TABLE_MIN + 2;
 /// `room_id → RoomMeta`.
 pub const T_ROOM: u8 = APP_TABLE_MIN + 3;
+/// `room_id ++ 0x00 ++ seq (u64 BE) → event_id (UTF-8)` — the per-room
+/// timeline order (`/messages` pagination, per-room sync windows).
+pub const T_ROOM_SEQ: u8 = APP_TABLE_MIN + 4;
+/// `room_id ++ 0x00 ++ user_id ++ 0x00 ++ receipt_type → ReceiptRecord`.
+pub const T_RECEIPT: u8 = APP_TABLE_MIN + 5;
+/// `event_id → redacting event_id (UTF-8)` — set when an accepted
+/// `m.room.redaction` applies to a locally known event.
+pub const T_REDACT: u8 = APP_TABLE_MIN + 6;
 
 /// Full state maps are stored every `MAX_GROUP_CHAIN` groups along a fork;
 /// deltas otherwise (spec.md §5.2, "state deltas with periodic full
@@ -90,6 +98,7 @@ pub struct RoomMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RoomCommand {
     Append(Box<AppendEvent>),
+    Receipt(ReceiptCmd),
 }
 
 /// The precomputed outcome of one event, ready to persist atomically.
@@ -111,6 +120,31 @@ pub struct AppendEvent {
     pub next_group: u64,
     /// `Some(version)` exactly for `m.room.create`: initializes the room.
     pub create_version: Option<String>,
+    /// `Some(target)` for an accepted `m.room.redaction` whose sender may
+    /// redact the (locally known, same-room) target — precomputed by the
+    /// pipeline; the apply just writes the `T_REDACT` redirect.
+    pub redacts: Option<String>,
+}
+
+/// A durable read receipt (`m.receipt` — receipts survive restart; only
+/// typing/presence are ephemeral, spec.md §5.5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptCmd {
+    pub room_id: String,
+    pub user_id: String,
+    /// `m.read` or `m.read.private`.
+    pub receipt_type: String,
+    pub event_id: String,
+    pub ts: u64,
+}
+
+/// Stored receipt state for one `(room, user, type)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptRecord {
+    pub event_id: String,
+    pub ts: u64,
+    /// Shard seq at which this receipt was recorded (sync windowing).
+    pub seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,18 +161,34 @@ pub enum RoomResponse {
     Duplicate {
         event_id: String,
     },
+    /// A receipt landed at `seq` (0 = no-op: the same receipt was already
+    /// recorded).
+    Receipt {
+        seq: u64,
+    },
 }
 
-/// Value of a `T_SEQ` entry.
+/// Value of a `T_SEQ` entry: what happened at one shard sequence position.
+/// Sync catch-up reads scan this table, so everything sync must replay
+/// (events *and* receipts) is keyed here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SeqEntry {
-    pub room_id: String,
-    pub event_id: String,
+pub enum SeqEntry {
+    Event {
+        room_id: String,
+        event_id: String,
+    },
+    Receipt {
+        room_id: String,
+        user_id: String,
+        receipt_type: String,
+        event_id: String,
+        ts: u64,
+    },
 }
 
-/// Change-stream payload for an accepted event (spec.md §5.2 step 6).
+/// Change-stream payload (spec.md §5.2 step 6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangePayload {
-    pub room_id: String,
-    pub event_id: String,
+pub enum ChangePayload {
+    Event { room_id: String, event_id: String },
+    Receipt { room_id: String },
 }
