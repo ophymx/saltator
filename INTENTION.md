@@ -51,11 +51,11 @@ Vetted before selection. Summary of what's clear and what to route around:
 
 ## Status
 
-**M0 (Foundations) complete** — see [spec.md](spec.md) §12 for the milestone
-plan. The workspace builds; a single-node cluster bootstraps its metadata
-Raft group, persists through restart, and serves the internal gRPC surface.
-Matrix spec pinned at v1.19. Next: M1 (core engine — auth rules, state-res
-v2, event pipeline).
+**M2 (Client-server) complete** — see [spec.md](spec.md) §12 for the
+milestone plan. A single-node Saltator serves the Matrix client-server API
+end to end: two users can register, create a room, and chat, surviving a
+node restart. Matrix spec pinned at v1.19. Next: M3 (federation — server
+keys, transactions, remote join + backfill).
 
 ## Next steps (from the original inception list)
 
