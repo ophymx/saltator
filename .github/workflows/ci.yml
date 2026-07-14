@@ -27,7 +27,10 @@ jobs:
 
   complement:
     name: complement (csapi)
-    runs-on: ubuntu-latest
+    # Pinned (not -latest): the saltator binary is built on this runner but
+    # executed inside the ubuntu:24.04 Complement image, so builder and
+    # image glibc must stay matched.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
