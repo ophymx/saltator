@@ -394,6 +394,16 @@ impl RoomServer {
             obj["state_key"] = sk.into();
         }
         let mut raw = canonicalize(obj)?;
+        // Size-check before signing: hashes/signatures only grow the event,
+        // and ruma's signer reports overflow as an opaque signing error.
+        let canonical_len = serde_json::to_string(&raw)
+            .map_err(|e| RoomError::Malformed(format!("unserializable: {e}")))?
+            .len();
+        if canonical_len > saltator_core::validation::MAX_PDU_BYTES {
+            return Err(RoomError::Validation(
+                saltator_core::validation::ValidationError::TooLarge(canonical_len),
+            ));
+        }
         self.signer.hash_and_sign_event(&mut raw, version)?;
         Ok((raw, version))
     }

@@ -42,6 +42,13 @@ where
                 e.to_string(),
             )
         })?;
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "M_NOT_JSON",
+                "Request body is not valid UTF-8",
+            ));
+        }
         let http_req = Request::from_parts(parts, bytes);
         T::try_from_http_request(http_req, &path_args)
             .map(Ar)

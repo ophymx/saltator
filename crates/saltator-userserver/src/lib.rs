@@ -357,6 +357,20 @@ impl UserServer {
         Ok(filter_id)
     }
 
+    /// Publish to / withdraw from the public room directory.
+    pub async fn set_room_visibility(&self, room_id: &str, public: bool) -> Result<()> {
+        match self
+            .propose(&UserCommand::SetRoomVisibility {
+                room_id: room_id.to_owned(),
+                public,
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
     pub async fn create_alias(&self, alias: &str, room_id: &str, creator: &UserId) -> Result<()> {
         match self
             .propose(&UserCommand::CreateAlias {
@@ -395,7 +409,15 @@ impl UserServer {
 
     // -- internals ---------------------------------------------------------
 
+    /// Canonicalize a localpart or full user ID for this server. Capitals
+    /// are downcased first (registration downcases, login is
+    /// case-insensitive — historical Matrix behavior).
+    pub fn canonical_user_id(&self, user: &str) -> Result<OwnedUserId> {
+        self.user_id_for(user)
+    }
+
     fn user_id_for(&self, user: &str) -> Result<OwnedUserId> {
+        let user = &user.to_lowercase();
         if user.starts_with('@') {
             let user_id = OwnedUserId::try_from(user.to_owned())
                 .map_err(|e| UserError::InvalidUsername(e.to_string()))?;

@@ -718,3 +718,312 @@ async fn account_data_filters_and_devices() {
 
     env.shutdown().await;
 }
+
+/// Regressions surfaced by the first Complement run: trailing-slash state
+/// URLs, username case handling, directory visibility, size/encoding
+/// rejections, history visibility, MSC4115 annotations, and the
+/// newly-joined-room incremental-sync race.
+#[tokio::test]
+async fn complement_shaped_regressions() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-password-1").await;
+    let bob = env.register("bob", "bob-password-1").await;
+
+    // Uppercase registration downcases; uppercase login canonicalizes.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/register",
+            None,
+            Some(json!({"username": "CaRoL", "password": "carol-password-1",
+                        "auth": {"type": "m.login.dummy"}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], format!("@carol:{SERVER}"));
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/login",
+            None,
+            Some(json!({"type": "m.login.password",
+                        "identifier": {"type": "m.id.user", "user": "CAROL"},
+                        "password": "carol-password-1"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let carol = body["access_token"].as_str().unwrap().to_owned();
+
+    // register/available validates the localpart.
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/register/available?username=not,valid",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_USERNAME");
+
+    // Invalid UTF-8 body → 400 M_NOT_JSON (not a UIA challenge).
+    let resp = env
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_matrix/client/v3/register")
+                .header("Content-Type", "application/json")
+                .body(Body::from(b"{ \"test\":\"a\x81\" }".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["errcode"], "M_NOT_JSON");
+
+    // Bob's sync position from before the room even exists: the classic
+    // newly-joined race. next_batch here predates every room event.
+    let (status, body) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let bob_since = body["next_batch"].as_str().unwrap().to_owned();
+
+    // Public room; v12 power-level override listing the creator must be
+    // sanitized (MSC4289), not rejected.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({
+                "visibility": "public",
+                "preset": "public_chat",
+                "name": "Complement Room",
+                "topic": "regressions",
+                "power_level_content_override":
+                    {"users": {format!("@alice:{SERVER}"): 100}, "users_default": 0},
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().unwrap().to_owned();
+    let room_enc = room_id.replace('!', "%21");
+
+    // Trailing-slash state URLs (empty state key).
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/state/m.room.name/"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "Complement Room");
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/state/m.room.power_levels/"),
+            Some(&alice),
+            Some(json!({"users": {}, "users_default": 10})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Directory: listed with name/topic; filtered search; visibility PUT.
+    let (status, body) = env
+        .req("GET", "/_matrix/client/v3/publicRooms", None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let chunk = &body["chunk"][0];
+    assert_eq!(chunk["room_id"], room_id.as_str(), "{body}");
+    assert_eq!(chunk["name"], "Complement Room");
+    assert_eq!(chunk["topic"], "regressions");
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/publicRooms",
+            Some(&alice),
+            Some(json!({"filter": {"generic_search_term": "zzz-no-match"}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["chunk"].as_array().unwrap().len(), 0);
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/directory/list/room/{room_enc}"),
+            Some(&alice),
+            Some(json!({"visibility": "private"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/directory/list/room/{room_enc}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["visibility"], "private");
+
+    // Canonical alias must exist and point at this room.
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/state/m.room.canonical_alias/"),
+            Some(&alice),
+            Some(json!({"alias": format!("#missing:{SERVER}")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_BAD_ALIAS");
+
+    // Oversized event → 413 M_TOO_LARGE.
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/big"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "x".repeat(70_000)})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["errcode"], "M_TOO_LARGE");
+
+    // Pre-join message, then bob joins.
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/pre"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "prejoin"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let prejoin_event = body["event_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/join"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Incremental sync from the pre-room since token must surface the
+    // newly-joined room even though its events predate the token.
+    let mut appeared = false;
+    for _ in 0..100 {
+        let (status, body) = env
+            .req(
+                "GET",
+                &format!("/_matrix/client/v3/sync?since={bob_since}"),
+                Some(&bob),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let room = &body["rooms"]["join"][&room_id];
+        if !room.is_null() {
+            let in_timeline = room["timeline"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(room["state"]["events"].as_array().into_iter().flatten())
+                .any(|e| {
+                    e["type"] == "m.room.member" && e["state_key"] == format!("@bob:{SERVER}")
+                });
+            assert!(in_timeline, "join membership missing: {room}");
+            appeared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        appeared,
+        "newly-joined room never appeared in incremental sync"
+    );
+
+    // MSC4115: bob sees his own membership annotated per event.
+    let sync = env
+        .sync_until(&bob, |b| !b["rooms"]["join"][&room_id].is_null())
+        .await;
+    let events = sync["rooms"]["join"][&room_id]["timeline"]["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for e in &events {
+        let m = e["unsigned"]["membership"].as_str().unwrap();
+        if e["event_id"] == prejoin_event.as_str() {
+            assert_eq!(m, "leave", "{e}");
+        }
+        if e["type"] == "m.room.member" && e["state_key"] == format!("@bob:{SERVER}") {
+            assert_eq!(m, "join", "{e}");
+        }
+    }
+
+    // History visibility on /event: carol (never a member) is denied with
+    // 404 under the default `shared` visibility, while bob (member) sees
+    // the pre-join event.
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/event/{prejoin_event}"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/event/{prejoin_event}"),
+            Some(&carol),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // world_readable admits non-members.
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/state/m.room.history_visibility/"),
+            Some(&alice),
+            Some(json!({"history_visibility": "world_readable"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/wr"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "world-readable"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let wr_event = body["event_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/event/{wr_event}"),
+            Some(&carol),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    env.shutdown().await;
+}

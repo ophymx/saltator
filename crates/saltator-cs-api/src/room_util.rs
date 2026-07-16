@@ -51,6 +51,64 @@ pub fn membership_in(rooms: &RoomServer, state: &StateMap, user_id: &str) -> Res
         .to_owned())
 }
 
+/// Content of the `(event_type, "")` event in a state map, if present.
+pub fn state_content_in(
+    rooms: &RoomServer,
+    state: &StateMap,
+    event_type: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(event_id) = state.get(&(event_type.to_owned(), String::new())) else {
+        return Ok(None);
+    };
+    let Some(raw) = raw_event(rooms, event_id)? else {
+        return Ok(None);
+    };
+    Ok(raw
+        .get("content")
+        .map(|c| serde_json::Value::from(c.clone())))
+}
+
+/// History-visibility check: may `user_id` see this event? Uses the state
+/// *at the event* (spec "Room history visibility"); `shared` additionally
+/// admits anyone who is a member now.
+pub fn user_can_see_event(
+    rooms: &RoomServer,
+    room_id: &str,
+    event_id: &str,
+    user_id: &str,
+) -> Result<bool> {
+    let Some(stored) = rooms.store().event(event_id).map_err(ApiError::internal)? else {
+        return Ok(false);
+    };
+    if stored.rejected.is_some() || stored.state_group_after == 0 {
+        return Ok(false);
+    }
+    let state_at: StateMap = rooms
+        .store()
+        .resolve_group(room_id, stored.state_group_after)
+        .map_err(ApiError::internal)?;
+    let membership_at = membership_in(rooms, &state_at, user_id)?;
+    if membership_at == "join" {
+        return Ok(true);
+    }
+    let visibility = state_content_in(rooms, &state_at, "m.room.history_visibility")?
+        .as_ref()
+        .and_then(|c| c.get("history_visibility").and_then(|v| v.as_str()))
+        .unwrap_or("shared")
+        .to_owned();
+    match visibility.as_str() {
+        "world_readable" => Ok(true),
+        "shared" => {
+            let current = current_state(rooms, room_id)?;
+            Ok(membership_in(rooms, &current, user_id)? == "join")
+        }
+        "invited" => Ok(membership_at == "invite"),
+        // "joined" and anything unrecognized: members-at-the-time only,
+        // and membership_at != join was established above.
+        _ => Ok(false),
+    }
+}
+
 /// 403 unless `user_id` is currently joined.
 pub fn require_joined(rooms: &RoomServer, room_id: &str, user_id: &str) -> Result<StateMap> {
     let state = current_state(rooms, room_id)?;
@@ -62,12 +120,15 @@ pub fn require_joined(rooms: &RoomServer, room_id: &str, user_id: &str) -> Resul
 
 /// An event in the client event format (redactions applied): `content`,
 /// `event_id`, `origin_server_ts`, `room_id`, `sender`, `state_key`,
-/// `type`, `unsigned`.
+/// `type`, `unsigned`. `as_user` is the requesting user, whose membership
+/// at the event is annotated as `unsigned.membership` (MSC4115 /
+/// spec v1.11+).
 pub fn client_event(
     rooms: &RoomServer,
     version: RoomVersion,
     room_id: &str,
     event_id: &str,
+    as_user: &str,
 ) -> Result<Option<serde_json::Value>> {
     let Some(raw) = rooms
         .store()
@@ -76,7 +137,25 @@ pub fn client_event(
     else {
         return Ok(None);
     };
-    Ok(Some(to_client_format(&raw, room_id, event_id)))
+    let mut ev = to_client_format(&raw, room_id, event_id);
+    if let Some(stored) = rooms.store().event(event_id).map_err(ApiError::internal)? {
+        if stored.state_group_after != 0 {
+            let state_at: StateMap = rooms
+                .store()
+                .resolve_group(room_id, stored.state_group_after)
+                .map_err(ApiError::internal)?;
+            let membership = membership_in(rooms, &state_at, as_user)?;
+            let unsigned = ev
+                .as_object_mut()
+                .expect("client event is an object")
+                .entry("unsigned")
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
+            if let Some(u) = unsigned.as_object_mut() {
+                u.insert("membership".to_owned(), membership.into());
+            }
+        }
+    }
+    Ok(Some(ev))
 }
 
 fn to_client_format(raw: &CanonicalJsonObject, room_id: &str, event_id: &str) -> serde_json::Value {

@@ -7,8 +7,8 @@ use saltator_store::{Result as StoreResult, StoreError};
 use crate::types::{
     account_data_key, user_key, Account, AccountDataEntry, AliasEntry, Device, MediaMeta,
     MembershipEntry, Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand,
-    UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_FILTER, T_MEDIA,
-    T_MEMBERSHIP, T_PROFILE, T_TOKEN,
+    UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_DIRECTORY, T_FILTER,
+    T_MEDIA, T_MEMBERSHIP, T_PROFILE, T_TOKEN,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -320,6 +320,14 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             ctx.delete(T_ALIAS, akey);
             Ok(UserResponse::Ok)
         }
+        UserCommand::SetRoomVisibility { room_id, public } => {
+            if *public {
+                ctx.put(T_DIRECTORY, room_id.as_bytes(), vec![1]);
+            } else {
+                ctx.delete(T_DIRECTORY, room_id.as_bytes());
+            }
+            Ok(UserResponse::Ok)
+        }
         UserCommand::PutMedia { media_id, meta } => {
             ctx.put(T_MEDIA, media_id.as_bytes(), enc("media encode", meta)?);
             Ok(UserResponse::Ok)
@@ -475,6 +483,21 @@ impl UserStore {
 
     pub fn alias(&self, alias: &str) -> StoreResult<Option<AliasEntry>> {
         self.get_typed("alias decode", T_ALIAS, alias.as_bytes())
+    }
+
+    pub fn room_is_public(&self, room_id: &str) -> StoreResult<bool> {
+        Ok(self.read.get(T_DIRECTORY, room_id.as_bytes())?.is_some())
+    }
+
+    /// All rooms published to the public directory.
+    pub fn public_rooms(&self) -> StoreResult<Vec<String>> {
+        let mut out = Vec::new();
+        for (k, _) in self.read.range(T_DIRECTORY, &[], &[])? {
+            out.push(
+                String::from_utf8(k).map_err(|_| StoreError::Engine("room id not UTF-8".into()))?,
+            );
+        }
+        Ok(out)
     }
 
     /// Aliases pointing at a room. Full table scan — alias tables are

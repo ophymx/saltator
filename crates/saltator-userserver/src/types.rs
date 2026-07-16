@@ -32,6 +32,9 @@ pub const T_CURSOR: u8 = APP_TABLE_MIN + 7;
 pub const T_ALIAS: u8 = APP_TABLE_MIN + 8;
 /// `media_id → MediaMeta`.
 pub const T_MEDIA: u8 = APP_TABLE_MIN + 9;
+/// `room_id → [1]` — rooms published to the public directory. Presence in
+/// the table is the fact; the value is a placeholder.
+pub const T_DIRECTORY: u8 = APP_TABLE_MIN + 10;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -223,6 +226,11 @@ pub enum UserCommand {
     PutMedia {
         media_id: String,
         meta: MediaMeta,
+    },
+    /// Publish to / withdraw from the public room directory.
+    SetRoomVisibility {
+        room_id: String,
+        public: bool,
     },
 }
 

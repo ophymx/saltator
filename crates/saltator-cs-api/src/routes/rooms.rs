@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use ruma::api::client::alias::{create_alias, delete_alias, get_alias};
-use ruma::api::client::directory::get_public_rooms;
+use ruma::api::client::directory::{
+    get_public_rooms, get_public_rooms_filtered, get_room_visibility, set_room_visibility,
+};
 use ruma::api::client::membership::{
     ban_user, forget_room, get_member_events, invite_user, join_room_by_id,
     join_room_by_id_or_alias, joined_members, joined_rooms, kick_user, leave_room, unban_user,
@@ -13,6 +15,7 @@ use ruma::api::client::membership::{
 use ruma::api::client::message::{get_message_events, send_message_event};
 use ruma::api::client::redact::redact_event;
 use ruma::api::client::room::get_room_event;
+use ruma::api::client::room::Visibility;
 use ruma::api::client::room::{aliases as room_aliases, create_room};
 use ruma::api::client::state::{get_state_event_for_key, get_state_events, send_state_event};
 use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
@@ -71,6 +74,15 @@ pub async fn create_room(
             .map_err(|e| ApiError::bad_json(format!("creation_content: {e}")))?,
         None => serde_json::Map::new(),
     };
+    let additional_creators: Vec<String> = creation_content
+        .get("additional_creators")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     let (room_id, outcome) = state
         .rooms
         .create_room(&auth.user_id, version, creation_content)
@@ -117,6 +129,18 @@ pub async fn create_room(
         let overrides: serde_json::Value = serde_json::from_str(overrides.json().get())
             .map_err(|e| ApiError::bad_json(format!("power_level_content_override: {e}")))?;
         merge_json(&mut pl_content, &overrides);
+    }
+    // Privileged-creator versions (v12+): creators have infinite power and
+    // MUST NOT appear in `users` (MSC4289). Clients still send pre-v12
+    // overrides that list the creator — sanitize rather than let auth
+    // reject the whole /createRoom.
+    if version.privileged_creators() {
+        if let Some(users) = pl_content.get_mut("users").and_then(|u| u.as_object_mut()) {
+            users.remove(auth.user_id.as_str());
+            for creator in &additional_creators {
+                users.remove(creator);
+            }
+        }
     }
     send_state_checked(
         &state,
@@ -229,6 +253,14 @@ pub async fn create_room(
     for invitee in &req.invite {
         // Best-effort: a bad invitee doesn't fail room creation.
         let _ = send_membership(&state, &room_id, &auth.user_id, invitee, "invite", None).await;
+    }
+
+    // 8. directory listing.
+    if req.visibility == Visibility::Public {
+        state
+            .users
+            .set_room_visibility(room_id.as_str(), true)
+            .await?;
     }
 
     Ok(Ra(create_room::v3::Response::new(room_id)))
@@ -500,6 +532,51 @@ pub async fn send_message_event(
     Ok(Ra(send_message_event::v3::Response::new(event_id)))
 }
 
+/// `m.room.canonical_alias` may only name aliases that exist and point at
+/// this room (`alias` and every `alt_aliases` entry alike).
+fn validate_canonical_alias(
+    state: &CsState,
+    room_id: &str,
+    content: &serde_json::Value,
+) -> Result<()> {
+    let mut candidates: Vec<&serde_json::Value> = Vec::new();
+    match content.get("alias") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(v) => candidates.push(v),
+    }
+    match content.get("alt_aliases") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Array(a)) => candidates.extend(a),
+        Some(_) => return Err(ApiError::invalid_param("alt_aliases must be an array")),
+    }
+    for v in candidates {
+        let Some(alias) = v.as_str() else {
+            return Err(ApiError::invalid_param("aliases must be strings"));
+        };
+        if alias.is_empty() {
+            // Same as absent: clears the alias.
+            continue;
+        }
+        if ruma::OwnedRoomAliasId::try_from(alias.to_owned()).is_err() {
+            return Err(ApiError::invalid_param(format!("invalid alias: {alias}")));
+        }
+        let points_here = state
+            .users
+            .store()
+            .alias(alias)
+            .map_err(internal)?
+            .is_some_and(|e| e.room_id == room_id);
+        if !points_here {
+            return Err(ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "M_BAD_ALIAS",
+                format!("{alias} does not point to this room"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn send_state_event(
     State(state): State<Arc<CsState>>,
     auth: Auth,
@@ -507,6 +584,9 @@ pub async fn send_state_event(
 ) -> Result<Ra<send_state_event::v3::Response>> {
     let content: serde_json::Value = serde_json::from_str(req.body.json().get())
         .map_err(|e| ApiError::bad_json(e.to_string()))?;
+    if req.event_type == ruma::events::StateEventType::RoomCanonicalAlias {
+        validate_canonical_alias(&state, req.room_id.as_str(), &content)?;
+    }
     let event_id = send_state_checked(
         &state,
         &req.room_id,
@@ -569,7 +649,13 @@ pub async fn get_state_events(
     let version = room_version(&meta)?;
     let mut events = Vec::new();
     for event_id in current.values() {
-        if let Some(ev) = client_event(&state.rooms, version, req.room_id.as_str(), event_id)? {
+        if let Some(ev) = client_event(
+            &state.rooms,
+            version,
+            req.room_id.as_str(),
+            event_id,
+            auth.user_id.as_str(),
+        )? {
             events.push(to_raw(&ev)?);
         }
     }
@@ -609,14 +695,24 @@ pub async fn get_room_event(
     auth: Auth,
     Ar(req): Ar<get_room_event::v3::Request>,
 ) -> Result<Ra<get_room_event::v3::Response>> {
-    require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
     let meta = room_meta(&state.rooms, req.room_id.as_str())?;
     let version = room_version(&meta)?;
+    // History-visibility gate; hidden events are indistinguishable from
+    // absent ones (404, not 403).
+    if !crate::room_util::user_can_see_event(
+        &state.rooms,
+        req.room_id.as_str(),
+        req.event_id.as_str(),
+        auth.user_id.as_str(),
+    )? {
+        return Err(ApiError::not_found("Event not found"));
+    }
     let ev = client_event(
         &state.rooms,
         version,
         req.room_id.as_str(),
         req.event_id.as_str(),
+        auth.user_id.as_str(),
     )?
     .ok_or_else(|| ApiError::not_found("Event not found"))?;
     // Cross-room probing guard: the event must belong to this room.
@@ -639,7 +735,14 @@ pub async fn get_members(
         if event_type != "m.room.member" {
             continue;
         }
-        let Some(ev) = client_event(&state.rooms, version, req.room_id.as_str(), event_id)? else {
+        let Some(ev) = client_event(
+            &state.rooms,
+            version,
+            req.room_id.as_str(),
+            event_id,
+            auth.user_id.as_str(),
+        )?
+        else {
             continue;
         };
         let membership = ev
@@ -744,7 +847,13 @@ pub async fn get_messages(
 
     let mut chunk = Vec::new();
     for (_, event_id) in &batch {
-        if let Some(ev) = client_event(&state.rooms, version, req.room_id.as_str(), event_id)? {
+        if let Some(ev) = client_event(
+            &state.rooms,
+            version,
+            req.room_id.as_str(),
+            event_id,
+            auth.user_id.as_str(),
+        )? {
             chunk.push(to_raw(&ev)?);
         }
     }
@@ -845,11 +954,173 @@ pub async fn get_room_aliases(
     Ok(Ra(room_aliases::v3::Response::new(aliases)))
 }
 
+/// Content of the room's current `(event_type, "")` state event, if any.
+fn state_content_of(
+    state: &CsState,
+    current: &crate::room_util::StateMap,
+    event_type: &str,
+) -> Result<Option<serde_json::Value>> {
+    crate::room_util::state_content_in(&state.rooms, current, event_type)
+}
+
+/// Directory listing entry for one published room.
+fn public_chunk(
+    state: &CsState,
+    room_id: &str,
+) -> Result<Option<ruma::directory::PublicRoomsChunk>> {
+    if state
+        .rooms
+        .store()
+        .meta(room_id)
+        .map_err(internal)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let current = current_state(&state.rooms, room_id)?;
+    let str_field = |content: &Option<serde_json::Value>, key: &str| -> Option<String> {
+        content
+            .as_ref()?
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+    };
+
+    let mut joined = 0u32;
+    for ((event_type, _), event_id) in &current {
+        if event_type != "m.room.member" {
+            continue;
+        }
+        if let Some(raw) = raw_event(&state.rooms, event_id)? {
+            let membership = raw
+                .get("content")
+                .and_then(|c| c.as_object())
+                .and_then(|c| c.get("membership"))
+                .and_then(|m| m.as_str());
+            if membership == Some("join") {
+                joined += 1;
+            }
+        }
+    }
+
+    let mut chunk: ruma::directory::PublicRoomsChunk = ruma::directory::PublicRoomsChunkInit {
+        num_joined_members: joined.into(),
+        room_id: OwnedRoomId::try_from(room_id.to_owned()).map_err(internal)?,
+        world_readable: false,
+        guest_can_join: false,
+    }
+    .into();
+    chunk.name = str_field(&state_content_of(state, &current, "m.room.name")?, "name");
+    chunk.topic = str_field(&state_content_of(state, &current, "m.room.topic")?, "topic");
+    chunk.canonical_alias = str_field(
+        &state_content_of(state, &current, "m.room.canonical_alias")?,
+        "alias",
+    )
+    .and_then(|a| a.try_into().ok());
+    chunk.avatar_url =
+        str_field(&state_content_of(state, &current, "m.room.avatar")?, "url").map(|u| u.into());
+    chunk.world_readable = str_field(
+        &state_content_of(state, &current, "m.room.history_visibility")?,
+        "history_visibility",
+    )
+    .as_deref()
+        == Some("world_readable");
+    chunk.guest_can_join = str_field(
+        &state_content_of(state, &current, "m.room.guest_access")?,
+        "guest_access",
+    )
+    .as_deref()
+        == Some("can_join");
+    chunk.join_rule = str_field(
+        &state_content_of(state, &current, "m.room.join_rules")?,
+        "join_rule",
+    )
+    .as_deref()
+    .unwrap_or("public")
+    .into();
+    Ok(Some(chunk))
+}
+
+fn directory_chunks(
+    state: &CsState,
+    search_term: Option<&str>,
+    limit: Option<ruma::UInt>,
+) -> Result<(Vec<ruma::directory::PublicRoomsChunk>, u64)> {
+    let mut chunks = Vec::new();
+    for room_id in state.users.store().public_rooms().map_err(internal)? {
+        let Some(chunk) = public_chunk(state, &room_id)? else {
+            continue;
+        };
+        if let Some(term) = search_term {
+            let term = term.to_lowercase();
+            let matches = [
+                chunk.name.as_deref().unwrap_or(""),
+                chunk.topic.as_deref().unwrap_or(""),
+                chunk.canonical_alias.as_ref().map_or("", |a| a.as_str()),
+            ]
+            .iter()
+            .any(|f| f.to_lowercase().contains(&term));
+            if !matches {
+                continue;
+            }
+        }
+        chunks.push(chunk);
+    }
+    let total = chunks.len() as u64;
+    if let Some(limit) = limit {
+        chunks.truncate(u64::from(limit) as usize);
+    }
+    Ok((chunks, total))
+}
+
 pub async fn public_rooms(
-    State(_state): State<Arc<CsState>>,
-    _req: Ar<get_public_rooms::v3::Request>,
+    State(state): State<Arc<CsState>>,
+    Ar(req): Ar<get_public_rooms::v3::Request>,
 ) -> Result<Ra<get_public_rooms::v3::Response>> {
-    // The public rooms directory is a cross-shard projection (spec.md §9)
-    // that lands with a real directory; M2 serves an empty list.
-    Ok(Ra(get_public_rooms::v3::Response::new(Vec::new())))
+    let (chunks, total) = directory_chunks(&state, None, req.limit)?;
+    let mut resp = get_public_rooms::v3::Response::new(chunks);
+    resp.total_room_count_estimate = ruma::UInt::try_from(total).ok();
+    Ok(Ra(resp))
+}
+
+pub async fn public_rooms_filtered(
+    State(state): State<Arc<CsState>>,
+    Ar(req): Ar<get_public_rooms_filtered::v3::Request>,
+) -> Result<Ra<get_public_rooms_filtered::v3::Response>> {
+    let (chunks, total) =
+        directory_chunks(&state, req.filter.generic_search_term.as_deref(), req.limit)?;
+    let mut resp = get_public_rooms_filtered::v3::Response::new();
+    resp.chunk = chunks;
+    resp.total_room_count_estimate = ruma::UInt::try_from(total).ok();
+    Ok(Ra(resp))
+}
+
+pub async fn get_visibility(
+    State(state): State<Arc<CsState>>,
+    Ar(req): Ar<get_room_visibility::v3::Request>,
+) -> Result<Ra<get_room_visibility::v3::Response>> {
+    room_meta(&state.rooms, req.room_id.as_str())?;
+    let public = state
+        .users
+        .store()
+        .room_is_public(req.room_id.as_str())
+        .map_err(internal)?;
+    Ok(Ra(get_room_visibility::v3::Response::new(if public {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    })))
+}
+
+pub async fn set_visibility(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<set_room_visibility::v3::Request>,
+) -> Result<Ra<set_room_visibility::v3::Response>> {
+    require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    state
+        .users
+        .set_room_visibility(req.room_id.as_str(), req.visibility == Visibility::Public)
+        .await?;
+    Ok(Ra(set_room_visibility::v3::Response::new()))
 }

@@ -152,6 +152,12 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
                 &p("/rooms/{room_id}/state/{event_type}"),
                 get(rooms::get_state_event_empty_key).put(rooms::send_state_event_empty_key),
             )
+            // Clients (and Complement) also use a trailing slash for the
+            // empty state key; axum treats that as a distinct path.
+            .route(
+                &p("/rooms/{room_id}/state/{event_type}/"),
+                get(rooms::get_state_event_empty_key).put(rooms::send_state_event_empty_key),
+            )
             .route(
                 &p("/rooms/{room_id}/state/{event_type}/{state_key}"),
                 get(rooms::get_state_event).put(rooms::send_state_event),
@@ -178,7 +184,14 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
                     .delete(rooms::delete_alias),
             )
             .route(&p("/rooms/{room_id}/aliases"), get(rooms::get_room_aliases))
-            .route(&p("/publicRooms"), get(rooms::public_rooms))
+            .route(
+                &p("/publicRooms"),
+                get(rooms::public_rooms).post(rooms::public_rooms_filtered),
+            )
+            .route(
+                &p("/directory/list/room/{room_id}"),
+                get(rooms::get_visibility).put(rooms::set_visibility),
+            )
             // -- sync / ephemeral
             .route(&p("/sync"), get(sync::sync_events))
             .route(
@@ -210,7 +223,22 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             "/_matrix/client/v1/media/thumbnail/{server_name}/{media_id}",
             get(media::thumbnail),
         )
-        .route("/_matrix/client/v1/media/config", get(media::config));
+        .route("/_matrix/client/v1/media/config", get(media::config))
+        // Legacy unauthenticated media (deprecated pre-1.11 surface, still
+        // widely used by clients).
+        .route(
+            "/_matrix/media/v3/download/{server_name}/{media_id}",
+            get(media::download_legacy),
+        )
+        .route(
+            "/_matrix/media/v3/download/{server_name}/{media_id}/{file_name}",
+            get(media::download_named_legacy),
+        )
+        .route(
+            "/_matrix/media/v3/thumbnail/{server_name}/{media_id}",
+            get(media::thumbnail_legacy),
+        )
+        .route("/_matrix/media/v3/config", get(media::config_legacy));
 
     app.fallback(unrecognized)
         .layer(

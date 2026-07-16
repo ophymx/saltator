@@ -157,11 +157,30 @@ fn build_sync(
         };
         match m.membership.as_str() {
             "join" => {
+                // A join projected after the client's last sync renders as
+                // if initial: the room's events may all predate the since
+                // token (join raced the membership projection), so the
+                // window must restart from zero or the room never appears.
+                let room_initial = initial || m.seq > since.user;
+                let room_since = if room_initial {
+                    SyncPos::default()
+                } else {
+                    since
+                };
                 let joined = build_joined_room(
-                    state, auth, &room_id, &m, since, now, limit, lazy, full_state, initial,
+                    state,
+                    auth,
+                    &room_id,
+                    &m,
+                    room_since,
+                    now,
+                    limit,
+                    lazy,
+                    full_state,
+                    room_initial,
                 )?;
                 // Suppress unchanged rooms on incremental syncs.
-                let unchanged = !initial
+                let unchanged = !room_initial
                     && joined.timeline.events.is_empty()
                     && joined.state.is_empty()
                     && joined.ephemeral.is_empty()
@@ -178,7 +197,7 @@ fn build_sync(
             "leave" | "ban" if !initial && m.seq > since.user => {
                 resp.rooms.leave.insert(
                     room_id,
-                    build_left_room(state, &room_id_str, &m, since, now)?,
+                    build_left_room(state, auth, &room_id_str, &m, since, now)?,
                 );
             }
             _ => {}
@@ -242,7 +261,13 @@ fn build_joined_room(
     }
     let mut timeline_senders: Vec<String> = Vec::new();
     for (_, event_id) in &window {
-        if let Some(ev) = client_event(rooms, version, room_id.as_str(), event_id)? {
+        if let Some(ev) = client_event(
+            rooms,
+            version,
+            room_id.as_str(),
+            event_id,
+            auth.user_id.as_str(),
+        )? {
             if let Some(sender) = ev.get("sender").and_then(|s| s.as_str()) {
                 timeline_senders.push(sender.to_owned());
             }
@@ -268,7 +293,13 @@ fn build_joined_room(
         if lazy && key.0 == "m.room.member" && !timeline_senders.contains(&key.1) {
             continue;
         }
-        if let Some(ev) = client_event(rooms, version, room_id.as_str(), event_id)? {
+        if let Some(ev) = client_event(
+            rooms,
+            version,
+            room_id.as_str(),
+            event_id,
+            auth.user_id.as_str(),
+        )? {
             state_events.push(to_raw(&ev)?);
         }
     }
@@ -390,6 +421,7 @@ fn build_invited_room(
 
 fn build_left_room(
     state: &CsState,
+    auth: &Auth,
     room_id: &str,
     _membership: &MembershipEntry,
     since: SyncPos,
@@ -408,7 +440,7 @@ fn build_left_room(
         .map_err(internal)?;
     window.reverse();
     for (_, event_id) in &window {
-        if let Some(ev) = client_event(rooms, version, room_id, event_id)? {
+        if let Some(ev) = client_event(rooms, version, room_id, event_id, auth.user_id.as_str())? {
             out.timeline.events.push(to_raw(&ev)?);
         }
     }

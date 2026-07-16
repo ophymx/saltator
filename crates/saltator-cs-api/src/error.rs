@@ -133,6 +133,9 @@ impl From<RoomError> for ApiError {
     fn from(e: RoomError) -> Self {
         match &e {
             RoomError::UnknownRoom(_) => Self::not_found(e.to_string()),
+            RoomError::Validation(saltator_core::validation::ValidationError::TooLarge(_)) => {
+                Self::new(StatusCode::PAYLOAD_TOO_LARGE, "M_TOO_LARGE", e.to_string())
+            }
             RoomError::Validation(_)
             | RoomError::Verification(_)
             | RoomError::Format(_)

@@ -119,10 +119,10 @@ pub async fn register_available(
     if !state.config.registration_enabled {
         return Err(ApiError::forbidden("Registration is disabled"));
     }
+    let user_id = state.users.canonical_user_id(&req.username)?;
     let store = state.users.store();
-    let user_id = format!("@{}:{}", req.username, state.config.server_name);
     if store
-        .account(&user_id)
+        .account(user_id.as_str())
         .map_err(ApiError::internal)?
         .is_some()
     {
