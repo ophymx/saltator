@@ -151,6 +151,19 @@ fn build_sync(
 
     let mut resp = v3::Response::new(format_token(now));
 
+    // Invites from ignored users are suppressed (m.ignored_user_list).
+    let ignored: std::collections::BTreeSet<String> = store
+        .account_data(user_id, "", "m.ignored_user_list")
+        .map_err(internal)?
+        .and_then(|entry| serde_json::from_slice::<serde_json::Value>(&entry.json).ok())
+        .and_then(|v| {
+            v.get("ignored_users").and_then(|u| {
+                u.as_object()
+                    .map(|o| o.keys().cloned().collect::<std::collections::BTreeSet<_>>())
+            })
+        })
+        .unwrap_or_default();
+
     for (room_id_str, m) in store.memberships(user_id).map_err(internal)? {
         let Ok(room_id) = OwnedRoomId::try_from(room_id_str.clone()) else {
             continue;
@@ -190,6 +203,9 @@ fn build_sync(
                 }
             }
             "invite" if initial || m.seq > since.user => {
+                if ignored.contains(&m.sender) {
+                    continue;
+                }
                 resp.rooms
                     .invite
                     .insert(room_id, build_invited_room(state, auth, &room_id_str, &m)?);

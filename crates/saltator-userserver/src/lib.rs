@@ -170,10 +170,15 @@ impl UserServer {
             })
             .await?
         {
-            UserResponse::Ok => Ok((user_id, session)),
-            UserResponse::UserExists => Err(UserError::UserExists),
-            other => Err(unexpected(other)),
+            UserResponse::Ok => {}
+            UserResponse::UserExists => return Err(UserError::UserExists),
+            other => return Err(unexpected(other)),
         }
+        // Default displayname = localpart (what Synapse does; clients and
+        // member events expect a name from the start).
+        self.set_profile(&user_id, Some(Some(user_id.localpart().to_owned())), None)
+            .await?;
+        Ok((user_id, session))
     }
 
     /// Password login. `user` may be a full user ID or a localpart.

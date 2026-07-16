@@ -51,6 +51,8 @@ pub async fn get_capabilities(
 ) -> Ra<get_capabilities::v3::Response> {
     use get_capabilities::v3::{Capabilities, RoomVersionStability, RoomVersionsCapability};
     let mut caps = Capabilities::new();
+    // Password changes land with the account-management surface (M5).
+    caps.change_password.enabled = false;
     caps.room_versions = RoomVersionsCapability::new(
         state.config.default_room_version.ruma_id(),
         [RoomVersion::V11, RoomVersion::V12]

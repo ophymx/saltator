@@ -124,7 +124,20 @@ pub async fn create_room(
             users.insert(invitee.to_string(), 100.into());
         }
     }
-    let mut pl_content: serde_json::Value = serde_json::json!({ "users": users });
+    // Spell out the spec defaults: clients (and Complement) expect the
+    // created power-level event to be complete, not sparse.
+    let mut pl_content: serde_json::Value = serde_json::json!({
+        "ban": 50,
+        "events": {},
+        "events_default": 0,
+        "invite": 0,
+        "kick": 50,
+        "notifications": { "room": 50 },
+        "redact": 50,
+        "state_default": 50,
+        "users": users,
+        "users_default": 0,
+    });
     if let Some(overrides) = &req.power_level_content_override {
         let overrides: serde_json::Value = serde_json::from_str(overrides.json().get())
             .map_err(|e| ApiError::bad_json(format!("power_level_content_override: {e}")))?;
@@ -233,7 +246,12 @@ pub async fn create_room(
             &auth.user_id,
             "m.room.topic",
             "",
-            serde_json::json!({ "topic": topic }),
+            // Plain topic plus its rich representation (spec v1.15,
+            // MSC3765-lineage `m.topic`).
+            serde_json::json!({
+                "topic": topic,
+                "m.topic": { "m.text": [{ "body": topic }] },
+            }),
         )
         .await?;
     }
@@ -672,6 +690,22 @@ pub async fn get_state_event(
     let event_id = current
         .get(&key)
         .ok_or_else(|| ApiError::not_found("No state with this type/key"))?;
+    // ?format=event returns the whole client-format event, not just the
+    // content.
+    if req.format == get_state_event_for_key::v3::StateEventFormat::Event {
+        let meta = room_meta(&state.rooms, req.room_id.as_str())?;
+        let version = room_version(&meta)?;
+        let ev = client_event(
+            &state.rooms,
+            version,
+            req.room_id.as_str(),
+            event_id,
+            auth.user_id.as_str(),
+        )?
+        .ok_or_else(|| ApiError::not_found("State event missing"))?;
+        let ev = serde_json::value::to_raw_value(&ev).map_err(internal)?;
+        return Ok(Ra(get_state_event_for_key::v3::Response::new(ev)));
+    }
     let raw = raw_event(&state.rooms, event_id)?
         .ok_or_else(|| ApiError::not_found("State event missing"))?;
     let content = raw

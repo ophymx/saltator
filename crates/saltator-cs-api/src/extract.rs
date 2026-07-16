@@ -42,13 +42,28 @@ where
                 e.to_string(),
             )
         })?;
-        if std::str::from_utf8(&bytes).is_err() {
+        // JSON bodies must be valid UTF-8; binary bodies (media uploads)
+        // pass through untouched. Absent Content-Type defaults to JSON per
+        // the Matrix convention.
+        let is_json_body = parts
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_none_or(|ct| ct.starts_with("application/json"));
+        if is_json_body && std::str::from_utf8(&bytes).is_err() {
             return Err(ApiError::new(
                 axum::http::StatusCode::BAD_REQUEST,
                 "M_NOT_JSON",
                 "Request body is not valid UTF-8",
             ));
         }
+        // An absent body on a JSON endpoint means `{}` (clients routinely
+        // POST /join, /leave, /forget with no body at all).
+        let bytes = if is_json_body && bytes.is_empty() {
+            bytes::Bytes::from_static(b"{}")
+        } else {
+            bytes
+        };
         let http_req = Request::from_parts(parts, bytes);
         T::try_from_http_request(http_req, &path_args)
             .map(Ar)
