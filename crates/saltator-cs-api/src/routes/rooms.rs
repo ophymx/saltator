@@ -345,7 +345,22 @@ async fn send_membership(
         .rooms
         .send_state(room_id, sender, "m.room.member", target.as_str(), content)
         .await?;
-    Ok(accepted_event_id(outcome)?.0)
+    let (event_id, seq) = accepted_event_id(outcome)?;
+    // Read-your-writes: clients chain membership calls (leave then forget,
+    // join then sync) and expect the next request to see this change, but
+    // the user-shard membership index trails the room shard. Block until
+    // the projection catches up; on timeout the event is already committed,
+    // so degrade to eventual consistency rather than fail.
+    if let Err(e) = saltator_userserver::wait_for_projection(
+        &state.users,
+        seq,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "membership projection lagging; responding anyway");
+    }
+    Ok(event_id)
 }
 
 // -- membership ---------------------------------------------------------------
