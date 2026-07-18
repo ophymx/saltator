@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use ruma::api::client::alias::{create_alias, delete_alias, get_alias};
 use ruma::api::client::directory::{
     get_public_rooms, get_public_rooms_filtered, get_room_visibility, set_room_visibility,
@@ -23,7 +23,7 @@ use ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 use saltator_core::RoomVersion;
 
 use crate::error::ApiError;
-use crate::extract::{Ar, Auth, Ra};
+use crate::extract::{Ar, Auth, Jb, Ra};
 use crate::room_util::{
     accepted_event_id, client_event, current_state, membership_in, raw_event, require_joined,
     room_meta, room_version, to_raw,
@@ -327,7 +327,41 @@ async fn send_membership(
     membership: &str,
     reason: Option<String>,
 ) -> Result<ruma::OwnedEventId> {
-    let mut content = serde_json::json!({ "membership": membership });
+    send_membership_with(
+        state,
+        room_id,
+        sender,
+        target,
+        membership,
+        reason,
+        Default::default(),
+    )
+    .await
+}
+
+/// `extra` carries client-supplied custom member-event content (the
+/// legacy /join body contract). Reserved fields are applied on top so a
+/// body can't spoof membership or profile.
+async fn send_membership_with(
+    state: &CsState,
+    room_id: &RoomId,
+    sender: &UserId,
+    target: &UserId,
+    membership: &str,
+    reason: Option<String>,
+    mut extra: serde_json::Map<String, serde_json::Value>,
+) -> Result<ruma::OwnedEventId> {
+    for reserved in [
+        "membership",
+        "displayname",
+        "avatar_url",
+        "join_authorised_via_users_server",
+        "third_party_invite",
+    ] {
+        extra.remove(reserved);
+    }
+    let mut content = serde_json::Value::Object(extra);
+    content["membership"] = membership.into();
     if let Some(reason) = reason {
         content["reason"] = reason.into();
     }
@@ -365,41 +399,56 @@ async fn send_membership(
 
 // -- membership ---------------------------------------------------------------
 
-pub async fn join_room(
-    State(state): State<Arc<CsState>>,
-    auth: Auth,
-    Ar(req): Ar<join_room_by_id::v3::Request>,
-) -> Result<Ra<join_room_by_id::v3::Response>> {
-    send_membership(
-        &state,
-        &req.room_id,
+/// Shared body handling for the two join endpoints: `reason` is spec'd,
+/// everything else rides along as custom member-event content.
+async fn join_with_body(
+    state: &CsState,
+    auth: &Auth,
+    room_id: &RoomId,
+    mut body: serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let reason = body
+        .remove("reason")
+        .and_then(|v| v.as_str().map(ToOwned::to_owned));
+    body.remove("third_party_signed");
+    send_membership_with(
+        state,
+        room_id,
         &auth.user_id,
         &auth.user_id,
         "join",
-        req.reason.clone(),
+        reason,
+        body,
     )
     .await?;
-    Ok(Ra(join_room_by_id::v3::Response::new(req.room_id)))
+    Ok(())
+}
+
+pub async fn join_room(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Path(room_id): Path<String>,
+    Jb(body): Jb,
+) -> Result<Ra<join_room_by_id::v3::Response>> {
+    let room_id = OwnedRoomId::try_from(room_id)
+        .map_err(|e| ApiError::invalid_param(format!("room_id: {e}")))?;
+    join_with_body(&state, &auth, &room_id, body).await?;
+    Ok(Ra(join_room_by_id::v3::Response::new(room_id)))
 }
 
 pub async fn join_by_id_or_alias(
     State(state): State<Arc<CsState>>,
     auth: Auth,
-    Ar(req): Ar<join_room_by_id_or_alias::v3::Request>,
+    Path(room_id_or_alias): Path<String>,
+    Jb(body): Jb,
 ) -> Result<Ra<join_room_by_id_or_alias::v3::Response>> {
-    let room_id: OwnedRoomId = match req.room_id_or_alias.clone().try_into() {
+    let id_or_alias = ruma::OwnedRoomOrAliasId::try_from(room_id_or_alias)
+        .map_err(|e| ApiError::invalid_param(format!("room_id_or_alias: {e}")))?;
+    let room_id: OwnedRoomId = match id_or_alias.try_into() {
         Ok(room_id) => room_id,
         Err(alias) => resolve_alias(&state, alias.as_str())?,
     };
-    send_membership(
-        &state,
-        &room_id,
-        &auth.user_id,
-        &auth.user_id,
-        "join",
-        req.reason.clone(),
-    )
-    .await?;
+    join_with_body(&state, &auth, &room_id, body).await?;
     Ok(Ra(join_room_by_id_or_alias::v3::Response::new(room_id)))
 }
 
@@ -819,9 +868,11 @@ pub async fn get_joined_members(
     State(state): State<Arc<CsState>>,
     auth: Auth,
     Ar(req): Ar<joined_members::v3::Request>,
-) -> Result<Ra<joined_members::v3::Response>> {
+) -> Result<axum::Json<serde_json::Value>> {
     let current = require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
-    let mut joined = std::collections::BTreeMap::new();
+    // Built as raw JSON: clients expect display_name/avatar_url keys to be
+    // present (null when unset), which ruma's RoomMember omits.
+    let mut joined = serde_json::Map::new();
     for ((event_type, state_key), event_id) in &current {
         if event_type != "m.room.member" {
             continue;
@@ -834,21 +885,20 @@ pub async fn get_joined_members(
         if content.get("membership").and_then(|m| m.as_str()) != Some("join") {
             continue;
         }
-        let Ok(user_id) = OwnedUserId::try_from(state_key.clone()) else {
+        if OwnedUserId::try_from(state_key.clone()).is_err() {
             continue;
-        };
-        let mut member = joined_members::v3::RoomMember::new();
-        member.display_name = content
-            .get("displayname")
-            .and_then(|d| d.as_str())
-            .map(ToOwned::to_owned);
-        member.avatar_url = content
-            .get("avatar_url")
-            .and_then(|a| a.as_str())
-            .map(|a| a.to_owned().into());
-        joined.insert(user_id, member);
+        }
+        joined.insert(
+            state_key.clone(),
+            serde_json::json!({
+                "display_name": content.get("displayname").cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "avatar_url": content.get("avatar_url").cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            }),
+        );
     }
-    Ok(Ra(joined_members::v3::Response::new(joined)))
+    Ok(axum::Json(serde_json::json!({ "joined": joined })))
 }
 
 pub async fn get_messages(

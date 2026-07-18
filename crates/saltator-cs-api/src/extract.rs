@@ -71,6 +71,47 @@ where
     }
 }
 
+/// A raw JSON object body, for endpoints that accept fields beyond their
+/// spec'd request type (e.g. custom member-event content on /join). Same
+/// conventions as [`Ar`]: absent body reads as `{}`, non-JSON is
+/// `M_NOT_JSON`.
+pub struct Jb(pub serde_json::Map<String, serde_json::Value>);
+
+impl<S> FromRequest<S> for Jb
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::to_bytes(req.into_body(), MAX_BODY)
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                    "M_TOO_LARGE",
+                    e.to_string(),
+                )
+            })?;
+        if bytes.is_empty() {
+            return Ok(Jb(serde_json::Map::new()));
+        }
+        match serde_json::from_slice(&bytes) {
+            Ok(serde_json::Value::Object(map)) => Ok(Jb(map)),
+            Ok(_) => Err(ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "M_NOT_JSON",
+                "Request body is not a JSON object",
+            )),
+            Err(e) => Err(ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "M_NOT_JSON",
+                format!("Request body is not valid JSON: {e}"),
+            )),
+        }
+    }
+}
+
 /// The authenticated caller.
 #[derive(Debug, Clone)]
 pub struct Auth {
