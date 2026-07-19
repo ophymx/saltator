@@ -5,6 +5,7 @@
 
 mod error;
 mod extract;
+mod presence;
 mod room_util;
 mod routes;
 mod txn;
@@ -21,6 +22,7 @@ use saltator_roomserver::RoomServer;
 use saltator_userserver::UserServer;
 
 pub use error::ApiError;
+pub use presence::PresenceMap;
 pub use typing::TypingMap;
 
 /// Client-facing configuration of the CS surface.
@@ -46,6 +48,7 @@ pub struct CsState {
     pub media: MediaStore,
     pub config: CsConfig,
     pub typing: TypingMap,
+    pub presence: PresenceMap,
     pub(crate) txns: txn::TxnCache,
 }
 
@@ -62,6 +65,7 @@ impl CsState {
             media,
             config,
             typing: TypingMap::new(),
+            presence: PresenceMap::new(),
             txns: txn::TxnCache::new(),
         })
     }

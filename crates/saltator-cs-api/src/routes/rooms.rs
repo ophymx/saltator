@@ -25,8 +25,8 @@ use saltator_core::RoomVersion;
 use crate::error::ApiError;
 use crate::extract::{Ar, Auth, Jb, Ra};
 use crate::room_util::{
-    accepted_event_id, client_event, current_state, membership_in, raw_event, require_joined,
-    room_meta, room_version, to_raw,
+    accepted_event_id, client_event, current_state, raw_event, require_joined, room_meta,
+    room_version, state_content_in, to_raw, StateMap,
 };
 use crate::CsState;
 
@@ -904,31 +904,60 @@ pub async fn get_joined_members(
 pub async fn get_messages(
     State(state): State<Arc<CsState>>,
     auth: Auth,
-    Ar(req): Ar<get_message_events::v3::Request>,
+    Path(room_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Ra<get_message_events::v3::Response>> {
     use ruma::api::Direction;
 
-    require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
-    let meta = room_meta(&state.rooms, req.room_id.as_str())?;
+    // Access is checked before query validation: a caller who may not read
+    // the room gets 403 no matter how malformed the request is.
+    require_joined(&state.rooms, &room_id, auth.user_id.as_str())?;
+    let meta = room_meta(&state.rooms, &room_id)?;
     let version = room_version(&meta)?;
-    let limit = (u64::from(req.limit) as usize).clamp(1, 1000);
-    let from = req.from.as_deref().map(parse_topo_token).transpose()?;
-    let to = req.to.as_deref().map(parse_topo_token).transpose()?;
+
+    let dir = match query.get("dir").map(String::as_str) {
+        Some("b") => Direction::Backward,
+        Some("f") => Direction::Forward,
+        Some(other) => {
+            return Err(ApiError::invalid_param(format!(
+                "dir: unknown value {other:?}"
+            )));
+        }
+        None => {
+            return Err(ApiError::invalid_param(
+                "dir: required parameter is missing",
+            ))
+        }
+    };
+    let limit = query
+        .get("limit")
+        .map(|l| {
+            l.parse::<usize>()
+                .map_err(|_| ApiError::invalid_param("limit: not an integer"))
+        })
+        .transpose()?
+        .unwrap_or(10)
+        .clamp(1, 1000);
+    let from = query.get("from").map(|s| parse_topo_token(s)).transpose()?;
+    let to = query.get("to").map(|s| parse_topo_token(s)).transpose()?;
+    // Room event filter: only `contains_url` is honored so far.
+    let contains_url = query
+        .get("filter")
+        .map(|f| {
+            serde_json::from_str::<serde_json::Value>(f)
+                .map_err(|e| ApiError::bad_json(format!("filter: {e}")))
+        })
+        .transpose()?
+        .and_then(|f| f.get("contains_url").and_then(|v| v.as_bool()));
 
     // Tokens are exclusive bounds on the room-shard seq.
     let store = state.rooms.store();
-    let (batch, next): (Vec<(u64, String)>, Option<u64>) = match req.dir {
+    let (batch, next): (Vec<(u64, String)>, Option<u64>) = match dir {
         Direction::Backward => {
             let upper = from.unwrap_or(u64::MAX);
             let lower = to.unwrap_or(0);
             let events = store
-                .room_timeline(
-                    req.room_id.as_str(),
-                    lower,
-                    Some(upper.saturating_sub(1)),
-                    limit,
-                    true,
-                )
+                .room_timeline(&room_id, lower, Some(upper.saturating_sub(1)), limit, true)
                 .map_err(internal)?;
             let next = events.last().map(|(s, _)| *s);
             (events, next)
@@ -937,7 +966,7 @@ pub async fn get_messages(
             let lower = from.unwrap_or(0);
             let upper = to.map(|t| t.saturating_sub(1));
             let events = store
-                .room_timeline(req.room_id.as_str(), lower, upper, limit, false)
+                .room_timeline(&room_id, lower, upper, limit, false)
                 .map_err(internal)?;
             let next = events.last().map(|(s, _)| *s);
             (events, next)
@@ -949,20 +978,33 @@ pub async fn get_messages(
         if let Some(ev) = client_event(
             &state.rooms,
             version,
-            req.room_id.as_str(),
+            &room_id,
             event_id,
             auth.user_id.as_str(),
         )? {
+            if let Some(want_url) = contains_url {
+                let has_url = ev
+                    .get("content")
+                    .and_then(|c| c.get("url"))
+                    .is_some_and(|u| u.is_string());
+                if has_url != want_url {
+                    continue;
+                }
+            }
             chunk.push(to_raw(&ev)?);
         }
     }
     let mut resp = get_message_events::v3::Response::new();
-    resp.start = req.from.clone().unwrap_or_else(|| "t0".to_owned());
-    resp.end = if batch.len() == limit {
+    resp.start = query
+        .get("from")
+        .cloned()
+        .unwrap_or_else(|| "t0".to_owned());
+    // `end` is always present: clients (and sytest) treat its absence as an
+    // error, and paginating past the boundary just yields an empty chunk.
+    resp.end = Some(
         next.map(|s| format!("t{s}"))
-    } else {
-        None
-    };
+            .unwrap_or_else(|| resp.start.clone()),
+    );
     resp.chunk = chunk;
     Ok(Ra(resp))
 }
@@ -1013,6 +1055,55 @@ pub async fn create_alias(
     Ok(Ra(create_alias::v3::Response::new()))
 }
 
+/// May `user_id` send state events of `event_type` in this room? Room
+/// creators in privileged-creator versions (v12+) always may; everyone
+/// else is measured against the power-level event.
+fn can_send_state(
+    rooms: &saltator_roomserver::RoomServer,
+    state_map: &StateMap,
+    version: RoomVersion,
+    user_id: &str,
+    event_type: &str,
+) -> Result<bool> {
+    if version.privileged_creators() {
+        if let Some(create_id) = state_map.get(&("m.room.create".to_owned(), String::new())) {
+            if let Some(raw) = raw_event(rooms, create_id)? {
+                let sender = raw.get("sender").and_then(|v| v.as_str());
+                if sender == Some(user_id) {
+                    return Ok(true);
+                }
+                let is_additional = raw
+                    .get("content")
+                    .and_then(|c| c.as_object())
+                    .and_then(|c| c.get("additional_creators"))
+                    .and_then(|a| a.as_array())
+                    .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(user_id)));
+                if is_additional {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    let pl = state_content_in(rooms, state_map, "m.room.power_levels")?;
+    let Some(pl) = pl else {
+        // No power-level event: auth-rule defaults (state_default 0).
+        return Ok(true);
+    };
+    let user_level = pl
+        .get("users")
+        .and_then(|u| u.get(user_id))
+        .and_then(|v| v.as_i64())
+        .or_else(|| pl.get("users_default").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+    let required = pl
+        .get("events")
+        .and_then(|e| e.get(event_type))
+        .and_then(|v| v.as_i64())
+        .or_else(|| pl.get("state_default").and_then(|v| v.as_i64()))
+        .unwrap_or(50);
+    Ok(user_level >= required)
+}
+
 pub async fn delete_alias(
     State(state): State<Arc<CsState>>,
     auth: Auth,
@@ -1024,15 +1115,55 @@ pub async fn delete_alias(
         .alias(req.room_alias.as_str())
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("Unknown room alias"))?;
-    // Creator may delete; otherwise a current room admin (PL ≥ 50).
-    if entry.creator != auth.user_id.as_str() {
-        let state_map = current_state(&state.rooms, &entry.room_id)?;
-        let membership = membership_in(&state.rooms, &state_map, auth.user_id.as_str())?;
-        if membership != "join" {
-            return Err(ApiError::forbidden("Not allowed to delete this alias"));
-        }
+    let state_map = current_state(&state.rooms, &entry.room_id)?;
+    let meta = room_meta(&state.rooms, &entry.room_id)?;
+    let version = room_version(&meta)?;
+    // The alias creator may delete their own; anyone else needs the power
+    // to administer aliases (the level to send m.room.canonical_alias).
+    if entry.creator != auth.user_id.as_str()
+        && !can_send_state(
+            &state.rooms,
+            &state_map,
+            version,
+            auth.user_id.as_str(),
+            "m.room.canonical_alias",
+        )?
+    {
+        return Err(ApiError::forbidden("Not allowed to delete this alias"));
     }
     state.users.delete_alias(req.room_alias.as_str()).await?;
+
+    // Deleting the room's canonical alias also clears it from room state
+    // (clients otherwise render a dangling alias). Best-effort: the
+    // directory deletion above stands even if the state update is refused.
+    if let Some(canonical) = state_content_in(&state.rooms, &state_map, "m.room.canonical_alias")? {
+        let alias = req.room_alias.as_str();
+        let mut content = canonical.as_object().cloned().unwrap_or_default();
+        let was_main = content.get("alias").and_then(|a| a.as_str()) == Some(alias);
+        if was_main {
+            content.remove("alias");
+        }
+        let mut was_alt = false;
+        if let Some(serde_json::Value::Array(alts)) = content.get_mut("alt_aliases") {
+            let before = alts.len();
+            alts.retain(|v| v.as_str() != Some(alias));
+            was_alt = alts.len() != before;
+        }
+        if was_main || was_alt {
+            if let Ok(room_id) = OwnedRoomId::try_from(entry.room_id.clone()) {
+                let _ = state
+                    .rooms
+                    .send_state(
+                        &room_id,
+                        &auth.user_id,
+                        "m.room.canonical_alias",
+                        "",
+                        serde_json::Value::Object(content),
+                    )
+                    .await;
+            }
+        }
+    }
     Ok(Ra(delete_alias::v3::Response::new()))
 }
 

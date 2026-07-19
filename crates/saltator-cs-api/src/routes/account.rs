@@ -392,18 +392,32 @@ pub async fn get_pushrules(
 }
 
 pub async fn set_presence(
-    _auth: Auth,
-    _req: Ar<set_presence::v3::Request>,
-) -> Ra<set_presence::v3::Response> {
-    // Presence is ephemeral and optional; accepted and dropped in M2.
-    Ra(set_presence::v3::Response::new())
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<set_presence::v3::Request>,
+) -> Result<Ra<set_presence::v3::Response>> {
+    if req.user_id != auth.user_id {
+        return Err(ApiError::forbidden("Cannot set another user's presence"));
+    }
+    state.presence.set(
+        auth.user_id.as_str(),
+        req.presence.as_str(),
+        req.status_msg.clone(),
+    );
+    Ok(Ra(set_presence::v3::Response::new()))
 }
 
 pub async fn get_presence(
+    State(state): State<Arc<CsState>>,
     _auth: Auth,
-    _req: Ar<get_presence::v3::Request>,
-) -> Ra<get_presence::v3::Response> {
-    Ra(get_presence::v3::Response::new(
-        ruma::presence::PresenceState::Offline,
-    ))
+    Ar(req): Ar<get_presence::v3::Request>,
+) -> Result<Ra<get_presence::v3::Response>> {
+    let mut resp = get_presence::v3::Response::new(ruma::presence::PresenceState::Offline);
+    if let Some(entry) = state.presence.get(req.user_id.as_str()) {
+        resp.presence = entry.presence.as_str().into();
+        resp.status_msg = entry.status_msg;
+        resp.last_active_ago = Some(entry.last_active.elapsed());
+        resp.currently_active = Some(entry.presence == "online");
+    }
+    Ok(Ra(resp))
 }

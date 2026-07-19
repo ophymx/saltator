@@ -38,10 +38,11 @@ struct SyncPos {
     room: u64,
     user: u64,
     typing: u64,
+    presence: u64,
 }
 
 fn format_token(p: SyncPos) -> String {
-    format!("s{}_{}_{}", p.room, p.user, p.typing)
+    format!("s{}_{}_{}_{}", p.room, p.user, p.typing, p.presence)
 }
 
 fn parse_token(s: &str) -> Result<SyncPos> {
@@ -49,9 +50,27 @@ fn parse_token(s: &str) -> Result<SyncPos> {
         .strip_prefix('s')
         .ok_or_else(|| ApiError::invalid_param("Invalid sync token"))?;
     let mut parts = body.split('_').map(|p| p.parse::<u64>());
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(Ok(room)), Some(Ok(user)), Some(Ok(typing)), None) => {
-            Ok(SyncPos { room, user, typing })
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        // Three-part tokens predate the presence component; window from 0.
+        (Some(Ok(room)), Some(Ok(user)), Some(Ok(typing)), None, None) => Ok(SyncPos {
+            room,
+            user,
+            typing,
+            presence: 0,
+        }),
+        (Some(Ok(room)), Some(Ok(user)), Some(Ok(typing)), Some(Ok(presence)), None) => {
+            Ok(SyncPos {
+                room,
+                user,
+                typing,
+                presence,
+            })
         }
         _ => Err(ApiError::invalid_param("Invalid sync token")),
     }
@@ -81,19 +100,29 @@ pub async fn sync_events(
         .min(Duration::from_secs(60));
     let deadline = tokio::time::Instant::now() + timeout;
 
+    // Syncing marks the caller present unless they opted out.
+    if req.set_presence != ruma::presence::PresenceState::Offline {
+        state
+            .presence
+            .set_active(auth.user_id.as_str(), req.set_presence.as_str());
+    }
+
     // Subscribe before the first compute (no lost wakeups).
     let mut room_rx = state.rooms.subscribe();
     let mut user_rx = state.users.subscribe();
     let mut typing_rx = state.typing.subscribe();
+    let mut presence_rx = state.presence.subscribe();
 
     loop {
         let now_pos = SyncPos {
             room: state.rooms.shard_handle().seq().map_err(internal)?,
             user: state.users.shard_handle().seq().map_err(internal)?,
             typing: state.typing.generation(),
+            presence: state.presence.generation(),
         };
         let resp = build_sync(&state, &auth, since, now_pos, limit, lazy, req.full_state)?;
-        let empty = resp.rooms.is_empty() && resp.account_data.is_empty();
+        let empty =
+            resp.rooms.is_empty() && resp.account_data.is_empty() && resp.presence.is_empty();
         if since.is_none() || !empty || timeout.is_zero() {
             return Ok(Ra(resp));
         }
@@ -101,6 +130,7 @@ pub async fn sync_events(
             _ = room_rx.recv() => {}
             _ = user_rx.recv() => {}
             _ = typing_rx.recv() => {}
+            _ = presence_rx.recv() => {}
             _ = tokio::time::sleep_until(deadline) => return Ok(Ra(resp)),
         }
     }
@@ -164,12 +194,14 @@ fn build_sync(
         })
         .unwrap_or_default();
 
+    let mut my_joined_rooms: std::collections::BTreeSet<String> = Default::default();
     for (room_id_str, m) in store.memberships(user_id).map_err(internal)? {
         let Ok(room_id) = OwnedRoomId::try_from(room_id_str.clone()) else {
             continue;
         };
         match m.membership.as_str() {
             "join" => {
+                my_joined_rooms.insert(room_id_str.clone());
                 // A join projected after the client's last sync renders as
                 // if initial: the room's events may all predate the since
                 // token (join raced the membership projection), so the
@@ -231,6 +263,34 @@ fn build_sync(
         resp.account_data
             .events
             .push(to_raw(&account_data_event(&data_type, &entry.json)?)?);
+    }
+
+    // Presence: users the caller shares a room with (and the caller) whose
+    // presence changed inside the window.
+    let presence_since = if initial { 0 } else { since.presence };
+    for snap in state.presence.changed_since(presence_since) {
+        let visible = snap.user_id == user_id
+            || store
+                .memberships(&snap.user_id)
+                .map_err(internal)?
+                .iter()
+                .any(|(rid, m)| m.membership == "join" && my_joined_rooms.contains(rid));
+        if !visible {
+            continue;
+        }
+        let mut content = serde_json::json!({
+            "presence": snap.entry.presence,
+            "last_active_ago": snap.entry.last_active.elapsed().as_millis() as u64,
+            "currently_active": snap.entry.presence == "online",
+        });
+        if let Some(msg) = &snap.entry.status_msg {
+            content["status_msg"] = msg.clone().into();
+        }
+        resp.presence.events.push(to_raw(&serde_json::json!({
+            "type": "m.presence",
+            "sender": snap.user_id,
+            "content": content,
+        }))?);
     }
 
     Ok(resp)
