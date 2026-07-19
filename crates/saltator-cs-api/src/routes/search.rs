@@ -9,7 +9,7 @@ use axum::extract::State;
 use ruma::api::client::search::search_events::{self, v3};
 
 use crate::error::ApiError;
-use crate::extract::{Ar, Auth, Ra};
+use crate::extract::{Ar, Auth};
 use crate::room_util::{client_event, room_meta, room_version, to_raw};
 use crate::CsState;
 
@@ -28,14 +28,29 @@ fn tokenize(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Serialize by hand rather than through ruma's `Response`: its `results`
+/// field is skipped when empty, but clients expect `results: []` on the
+/// final (empty) page of a paginated search.
+fn respond(
+    room_events: search_events::v3::ResultRoomEvents,
+) -> Result<axum::Json<serde_json::Value>> {
+    let mut re = serde_json::to_value(&room_events).map_err(internal)?;
+    if let Some(obj) = re.as_object_mut() {
+        obj.entry("results")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    }
+    Ok(axum::Json(
+        serde_json::json!({ "search_categories": { "room_events": re } }),
+    ))
+}
+
 pub async fn search(
     State(state): State<Arc<CsState>>,
     auth: Auth,
     Ar(req): Ar<v3::Request>,
-) -> Result<Ra<v3::Response>> {
-    let mut categories = search_events::v3::ResultCategories::new();
+) -> Result<axum::Json<serde_json::Value>> {
     let Some(criteria) = &req.search_categories.room_events else {
-        return Ok(Ra(v3::Response::new(categories)));
+        return respond(search_events::v3::ResultRoomEvents::new());
     };
     let terms = tokenize(&criteria.search_term);
     if terms.is_empty() {
@@ -165,6 +180,5 @@ pub async fn search(
         result.context = context;
         room_events.results.push(result);
     }
-    categories.room_events = room_events;
-    Ok(Ra(v3::Response::new(categories)))
+    respond(room_events)
 }
