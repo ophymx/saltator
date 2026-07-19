@@ -117,7 +117,10 @@ pub async fn search(
 
     let mut room_events = search_events::v3::ResultRoomEvents::new();
     room_events.count = Some(ruma::UInt::try_from(matches.len() as u64).unwrap_or(ruma::UInt::MAX));
-    if offset + limit < matches.len() {
+    // next_batch whenever this page is full — even with nothing after it.
+    // Clients (and sytest) probe for the end by paginating until they get
+    // an empty page with no token, not by comparing against `count`.
+    if matches.len().saturating_sub(offset) >= limit {
         room_events.next_batch = Some((offset + limit).to_string());
     }
     let before_limit = u64::from(criteria.event_context.before_limit) as usize;
