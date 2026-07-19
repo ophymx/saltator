@@ -73,7 +73,7 @@ impl CsState {
 
 /// Build the client-server router. Serve this on the client listener.
 pub fn router(state: Arc<CsState>) -> axum::Router {
-    use routes::{account, media, rooms, session, sync};
+    use routes::{account, media, rooms, search, session, sync};
 
     let mut app = axum::Router::new()
         .route(
@@ -135,6 +135,7 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
                 get(account::get_presence).put(account::set_presence),
             )
             // -- rooms
+            .route(&p("/search"), post(search::search))
             .route(&p("/createRoom"), post(rooms::create_room))
             .route(
                 &p("/join/{room_id_or_alias}"),
@@ -215,6 +216,11 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
     // -- media (authenticated endpoints only, Matrix 1.11+)
     app = app
         .route("/_matrix/media/v3/upload", post(media::upload))
+        .route("/_matrix/media/v1/create", post(media::create_async))
+        .route(
+            "/_matrix/media/v3/upload/{server_name}/{media_id}",
+            put(media::upload_async),
+        )
         .route(
             "/_matrix/client/v1/media/download/{server_name}/{media_id}",
             get(media::download),

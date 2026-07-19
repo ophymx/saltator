@@ -131,6 +131,10 @@ pub struct MediaMeta {
     pub filename: Option<String>,
     pub size: u64,
     pub created_ts: u64,
+    /// Async upload (MSC2246): the ID is reserved but the content hasn't
+    /// arrived yet.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// One membership change extracted from the room change stream.

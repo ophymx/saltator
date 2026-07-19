@@ -8,7 +8,7 @@ use axum::extract::State;
 use ruma::api::client::authenticated_media::{
     get_content, get_content_as_filename, get_content_thumbnail, get_media_config,
 };
-use ruma::api::client::media::create_content;
+use ruma::api::client::media::{create_content, create_content_async, create_mxc_uri};
 
 use ruma::http_headers::{ContentDisposition, ContentDispositionType};
 
@@ -48,6 +48,7 @@ pub async fn upload(
                 filename: req.filename.clone(),
                 size: req.file.len() as u64,
                 created_ts: now_ms(),
+                pending: false,
             },
         )
         .await?;
@@ -55,6 +56,98 @@ pub async fn upload(
         .try_into()
         .map_err(internal)?;
     Ok(Ra(create_content::v3::Response::new(uri)))
+}
+
+// -- async uploads (MSC2246, spec v1.7) --------------------------------------
+
+pub async fn create_async(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    _req: Ar<create_mxc_uri::v1::Request>,
+) -> Result<Ra<create_mxc_uri::v1::Response>> {
+    // Reserved IDs are random (content-addressing needs the content).
+    let media_id = {
+        use base64::Engine as _;
+        use rand::RngCore as _;
+        let mut bytes = [0u8; 24];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    };
+    state
+        .users
+        .put_media(
+            &media_id,
+            MediaMeta {
+                owner: auth.user_id.to_string(),
+                content_type: None,
+                filename: None,
+                size: 0,
+                created_ts: now_ms(),
+                pending: true,
+            },
+        )
+        .await?;
+    let uri = format!("mxc://{}/{media_id}", state.config.server_name)
+        .try_into()
+        .map_err(internal)?;
+    Ok(Ra(create_mxc_uri::v1::Response::new(uri)))
+}
+
+pub async fn upload_async(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<create_content_async::v3::Request>,
+) -> Result<axum::Json<serde_json::Value>> {
+    if req.server_name != state.config.server_name {
+        return Err(ApiError::not_found("Media ID is not on this server"));
+    }
+    let meta = state
+        .users
+        .store()
+        .media(&req.media_id)
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::not_found("Unknown media ID"))?;
+    if meta.owner != auth.user_id.as_str() {
+        return Err(ApiError::forbidden("Media ID was reserved by another user"));
+    }
+    if !meta.pending {
+        return Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "M_CANNOT_OVERWRITE_MEDIA",
+            "Media ID already has content",
+        ));
+    }
+    if req.file.len() as u64 > state.config.max_upload_size {
+        return Err(ApiError::new(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "M_TOO_LARGE",
+            "Upload too large",
+        ));
+    }
+    state.media.store_at(&req.media_id, &req.file).await?;
+    state
+        .users
+        .put_media(
+            &req.media_id,
+            MediaMeta {
+                owner: meta.owner,
+                content_type: req.content_type.clone(),
+                filename: req.filename.clone(),
+                size: req.file.len() as u64,
+                created_ts: meta.created_ts,
+                pending: false,
+            },
+        )
+        .await?;
+    Ok(axum::Json(serde_json::json!({})))
+}
+
+fn not_yet_uploaded() -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::GATEWAY_TIMEOUT,
+        "M_NOT_YET_UPLOADED",
+        "Media has been reserved but not yet uploaded",
+    )
 }
 
 fn lookup_meta(
@@ -66,12 +159,16 @@ fn lookup_meta(
         // Remote media fetching arrives with federation (M3).
         return Err(ApiError::not_found("Remote media not available"));
     }
-    state
+    let meta = state
         .users
         .store()
         .media(media_id)
         .map_err(internal)?
-        .ok_or_else(|| ApiError::not_found("Unknown media"))
+        .ok_or_else(|| ApiError::not_found("Unknown media"))?;
+    if meta.pending {
+        return Err(not_yet_uploaded());
+    }
+    Ok(meta)
 }
 
 pub async fn download(
@@ -162,12 +259,16 @@ fn legacy_meta(state: &CsState, server_name: &str, media_id: &str) -> Result<Med
     if server_name != state.config.server_name.as_str() {
         return Err(ApiError::not_found("Remote media not available"));
     }
-    state
+    let meta = state
         .users
         .store()
         .media(media_id)
         .map_err(internal)?
-        .ok_or_else(|| ApiError::not_found("Unknown media"))
+        .ok_or_else(|| ApiError::not_found("Unknown media"))?;
+    if meta.pending {
+        return Err(not_yet_uploaded());
+    }
+    Ok(meta)
 }
 
 fn blob_response(

@@ -80,6 +80,12 @@ impl MediaStore {
         Ok(media_id)
     }
 
+    /// Store a blob under a caller-chosen media ID (async uploads reserve
+    /// the ID before the content exists, so it can't be content-addressed).
+    pub async fn store_at(&self, media_id: &str, bytes: &[u8]) -> Result<()> {
+        write_atomic(&self.blob_path(media_id)?, bytes).await
+    }
+
     /// Read a blob back, `None` if absent.
     pub async fn read(&self, media_id: &str) -> Result<Option<Vec<u8>>> {
         match tokio::fs::read(self.blob_path(media_id)?).await {
