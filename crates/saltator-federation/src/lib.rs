@@ -1,2 +1,166 @@
 //! Server-server HTTP surface, request signing/verification, outbound
-//! queues (spec.md §5.4). Implementation begins in M3.
+//! queues (spec.md §5.4). M3 work in progress: server keys first.
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::routing::get;
+use ruma::{CanonicalJsonObject, CanonicalJsonValue, OwnedServerName};
+
+use saltator_roomserver::ServerSigner;
+
+/// How far ahead `valid_until_ts` promises our keys: 24 h. The spec caps
+/// what verifiers may honor at 7 days and tells origins not to serve
+/// responses expiring in under an hour; a day keeps re-fetch traffic low
+/// while bounding how long a compromised key stays trusted. Signed fresh
+/// per request, so the horizon never goes stale.
+const KEY_VALIDITY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// A rotated-out signing key, served in `old_verify_keys`.
+#[derive(Debug, Clone)]
+pub struct OldVerifyKey {
+    /// `ed25519:<version>`.
+    pub key_id: String,
+    pub public_key_b64: String,
+    pub expired_ts_ms: u64,
+}
+
+/// Shared state of the federation router.
+pub struct FedState {
+    pub server_name: OwnedServerName,
+    pub signer: Arc<ServerSigner>,
+    /// Snapshot taken at startup; rotation is an offline operation.
+    pub old_keys: Vec<OldVerifyKey>,
+}
+
+/// Build the server-server router. Serve this on the federation listener.
+pub fn router(state: Arc<FedState>) -> axum::Router {
+    axum::Router::new()
+        .route("/_matrix/key/v2/server", get(serve_server_keys))
+        .with_state(state)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_millis() as u64
+}
+
+/// `GET /_matrix/key/v2/server` (spec "Publishing keys").
+async fn serve_server_keys(
+    State(state): State<Arc<FedState>>,
+) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+    let object = server_keys_object(&state).map_err(|e| {
+        tracing::error!(error = %e, "signing /key/v2/server response");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let value =
+        serde_json::to_value(&object).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(axum::Json(value))
+}
+
+/// The signed key-publication object (extracted for tests).
+fn server_keys_object(state: &FedState) -> Result<CanonicalJsonObject, String> {
+    let mut verify_keys = CanonicalJsonObject::new();
+    let mut key_obj = CanonicalJsonObject::new();
+    key_obj.insert(
+        "key".to_owned(),
+        CanonicalJsonValue::String(state.signer.public_key_b64()),
+    );
+    verify_keys.insert(state.signer.key_id(), CanonicalJsonValue::Object(key_obj));
+
+    let mut old_verify_keys = CanonicalJsonObject::new();
+    for old in &state.old_keys {
+        let mut key_obj = CanonicalJsonObject::new();
+        key_obj.insert(
+            "key".to_owned(),
+            CanonicalJsonValue::String(old.public_key_b64.clone()),
+        );
+        key_obj.insert(
+            "expired_ts".to_owned(),
+            CanonicalJsonValue::Integer(
+                ruma::Int::try_from(old.expired_ts_ms as i64).unwrap_or(ruma::Int::MAX),
+            ),
+        );
+        old_verify_keys.insert(old.key_id.clone(), CanonicalJsonValue::Object(key_obj));
+    }
+
+    let mut object = CanonicalJsonObject::new();
+    object.insert(
+        "server_name".to_owned(),
+        CanonicalJsonValue::String(state.server_name.as_str().to_owned()),
+    );
+    object.insert(
+        "valid_until_ts".to_owned(),
+        CanonicalJsonValue::Integer(
+            ruma::Int::try_from((now_ms() + KEY_VALIDITY_MS) as i64).unwrap_or(ruma::Int::MAX),
+        ),
+    );
+    object.insert(
+        "verify_keys".to_owned(),
+        CanonicalJsonValue::Object(verify_keys),
+    );
+    object.insert(
+        "old_verify_keys".to_owned(),
+        CanonicalJsonValue::Object(old_verify_keys),
+    );
+    state
+        .signer
+        .sign_json(&mut object)
+        .map_err(|e| e.to_string())?;
+    Ok(object)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_keys_response_is_well_formed_and_verifies() {
+        let server_name: OwnedServerName = "example.test".try_into().unwrap();
+        let (signer, _der) = ServerSigner::generate(server_name.clone(), "1".to_owned());
+        let state = FedState {
+            server_name,
+            signer: Arc::new(signer),
+            old_keys: vec![OldVerifyKey {
+                key_id: "ed25519:0".to_owned(),
+                public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                expired_ts_ms: 1_700_000_000_000,
+            }],
+        };
+        let object = server_keys_object(&state).unwrap();
+
+        assert_eq!(
+            object.get("server_name"),
+            Some(&CanonicalJsonValue::String("example.test".into()))
+        );
+        let verify_keys = match object.get("verify_keys") {
+            Some(CanonicalJsonValue::Object(o)) => o,
+            other => panic!("verify_keys: {other:?}"),
+        };
+        assert!(verify_keys.contains_key("ed25519:1"));
+        let old = match object.get("old_verify_keys") {
+            Some(CanonicalJsonValue::Object(o)) => o,
+            other => panic!("old_verify_keys: {other:?}"),
+        };
+        let old_entry = match old.get("ed25519:0") {
+            Some(CanonicalJsonValue::Object(o)) => o,
+            other => panic!("old ed25519:0: {other:?}"),
+        };
+        assert!(old_entry.contains_key("expired_ts"));
+
+        // valid_until_ts sits inside the spec window (>1h, ≤7d out).
+        let valid_until = match object.get("valid_until_ts") {
+            Some(CanonicalJsonValue::Integer(i)) => i64::from(*i) as u64,
+            other => panic!("valid_until_ts: {other:?}"),
+        };
+        let now = now_ms();
+        assert!(valid_until > now + 60 * 60 * 1000);
+        assert!(valid_until <= now + 7 * 24 * 60 * 60 * 1000);
+
+        // The response verifies against its own advertised key.
+        let public_keys = state.signer.public_key_map();
+        ruma::signatures::verify_json(&public_keys, &object).expect("signature verifies");
+    }
+}

@@ -132,12 +132,14 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // metadata group (spec.md §5.4, §10).
     let server_name = server_name_of(&cfg)?;
     let kek = keys::load_kek(&cfg.data_dir.join("master.key"), fresh_bootstrap)?;
-    let signer = keys::load_signing_key(&meta, &kek, &cfg.data_dir, server_name.clone()).await?;
+    let signer =
+        Arc::new(keys::load_signing_key(&meta, &kek, &cfg.data_dir, server_name.clone()).await?);
+    let old_keys = keys::old_verify_keys(&meta, &kek, server_name.clone()).await?;
 
     let rooms = saltator_roomserver::RoomServer::start(
         cfg.node.id,
         engine.clone(),
-        Arc::new(signer),
+        signer.clone(),
         saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_roomserver::ROOM_SHARD),
         Some(cfg.node.advertise.clone()),
         Some(&registry),
@@ -175,7 +177,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         rooms.clone(),
         media,
         saltator_cs_api::CsConfig {
-            server_name,
+            server_name: server_name.clone(),
             default_room_version,
             registration_enabled: cfg.client.registration_enabled,
             max_upload_size: cfg.client.max_upload_size,
@@ -186,12 +188,29 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let cs_listener = tokio::net::TcpListener::bind(cfg.listeners.client).await?;
     tracing::info!(listen = %cfg.listeners.client, "client-server API listening");
 
+    let fed_state = Arc::new(saltator_federation::FedState {
+        server_name: server_name.clone(),
+        signer: signer.clone(),
+        old_keys,
+    });
+    let fed_router = saltator_federation::router(fed_state);
+    let fed_listener = tokio::net::TcpListener::bind(cfg.listeners.federation).await?;
+    tracing::info!(listen = %cfg.listeners.federation, "federation API listening");
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut cs_shutdown = shutdown_rx.clone();
     let cs_task = tokio::spawn(async move {
         axum::serve(cs_listener, cs_router)
             .with_graceful_shutdown(async move {
                 let _ = cs_shutdown.wait_for(|stop| *stop).await;
+            })
+            .await
+    });
+    let mut fed_shutdown = shutdown_rx.clone();
+    let fed_task = tokio::spawn(async move {
+        axum::serve(fed_listener, fed_router)
+            .with_graceful_shutdown(async move {
+                let _ = fed_shutdown.wait_for(|stop| *stop).await;
             })
             .await
     });
@@ -217,10 +236,6 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     });
 
     tracing::info!(listen = %cfg.listeners.internal, "internal RPC listening");
-    tracing::info!(
-        federation = %cfg.listeners.federation,
-        "federation listener configured; served from M3",
-    );
     saltator_cluster::serve_internal(
         meta.clone(),
         registry.clone(),
@@ -231,6 +246,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     .await?;
 
     cs_task.await??;
+    fed_task.await??;
     projection.abort();
     rooms.shutdown().await?;
     users.shutdown().await?;

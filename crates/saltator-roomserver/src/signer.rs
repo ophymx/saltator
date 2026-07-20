@@ -62,6 +62,26 @@ impl ServerSigner {
         .map_err(|e| SignError(e.to_string()))
     }
 
+    /// Sign an arbitrary JSON object in place (spec "Signing JSON") —
+    /// federation responses, `/key/v2/server`, X-Matrix request bodies.
+    pub fn sign_json(&self, object: &mut CanonicalJsonObject) -> Result<(), SignError> {
+        ruma::signatures::sign_json(self.server_name.as_str(), &self.key_pair, object)
+            .map_err(|e| SignError(e.to_string()))
+    }
+
+    /// `ed25519:<version>` of the active key.
+    pub fn key_id(&self) -> String {
+        format!("ed25519:{}", self.key_pair.version())
+    }
+
+    /// Unpadded-base64 public key of the active key.
+    pub fn public_key_b64(&self) -> String {
+        ruma::serde::Base64::<ruma::serde::base64::Standard>::new(
+            self.key_pair.public_key().to_vec(),
+        )
+        .encode()
+    }
+
     /// This server's verification keys, in the shape `verify_event` wants.
     /// (`entity → "ed25519:<version>" → base64 public key`.)
     pub fn public_key_map(&self) -> PublicKeyMap {

@@ -198,6 +198,48 @@ async fn expire_version(meta: &MetadataHandle, version: &str) -> anyhow::Result<
     Ok(())
 }
 
+/// Expired signing-key versions with their public keys, for
+/// `old_verify_keys` on `/_matrix/key/v2/server`. Key versions are
+/// auto-incremented integers, so `0..=current` enumerates every version
+/// ever stored; rotation only happens offline, so a startup snapshot
+/// stays correct for the process lifetime.
+pub async fn old_verify_keys(
+    meta: &MetadataHandle,
+    kek: &[u8; 32],
+    server_name: ruma::OwnedServerName,
+) -> anyhow::Result<Vec<saltator_federation::OldVerifyKey>> {
+    let Some(current) = meta.read(CURRENT_KEY).await? else {
+        return Ok(Vec::new());
+    };
+    let current: u64 = String::from_utf8(current)
+        .context("signing_key_current not UTF-8")?
+        .parse()
+        .context("signing_key_current not numeric")?;
+    let mut out = Vec::new();
+    for version in 0..current {
+        let version = version.to_string();
+        let Some(blob) = meta.read(&version_key(&version)).await? else {
+            continue;
+        };
+        let Some(key_meta) = meta.read(&meta_key(&version)).await? else {
+            continue;
+        };
+        let key_meta: KeyMeta = serde_json::from_slice(&key_meta)
+            .with_context(|| format!("corrupt signing_key_meta/{version}"))?;
+        let Some(expired_ts_ms) = key_meta.expired_ts_ms else {
+            continue;
+        };
+        let der = decrypt(kek, &version, &blob)?;
+        let signer = ServerSigner::from_der(server_name.clone(), &der, version)?;
+        out.push(saltator_federation::OldVerifyKey {
+            key_id: signer.key_id(),
+            public_key_b64: signer.public_key_b64(),
+            expired_ts_ms,
+        });
+    }
+    Ok(out)
+}
+
 /// Mint signing key version N+1 and make it active; version N is stamped
 /// expired but stays stored for verification. Run offline (the node must
 /// be stopped).
