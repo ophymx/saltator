@@ -1,5 +1,14 @@
 //! Server-server HTTP surface, request signing/verification, outbound
-//! queues (spec.md §5.4). M3 work in progress: server keys first.
+//! queues (spec.md §5.4). M3 work in progress: server keys + X-Matrix
+//! request authentication.
+
+mod keys;
+mod xmatrix;
+
+pub use keys::{KeyCache, KeyError};
+pub use xmatrix::{
+    parse_authorization, sign_request, signing_object, verify_request, AuthError, AuthParams,
+};
 
 use std::sync::Arc;
 
