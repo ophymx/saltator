@@ -662,3 +662,52 @@ async fn receipts_redactions_room_timeline() {
 
     env.server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn remote_servers_in_room_lists_only_joined_remotes() {
+    let env = start_env().await;
+    let room_id = bootstrap_room(&env, RoomVersion::V11).await;
+
+    // The bootstrap room has only local members (alice, bob on hs.test).
+    let servers = env
+        .server
+        .remote_servers_in_room(room_id.as_str(), SERVER)
+        .unwrap();
+    assert!(
+        servers.is_empty(),
+        "local-only room has no remote destinations, got {servers:?}"
+    );
+
+    // Inviting a remote user does not make them a destination: only joined
+    // members count.
+    let alice = user("alice");
+    let outcome = env
+        .server
+        .send_state(
+            &room_id,
+            &alice,
+            "m.room.member",
+            "@carol:remote.example",
+            json!({"membership": "invite"}),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Accepted { .. }));
+    let servers = env
+        .server
+        .remote_servers_in_room(room_id.as_str(), SERVER)
+        .unwrap();
+    assert!(
+        servers.is_empty(),
+        "invited (not joined) remote is not a destination, got {servers:?}"
+    );
+
+    // An unknown room yields no destinations.
+    let none = env
+        .server
+        .remote_servers_in_room("!nonexistent:hs.test", SERVER)
+        .unwrap();
+    assert!(none.is_empty());
+
+    env.server.shutdown().await.unwrap();
+}

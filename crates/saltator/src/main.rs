@@ -196,6 +196,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let fed_listener = tokio::net::TcpListener::bind(cfg.listeners.federation).await?;
     tracing::info!(listen = %cfg.listeners.federation, "federation API listening");
 
+    // Outbound federation: forward locally originated events to remote
+    // servers sharing each room.
+    let fed_client = Arc::new(saltator_federation::FederationClient::new(signer.clone()));
+    let fed_sender =
+        saltator_federation::spawn_sender(rooms.clone(), fed_client, server_name.clone());
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut cs_shutdown = shutdown_rx.clone();
     let cs_task = tokio::spawn(async move {
@@ -246,6 +252,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     cs_task.await??;
     fed_task.await??;
+    fed_sender.abort();
     projection.abort();
     rooms.shutdown().await?;
     users.shutdown().await?;

@@ -5,12 +5,14 @@
 mod inbound;
 mod keys;
 mod outbound;
+mod sender;
 mod transactions;
 mod xmatrix;
 
 pub use inbound::{AuthRejection, Authenticated};
 pub use keys::{KeyCache, KeyError};
 pub use outbound::{FederationClient, OutboundError};
+pub use sender::spawn_sender;
 pub use xmatrix::{
     parse_authorization, sign_request, signing_object, verify_request, AuthError, AuthParams,
 };

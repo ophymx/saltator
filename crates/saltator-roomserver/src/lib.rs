@@ -170,6 +170,51 @@ impl RoomServer {
         self.handle.subscribe()
     }
 
+    /// Server names (other than `exclude`) of users currently joined to
+    /// `room_id` — the destinations an outbound event must reach. Empty if
+    /// the room is unknown.
+    pub fn remote_servers_in_room(&self, room_id: &str, exclude: &str) -> Result<Vec<String>> {
+        let store = self.store();
+        let Some(meta) = store
+            .meta(room_id)
+            .map_err(|e| RoomError::Storage(e.to_string()))?
+        else {
+            return Ok(Vec::new());
+        };
+        let state = store
+            .resolve_group(room_id, meta.current_group)
+            .map_err(|e| RoomError::Storage(e.to_string()))?;
+        let mut servers = BTreeSet::new();
+        for ((event_type, state_key), event_id) in &state {
+            if event_type != "m.room.member" {
+                continue;
+            }
+            let Some(stored) = store
+                .event(event_id)
+                .map_err(|e| RoomError::Storage(e.to_string()))?
+            else {
+                continue;
+            };
+            let raw: serde_json::Value =
+                serde_json::from_slice(&stored.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
+            let joined = raw
+                .get("content")
+                .and_then(|c| c.get("membership"))
+                .and_then(|m| m.as_str())
+                == Some("join");
+            if !joined {
+                continue;
+            }
+            if let Ok(user) = UserId::parse(state_key.as_str()) {
+                let server = user.server_name().as_str();
+                if server != exclude {
+                    servers.insert(server.to_owned());
+                }
+            }
+        }
+        Ok(servers.into_iter().collect())
+    }
+
     /// Decode a change-stream payload.
     pub fn decode_change(payload: &[u8]) -> Result<ChangePayload> {
         postcard::from_bytes(payload).map_err(|e| RoomError::Codec(e.to_string()))
