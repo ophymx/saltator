@@ -2,10 +2,14 @@
 //! queues (spec.md §5.4). M3 work in progress: server keys + X-Matrix
 //! request authentication.
 
+mod inbound;
 mod keys;
+mod outbound;
 mod xmatrix;
 
+pub use inbound::{AuthRejection, Authenticated};
 pub use keys::{KeyCache, KeyError};
+pub use outbound::{FederationClient, OutboundError};
 pub use xmatrix::{
     parse_authorization, sign_request, signing_object, verify_request, AuthError, AuthParams,
 };
@@ -40,13 +44,43 @@ pub struct FedState {
     pub signer: Arc<ServerSigner>,
     /// Snapshot taken at startup; rotation is an offline operation.
     pub old_keys: Vec<OldVerifyKey>,
+    /// Fetches and caches calling servers' keys for inbound auth.
+    pub key_cache: KeyCache,
+}
+
+impl FedState {
+    /// Construct with a default (real-DNS) key cache.
+    pub fn new(
+        server_name: OwnedServerName,
+        signer: Arc<ServerSigner>,
+        old_keys: Vec<OldVerifyKey>,
+    ) -> Self {
+        Self {
+            server_name,
+            signer,
+            old_keys,
+            key_cache: KeyCache::new(),
+        }
+    }
 }
 
 /// Build the server-server router. Serve this on the federation listener.
 pub fn router(state: Arc<FedState>) -> axum::Router {
     axum::Router::new()
         .route("/_matrix/key/v2/server", get(serve_server_keys))
+        .route("/_matrix/federation/v1/version", get(serve_version))
         .with_state(state)
+}
+
+/// `GET /_matrix/federation/v1/version` — unauthenticated reachability
+/// probe (spec "Server implementation").
+async fn serve_version() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "server": {
+            "name": "saltator",
+            "version": env!("CARGO_PKG_VERSION"),
+        }
+    }))
 }
 
 fn now_ms() -> u64 {
@@ -129,15 +163,15 @@ mod tests {
     fn server_keys_response_is_well_formed_and_verifies() {
         let server_name: OwnedServerName = "example.test".try_into().unwrap();
         let (signer, _der) = ServerSigner::generate(server_name.clone(), "1".to_owned());
-        let state = FedState {
+        let state = FedState::new(
             server_name,
-            signer: Arc::new(signer),
-            old_keys: vec![OldVerifyKey {
+            Arc::new(signer),
+            vec![OldVerifyKey {
                 key_id: "ed25519:0".to_owned(),
                 public_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
                 expired_ts_ms: 1_700_000_000_000,
             }],
-        };
+        );
         let object = server_keys_object(&state).unwrap();
 
         assert_eq!(
