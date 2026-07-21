@@ -2506,6 +2506,7 @@ dependencies = [
  "saltator-cluster",
  "saltator-core",
  "saltator-cs-api",
+ "saltator-federation",
  "saltator-media",
  "saltator-roomserver",
  "saltator-shard",
@@ -2561,6 +2562,7 @@ dependencies = [
  "futures-util",
  "http",
  "postcard",
+ "rand 0.8.7",
  "ruma",
  "saltator-core",
  "saltator-media",
@@ -2581,6 +2583,16 @@ dependencies = [
 [[package]]
 name = "saltator-federation"
 version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "reqwest",
+ "ruma",
+ "saltator-roomserver",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "saltator-media"
