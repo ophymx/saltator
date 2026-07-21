@@ -1,0 +1,196 @@
+//! End-to-end resident-side remote join over HTTP: node B fetches a join
+//! template from node A (`make_join`), signs it, submits it
+//! (`send_join`), and receives A's room state with B's membership applied.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use ruma::{CanonicalJsonObject, CanonicalJsonValue, OwnedServerName};
+use serde_json::json;
+
+use saltator_core::RoomVersion;
+use saltator_federation::{router, sign_request, FedState, KeyCache, OldVerifyKey};
+use saltator_roomserver::{Outcome, RoomServer, ServerSigner};
+use saltator_shard::NoopNetworkFactory;
+use saltator_store::RocksEngine;
+
+async fn spawn(app: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn start_rooms(
+    server: &str,
+    signer: Arc<ServerSigner>,
+    dir: &std::path::Path,
+) -> Arc<RoomServer> {
+    let engine = Arc::new(RocksEngine::open(&dir.join(server)).unwrap());
+    let rooms = RoomServer::start(
+        1,
+        engine,
+        signer,
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    rooms
+        .shard_handle()
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    rooms
+}
+
+fn obj(v: serde_json::Value) -> CanonicalJsonObject {
+    match CanonicalJsonValue::try_from(v).unwrap() {
+        CanonicalJsonValue::Object(o) => o,
+        _ => panic!("not an object"),
+    }
+}
+
+#[tokio::test]
+async fn remote_join_handshake_returns_room_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let a_name: OwnedServerName = "a.test".try_into().unwrap();
+    let b_name: OwnedServerName = "b.test".try_into().unwrap();
+    let (a_signer, _) = ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let (b_signer, _) = ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let b_signer = Arc::new(b_signer);
+
+    // Node A hosts a public room.
+    let rooms = start_rooms("a", a_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let (room_id, oc) = rooms
+        .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+        .await
+        .unwrap();
+    assert!(matches!(oc, Outcome::Accepted { .. }));
+    // Bootstrap to a joinable state: creator joins, power levels, public
+    // join rule.
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        let oc = rooms
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+        assert!(matches!(oc, Outcome::Accepted { .. }), "{ty} not accepted");
+    }
+
+    // B's key server, so A can verify B's requests and B's signed join.
+    let b_key_base = spawn(router(Arc::new(FedState::new(
+        b_name.clone(),
+        b_signer.clone(),
+        Vec::<OldVerifyKey>::new(),
+    ))))
+    .await;
+
+    // Node A's federation surface, authenticating callers against B's keys.
+    let a_state = Arc::new(FedState {
+        server_name: a_name.clone(),
+        signer: a_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(b_key_base),
+        rooms: Some(rooms.clone()),
+    });
+    let a_base = spawn(router(a_state)).await;
+
+    let http = reqwest::Client::new();
+    let bob = "@bob:b.test";
+
+    // --- make_join: B asks A for a template.
+    let mj_path = format!(
+        "/_matrix/federation/v1/make_join/{}/{}",
+        urlencoding(room_id.as_str()),
+        urlencoding(bob)
+    );
+    let auth = sign_request(&b_signer, "GET", &mj_path, "a.test", None).unwrap();
+    let mj: serde_json::Value = http
+        .get(format!("{a_base}{mj_path}"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mj["room_version"], "11", "make_join: {mj}");
+    let template = mj["event"].clone();
+    assert_eq!(template["sender"], bob);
+    assert_eq!(template["content"]["membership"], "join");
+
+    // --- B fills and signs the template into a real join PDU.
+    let mut join = obj(template);
+    let version = RoomVersion::V11;
+    b_signer.hash_and_sign_event(&mut join, version).unwrap();
+    let join_value = serde_json::Value::from(CanonicalJsonValue::Object(join));
+
+    // --- send_join: B submits the signed join; A applies it and returns
+    // the room state.
+    let sj_path = format!(
+        "/_matrix/federation/v2/send_join/{}/{}",
+        urlencoding(room_id.as_str()),
+        urlencoding("$placeholder")
+    );
+    let content = CanonicalJsonValue::try_from(join_value.clone()).unwrap();
+    let auth = sign_request(&b_signer, "PUT", &sj_path, "a.test", Some(&content)).unwrap();
+    let resp = http
+        .put(format!("{a_base}{sj_path}"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&join_value)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "send_join status");
+    let sj: serde_json::Value = resp.json().await.unwrap();
+
+    // The returned state carries the create event and bob's join.
+    let state = sj["state"].as_array().expect("state array");
+    let has_create = state.iter().any(|e| e["type"] == "m.room.create");
+    let has_bob_join = state.iter().any(|e| {
+        e["type"] == "m.room.member"
+            && e["state_key"] == bob
+            && e["content"]["membership"] == "join"
+    });
+    assert!(has_create, "state missing create: {sj}");
+    assert!(has_bob_join, "state missing bob's join membership: {sj}");
+    assert_eq!(sj["origin"], "a.test");
+    assert!(sj["auth_chain"].as_array().is_some());
+
+    // A now counts b.test as a remote server in the room.
+    let servers = rooms
+        .remote_servers_in_room(room_id.as_str(), "a.test")
+        .unwrap();
+    assert_eq!(servers, vec!["b.test".to_owned()]);
+}
+
+/// Minimal path-segment percent-encoding for room/user/event IDs.
+fn urlencoding(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}

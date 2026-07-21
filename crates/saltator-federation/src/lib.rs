@@ -3,6 +3,7 @@
 //! request authentication.
 
 mod inbound;
+mod joins;
 mod keys;
 mod outbound;
 mod sender;
@@ -85,6 +86,14 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route(
             "/_matrix/federation/v1/send/{txn_id}",
             put(transactions::send_transaction),
+        )
+        .route(
+            "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
+            get(joins::make_join),
+        )
+        .route(
+            "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
+            put(joins::send_join),
         )
         .with_state(state)
 }

@@ -118,6 +118,29 @@ impl Outcome {
     }
 }
 
+/// The `PUT /send_join` response payload: the co-signed join event, the
+/// room's current state, and the auth chain backing that state.
+pub struct SendJoinResult {
+    pub event: CanonicalJsonObject,
+    pub state: Vec<CanonicalJsonObject>,
+    pub auth_chain: Vec<CanonicalJsonObject>,
+}
+
+/// Event IDs referenced by an event's `auth_events` (v3+ list-of-strings
+/// form; v1 tuple form is not produced by this server).
+fn auth_event_ids(obj: &CanonicalJsonObject) -> Vec<String> {
+    match obj.get("auth_events") {
+        Some(CanonicalJsonValue::Array(a)) => a
+            .iter()
+            .filter_map(|v| match v {
+                CanonicalJsonValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub struct RoomServer {
     handle: ShardHandle,
     signer: Arc<ServerSigner>,
@@ -314,6 +337,152 @@ impl RoomServer {
     pub fn pdu_event_id(&self, raw: &CanonicalJsonObject) -> Option<OwnedEventId> {
         let (version, _room_id, _is_create) = self.classify(raw).ok()?;
         event::event_id(raw, version).ok()
+    }
+
+    /// Build an unsigned `m.room.member` join template for `user_id` (a
+    /// user on another server) — the `GET /make_join` response. prev/auth
+    /// events and depth are computed from current room state; the joining
+    /// server fills in `origin`/`origin_server_ts`/`event_id` and signs.
+    pub fn make_join_template(
+        &self,
+        room_id: &ruma::RoomId,
+        user_id: &UserId,
+    ) -> Result<(RoomVersion, CanonicalJsonObject)> {
+        let store = self.store();
+        let meta = store
+            .meta(room_id.as_str())
+            .map_err(storage_err)?
+            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_string()))?;
+        let version = RoomVersion::parse(&meta.version)?;
+        let current = store
+            .resolve_group(room_id.as_str(), meta.current_group)
+            .map_err(storage_err)?;
+
+        let mut depth: u64 = 0;
+        for id in &meta.extremities {
+            let prev = store
+                .event(id)
+                .map_err(storage_err)?
+                .ok_or_else(|| RoomError::MissingEvents(vec![id.clone()]))?;
+            depth = depth.max(prev.depth);
+        }
+
+        let content = serde_json::json!({ "membership": "join" });
+        let content_obj = canonicalize(content)?;
+        let auth_types = auth::auth_types_for_event(
+            version,
+            "m.room.member",
+            user_id,
+            Some(user_id.as_str()),
+            &content_obj,
+        );
+        let auth_events: Vec<&String> = auth_types.iter().filter_map(|k| current.get(k)).collect();
+
+        let template = canonicalize(serde_json::json!({
+            "room_id": room_id.as_str(),
+            "sender": user_id.as_str(),
+            "state_key": user_id.as_str(),
+            "origin_server_ts": now_ms(),
+            "type": "m.room.member",
+            "content": CanonicalJsonValue::Object(content_obj),
+            "auth_events": auth_events,
+            "prev_events": meta.extremities,
+            "depth": depth + 1,
+        }))?;
+        Ok((version, template))
+    }
+
+    /// Apply a remote server's signed join event (`PUT /send_join`) and
+    /// return the room's current state and its auth chain, plus the join
+    /// co-signed by us. The caller must have trusted the origin's keys.
+    pub async fn send_join(&self, raw: CanonicalJsonObject) -> Result<SendJoinResult> {
+        let (version, room_id, _is_create) = self.classify(&raw)?;
+        // Verify + persist through the normal pipeline (signature, hash,
+        // auth against join rules).
+        let outcome = {
+            let _guard = self.lock_room(room_id.as_str()).await;
+            self.process(raw, version, &room_id, false).await?
+        };
+        match &outcome {
+            Outcome::Accepted { .. } | Outcome::Duplicate { .. } => {}
+            Outcome::Rejected { reason, .. } => {
+                return Err(RoomError::Malformed(format!("join rejected: {reason}")));
+            }
+        }
+        let event_id = outcome.event_id().to_string();
+
+        let store = self.store();
+        // Co-sign the accepted join (resident adds its signature).
+        let mut event = store
+            .event(&event_id)
+            .map_err(storage_err)?
+            .ok_or_else(|| RoomError::MissingEvents(vec![event_id.clone()]))?;
+        let mut signed: CanonicalJsonObject =
+            serde_json::from_slice(&event.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
+        // Re-runs the (identical) content hash and merges our signature in
+        // alongside the joiner's.
+        self.signer.hash_and_sign_event(&mut signed, version)?;
+        event.raw = raw_bytes(&signed)?;
+
+        // Current room state, and the transitive auth chain behind it.
+        let meta = store
+            .meta(room_id.as_str())
+            .map_err(storage_err)?
+            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_string()))?;
+        let state_map = store
+            .resolve_group(room_id.as_str(), meta.current_group)
+            .map_err(storage_err)?;
+        let mut state = Vec::new();
+        let mut auth_seed = BTreeSet::new();
+        for event_id in state_map.values() {
+            if let Some(obj) = self.load_raw(&store, event_id)? {
+                for auth_id in auth_event_ids(&obj) {
+                    auth_seed.insert(auth_id);
+                }
+                state.push(obj);
+            }
+        }
+        let auth_chain = self.collect_auth_chain(&store, auth_seed)?;
+
+        Ok(SendJoinResult {
+            event: signed,
+            state,
+            auth_chain,
+        })
+    }
+
+    fn load_raw(&self, store: &RoomStore, event_id: &str) -> Result<Option<CanonicalJsonObject>> {
+        let Some(stored) = store.event(event_id).map_err(storage_err)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            serde_json::from_slice(&stored.raw).map_err(|e| RoomError::Codec(e.to_string()))?,
+        ))
+    }
+
+    /// Transitive closure of `auth_events` starting from `seed` event IDs.
+    fn collect_auth_chain(
+        &self,
+        store: &RoomStore,
+        seed: BTreeSet<String>,
+    ) -> Result<Vec<CanonicalJsonObject>> {
+        let mut seen = BTreeSet::new();
+        let mut queue: Vec<String> = seed.into_iter().collect();
+        let mut chain = Vec::new();
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(obj) = self.load_raw(store, &id)? {
+                for auth_id in auth_event_ids(&obj) {
+                    if !seen.contains(&auth_id) {
+                        queue.push(auth_id);
+                    }
+                }
+                chain.push(obj);
+            }
+        }
+        Ok(chain)
     }
 
     /// Record a read receipt (durable; bumps the shard seq so `/sync`
