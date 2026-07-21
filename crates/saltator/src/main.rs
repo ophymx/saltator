@@ -188,11 +188,10 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let cs_listener = tokio::net::TcpListener::bind(cfg.listeners.client).await?;
     tracing::info!(listen = %cfg.listeners.client, "client-server API listening");
 
-    let fed_state = Arc::new(saltator_federation::FedState::new(
-        server_name.clone(),
-        signer.clone(),
-        old_keys,
-    ));
+    let fed_state = Arc::new(
+        saltator_federation::FedState::new(server_name.clone(), signer.clone(), old_keys)
+            .with_rooms(rooms.clone()),
+    );
     let fed_router = saltator_federation::router(fed_state);
     let fed_listener = tokio::net::TcpListener::bind(cfg.listeners.federation).await?;
     tracing::info!(listen = %cfg.listeners.federation, "federation API listening");

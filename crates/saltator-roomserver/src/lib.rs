@@ -263,6 +263,14 @@ impl RoomServer {
         self.process(raw, version, &room_id, is_create).await
     }
 
+    /// The event ID a PDU will have, without ingesting it. Lets the
+    /// `/send` handler key per-PDU results even when ingest fails before an
+    /// [`Outcome`] exists. `None` if the PDU is too malformed to classify.
+    pub fn pdu_event_id(&self, raw: &CanonicalJsonObject) -> Option<OwnedEventId> {
+        let (version, _room_id, _is_create) = self.classify(raw).ok()?;
+        event::event_id(raw, version).ok()
+    }
+
     /// Record a read receipt (durable; bumps the shard seq so `/sync`
     /// windows cover it). Returns the receipt's seq — 0 if it was already
     /// recorded for the same event.

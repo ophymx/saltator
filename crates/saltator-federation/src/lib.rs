@@ -5,6 +5,7 @@
 mod inbound;
 mod keys;
 mod outbound;
+mod transactions;
 mod xmatrix;
 
 pub use inbound::{AuthRejection, Authenticated};
@@ -17,10 +18,10 @@ pub use xmatrix::{
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::routing::get;
+use axum::routing::{get, put};
 use ruma::{CanonicalJsonObject, CanonicalJsonValue, OwnedServerName};
 
-use saltator_roomserver::ServerSigner;
+use saltator_roomserver::{RoomServer, ServerSigner};
 
 /// How far ahead `valid_until_ts` promises our keys: 24 h. The spec caps
 /// what verifiers may honor at 7 days and tells origins not to serve
@@ -46,10 +47,13 @@ pub struct FedState {
     pub old_keys: Vec<OldVerifyKey>,
     /// Fetches and caches calling servers' keys for inbound auth.
     pub key_cache: KeyCache,
+    /// The room pipeline inbound PDUs route into. `None` in key-only
+    /// deployments and auth-only tests.
+    pub rooms: Option<Arc<RoomServer>>,
 }
 
 impl FedState {
-    /// Construct with a default (real-DNS) key cache.
+    /// Construct with a default (real-DNS) key cache and no room server.
     pub fn new(
         server_name: OwnedServerName,
         signer: Arc<ServerSigner>,
@@ -60,7 +64,14 @@ impl FedState {
             signer,
             old_keys,
             key_cache: KeyCache::new(),
+            rooms: None,
         }
+    }
+
+    /// Attach the room server so inbound transactions can be applied.
+    pub fn with_rooms(mut self, rooms: Arc<RoomServer>) -> Self {
+        self.rooms = Some(rooms);
+        self
     }
 }
 
@@ -69,6 +80,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
     axum::Router::new()
         .route("/_matrix/key/v2/server", get(serve_server_keys))
         .route("/_matrix/federation/v1/version", get(serve_version))
+        .route(
+            "/_matrix/federation/v1/send/{txn_id}",
+            put(transactions::send_transaction),
+        )
         .with_state(state)
 }
 
