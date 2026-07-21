@@ -194,3 +194,90 @@ fn urlencoding(s: &str) -> String {
     }
     out
 }
+
+#[tokio::test]
+async fn join_client_drives_the_full_handshake() {
+    use saltator_federation::{join_remote_room, resident_of_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let a_name: OwnedServerName = "a.test".try_into().unwrap();
+    let b_name: OwnedServerName = "b.test".try_into().unwrap();
+    let (a_signer, _) = ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let (b_signer, _) = ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let b_signer = Arc::new(b_signer);
+
+    // Node A hosts a public room.
+    let rooms = start_rooms("a", a_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let (room_id, _) = rooms
+        .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        rooms
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+    }
+
+    let b_key_base = spawn(router(Arc::new(FedState::new(
+        b_name.clone(),
+        b_signer.clone(),
+        Vec::<OldVerifyKey>::new(),
+    ))))
+    .await;
+    let a_state = Arc::new(FedState {
+        server_name: a_name.clone(),
+        signer: a_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(b_key_base),
+        rooms: Some(rooms.clone()),
+    });
+    let a_base = spawn(router(a_state)).await;
+
+    // The joining side derives the resident from the room ID and runs the
+    // handshake with its own signing client.
+    assert_eq!(
+        resident_of_room(room_id.as_str()).as_deref(),
+        Some("a.test")
+    );
+    let client = FederationClient::with_base_url(b_signer.clone(), a_base);
+    let resp = join_remote_room(
+        &client,
+        &b_signer,
+        "a.test",
+        room_id.as_str(),
+        "@bob:b.test",
+    )
+    .await
+    .expect("join handshake succeeds");
+
+    assert_eq!(resp.room_version, RoomVersion::V11);
+    // Our membership event came back, co-signed by both servers.
+    let sigs = resp
+        .event
+        .get("signatures")
+        .and_then(|s| s.as_object())
+        .unwrap();
+    assert!(sigs.contains_key("a.test"), "resident co-signature missing");
+    assert!(sigs.contains_key("b.test"), "our signature missing");
+    // State includes the create event and our join.
+    let has_create = resp.state.iter().any(|e| {
+        matches!(e.get("type"), Some(ruma::CanonicalJsonValue::String(s)) if s == "m.room.create")
+    });
+    assert!(has_create, "state missing create event");
+    assert!(!resp.auth_chain.is_empty(), "auth chain empty");
+}

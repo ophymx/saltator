@@ -3,6 +3,7 @@
 //! request authentication.
 
 mod inbound;
+mod join_client;
 mod joins;
 mod keys;
 mod outbound;
@@ -11,6 +12,7 @@ mod transactions;
 mod xmatrix;
 
 pub use inbound::{AuthRejection, Authenticated};
+pub use join_client::{join_remote_room, resident_of_room, JoinError, JoinResponse};
 pub use keys::{KeyCache, KeyError};
 pub use outbound::{FederationClient, OutboundError};
 pub use sender::spawn_sender;

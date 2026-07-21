@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+saltator-core.workspace = true
 saltator-roomserver.workspace = true
 
 axum.workspace = true
@@ -19,7 +20,6 @@ reqwest.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-saltator-core.workspace = true
 saltator-shard.workspace = true
 saltator-store.workspace = true
 serde_json.workspace = true
