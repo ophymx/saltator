@@ -23,6 +23,27 @@ pub struct Config {
 
     #[serde(default)]
     pub client: ClientConfig,
+
+    #[serde(default)]
+    pub federation: FederationConfig,
+}
+
+/// Server-server (federation) transport configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederationConfig {
+    /// PEM certificate chain for the federation TLS listener. When unset,
+    /// the federation port is served over plain HTTP (dev / behind a TLS
+    /// terminator). Real federation requires TLS.
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key matching `tls_cert`.
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+    /// Extra CA (PEM bundle) to trust for outbound federation, in addition
+    /// to the system roots — e.g. Complement's or a test harness's CA.
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
 }
 
 /// Client-server API behavior.
@@ -140,6 +161,15 @@ registration_enabled = true
 default_room_version = "12"
 max_upload_size = 52428800
 # well_known_client = "https://matrix.example.org"
+
+[federation]
+# Serve the federation port over HTTPS. Real federation requires TLS;
+# leave both unset to serve plain HTTP (dev, or behind a TLS terminator).
+# tls_cert = "/etc/saltator/fed.crt"
+# tls_key = "/etc/saltator/fed.key"
+# Extra CA to trust for outbound federation, beyond the system roots
+# (private PKI / test harnesses like Complement).
+# ca_cert = "/etc/saltator/ca.crt"
 "#;
 
 #[cfg(test)]

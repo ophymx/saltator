@@ -8,7 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use ruma::signatures::PublicKeyMap;
 use ruma::{CanonicalJsonObject, CanonicalJsonValue};
@@ -32,10 +31,15 @@ pub struct KeyCache {
 
 impl KeyCache {
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("building reqwest client");
+        Self::from_http(crate::http_client::build_http_client(None))
+    }
+
+    /// Trust `ca_pem` in addition to the system roots (Complement's CA).
+    pub fn with_ca(ca_pem: &[u8]) -> Self {
+        Self::from_http(crate::http_client::build_http_client(Some(ca_pem)))
+    }
+
+    fn from_http(http: reqwest::Client) -> Self {
         Self {
             resolver: crate::resolver::ServerResolver::new(http.clone()),
             http,

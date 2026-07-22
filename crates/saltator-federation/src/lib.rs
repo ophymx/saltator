@@ -2,6 +2,7 @@
 //! queues (spec.md §5.4). M3 work in progress: server keys + X-Matrix
 //! request authentication.
 
+mod http_client;
 mod inbound;
 mod join_client;
 mod joins;
@@ -12,6 +13,7 @@ mod sender;
 mod transactions;
 mod xmatrix;
 
+pub use http_client::build_http_client;
 pub use inbound::{AuthRejection, Authenticated};
 pub use join_client::{join_remote_room, resident_of_room, JoinError, JoinResponse};
 pub use keys::{KeyCache, KeyError};

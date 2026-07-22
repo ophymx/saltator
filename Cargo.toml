@@ -42,6 +42,7 @@ blake3 = "1"
 rand = "0.8"
 base64 = "0.22"
 axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["cors"] }
 http = "1"
 bytes = "1"
@@ -49,7 +50,9 @@ futures-util = "0.3"
 sha2 = "0.10"
 chacha20poly1305 = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = "0.23"
+rcgen = "0.13"
 
 [profile.release]
 lto = "thin"

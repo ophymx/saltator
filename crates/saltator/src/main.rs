@@ -47,6 +47,9 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Start { config } => {
             init_tracing();
+            // rustls needs a process-default crypto provider before any TLS
+            // (federation listener / outbound client) is set up.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             let cfg = Config::load(&config)?;
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -172,9 +175,21 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let default_room_version = saltator_core::RoomVersion::parse(&cfg.client.default_room_version)
         .map_err(|e| anyhow::anyhow!("client.default_room_version: {e}"))?;
     let media = saltator_media::MediaStore::open(cfg.data_dir.join("media"))?;
+    // Optional extra CA for outbound federation (test harnesses / private
+    // PKI). System roots are always trusted.
+    let outbound_ca =
+        match &cfg.federation.ca_cert {
+            Some(path) => Some(std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("reading federation.ca_cert {}: {e}", path.display())
+            })?),
+            None => None,
+        };
     // Signed client for outbound federation, shared by the CS `/join` path
     // and the event sender.
-    let fed_client = Arc::new(saltator_federation::FederationClient::new(signer.clone()));
+    let fed_client = Arc::new(match &outbound_ca {
+        Some(ca) => saltator_federation::FederationClient::with_ca(signer.clone(), ca),
+        None => saltator_federation::FederationClient::new(signer.clone()),
+    });
     let cs_state = saltator_cs_api::CsState::new(
         users.clone(),
         rooms.clone(),
@@ -192,13 +207,35 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let cs_listener = tokio::net::TcpListener::bind(cfg.listeners.client).await?;
     tracing::info!(listen = %cfg.listeners.client, "client-server API listening");
 
-    let fed_state = Arc::new(
-        saltator_federation::FedState::new(server_name.clone(), signer.clone(), old_keys)
-            .with_rooms(rooms.clone()),
-    );
+    let key_cache = match &outbound_ca {
+        Some(ca) => saltator_federation::KeyCache::with_ca(ca),
+        None => saltator_federation::KeyCache::new(),
+    };
+    let fed_state = Arc::new(saltator_federation::FedState {
+        server_name: server_name.clone(),
+        signer: signer.clone(),
+        old_keys,
+        key_cache,
+        rooms: Some(rooms.clone()),
+    });
     let fed_router = saltator_federation::router(fed_state);
-    let fed_listener = tokio::net::TcpListener::bind(cfg.listeners.federation).await?;
-    tracing::info!(listen = %cfg.listeners.federation, "federation API listening");
+    // Federation is served over HTTPS when a cert is configured; otherwise
+    // plain HTTP (dev, or behind an external TLS terminator).
+    let fed_tls = match (&cfg.federation.tls_cert, &cfg.federation.tls_key) {
+        (Some(cert), Some(key)) => Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .map_err(|e| anyhow::anyhow!("loading federation TLS cert/key: {e}"))?,
+        ),
+        (None, None) => None,
+        _ => anyhow::bail!("federation.tls_cert and federation.tls_key must be set together"),
+    };
+    let fed_addr = cfg.listeners.federation;
+    tracing::info!(
+        listen = %fed_addr,
+        tls = fed_tls.is_some(),
+        "federation API listening",
+    );
 
     // Outbound federation: forward locally originated events to remote
     // servers sharing each room.
@@ -214,14 +251,32 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             })
             .await
     });
-    let mut fed_shutdown = shutdown_rx.clone();
-    let fed_task = tokio::spawn(async move {
-        axum::serve(fed_listener, fed_router)
-            .with_graceful_shutdown(async move {
-                let _ = fed_shutdown.wait_for(|stop| *stop).await;
-            })
-            .await
-    });
+    // axum-server drives both the HTTPS and plain-HTTP federation paths;
+    // its Handle carries graceful shutdown.
+    let fed_handle = axum_server::Handle::new();
+    let fed_task = {
+        let handle = fed_handle.clone();
+        tokio::spawn(async move {
+            let svc = fed_router.into_make_service();
+            match fed_tls {
+                Some(tls) => {
+                    axum_server::bind_rustls(fed_addr, tls)
+                        .handle(handle)
+                        .serve(svc)
+                        .await
+                }
+                None => axum_server::bind(fed_addr).handle(handle).serve(svc).await,
+            }
+        })
+    };
+    {
+        let mut fed_shutdown = shutdown_rx.clone();
+        let handle = fed_handle.clone();
+        tokio::spawn(async move {
+            let _ = fed_shutdown.wait_for(|stop| *stop).await;
+            handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
+    }
 
     let internal_shutdown = {
         let mut rx = shutdown_rx.clone();

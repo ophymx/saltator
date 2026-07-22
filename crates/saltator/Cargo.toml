@@ -24,9 +24,11 @@ ruma.workspace = true
 
 anyhow.workspace = true
 axum.workspace = true
+axum-server.workspace = true
 chacha20poly1305 = { workspace = true }
 clap.workspace = true
 rand.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -4,12 +4,12 @@
 //! resolution and TLS.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use ruma::CanonicalJsonValue;
 
 use saltator_roomserver::ServerSigner;
 
+use crate::http_client::build_http_client;
 use crate::resolver::ServerResolver;
 use crate::xmatrix::sign_request;
 
@@ -24,10 +24,15 @@ pub struct FederationClient {
 
 impl FederationClient {
     pub fn new(signer: Arc<ServerSigner>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("building reqwest client");
+        Self::from_http(signer, build_http_client(None))
+    }
+
+    /// Trust `ca_pem` in addition to the system roots (e.g. Complement's CA).
+    pub fn with_ca(signer: Arc<ServerSigner>, ca_pem: &[u8]) -> Self {
+        Self::from_http(signer, build_http_client(Some(ca_pem)))
+    }
+
+    fn from_http(signer: Arc<ServerSigner>, http: reqwest::Client) -> Self {
         Self {
             resolver: ServerResolver::new(http.clone()),
             http,
