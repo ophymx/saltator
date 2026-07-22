@@ -1,6 +1,7 @@
-//! Outbound federation requests: sign with our key and deliver. Real
-//! destination resolution (well-known / SRV) is a later M3 step; for now a
-//! destination resolves to `https://{server_name}`, overridable for tests.
+//! Outbound federation requests: sign with our key and deliver.
+//! Destinations are resolved to a base URL + `Host` header per the spec
+//! (see [`crate::resolver`]); tests may pin a fixed base URL to bypass
+//! resolution and TLS.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,23 +10,27 @@ use ruma::CanonicalJsonValue;
 
 use saltator_roomserver::ServerSigner;
 
+use crate::resolver::ServerResolver;
 use crate::xmatrix::sign_request;
 
 /// Signs and sends server-server requests on behalf of one homeserver.
 pub struct FederationClient {
     http: reqwest::Client,
     signer: Arc<ServerSigner>,
-    /// Test override; production resolves `https://{destination}`.
+    resolver: ServerResolver,
+    /// Test override: a fixed base URL that skips resolution.
     base_url: Option<String>,
 }
 
 impl FederationClient {
     pub fn new(signer: Arc<ServerSigner>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("building reqwest client");
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("building reqwest client"),
+            resolver: ServerResolver::new(http.clone()),
+            http,
             signer,
             base_url: None,
         }
@@ -76,15 +81,23 @@ impl FederationClient {
         let auth = sign_request(&self.signer, method, path, destination, content.as_ref())
             .map_err(|e| OutboundError::Sign(e.to_string()))?;
 
-        let base = self
-            .base_url
-            .clone()
-            .unwrap_or_else(|| format!("https://{destination}"));
+        // Resolve the destination (base URL + Host header), unless a fixed
+        // base URL was pinned for tests.
+        let (base, host_header) = match &self.base_url {
+            Some(base) => (base.clone(), None),
+            None => {
+                let r = self.resolver.resolve(destination).await;
+                (r.base_url, Some(r.host_header))
+            }
+        };
         let url = format!("{base}{path}");
         let mut req = self
             .http
             .request(method.parse().map_err(|_| OutboundError::BadMethod)?, &url)
             .header(reqwest::header::AUTHORIZATION, auth);
+        if let Some(host) = host_header {
+            req = req.header(reqwest::header::HOST, host);
+        }
         if let Some(body) = body {
             req = req.json(body);
         }

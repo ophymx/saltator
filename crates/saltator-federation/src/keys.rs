@@ -25,18 +25,20 @@ struct CachedKeys {
 pub struct KeyCache {
     http: reqwest::Client,
     cache: Mutex<BTreeMap<String, CachedKeys>>,
-    /// Overridable for tests; production resolves `https://{name}` (real
-    /// SRV/well-known delegation is a later M3 step).
+    resolver: crate::resolver::ServerResolver,
+    /// Test override: a fixed base URL that skips resolution.
     base_url: Option<String>,
 }
 
 impl KeyCache {
     pub fn new() -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("building reqwest client");
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("building reqwest client"),
+            resolver: crate::resolver::ServerResolver::new(http.clone()),
+            http,
             cache: Mutex::new(BTreeMap::new()),
             base_url: None,
         }
@@ -66,12 +68,19 @@ impl KeyCache {
     }
 
     async fn fetch(&self, server: &str, now_ms: u64) -> Result<CachedKeys, KeyError> {
-        let base = self
-            .base_url
-            .clone()
-            .unwrap_or_else(|| format!("https://{server}"));
+        let (base, host_header) = match &self.base_url {
+            Some(base) => (base.clone(), None),
+            None => {
+                let r = self.resolver.resolve(server).await;
+                (r.base_url, Some(r.host_header))
+            }
+        };
         let url = format!("{base}/_matrix/key/v2/server");
-        let resp = self.http.get(&url).send().await.map_err(KeyError::Http)?;
+        let mut req = self.http.get(&url);
+        if let Some(host) = host_header {
+            req = req.header(reqwest::header::HOST, host);
+        }
+        let resp = req.send().await.map_err(KeyError::Http)?;
         if !resp.status().is_success() {
             return Err(KeyError::Status(resp.status().as_u16()));
         }
