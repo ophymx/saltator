@@ -172,6 +172,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let default_room_version = saltator_core::RoomVersion::parse(&cfg.client.default_room_version)
         .map_err(|e| anyhow::anyhow!("client.default_room_version: {e}"))?;
     let media = saltator_media::MediaStore::open(cfg.data_dir.join("media"))?;
+    // Signed client for outbound federation, shared by the CS `/join` path
+    // and the event sender.
+    let fed_client = Arc::new(saltator_federation::FederationClient::new(signer.clone()));
     let cs_state = saltator_cs_api::CsState::new(
         users.clone(),
         rooms.clone(),
@@ -183,7 +186,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             max_upload_size: cfg.client.max_upload_size,
             well_known_client: cfg.client.well_known_client.clone(),
         },
-    );
+    )
+    .with_federation(fed_client.clone(), signer.clone());
     let cs_router = saltator_cs_api::router(cs_state);
     let cs_listener = tokio::net::TcpListener::bind(cfg.listeners.client).await?;
     tracing::info!(listen = %cfg.listeners.client, "client-server API listening");
@@ -198,7 +202,6 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // Outbound federation: forward locally originated events to remote
     // servers sharing each room.
-    let fed_client = Arc::new(saltator_federation::FederationClient::new(signer.clone()));
     let fed_sender =
         saltator_federation::spawn_sender(rooms.clone(), fed_client, server_name.clone());
 

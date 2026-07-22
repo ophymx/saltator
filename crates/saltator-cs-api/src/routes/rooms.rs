@@ -400,7 +400,8 @@ async fn send_membership_with(
 // -- membership ---------------------------------------------------------------
 
 /// Shared body handling for the two join endpoints: `reason` is spec'd,
-/// everything else rides along as custom member-event content.
+/// everything else rides along as custom member-event content. A room we
+/// don't host is joined over federation.
 async fn join_with_body(
     state: &CsState,
     auth: &Auth,
@@ -411,16 +412,74 @@ async fn join_with_body(
         .remove("reason")
         .and_then(|v| v.as_str().map(ToOwned::to_owned));
     body.remove("third_party_signed");
-    send_membership_with(
-        state,
-        room_id,
-        &auth.user_id,
-        &auth.user_id,
-        "join",
-        reason,
-        body,
+
+    // Local room: the normal pipeline. We host it iff its meta exists.
+    let hosted = state
+        .rooms
+        .store()
+        .meta(room_id.as_str())
+        .map_err(internal)?
+        .is_some();
+    if hosted {
+        send_membership_with(
+            state,
+            room_id,
+            &auth.user_id,
+            &auth.user_id,
+            "join",
+            reason,
+            body,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    join_remote(state, auth, room_id).await
+}
+
+/// Join a room hosted on another server: run the make_join/send_join
+/// handshake against a resident and import the returned state.
+async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId) -> Result<()> {
+    let Some(fed) = &state.federation else {
+        return Err(ApiError::not_found("Unknown room"));
+    };
+    // Resolve a resident server. Room IDs before v12 carry the creating
+    // server; v12 rooms need an invite origin, which we don't track yet.
+    let destination = saltator_federation::resident_of_room(room_id.as_str())
+        .ok_or_else(|| ApiError::not_found("Cannot determine a server to join through"))?;
+
+    let resp = saltator_federation::join_remote_room(
+        &fed.client,
+        &fed.signer,
+        &destination,
+        room_id.as_str(),
+        auth.user_id.as_str(),
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            format!("remote join failed: {e}"),
+        )
+    })?;
+
+    let outcome = state
+        .rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .map_err(internal)?;
+    accepted_event_id(outcome)?;
+
+    // Read-your-writes: block until the membership projection sees the join
+    // so the immediately following /sync shows the room.
+    let seq = state.rooms.shard_handle().seq().map_err(internal)?;
+    let _ = saltator_userserver::wait_for_projection(
+        &state.users,
+        seq,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
     Ok(())
 }
 

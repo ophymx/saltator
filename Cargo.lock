@@ -2565,6 +2565,7 @@ dependencies = [
  "rand 0.8.7",
  "ruma",
  "saltator-core",
+ "saltator-federation",
  "saltator-media",
  "saltator-roomserver",
  "saltator-shard",

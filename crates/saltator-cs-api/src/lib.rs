@@ -17,8 +17,9 @@ use axum::routing::{get, post, put};
 use ruma::OwnedServerName;
 
 use saltator_core::RoomVersion;
+use saltator_federation::FederationClient;
 use saltator_media::MediaStore;
-use saltator_roomserver::RoomServer;
+use saltator_roomserver::{RoomServer, ServerSigner};
 use saltator_userserver::UserServer;
 
 pub use error::ApiError;
@@ -49,7 +50,19 @@ pub struct CsState {
     pub config: CsConfig,
     pub typing: TypingMap,
     pub presence: PresenceMap,
+    /// Outbound federation, present once the federation surface is wired
+    /// (absent in client-only test harnesses). Enables joining remote
+    /// rooms.
+    pub federation: Option<Federation>,
     pub(crate) txns: txn::TxnCache,
+}
+
+/// The bits of the federation surface the CS API drives directly: a signed
+/// client for remote requests and our signing identity.
+#[derive(Clone)]
+pub struct Federation {
+    pub client: Arc<FederationClient>,
+    pub signer: Arc<ServerSigner>,
 }
 
 impl CsState {
@@ -66,8 +79,22 @@ impl CsState {
             config,
             typing: TypingMap::new(),
             presence: PresenceMap::new(),
+            federation: None,
             txns: txn::TxnCache::new(),
         })
+    }
+
+    /// Attach outbound federation so `/join` can reach remote rooms.
+    pub fn with_federation(
+        mut self: Arc<Self>,
+        client: Arc<FederationClient>,
+        signer: Arc<ServerSigner>,
+    ) -> Arc<Self> {
+        // `self` is freshly built here (single owner), so this is safe.
+        Arc::get_mut(&mut self)
+            .expect("with_federation called on a shared CsState")
+            .federation = Some(Federation { client, signer });
+        self
     }
 }
 
