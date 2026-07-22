@@ -451,6 +451,96 @@ impl RoomServer {
         })
     }
 
+    /// Import a room from a `send_join` response: trust the resident's
+    /// state dump wholesale and initialize the room so the local joiner can
+    /// sync and send. `join` is our co-signed membership event; `state` is
+    /// the resolved room state; `auth_chain` backs it. Returns the join's
+    /// outcome. Idempotent: a room we already host is left untouched.
+    pub async fn import_room(
+        &self,
+        version: RoomVersion,
+        join: CanonicalJsonObject,
+        state: Vec<CanonicalJsonObject>,
+        auth_chain: Vec<CanonicalJsonObject>,
+    ) -> Result<Outcome> {
+        let join_id = event::event_id(&join, version)?;
+        let room_id = str_of(&join, "room_id")?.to_owned();
+        let join_depth = join
+            .get("depth")
+            .and_then(|d| d.as_integer())
+            .and_then(|i| u64::try_from(i64::from(i)).ok())
+            .unwrap_or(0);
+
+        // Build the resolved state map, then force our join into it (the
+        // resident may return state from before the join was applied).
+        let mut state_map: BTreeMap<(String, String), String> = BTreeMap::new();
+        let mut events = Vec::new();
+        let mut seen = BTreeSet::new();
+        let push_event = |obj: &CanonicalJsonObject,
+                          events: &mut Vec<types::ImportEvent>,
+                          seen: &mut BTreeSet<String>|
+         -> Result<Option<String>> {
+            let id = event::event_id(obj, version)?.to_string();
+            if seen.insert(id.clone()) {
+                let depth = obj
+                    .get("depth")
+                    .and_then(|d| d.as_integer())
+                    .and_then(|i| u64::try_from(i64::from(i)).ok())
+                    .unwrap_or(0);
+                events.push(types::ImportEvent {
+                    event_id: id.clone(),
+                    raw: raw_bytes(obj)?,
+                    depth,
+                });
+            }
+            Ok(Some(id))
+        };
+
+        for obj in auth_chain.iter().chain(state.iter()) {
+            let id = push_event(obj, &mut events, &mut seen)?.unwrap();
+            // Only state events (those with a state_key) enter the map.
+            if let (Ok(ty), Some(CanonicalJsonValue::String(sk))) =
+                (str_of(obj, "type"), obj.get("state_key"))
+            {
+                state_map.insert((ty.to_owned(), sk.clone()), id);
+            }
+        }
+        // The join membership is always the joiner's current state.
+        let sender = str_of(&join, "sender")?.to_owned();
+        state_map.insert(("m.room.member".to_owned(), sender), join_id.to_string());
+
+        let create_event_id = state_map
+            .get(&("m.room.create".to_owned(), String::new()))
+            .cloned()
+            .ok_or_else(|| RoomError::Malformed("send_join state has no create event".into()))?;
+
+        let cmd = RoomCommand::Import(Box::new(types::ImportRoom {
+            room_id,
+            version: version.as_str().to_owned(),
+            create_event_id,
+            events,
+            join_event_id: join_id.to_string(),
+            join_raw: raw_bytes(&join)?,
+            join_depth,
+            state: state_map.into_iter().collect(),
+        }));
+
+        match self.propose_cmd(&cmd).await? {
+            RoomResponse::Accepted { event_id, seq } => Ok(Outcome::Accepted {
+                event_id: OwnedEventId::try_from(event_id)
+                    .map_err(|e| RoomError::Malformed(e.to_string()))?,
+                seq,
+            }),
+            RoomResponse::Duplicate { event_id } => Ok(Outcome::Duplicate {
+                event_id: OwnedEventId::try_from(event_id)
+                    .map_err(|e| RoomError::Malformed(e.to_string()))?,
+            }),
+            other => Err(RoomError::Codec(format!(
+                "unexpected import response: {other:?}"
+            ))),
+        }
+    }
+
     fn load_raw(&self, store: &RoomStore, event_id: &str) -> Result<Option<CanonicalJsonObject>> {
         let Some(stored) = store.event(event_id).map_err(storage_err)? else {
             return Ok(None);

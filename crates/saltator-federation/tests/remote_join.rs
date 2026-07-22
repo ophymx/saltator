@@ -280,4 +280,45 @@ async fn join_client_drives_the_full_handshake() {
     });
     assert!(has_create, "state missing create event");
     assert!(!resp.auth_chain.is_empty(), "auth chain empty");
+
+    // --- Import the response into node B's own room shard.
+    let b_rooms = start_rooms("b", b_signer.clone(), dir.path()).await;
+    let outcome = b_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import succeeds");
+    assert!(
+        matches!(outcome, Outcome::Accepted { .. }),
+        "import: {outcome:?}"
+    );
+
+    // B now hosts the room: bob is joined, and a.test is a remote peer.
+    let b_state =
+        b_rooms.make_join_template(&room_id, &ruma::UserId::parse("@carol:c.test").unwrap());
+    assert!(b_state.is_ok(), "B should now know the room");
+    let peers = b_rooms
+        .remote_servers_in_room(room_id.as_str(), "b.test")
+        .unwrap();
+    assert_eq!(
+        peers,
+        vec!["a.test".to_owned()],
+        "B sees a.test in the room"
+    );
+
+    // Bob can send a message in the imported room (prev = his join,
+    // auth resolves against imported state).
+    let bob = ruma::UserId::parse("@bob:b.test").unwrap();
+    let sent = b_rooms
+        .send_message(
+            &room_id,
+            &bob,
+            "m.room.message",
+            json!({"msgtype":"m.text","body":"hi from bob"}),
+        )
+        .await
+        .expect("send in imported room");
+    assert!(
+        matches!(sent, Outcome::Accepted { .. }),
+        "bob's message: {sent:?}"
+    );
 }

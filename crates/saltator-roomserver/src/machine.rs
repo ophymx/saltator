@@ -10,9 +10,9 @@ use saltator_shard::{ApplyCtx, ReadCtx, ShardApp};
 use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
-    AppendEvent, ChangePayload, ReceiptCmd, ReceiptRecord, RoomCommand, RoomMeta, RoomResponse,
-    SeqEntry, StateGroup, StoredEvent, T_EVENT, T_GROUP, T_RECEIPT, T_REDACT, T_ROOM, T_ROOM_SEQ,
-    T_SEQ,
+    AppendEvent, ChangePayload, ImportRoom, ReceiptCmd, ReceiptRecord, RoomCommand, RoomMeta,
+    RoomResponse, SeqEntry, StateGroup, StoredEvent, T_EVENT, T_GROUP, T_RECEIPT, T_REDACT, T_ROOM,
+    T_ROOM_SEQ, T_SEQ,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -64,6 +64,7 @@ impl ShardApp for RoomApp {
         let resp = match dec::<RoomCommand>("room command decode", command)? {
             RoomCommand::Append(cmd) => apply_append(ctx, &cmd)?,
             RoomCommand::Receipt(cmd) => apply_receipt(ctx, &cmd)?,
+            RoomCommand::Import(cmd) => apply_import(ctx, &cmd)?,
         };
         enc("room response encode", &resp)
     }
@@ -244,6 +245,106 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
 
     Ok(RoomResponse::Accepted {
         event_id: cmd.event_id.clone(),
+        seq,
+    })
+}
+
+fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomResponse> {
+    // Idempotence: an already-known room is not re-imported.
+    if ctx.get(T_ROOM, cmd.room_id.as_bytes())?.is_some() {
+        return Ok(RoomResponse::Duplicate {
+            event_id: cmd.join_event_id.clone(),
+        });
+    }
+
+    // Supporting events (create + auth chain + current state): stored so
+    // resolution and later sends can reach them, but kept out of the
+    // timeline (seq 0), like rejected events.
+    for ev in &cmd.events {
+        if ctx.get(T_EVENT, ev.event_id.as_bytes())?.is_some() {
+            continue;
+        }
+        let stored = StoredEvent {
+            raw: ev.raw.clone(),
+            seq: 0,
+            state_group_after: 0,
+            depth: ev.depth,
+            rejected: None,
+        };
+        ctx.put(
+            T_EVENT,
+            ev.event_id.as_bytes(),
+            enc("event encode", &stored)?,
+        );
+    }
+
+    // The initial state-group snapshot: the room's resolved state after the
+    // join. Group ids start at 1.
+    const IMPORT_GROUP: u64 = 1;
+    let group = StateGroup {
+        parent: None,
+        chain_len: 0,
+        entries: cmd.state.clone(),
+    };
+    ctx.put(
+        T_GROUP,
+        &room_u64_key(&cmd.room_id, IMPORT_GROUP),
+        enc("state group encode", &group)?,
+    );
+
+    // The membership event is the one timeline entry — emitted so `/sync`
+    // and the membership projection see the join.
+    let seq = ctx.emit(enc(
+        "change payload encode",
+        &ChangePayload::Event {
+            room_id: cmd.room_id.clone(),
+            event_id: cmd.join_event_id.clone(),
+        },
+    )?);
+    let join_stored = StoredEvent {
+        raw: cmd.join_raw.clone(),
+        seq,
+        state_group_after: IMPORT_GROUP,
+        depth: cmd.join_depth,
+        rejected: None,
+    };
+    ctx.put(
+        T_EVENT,
+        cmd.join_event_id.as_bytes(),
+        enc("event encode", &join_stored)?,
+    );
+    ctx.put(
+        T_SEQ,
+        &seq.to_be_bytes(),
+        enc(
+            "seq entry encode",
+            &SeqEntry::Event {
+                room_id: cmd.room_id.clone(),
+                event_id: cmd.join_event_id.clone(),
+            },
+        )?,
+    );
+    ctx.put(
+        T_ROOM_SEQ,
+        &room_u64_key(&cmd.room_id, seq),
+        cmd.join_event_id.as_bytes(),
+    );
+
+    let meta = RoomMeta {
+        version: cmd.version.clone(),
+        create_event_id: cmd.create_event_id.clone(),
+        current_group: IMPORT_GROUP,
+        next_group: IMPORT_GROUP + 1,
+        extremities: vec![cmd.join_event_id.clone()],
+    };
+    ctx.put(
+        T_ROOM,
+        cmd.room_id.as_bytes(),
+        enc("room meta encode", &meta)?,
+    );
+
+    Ok(RoomResponse::Accepted {
+        event_id: cmd.join_event_id.clone(),
         seq,
     })
 }

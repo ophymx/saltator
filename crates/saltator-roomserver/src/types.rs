@@ -99,6 +99,38 @@ pub struct RoomMeta {
 pub enum RoomCommand {
     Append(Box<AppendEvent>),
     Receipt(ReceiptCmd),
+    Import(Box<ImportRoom>),
+}
+
+/// Bulk-initialize a room from a `send_join` response: the state dump the
+/// resident server returned, plus our co-signed membership event. Unlike
+/// [`AppendEvent`], the imported state is trusted wholesale (no per-event
+/// prev/auth resolution — a state snapshot has none), so this is only for
+/// the join-a-remote-room path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportRoom {
+    pub room_id: String,
+    pub version: String,
+    pub create_event_id: String,
+    /// Supporting events (auth chain + current state): stored so state
+    /// resolution and later sends can reference them, but not placed in
+    /// the room timeline.
+    pub events: Vec<ImportEvent>,
+    /// Our membership event — emitted to the change stream so `/sync` and
+    /// the membership projection observe the join.
+    pub join_event_id: String,
+    pub join_raw: Vec<u8>,
+    pub join_depth: u64,
+    /// The resolved room state after the join: `(type, state_key) →
+    /// event_id`, forming the room's initial state-group snapshot.
+    pub state: Vec<((String, String), String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportEvent {
+    pub event_id: String,
+    pub raw: Vec<u8>,
+    pub depth: u64,
 }
 
 /// The precomputed outcome of one event, ready to persist atomically.
