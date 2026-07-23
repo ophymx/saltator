@@ -516,6 +516,27 @@ pub async fn leave_room(
     auth: Auth,
     Ar(req): Ar<leave_room::v3::Request>,
 ) -> Result<Ra<leave_room::v3::Response>> {
+    // A room we don't host that the user has a pending invite to: rejecting
+    // it is a leave over federation (make_leave/send_leave).
+    let hosted = state
+        .rooms
+        .store()
+        .meta(req.room_id.as_str())
+        .map_err(internal)?
+        .is_some();
+    if !hosted {
+        if let Some(entry) = state
+            .users
+            .store()
+            .membership(auth.user_id.as_str(), req.room_id.as_str())
+            .map_err(internal)?
+        {
+            if entry.membership == "invite" {
+                leave_remote(&state, &auth, &req.room_id, &entry.sender).await?;
+                return Ok(Ra(leave_room::v3::Response::new()));
+            }
+        }
+    }
     send_membership(
         &state,
         &req.room_id,
@@ -526,6 +547,49 @@ pub async fn leave_room(
     )
     .await?;
     Ok(Ra(leave_room::v3::Response::new()))
+}
+
+/// Reject a pending remote invite by running the make_leave/send_leave
+/// handshake against the inviting server, then clearing the local invite.
+async fn leave_remote(
+    state: &CsState,
+    auth: &Auth,
+    room_id: &RoomId,
+    invite_sender: &str,
+) -> Result<()> {
+    let Some(fed) = &state.federation else {
+        return Err(ApiError::forbidden("Federation is not configured"));
+    };
+    // The resident to leave through: the inviting user's server, falling
+    // back to the room ID's server.
+    let destination = ruma::UserId::parse(invite_sender)
+        .ok()
+        .map(|u| u.server_name().as_str().to_owned())
+        .or_else(|| saltator_federation::resident_of_room(room_id.as_str()))
+        .ok_or_else(|| ApiError::not_found("Cannot determine a server to leave through"))?;
+
+    saltator_federation::leave_remote_room(
+        &fed.client,
+        &fed.signer,
+        &destination,
+        room_id.as_str(),
+        auth.user_id.as_str(),
+    )
+    .await
+    .map_err(|e| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            format!("remote leave failed: {e}"),
+        )
+    })?;
+
+    state
+        .users
+        .record_remote_leave(auth.user_id.as_str(), room_id.as_str())
+        .await
+        .map_err(internal)?;
+    Ok(())
 }
 
 pub async fn forget_room(

@@ -15,7 +15,9 @@ mod xmatrix;
 
 pub use http_client::build_http_client;
 pub use inbound::{AuthRejection, Authenticated};
-pub use join_client::{join_remote_room, resident_of_room, JoinError, JoinResponse};
+pub use join_client::{
+    join_remote_room, leave_remote_room, resident_of_room, JoinError, JoinResponse,
+};
 pub use keys::{KeyCache, KeyError};
 pub use outbound::{FederationClient, OutboundError};
 pub use resolver::{ResolvedServer, ServerResolver};
@@ -110,6 +112,14 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route(
             "/_matrix/federation/v2/invite/{room_id}/{event_id}",
             put(joins::invite),
+        )
+        .route(
+            "/_matrix/federation/v1/make_leave/{room_id}/{user_id}",
+            get(joins::make_leave),
+        )
+        .route(
+            "/_matrix/federation/v2/send_leave/{room_id}/{event_id}",
+            put(joins::send_leave),
         )
         .route(
             "/_matrix/federation/v2/send_join/{room_id}/{event_id}",

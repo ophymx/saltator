@@ -324,3 +324,94 @@ async fn join_client_drives_the_full_handshake() {
         "bob's message: {sent:?}"
     );
 }
+
+#[tokio::test]
+async fn leave_client_rejects_over_federation() {
+    use saltator_federation::{join_remote_room, leave_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let a_name: OwnedServerName = "a.test".try_into().unwrap();
+    let b_name: OwnedServerName = "b.test".try_into().unwrap();
+    let (a_signer, _) = ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let (b_signer, _) = ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let b_signer = Arc::new(b_signer);
+
+    // A hosts a public room.
+    let rooms = start_rooms("a", a_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let (room_id, _) = rooms
+        .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        rooms
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+    }
+
+    let b_key_base = spawn(router(Arc::new(FedState::new(
+        b_name.clone(),
+        b_signer.clone(),
+        Vec::<OldVerifyKey>::new(),
+    ))))
+    .await;
+    let a_state = Arc::new(FedState {
+        server_name: a_name.clone(),
+        signer: a_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(b_key_base),
+        rooms: Some(rooms.clone()),
+        users: None,
+    });
+    let a_base = spawn(router(a_state)).await;
+
+    let client = FederationClient::with_base_url(b_signer.clone(), a_base);
+    // B joins, then leaves.
+    join_remote_room(
+        &client,
+        &b_signer,
+        "a.test",
+        room_id.as_str(),
+        "@bob:b.test",
+    )
+    .await
+    .expect("join");
+    assert_eq!(
+        rooms
+            .remote_servers_in_room(room_id.as_str(), "a.test")
+            .unwrap(),
+        vec!["b.test".to_owned()],
+        "b.test should be a member after join"
+    );
+
+    leave_remote_room(
+        &client,
+        &b_signer,
+        "a.test",
+        room_id.as_str(),
+        "@bob:b.test",
+    )
+    .await
+    .expect("leave");
+    assert!(
+        rooms
+            .remote_servers_in_room(room_id.as_str(), "a.test")
+            .unwrap()
+            .is_empty(),
+        "b.test should be gone after leave"
+    );
+}

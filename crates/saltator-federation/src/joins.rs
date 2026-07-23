@@ -116,6 +116,81 @@ fn to_array(events: Vec<CanonicalJsonObject>) -> serde_json::Value {
     )
 }
 
+/// `GET /_matrix/federation/v1/make_leave/{roomId}/{userId}`: template for
+/// a remote user to leave/reject.
+pub async fn make_leave(
+    State(state): State<Arc<FedState>>,
+    Path((room_id, user_id)): Path<(String, String)>,
+    _auth: Authenticated,
+) -> FedResult {
+    let Some(rooms) = state.rooms.clone() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
+    };
+    let room = ruma::RoomId::parse(&room_id)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad room id"))?;
+    let user = ruma::UserId::parse(&user_id)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad user id"))?;
+    match rooms.make_leave_template(&room, &user) {
+        Ok((version, template)) => Ok(axum::Json(serde_json::json!({
+            "room_version": version.as_str(),
+            "event": CanonicalJsonValue::Object(template),
+        }))),
+        Err(saltator_roomserver::RoomError::UnknownRoom(_)) => {
+            Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room"))
+        }
+        Err(e) => Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        )),
+    }
+}
+
+/// `PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}`: apply a
+/// remote signed leave/reject.
+pub async fn send_leave(
+    State(state): State<Arc<FedState>>,
+    Path((_room_id, _event_id)): Path<(String, String)>,
+    auth: Authenticated,
+) -> FedResult {
+    let Some(rooms) = state.rooms.clone() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
+    };
+    let now = crate::now_ms();
+    if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
+        if let Some(set) = keys.get(&auth.origin) {
+            rooms.trust_keys(&auth.origin, set.clone());
+        }
+    }
+    let body: serde_json::Value = auth.json().map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "M_NOT_JSON",
+            "leave event is not valid JSON",
+        )
+    })?;
+    let raw: CanonicalJsonObject = match CanonicalJsonValue::try_from(body) {
+        Ok(CanonicalJsonValue::Object(o)) => o,
+        _ => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "M_BAD_JSON",
+                "leave event is not an object",
+            ))
+        }
+    };
+    match rooms.send_leave(raw).await {
+        Ok(saltator_roomserver::Outcome::Rejected { reason, .. }) => {
+            Err(err(StatusCode::FORBIDDEN, "M_FORBIDDEN", &reason))
+        }
+        Ok(_) => Ok(axum::Json(serde_json::json!({}))),
+        Err(saltator_roomserver::RoomError::UnknownRoom(_)) => {
+            Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room"))
+        }
+        Err(e) => Err(err(StatusCode::FORBIDDEN, "M_FORBIDDEN", &e.to_string())),
+    }
+}
+
 /// `PUT /_matrix/federation/v2/invite/{roomId}/{eventId}` (spec "Inviting
 /// to a room"): a remote server asks us to co-sign an `m.room.member`
 /// invite for one of our users. We validate it, add our signature, record

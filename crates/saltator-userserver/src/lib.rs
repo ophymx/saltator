@@ -432,6 +432,16 @@ impl UserServer {
         .await
     }
 
+    /// Reject a pending remote invite (or leave a remote room): set `leave`
+    /// membership and clear the stored invite state.
+    pub async fn record_remote_leave(&self, user_id: &str, room_id: &str) -> Result<()> {
+        self.expect_ok(&UserCommand::RecordRemoteLeave {
+            user_id: user_id.to_owned(),
+            room_id: room_id.to_owned(),
+        })
+        .await
+    }
+
     // -- internals ---------------------------------------------------------
 
     /// Canonicalize a localpart or full user ID for this server. Capitals

@@ -116,6 +116,60 @@ pub async fn join_remote_room(
     })
 }
 
+/// Reject a remote invite / leave a remote room: run the make_leave /
+/// send_leave handshake against `destination`.
+pub async fn leave_remote_room(
+    client: &FederationClient,
+    signer: &ServerSigner,
+    destination: &str,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(), JoinError> {
+    let make_path = format!(
+        "/_matrix/federation/v1/make_leave/{}/{}",
+        encode_segment(room_id),
+        encode_segment(user_id),
+    );
+    let make = client
+        .get(destination, &make_path)
+        .await
+        .map_err(JoinError::Transport)?;
+    let room_version = make
+        .get("room_version")
+        .and_then(|v| v.as_str())
+        .ok_or(JoinError::Malformed("make_leave without room_version"))?;
+    let version = RoomVersion::parse(room_version)
+        .map_err(|_| JoinError::UnsupportedVersion(room_version.to_owned()))?;
+    let template = match make.get("event") {
+        Some(serde_json::Value::Object(_)) => make["event"].clone(),
+        _ => return Err(JoinError::Malformed("make_leave without event template")),
+    };
+    let mut leave = match CanonicalJsonValue::try_from(template) {
+        Ok(CanonicalJsonValue::Object(o)) => o,
+        _ => return Err(JoinError::Malformed("event template is not an object")),
+    };
+    expect_str(&leave, "type", "m.room.member")?;
+    expect_str(&leave, "sender", user_id)?;
+    expect_str(&leave, "state_key", user_id)?;
+    signer
+        .hash_and_sign_event(&mut leave, version)
+        .map_err(|e| JoinError::Sign(e.to_string()))?;
+    let event_id = saltator_core::event::event_id(&leave, version)
+        .map_err(|e| JoinError::Sign(format!("event id: {e}")))?
+        .to_string();
+    let leave_value = serde_json::Value::from(CanonicalJsonValue::Object(leave));
+    let send_path = format!(
+        "/_matrix/federation/v2/send_leave/{}/{}",
+        encode_segment(room_id),
+        encode_segment(&event_id),
+    );
+    client
+        .put(destination, &send_path, &leave_value)
+        .await
+        .map_err(JoinError::Transport)?;
+    Ok(())
+}
+
 fn expect_str(obj: &CanonicalJsonObject, key: &str, want: &str) -> Result<(), JoinError> {
     match obj.get(key) {
         Some(CanonicalJsonValue::String(s)) if s == want => Ok(()),

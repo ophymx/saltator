@@ -364,6 +364,26 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             );
             Ok(UserResponse::Ok)
         }
+        UserCommand::RecordRemoteLeave { user_id, room_id } => {
+            let seq = emit_user_change(ctx, user_id)?;
+            let mkey = user_key(user_id, room_id);
+            ctx.put(
+                T_MEMBERSHIP,
+                &mkey,
+                enc(
+                    "membership encode",
+                    &MembershipEntry {
+                        membership: "leave".to_owned(),
+                        event_id: String::new(),
+                        sender: user_id.clone(),
+                        room_seq: seq,
+                        seq,
+                    },
+                )?,
+            );
+            ctx.delete(T_INVITE_STATE, &mkey);
+            Ok(UserResponse::Ok)
+        }
     }
 }
 

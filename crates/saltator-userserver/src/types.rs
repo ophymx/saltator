@@ -251,6 +251,12 @@ pub enum UserCommand {
         /// Stripped-state event JSON, one entry per event.
         stripped_state: Vec<Vec<u8>>,
     },
+    /// Reject/leave a remote room: set `leave` membership and clear the
+    /// pending-invite stripped state.
+    RecordRemoteLeave {
+        user_id: String,
+        room_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

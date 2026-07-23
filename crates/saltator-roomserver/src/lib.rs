@@ -369,6 +369,26 @@ impl RoomServer {
         room_id: &ruma::RoomId,
         user_id: &UserId,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
+        self.make_membership_template(room_id, user_id, "join")
+    }
+
+    /// Build an unsigned `m.room.member` leave template — the `GET
+    /// /make_leave` response (used to reject a remote invite or leave a
+    /// remote room).
+    pub fn make_leave_template(
+        &self,
+        room_id: &ruma::RoomId,
+        user_id: &UserId,
+    ) -> Result<(RoomVersion, CanonicalJsonObject)> {
+        self.make_membership_template(room_id, user_id, "leave")
+    }
+
+    fn make_membership_template(
+        &self,
+        room_id: &ruma::RoomId,
+        user_id: &UserId,
+        membership: &str,
+    ) -> Result<(RoomVersion, CanonicalJsonObject)> {
         let store = self.store();
         let meta = store
             .meta(room_id.as_str())
@@ -388,7 +408,7 @@ impl RoomServer {
             depth = depth.max(prev.depth);
         }
 
-        let content = serde_json::json!({ "membership": "join" });
+        let content = serde_json::json!({ "membership": membership });
         let content_obj = canonicalize(content)?;
         let auth_types = auth::auth_types_for_event(
             version,
@@ -411,6 +431,16 @@ impl RoomServer {
             "depth": depth + 1,
         }))?;
         Ok((version, template))
+    }
+
+    /// Apply a remote server's signed leave/reject event (`PUT
+    /// /send_leave`). Verifies + persists it through the normal pipeline
+    /// (the outbound sender distributes it). The caller must have trusted
+    /// the origin's keys.
+    pub async fn send_leave(&self, raw: CanonicalJsonObject) -> Result<Outcome> {
+        let (version, room_id, _is_create) = self.classify(&raw)?;
+        let _guard = self.lock_room(room_id.as_str()).await;
+        self.process(raw, version, &room_id, false).await
     }
 
     /// Apply a remote server's signed join event (`PUT /send_join`) and
