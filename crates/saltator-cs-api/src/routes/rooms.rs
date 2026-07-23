@@ -558,16 +558,123 @@ pub async fn invite_user(
     let invite_user::v3::InvitationRecipient::UserId(invite) = &req.recipient else {
         return Err(ApiError::invalid_param("Third-party invites not supported"));
     };
-    send_membership(
-        &state,
-        &req.room_id,
-        &auth.user_id,
-        &invite.user_id,
-        "invite",
-        invite.reason.clone(),
-    )
-    .await?;
+    // A user on another server must co-sign their own invite over
+    // federation before we can put it in the room.
+    if invite.user_id.server_name() != state.config.server_name {
+        invite_remote(&state, &auth, &req.room_id, &invite.user_id).await?;
+    } else {
+        send_membership(
+            &state,
+            &req.room_id,
+            &auth.user_id,
+            &invite.user_id,
+            "invite",
+            invite.reason.clone(),
+        )
+        .await?;
+    }
     Ok(Ra(invite_user::v3::Response::new()))
+}
+
+/// Stripped current-room state to accompany a federated invite
+/// (`invite_room_state`): the create event plus the identifying state
+/// clients render on an invite.
+fn invite_room_state(state: &CsState, room_id: &str) -> Result<Vec<serde_json::Value>> {
+    const TYPES: &[&str] = &[
+        "m.room.create",
+        "m.room.join_rules",
+        "m.room.canonical_alias",
+        "m.room.name",
+        "m.room.avatar",
+        "m.room.topic",
+        "m.room.encryption",
+    ];
+    let current = current_state(&state.rooms, room_id)?;
+    let mut out = Vec::new();
+    for t in TYPES {
+        if let Some(event_id) = current.get(&((*t).to_owned(), String::new())) {
+            if let Some(raw) = raw_event(&state.rooms, event_id)? {
+                out.push(crate::room_util::stripped_event(&raw));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Invite a user on another server: build and sign the `m.room.member`
+/// invite, have the target's server co-sign it (`PUT /invite`), then
+/// ingest the co-signed event into the room.
+async fn invite_remote(
+    state: &CsState,
+    auth: &Auth,
+    room_id: &RoomId,
+    invitee: &UserId,
+) -> Result<()> {
+    let Some(fed) = &state.federation else {
+        return Err(ApiError::forbidden("Federation is not configured"));
+    };
+    let (version, event) = state
+        .rooms
+        .build_invite(room_id, &auth.user_id, invitee)
+        .await
+        .map_err(internal)?;
+    let event_id = saltator_core::event::event_id(&event, version).map_err(internal)?;
+
+    let body = serde_json::json!({
+        "room_version": version.as_str(),
+        "event": ruma::CanonicalJsonValue::Object(event),
+        "invite_room_state": invite_room_state(state, room_id.as_str())?,
+    });
+    let path = format!(
+        "/_matrix/federation/v2/invite/{}/{}",
+        encode_segment(room_id.as_str()),
+        encode_segment(event_id.as_str()),
+    );
+    let resp = fed
+        .client
+        .put(invitee.server_name().as_str(), &path, &body)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "M_UNKNOWN",
+                format!("remote invite failed: {e}"),
+            )
+        })?;
+
+    // Ingest the doubly-signed event into the room (distributes to any
+    // other resident servers via the outbound sender).
+    let signed = match resp
+        .get("event")
+        .cloned()
+        .map(ruma::CanonicalJsonValue::try_from)
+    {
+        Some(Ok(ruma::CanonicalJsonValue::Object(o))) => o,
+        _ => {
+            return Err(ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "M_UNKNOWN",
+                "invite response missing signed event",
+            ))
+        }
+    };
+    let outcome = state.rooms.ingest_pdu(signed).await.map_err(internal)?;
+    accepted_event_id(outcome)?;
+    Ok(())
+}
+
+/// Percent-encode a path segment (room/event IDs contain `!`, `$`, `:`).
+fn encode_segment(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 pub async fn kick_user(

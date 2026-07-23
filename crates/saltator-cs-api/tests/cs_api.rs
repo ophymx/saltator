@@ -1462,3 +1462,253 @@ async fn inbound_federated_invite_appears_in_sync() {
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
 }
+
+// --- Outbound federated invite (full round-trip) -------------------------
+
+async fn cs_stack(
+    server: &str,
+    dir: &std::path::Path,
+    fed_client_base: Option<String>,
+) -> (
+    Arc<RoomServer>,
+    Arc<UserServer>,
+    Arc<saltator_roomserver::ServerSigner>,
+    axum::Router,
+    tokio::task::JoinHandle<()>,
+) {
+    let engine = Arc::new(RocksEngine::open(&dir.join(server)).unwrap());
+    let name = ruma::OwnedServerName::try_from(server).unwrap();
+    let (signer, _) = saltator_roomserver::ServerSigner::generate(name.clone(), "1".to_owned());
+    let signer = Arc::new(signer);
+    let rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let users = UserServer::start(
+        1,
+        engine,
+        name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [rooms.shard_handle(), users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let projection = spawn_membership_projection(users.clone(), rooms.clone());
+    let media = MediaStore::open(dir.join(format!("{server}-media"))).unwrap();
+    let mut cs = CsState::new(
+        users.clone(),
+        rooms.clone(),
+        media,
+        CsConfig {
+            server_name: name,
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    );
+    if let Some(base) = fed_client_base {
+        cs = cs.with_federation(
+            Arc::new(FederationClient::with_base_url(signer.clone(), base)),
+            signer.clone(),
+        );
+    }
+    let router = saltator_cs_api::router(cs);
+    (rooms, users, signer, router, projection)
+}
+
+async fn oneshot(
+    router: &axum::Router,
+    method: &'static str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut b = Request::builder().method(method).uri(path);
+    if let Some(t) = token {
+        b = b.header("Authorization", format!("Bearer {t}"));
+    }
+    let bd = match body {
+        Some(v) => {
+            b = b.header("Content-Type", "application/json");
+            Body::from(serde_json::to_vec(&v).unwrap())
+        }
+        None => Body::empty(),
+    };
+    let resp = router.clone().oneshot(b.body(bd).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let val: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, val)
+}
+
+async fn reg(router: &axum::Router, user: &str) -> String {
+    let (_s, ch) = oneshot(
+        router,
+        "POST",
+        "/_matrix/client/v3/register",
+        None,
+        Some(json!({"username":user,"password":"pw-12345678"})),
+    )
+    .await;
+    let session = ch["session"].as_str().unwrap().to_owned();
+    let (_s, r) = oneshot(router, "POST", "/_matrix/client/v3/register", None, Some(json!({"username":user,"password":"pw-12345678","auth":{"type":"m.login.dummy","session":session}}))).await;
+    r["access_token"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn outbound_federated_invite_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Node B: full stack; its fed endpoint records invites. Key server for
+    // A is B's own fed router (serves keys); B authenticates A via A's keys.
+    let (b_rooms, b_users, b_signer, b_router, b_proj) = cs_stack("b.test", dir.path(), None).await;
+
+    // A's signing identity + key server so B can verify A's requests and
+    // the invite event signature.
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let (a_signer, _) = saltator_roomserver::ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let a_key_base = spawn_fed("a.test", a_signer.clone(), None, None).await;
+
+    // B's federation endpoint: authenticates A, records invites into b_users.
+    let b_fed = Arc::new(FedState {
+        server_name: ruma::OwnedServerName::try_from("b.test").unwrap(),
+        signer: b_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(a_key_base),
+        rooms: Some(b_rooms.clone()),
+        users: Some(b_users.clone()),
+    });
+    let b_fed_base = {
+        let app = saltator_federation::router(b_fed);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+
+    // Node A: full stack, CS federation client aimed at B's fed endpoint,
+    // reusing the a_signer we already made for the key server.
+    let a_engine = Arc::new(RocksEngine::open(&dir.path().join("a.test")).unwrap());
+    let a_rooms = RoomServer::start(
+        1,
+        a_engine.clone(),
+        a_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let a_users = UserServer::start(
+        1,
+        a_engine,
+        a_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [a_rooms.shard_handle(), a_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let a_proj = spawn_membership_projection(a_users.clone(), a_rooms.clone());
+    let a_media = MediaStore::open(dir.path().join("a-media")).unwrap();
+    let a_cs = CsState::new(
+        a_users.clone(),
+        a_rooms.clone(),
+        a_media,
+        CsConfig {
+            server_name: a_name,
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(
+            a_signer.clone(),
+            b_fed_base,
+        )),
+        a_signer.clone(),
+    );
+    let a_router = saltator_cs_api::router(a_cs);
+
+    // bob registers on B.
+    let bob = reg(&b_router, "bob").await;
+
+    // alice registers on A, creates a room, and invites @bob:b.test.
+    let alice = reg(&a_router, "alice").await;
+    let (status, room) = oneshot(
+        &a_router,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&alice),
+        Some(json!({"preset":"private_chat"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let enc: String = room_id
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let (status, body) = oneshot(
+        &a_router,
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{enc}/invite"),
+        Some(&alice),
+        Some(json!({"user_id":"@bob:b.test"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "invite failed: {body}");
+
+    // bob on B sees the invite.
+    let (status, sync) = oneshot(
+        &b_router,
+        "GET",
+        "/_matrix/client/v3/sync",
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        sync["rooms"]["invite"].get(&room_id).is_some(),
+        "invite missing from bob's sync: {sync}"
+    );
+
+    a_proj.abort();
+    b_proj.abort();
+    a_rooms.shutdown().await.unwrap();
+    a_users.shutdown().await.unwrap();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}

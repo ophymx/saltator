@@ -339,6 +339,27 @@ impl RoomServer {
         event::event_id(raw, version).ok()
     }
 
+    /// Build and sign an `m.room.member` invite for `target` (a remote
+    /// user), without applying it: a remote invitee's server must co-sign
+    /// it (via `PUT /invite`) before we ingest the co-signed event. Returns
+    /// the room version and the signed event.
+    pub async fn build_invite(
+        &self,
+        room_id: &ruma::RoomId,
+        sender: &UserId,
+        target: &UserId,
+    ) -> Result<(RoomVersion, CanonicalJsonObject)> {
+        let _guard = self.lock_room(room_id.as_str()).await;
+        let (raw, version) = self.build_local(
+            room_id,
+            sender,
+            "m.room.member",
+            Some(target.as_str()),
+            serde_json::json!({ "membership": "invite" }),
+        )?;
+        Ok((version, raw))
+    }
+
     /// Build an unsigned `m.room.member` join template for `user_id` (a
     /// user on another server) — the `GET /make_join` response. prev/auth
     /// events and depth are computed from current room state; the joining
