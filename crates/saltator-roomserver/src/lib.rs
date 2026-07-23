@@ -454,15 +454,18 @@ impl RoomServer {
 
     /// Walk the room DAG backward from `start` event IDs along
     /// `prev_events`, returning up to `limit` events (the `/backfill`
-    /// response). Highest-depth (most recent) first. Unknown start IDs are
-    /// skipped; rejected events are not returned.
+    /// response). The `start` events are included; highest-depth (most
+    /// recent) first. Unknown start IDs are skipped; rejected events are
+    /// not returned.
     pub fn backfill(&self, start: &[String], limit: usize) -> Result<Vec<CanonicalJsonObject>> {
-        self.walk_back(start, &BTreeSet::new(), limit, 0)
+        self.walk_back(start.to_vec(), &BTreeSet::new(), limit, 0)
     }
 
-    /// `POST /get_missing_events`: walk backward from `latest` along
-    /// `prev_events`, stopping at (and excluding) `earliest`, returning up
-    /// to `limit` events at depth ≥ `min_depth`.
+    /// `POST /get_missing_events`: return the ancestors of `latest`
+    /// (the events themselves excluded) along `prev_events`, stopping at
+    /// and excluding `earliest`, up to `limit` events at depth ≥
+    /// `min_depth`. Oldest (lowest-depth) first — the order a requester
+    /// applies them in.
     pub fn get_missing_events(
         &self,
         earliest: &[String],
@@ -470,26 +473,39 @@ impl RoomServer {
         limit: usize,
         min_depth: u64,
     ) -> Result<Vec<CanonicalJsonObject>> {
-        let stop: BTreeSet<String> = earliest.iter().cloned().collect();
-        self.walk_back(latest, &stop, limit, min_depth)
+        let store = self.store();
+        // Exclude both the earliest boundary and the latest events
+        // themselves; seed the walk with the latest events' parents.
+        let mut stop: BTreeSet<String> = earliest.iter().cloned().collect();
+        let mut seed = Vec::new();
+        for id in latest {
+            stop.insert(id.clone());
+            if let Some(stored) = store.event(id).map_err(storage_err)? {
+                let raw: CanonicalJsonObject = serde_json::from_slice(&stored.raw)
+                    .map_err(|e| RoomError::Codec(e.to_string()))?;
+                seed.extend(prev_event_ids(&raw));
+            }
+        }
+        let mut events = self.walk_back(seed, &stop, limit, min_depth)?;
+        events.reverse(); // newest-first walk → oldest-first response
+        Ok(events)
     }
 
-    /// Shared backward DAG walk: BFS over `prev_events` from `start`,
+    /// Shared backward DAG walk: BFS over `prev_events` from `seed`,
     /// skipping `stop` IDs, collecting non-rejected events at depth ≥
     /// `min_depth`, newest (highest depth) first, capped at `limit`.
     fn walk_back(
         &self,
-        start: &[String],
+        seed: Vec<String>,
         stop: &BTreeSet<String>,
         limit: usize,
         min_depth: u64,
     ) -> Result<Vec<CanonicalJsonObject>> {
         let store = self.store();
         let mut seen: BTreeSet<String> = stop.clone();
-        // Frontier ordered by depth (max-heap via Reverse-less BTree of
-        // (depth, id)); process highest depth first.
+        // Frontier ordered by depth; process highest depth first.
         let mut frontier: BTreeSet<(u64, String)> = BTreeSet::new();
-        for id in start {
+        for id in &seed {
             if seen.contains(id) {
                 continue;
             }
@@ -502,10 +518,10 @@ impl RoomServer {
         let mut out = Vec::new();
         while out.len() < limit {
             // Pop the highest-depth entry.
-            let Some((_depth, id)) = frontier.iter().next_back().cloned() else {
+            let Some((depth, id)) = frontier.iter().next_back().cloned() else {
                 break;
             };
-            frontier.remove(&(_depth, id.clone()));
+            frontier.remove(&(depth, id.clone()));
             if !seen.insert(id.clone()) {
                 continue;
             }

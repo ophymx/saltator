@@ -753,8 +753,9 @@ async fn backfill_and_get_missing_events_walk_the_dag() {
     // and the set is the last three.
     assert!(bf_ids.contains(&ids[4]) && bf_ids.contains(&ids[3]) && bf_ids.contains(&ids[2]));
 
-    // get_missing_events between m1 (earliest) and m4 (latest): returns
-    // m4, m3, m2 and stops before m1.
+    // get_missing_events(earliest=m1, latest=m4): the *ancestors* of m4
+    // (m4 excluded) down to but not including m1 — so m3 then m2, oldest
+    // first.
     let gme = env
         .server
         .get_missing_events(&[ids[1].clone()], &[ids[4].clone()], 10, 0)
@@ -767,9 +768,13 @@ async fn backfill_and_get_missing_events_walk_the_dag() {
                 .to_string()
         })
         .collect();
-    assert!(gme_ids.contains(&ids[4]) && gme_ids.contains(&ids[3]) && gme_ids.contains(&ids[2]));
+    assert_eq!(
+        gme_ids,
+        vec![ids[2].clone(), ids[3].clone()],
+        "gap, oldest first"
+    );
+    assert!(!gme_ids.contains(&ids[4]), "latest_events must be excluded");
     assert!(!gme_ids.contains(&ids[1]), "earliest must be excluded");
-    assert!(!gme_ids.contains(&ids[0]), "walk must stop at earliest");
 
     env.server.shutdown().await.unwrap();
 }
