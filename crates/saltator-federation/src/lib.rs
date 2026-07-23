@@ -65,6 +65,10 @@ pub struct FedState {
     /// The user shard, for recording pending remote invites. `None` when
     /// no user server is wired.
     pub users: Option<Arc<saltator_userserver::UserServer>>,
+    /// Outbound client, for fetches made while handling inbound requests
+    /// (e.g. filling DAG gaps via `/get_missing_events`). `None` disables
+    /// gap-filling.
+    pub client: Option<Arc<FederationClient>>,
 }
 
 impl FedState {
@@ -81,6 +85,7 @@ impl FedState {
             key_cache: KeyCache::new(),
             rooms: None,
             users: None,
+            client: None,
         }
     }
 
@@ -93,6 +98,12 @@ impl FedState {
     /// Attach the user shard so inbound invites can be recorded.
     pub fn with_users(mut self, users: Arc<saltator_userserver::UserServer>) -> Self {
         self.users = Some(users);
+        self
+    }
+
+    /// Attach an outbound client so inbound processing can fill DAG gaps.
+    pub fn with_client(mut self, client: Arc<FederationClient>) -> Self {
+        self.client = Some(client);
         self
     }
 }

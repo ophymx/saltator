@@ -67,6 +67,16 @@ impl FederationClient {
         self.send(destination, "PUT", path, Some(body)).await
     }
 
+    /// Signed `POST` with a JSON body.
+    pub async fn post(
+        &self,
+        destination: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, OutboundError> {
+        self.send(destination, "POST", path, Some(body)).await
+    }
+
     async fn send(
         &self,
         destination: &str,

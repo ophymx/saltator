@@ -1052,6 +1052,7 @@ async fn spawn_fed(
         key_cache,
         rooms: None,
         users: None,
+        client: None,
     };
     if let Some(r) = rooms {
         state = state.with_rooms(r);
@@ -1343,6 +1344,7 @@ async fn inbound_federated_invite_appears_in_sync() {
         key_cache: KeyCache::with_base_url(a_key_base),
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
+        client: None,
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -1595,6 +1597,7 @@ async fn outbound_federated_invite_round_trip() {
         key_cache: KeyCache::with_base_url(a_key_base),
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
+        client: None,
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);

@@ -218,6 +218,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         key_cache,
         rooms: Some(rooms.clone()),
         users: Some(users.clone()),
+        client: Some(fed_client.clone()),
     });
     let fed_router = saltator_federation::router(fed_state);
     // Federation is served over HTTPS when a cert is configured; otherwise

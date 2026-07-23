@@ -452,6 +452,18 @@ impl RoomServer {
         self.process(raw, version, &room_id, false).await
     }
 
+    /// The room's current forward extremities (the DAG leaves). Empty if
+    /// the room is unknown. Used as `earliest_events` when requesting a
+    /// gap fill, so the peer walks back only to what we already have.
+    pub fn room_extremities(&self, room_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .store()
+            .meta(room_id)
+            .map_err(storage_err)?
+            .map(|m| m.extremities)
+            .unwrap_or_default())
+    }
+
     /// Walk the room DAG backward from `start` event IDs along
     /// `prev_events`, returning up to `limit` events (the `/backfill`
     /// response). The `start` events are included; highest-depth (most
