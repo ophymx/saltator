@@ -203,6 +203,10 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         },
     )
     .with_federation(fed_client.clone(), signer.clone());
+    // Typing/presence maps are shared with the federation surface (inbound
+    // EDUs update them).
+    let cs_typing = cs_state.typing_map();
+    let cs_presence = cs_state.presence_map();
     let cs_router = saltator_cs_api::router(cs_state);
     let cs_listener = tokio::net::TcpListener::bind(cfg.listeners.client).await?;
     tracing::info!(listen = %cfg.listeners.client, "client-server API listening");
@@ -211,6 +215,10 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         Some(ca) => saltator_federation::KeyCache::with_ca(ca),
         None => saltator_federation::KeyCache::new(),
     };
+    let edu_sink = Arc::new(saltator_cs_api::EphemeralEduSink::new(
+        cs_typing.clone(),
+        cs_presence.clone(),
+    ));
     let fed_state = Arc::new(saltator_federation::FedState {
         server_name: server_name.clone(),
         signer: signer.clone(),
@@ -219,6 +227,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         rooms: Some(rooms.clone()),
         users: Some(users.clone()),
         client: Some(fed_client.clone()),
+        edu_sink: Some(edu_sink),
     });
     let fed_router = saltator_federation::router(fed_state);
     // Federation is served over HTTPS when a cert is configured; otherwise

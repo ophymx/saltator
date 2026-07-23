@@ -111,6 +111,7 @@ async fn remote_join_handshake_returns_room_state() {
         rooms: Some(rooms.clone()),
         users: None,
         client: None,
+        edu_sink: None,
     });
     let a_base = spawn(router(a_state)).await;
 
@@ -249,6 +250,7 @@ async fn join_client_drives_the_full_handshake() {
         rooms: Some(rooms.clone()),
         users: None,
         client: None,
+        edu_sink: None,
     });
     let a_base = spawn(router(a_state)).await;
 
@@ -379,6 +381,7 @@ async fn leave_client_rejects_over_federation() {
         rooms: Some(rooms.clone()),
         users: None,
         client: None,
+        edu_sink: None,
     });
     let a_base = spawn(router(a_state)).await;
 

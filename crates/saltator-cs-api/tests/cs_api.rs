@@ -1053,6 +1053,7 @@ async fn spawn_fed(
         rooms: None,
         users: None,
         client: None,
+        edu_sink: None,
     };
     if let Some(r) = rooms {
         state = state.with_rooms(r);
@@ -1345,6 +1346,7 @@ async fn inbound_federated_invite_appears_in_sync() {
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
         client: None,
+        edu_sink: None,
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -1598,6 +1600,7 @@ async fn outbound_federated_invite_round_trip() {
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
         client: None,
+        edu_sink: None,
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -1712,6 +1715,195 @@ async fn outbound_federated_invite_round_trip() {
     b_proj.abort();
     a_rooms.shutdown().await.unwrap();
     a_users.shutdown().await.unwrap();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}
+
+// --- Inbound EDUs (typing/presence over federation) ----------------------
+
+#[tokio::test]
+async fn inbound_typing_and_presence_edus_reach_sync() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Node A: signer + key server (the sending server).
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let (a_signer, _) = saltator_roomserver::ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let a_key_base = spawn_fed("a.test", a_signer.clone(), None, None).await;
+
+    // Node B: full CS stack.
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    let b_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let media = MediaStore::open(b_dir.join("media")).unwrap();
+    let cs_state = CsState::new(
+        b_users.clone(),
+        b_rooms.clone(),
+        media,
+        CsConfig {
+            server_name: b_name.clone(),
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    );
+    let cs_router = saltator_cs_api::router(cs_state.clone());
+
+    // B's federation endpoint with an EDU sink into the shared maps.
+    let sink = Arc::new(saltator_cs_api::EphemeralEduSink::new(
+        cs_state.typing_map(),
+        cs_state.presence_map(),
+    ));
+    let b_fed = Arc::new(FedState {
+        server_name: b_name.clone(),
+        signer: b_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(a_key_base),
+        rooms: Some(b_rooms.clone()),
+        users: Some(b_users.clone()),
+        client: None,
+        edu_sink: Some(sink),
+    });
+    let b_fed_base = {
+        let app = saltator_federation::router(b_fed);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+
+    // Register bob on B and create a room he's in (so typing has a room).
+    let http = |method: &'static str, path: String, token: Option<String>, body: Option<Value>| {
+        let router = cs_router.clone();
+        async move {
+            let mut b = axum::http::Request::builder().method(method).uri(path);
+            if let Some(t) = token {
+                b = b.header("Authorization", format!("Bearer {t}"));
+            }
+            let body = match body {
+                Some(v) => {
+                    b = b.header("Content-Type", "application/json");
+                    axum::body::Body::from(serde_json::to_vec(&v).unwrap())
+                }
+                None => axum::body::Body::empty(),
+            };
+            let resp = tower::ServiceExt::oneshot(router, b.body(body).unwrap())
+                .await
+                .unwrap();
+            let st = resp.status();
+            let by = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                st,
+                if by.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&by).unwrap_or(Value::Null)
+                },
+            )
+        }
+    };
+    let (_s, ch) = http(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({"username":"bob","password":"pw-12345678"})),
+    )
+    .await;
+    let session = ch["session"].as_str().unwrap().to_owned();
+    let (_s, reg) = http("POST","/_matrix/client/v3/register".into(),None,Some(json!({"username":"bob","password":"pw-12345678","auth":{"type":"m.login.dummy","session":session}}))).await;
+    let bob = reg["access_token"].as_str().unwrap().to_owned();
+    let (_s, room) = http(
+        "POST",
+        "/_matrix/client/v3/createRoom".into(),
+        Some(bob.clone()),
+        Some(json!({"preset":"public_chat"})),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // A sends a transaction with typing + presence EDUs for @alice:a.test.
+    let txn = json!({
+        "origin": "a.test", "origin_server_ts": 1000, "pdus": [],
+        "edus": [
+            {"edu_type":"m.typing","content":{"room_id":room_id,"user_id":"@alice:a.test","typing":true}},
+            {"edu_type":"m.presence","content":{"push":[{"user_id":"@alice:a.test","presence":"online","status_msg":"hi"}]}},
+        ],
+    });
+    let client = FederationClient::with_base_url(a_signer.clone(), b_fed_base);
+    client
+        .put("b.test", "/_matrix/federation/v1/send/edutxn", &txn)
+        .await
+        .expect("EDU transaction accepted");
+
+    // bob's /sync shows alice typing in the room, and alice's presence.
+    let (status, sync) = http(
+        "GET",
+        "/_matrix/client/v3/sync".into(),
+        Some(bob.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let typing = &sync["rooms"]["join"][&room_id]["ephemeral"]["events"];
+    let has_typing = typing
+        .as_array()
+        .map(|a| {
+            a.iter().any(|e| {
+                e["type"] == "m.typing"
+                    && e["content"]["user_ids"]
+                        .as_array()
+                        .map(|u| u.iter().any(|x| x == "@alice:a.test"))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(has_typing, "alice should be typing in bob's sync: {typing}");
+    // Presence for a non-room-mate isn't shown in /sync (visibility filter),
+    // but the inbound EDU updated the map — check it directly.
+    let (status, ps) = http(
+        "GET",
+        "/_matrix/client/v3/presence/@alice:a.test/status".into(),
+        Some(bob),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ps["presence"], "online", "alice presence from EDU: {ps}");
+    assert_eq!(ps["status_msg"], "hi");
+
+    projection.abort();
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
 }

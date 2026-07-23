@@ -42,6 +42,17 @@ use saltator_roomserver::{RoomServer, ServerSigner};
 /// per request, so the horizon never goes stale.
 const KEY_VALIDITY_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Sink for ephemeral data carried by inbound EDUs (typing, presence).
+/// Implemented by the CS layer over its typing/presence maps; the
+/// federation crate can't reach those directly (it must not depend on
+/// cs-api).
+pub trait EduSink: Send + Sync {
+    /// A remote user started or stopped typing in a room.
+    fn typing(&self, room_id: &str, user_id: &str, typing: bool);
+    /// A remote user's presence changed.
+    fn presence(&self, user_id: &str, presence: &str, status_msg: Option<String>);
+}
+
 /// A rotated-out signing key, served in `old_verify_keys`.
 #[derive(Debug, Clone)]
 pub struct OldVerifyKey {
@@ -69,6 +80,8 @@ pub struct FedState {
     /// (e.g. filling DAG gaps via `/get_missing_events`). `None` disables
     /// gap-filling.
     pub client: Option<Arc<FederationClient>>,
+    /// Where inbound EDUs (typing/presence) are applied. `None` drops them.
+    pub edu_sink: Option<Arc<dyn EduSink>>,
 }
 
 impl FedState {
@@ -86,7 +99,14 @@ impl FedState {
             rooms: None,
             users: None,
             client: None,
+            edu_sink: None,
         }
+    }
+
+    /// Attach the EDU sink (typing/presence) for inbound transactions.
+    pub fn with_edu_sink(mut self, sink: Arc<dyn EduSink>) -> Self {
+        self.edu_sink = Some(sink);
+        self
     }
 
     /// Attach the room server so inbound transactions can be applied.

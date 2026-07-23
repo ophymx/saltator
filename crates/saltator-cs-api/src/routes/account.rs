@@ -404,6 +404,21 @@ pub async fn set_presence(
         req.presence.as_str(),
         req.status_msg.clone(),
     );
+    // Forward to remote servers sharing a room with the user.
+    let dests = crate::routes::edu::presence_destinations(&state, auth.user_id.as_str());
+    let edu = serde_json::json!({
+        "edu_type": "m.presence",
+        "content": {
+            "push": [{
+                "user_id": auth.user_id.as_str(),
+                "presence": req.presence.as_str(),
+                "status_msg": req.status_msg,
+                "last_active_ago": 0,
+                "currently_active": req.presence.as_str() == "online",
+            }],
+        },
+    });
+    crate::routes::edu::send_edu(&state, dests, edu);
     Ok(Ra(set_presence::v3::Response::new()))
 }
 

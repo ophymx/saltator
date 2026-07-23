@@ -2,8 +2,9 @@
 //! "Transactions"). Each embedded PDU is run through the room pipeline;
 //! per-PDU results are aggregated and always returned with 200. A PDU that
 //! references events we don't have triggers a `/get_missing_events` fetch
-//! to fill the gap, then a retry. EDUs (typing/receipts/presence) are
-//! accepted and ignored until their handlers land.
+//! to fill the gap, then a retry. `m.typing` / `m.presence` EDUs are
+//! applied to the shared ephemeral maps; other EDU types (to-device,
+//! device-list) are dropped until M5.
 
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use crate::FedState;
 
 /// Spec transaction limits.
 const MAX_PDUS: usize = 50;
+const MAX_EDUS: usize = 100;
 /// Events to fetch per gap-fill request.
 const GAP_FILL_LIMIT: usize = 50;
 
@@ -46,7 +48,74 @@ pub async fn send_transaction(
         }
     }
 
+    // Ephemeral EDUs (typing/presence): applied best-effort, no per-EDU
+    // result. Device-list and to-device EDUs are ignored until M5.
+    if let Some(sink) = &state.edu_sink {
+        if let Some(edus) = body.get("edus").and_then(|e| e.as_array()) {
+            for edu in edus.iter().take(MAX_EDUS) {
+                apply_edu(sink.as_ref(), &auth.origin, edu);
+            }
+        }
+    }
+
     Ok(axum::Json(serde_json::json!({ "pdus": results })))
+}
+
+/// Apply one EDU to the sink. Only `m.typing` and `m.presence` are handled;
+/// others are dropped.
+fn apply_edu(sink: &dyn crate::EduSink, origin: &str, edu: &serde_json::Value) {
+    let content = edu.get("content");
+    match edu.get("edu_type").and_then(|t| t.as_str()) {
+        Some("m.typing") => {
+            let c = content;
+            let (Some(room_id), Some(user_id)) = (
+                c.and_then(|c| c.get("room_id")).and_then(|v| v.as_str()),
+                c.and_then(|c| c.get("user_id")).and_then(|v| v.as_str()),
+            ) else {
+                return;
+            };
+            // Only accept typing for users on the sending server.
+            if ruma::UserId::parse(user_id)
+                .map(|u| u.server_name().as_str() == origin)
+                .unwrap_or(false)
+            {
+                let typing = c
+                    .and_then(|c| c.get("typing"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                sink.typing(room_id, user_id, typing);
+            }
+        }
+        Some("m.presence") => {
+            let Some(push) = content
+                .and_then(|c| c.get("push"))
+                .and_then(|p| p.as_array())
+            else {
+                return;
+            };
+            for update in push {
+                let Some(user_id) = update.get("user_id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !ruma::UserId::parse(user_id)
+                    .map(|u| u.server_name().as_str() == origin)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let presence = update
+                    .get("presence")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("offline");
+                let status_msg = update
+                    .get("status_msg")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                sink.presence(user_id, presence, status_msg);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Run one PDU through the room pipeline, returning its event ID (when

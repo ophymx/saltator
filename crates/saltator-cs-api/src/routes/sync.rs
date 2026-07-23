@@ -685,7 +685,7 @@ pub async fn send_typing(
         ));
     }
     crate::room_util::require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
-    match req.state {
+    let is_typing = match req.state {
         Typing::Yes(info) => {
             state.typing.set(
                 req.room_id.as_str(),
@@ -693,6 +693,7 @@ pub async fn send_typing(
                 true,
                 info.timeout.min(Duration::from_secs(120)),
             );
+            true
         }
         Typing::No => {
             state.typing.set(
@@ -701,7 +702,19 @@ pub async fn send_typing(
                 false,
                 Duration::ZERO,
             );
+            false
         }
-    }
+    };
+    // Forward to remote servers with a member in the room.
+    let dests = crate::routes::edu::room_destinations(&state, req.room_id.as_str());
+    let edu = serde_json::json!({
+        "edu_type": "m.typing",
+        "content": {
+            "room_id": req.room_id.as_str(),
+            "user_id": auth.user_id.as_str(),
+            "typing": is_typing,
+        },
+    });
+    crate::routes::edu::send_edu(&state, dests, edu);
     Ok(Ra(create_typing_event::v3::Response::new()))
 }

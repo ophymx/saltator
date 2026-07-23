@@ -24,6 +24,7 @@ fn fed_state(name: &str, key_cache: KeyCache) -> Arc<FedState> {
         rooms: None,
         users: None,
         client: None,
+        edu_sink: None,
     })
 }
 

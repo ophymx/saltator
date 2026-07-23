@@ -87,6 +87,7 @@ async fn send_transaction_routes_pdus_and_reports_results() {
         rooms: Some(rooms.clone()),
         users: None,
         client: None,
+        edu_sink: None,
     });
     let base = spawn(router(state)).await;
 
@@ -235,6 +236,7 @@ async fn send_fills_dag_gap_via_get_missing_events() {
         rooms: Some(rooms_a.clone()),
         users: None,
         client: None,
+        edu_sink: None,
     });
     let a_base = spawn(router(a_state)).await;
 
@@ -283,6 +285,7 @@ async fn send_fills_dag_gap_via_get_missing_events() {
             b_signer.clone(),
             a_base.clone(),
         ))),
+        edu_sink: None,
     });
     let b_base = spawn(router(b_state)).await;
 

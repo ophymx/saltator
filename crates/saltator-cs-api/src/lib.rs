@@ -48,8 +48,11 @@ pub struct CsState {
     pub rooms: Arc<RoomServer>,
     pub media: MediaStore,
     pub config: CsConfig,
-    pub typing: TypingMap,
-    pub presence: PresenceMap,
+    /// Ephemeral typing state — shared with the federation surface, which
+    /// updates it from inbound `m.typing` EDUs.
+    pub typing: Arc<TypingMap>,
+    /// Ephemeral presence — shared with the federation surface.
+    pub presence: Arc<PresenceMap>,
     /// Outbound federation, present once the federation surface is wired
     /// (absent in client-only test harnesses). Enables joining remote
     /// rooms.
@@ -65,6 +68,32 @@ pub struct Federation {
     pub signer: Arc<ServerSigner>,
 }
 
+/// Applies inbound EDUs (typing/presence) to the shared ephemeral maps —
+/// the CS side of [`saltator_federation::EduSink`].
+pub struct EphemeralEduSink {
+    typing: Arc<TypingMap>,
+    presence: Arc<PresenceMap>,
+}
+
+impl EphemeralEduSink {
+    pub fn new(typing: Arc<TypingMap>, presence: Arc<PresenceMap>) -> Self {
+        Self { typing, presence }
+    }
+}
+
+impl saltator_federation::EduSink for EphemeralEduSink {
+    fn typing(&self, room_id: &str, user_id: &str, typing: bool) {
+        // Remote typing notifications expire on the same 30s cadence
+        // clients refresh at.
+        self.typing
+            .set(room_id, user_id, typing, std::time::Duration::from_secs(30));
+    }
+
+    fn presence(&self, user_id: &str, presence: &str, status_msg: Option<String>) {
+        self.presence.set(user_id, presence, status_msg);
+    }
+}
+
 impl CsState {
     pub fn new(
         users: Arc<UserServer>,
@@ -77,11 +106,21 @@ impl CsState {
             rooms,
             media,
             config,
-            typing: TypingMap::new(),
-            presence: PresenceMap::new(),
+            typing: Arc::new(TypingMap::new()),
+            presence: Arc::new(PresenceMap::new()),
             federation: None,
             txns: txn::TxnCache::new(),
         })
+    }
+
+    /// The shared typing map (to pass to the federation surface).
+    pub fn typing_map(&self) -> Arc<TypingMap> {
+        self.typing.clone()
+    }
+
+    /// The shared presence map (to pass to the federation surface).
+    pub fn presence_map(&self) -> Arc<PresenceMap> {
+        self.presence.clone()
     }
 
     /// Attach outbound federation so `/join` can reach remote rooms.
