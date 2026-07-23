@@ -2,6 +2,7 @@
 //! queues (spec.md §5.4). M3 work in progress: server keys + X-Matrix
 //! request authentication.
 
+mod backfill;
 mod http_client;
 mod inbound;
 mod join_client;
@@ -29,7 +30,7 @@ pub use xmatrix::{
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use ruma::{CanonicalJsonObject, CanonicalJsonValue, OwnedServerName};
 
 use saltator_roomserver::{RoomServer, ServerSigner};
@@ -112,6 +113,14 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route(
             "/_matrix/federation/v2/invite/{room_id}/{event_id}",
             put(joins::invite),
+        )
+        .route(
+            "/_matrix/federation/v1/backfill/{room_id}",
+            get(backfill::backfill),
+        )
+        .route(
+            "/_matrix/federation/v1/get_missing_events/{room_id}",
+            post(backfill::get_missing_events),
         )
         .route(
             "/_matrix/federation/v1/make_leave/{room_id}/{user_id}",

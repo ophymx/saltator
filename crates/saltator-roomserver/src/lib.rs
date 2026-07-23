@@ -129,7 +129,16 @@ pub struct SendJoinResult {
 /// Event IDs referenced by an event's `auth_events` (v3+ list-of-strings
 /// form; v1 tuple form is not produced by this server).
 fn auth_event_ids(obj: &CanonicalJsonObject) -> Vec<String> {
-    match obj.get("auth_events") {
+    id_list(obj, "auth_events")
+}
+
+/// Event IDs in an event's `prev_events` (v3+ list-of-strings form).
+fn prev_event_ids(obj: &CanonicalJsonObject) -> Vec<String> {
+    id_list(obj, "prev_events")
+}
+
+fn id_list(obj: &CanonicalJsonObject, key: &str) -> Vec<String> {
+    match obj.get(key) {
         Some(CanonicalJsonValue::Array(a)) => a
             .iter()
             .filter_map(|v| match v {
@@ -441,6 +450,85 @@ impl RoomServer {
         let (version, room_id, _is_create) = self.classify(&raw)?;
         let _guard = self.lock_room(room_id.as_str()).await;
         self.process(raw, version, &room_id, false).await
+    }
+
+    /// Walk the room DAG backward from `start` event IDs along
+    /// `prev_events`, returning up to `limit` events (the `/backfill`
+    /// response). Highest-depth (most recent) first. Unknown start IDs are
+    /// skipped; rejected events are not returned.
+    pub fn backfill(&self, start: &[String], limit: usize) -> Result<Vec<CanonicalJsonObject>> {
+        self.walk_back(start, &BTreeSet::new(), limit, 0)
+    }
+
+    /// `POST /get_missing_events`: walk backward from `latest` along
+    /// `prev_events`, stopping at (and excluding) `earliest`, returning up
+    /// to `limit` events at depth ≥ `min_depth`.
+    pub fn get_missing_events(
+        &self,
+        earliest: &[String],
+        latest: &[String],
+        limit: usize,
+        min_depth: u64,
+    ) -> Result<Vec<CanonicalJsonObject>> {
+        let stop: BTreeSet<String> = earliest.iter().cloned().collect();
+        self.walk_back(latest, &stop, limit, min_depth)
+    }
+
+    /// Shared backward DAG walk: BFS over `prev_events` from `start`,
+    /// skipping `stop` IDs, collecting non-rejected events at depth ≥
+    /// `min_depth`, newest (highest depth) first, capped at `limit`.
+    fn walk_back(
+        &self,
+        start: &[String],
+        stop: &BTreeSet<String>,
+        limit: usize,
+        min_depth: u64,
+    ) -> Result<Vec<CanonicalJsonObject>> {
+        let store = self.store();
+        let mut seen: BTreeSet<String> = stop.clone();
+        // Frontier ordered by depth (max-heap via Reverse-less BTree of
+        // (depth, id)); process highest depth first.
+        let mut frontier: BTreeSet<(u64, String)> = BTreeSet::new();
+        for id in start {
+            if seen.contains(id) {
+                continue;
+            }
+            if let Some(ev) = store.event(id).map_err(storage_err)? {
+                if ev.rejected.is_none() {
+                    frontier.insert((ev.depth, id.clone()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        while out.len() < limit {
+            // Pop the highest-depth entry.
+            let Some((_depth, id)) = frontier.iter().next_back().cloned() else {
+                break;
+            };
+            frontier.remove(&(_depth, id.clone()));
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(stored) = store.event(&id).map_err(storage_err)? else {
+                continue;
+            };
+            if stored.rejected.is_some() || stored.depth < min_depth {
+                continue;
+            }
+            let raw: CanonicalJsonObject =
+                serde_json::from_slice(&stored.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
+            for prev in prev_event_ids(&raw) {
+                if !seen.contains(&prev) {
+                    if let Some(pv) = store.event(&prev).map_err(storage_err)? {
+                        if pv.rejected.is_none() {
+                            frontier.insert((pv.depth, prev));
+                        }
+                    }
+                }
+            }
+            out.push(raw);
+        }
+        Ok(out)
     }
 
     /// Apply a remote server's signed join event (`PUT /send_join`) and

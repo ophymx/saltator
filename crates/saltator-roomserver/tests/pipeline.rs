@@ -711,3 +711,65 @@ async fn remote_servers_in_room_lists_only_joined_remotes() {
 
     env.server.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn backfill_and_get_missing_events_walk_the_dag() {
+    let env = start_env().await;
+    let room_id = bootstrap_room(&env, RoomVersion::V11).await;
+    let alice = user("alice");
+
+    // A linear chain of five messages.
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let out = env
+            .server
+            .send_message(
+                &room_id,
+                &alice,
+                "m.room.message",
+                json!({"body": format!("m{i}")}),
+            )
+            .await
+            .unwrap();
+        match out {
+            Outcome::Accepted { event_id, .. } => ids.push(event_id.to_string()),
+            other => panic!("send {i}: {other:?}"),
+        }
+    }
+
+    // Backfill from the last message, limit 3: newest-first, includes the
+    // starting event.
+    let bf = env.server.backfill(&[ids[4].clone()], 3).unwrap();
+    assert_eq!(bf.len(), 3, "backfill should return the limit");
+    let bf_ids: Vec<String> = bf
+        .iter()
+        .map(|e| {
+            saltator_core::event::event_id(e, RoomVersion::V11)
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    // Newest three (m4, m3, m2) in some order — assert the newest is present
+    // and the set is the last three.
+    assert!(bf_ids.contains(&ids[4]) && bf_ids.contains(&ids[3]) && bf_ids.contains(&ids[2]));
+
+    // get_missing_events between m1 (earliest) and m4 (latest): returns
+    // m4, m3, m2 and stops before m1.
+    let gme = env
+        .server
+        .get_missing_events(&[ids[1].clone()], &[ids[4].clone()], 10, 0)
+        .unwrap();
+    let gme_ids: Vec<String> = gme
+        .iter()
+        .map(|e| {
+            saltator_core::event::event_id(e, RoomVersion::V11)
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert!(gme_ids.contains(&ids[4]) && gme_ids.contains(&ids[3]) && gme_ids.contains(&ids[2]));
+    assert!(!gme_ids.contains(&ids[1]), "earliest must be excluded");
+    assert!(!gme_ids.contains(&ids[0]), "walk must stop at earliest");
+
+    env.server.shutdown().await.unwrap();
+}
