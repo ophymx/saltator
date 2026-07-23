@@ -85,6 +85,7 @@ async fn send_transaction_routes_pdus_and_reports_results() {
         old_keys: Vec::new(),
         key_cache: KeyCache::with_base_url(key_base),
         rooms: Some(rooms.clone()),
+        users: None,
     });
     let base = spawn(router(state)).await;
 

@@ -115,3 +115,162 @@ fn to_array(events: Vec<CanonicalJsonObject>) -> serde_json::Value {
             .collect(),
     )
 }
+
+/// `PUT /_matrix/federation/v2/invite/{roomId}/{eventId}` (spec "Inviting
+/// to a room"): a remote server asks us to co-sign an `m.room.member`
+/// invite for one of our users. We validate it, add our signature, record
+/// it as a pending invite so the user sees it in `/sync`, and return the
+/// doubly-signed event.
+pub async fn invite(
+    State(state): State<Arc<FedState>>,
+    Path((_room_id, _event_id)): Path<(String, String)>,
+    auth: Authenticated,
+) -> FedResult {
+    let body: serde_json::Value = auth.json().map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "M_NOT_JSON",
+            "invite body is not valid JSON",
+        )
+    })?;
+    let room_version = body
+        .get("room_version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "M_INVALID_PARAM",
+                "missing room_version",
+            )
+        })?;
+    let version = saltator_core::RoomVersion::parse(room_version).map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "M_INCOMPATIBLE_ROOM_VERSION",
+            "bad room_version",
+        )
+    })?;
+    let event: CanonicalJsonObject =
+        match body.get("event").cloned().map(CanonicalJsonValue::try_from) {
+            Some(Ok(CanonicalJsonValue::Object(o))) => o,
+            _ => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "M_INVALID_PARAM",
+                    "missing event",
+                ))
+            }
+        };
+
+    // Structural validation (spec: sign only genuine invites for our users).
+    let invalid = |m: &str| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", m);
+    if event.get("type").and_then(|v| v.as_str()) != Some("m.room.member") {
+        return Err(invalid("event type is not m.room.member"));
+    }
+    let membership = event
+        .get("content")
+        .and_then(|c| c.as_object())
+        .and_then(|c| c.get("membership"))
+        .and_then(|m| m.as_str());
+    if membership != Some("invite") {
+        return Err(invalid("membership is not invite"));
+    }
+    let sender = event
+        .get("sender")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let sender_ok = ruma::UserId::parse(&sender)
+        .map(|u| u.server_name().as_str() == auth.origin)
+        .unwrap_or(false);
+    if !sender_ok {
+        return Err(invalid("sender is not on the origin server"));
+    }
+    let state_key = event
+        .get("state_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let invitee = ruma::OwnedUserId::try_from(state_key.clone())
+        .map_err(|_| invalid("state_key is not a user id"))?;
+    if invitee.server_name() != state.server_name {
+        return Err(invalid("invited user is not on this server"));
+    }
+
+    // Verify the origin's signature on the event.
+    let now = crate::now_ms();
+    let origin_keys = state
+        .key_cache
+        .keys_for(&auth.origin, now)
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::FORBIDDEN,
+                "M_FORBIDDEN",
+                &format!("origin keys: {e}"),
+            )
+        })?;
+    if ruma::signatures::verify_event(&origin_keys, &event, &version.rules()).is_err() {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_INVALID_PARAM",
+            "invite event signature verification failed",
+        ));
+    }
+
+    // Add our signature.
+    let mut signed = event;
+    if let Err(e) = state.signer.hash_and_sign_event(&mut signed, version) {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        ));
+    }
+
+    // Record the pending invite (with its stripped state) so the invited
+    // user sees it in /sync. The invite member event itself is included.
+    if let Some(users) = &state.users {
+        let mut stripped: Vec<Vec<u8>> = Vec::new();
+        if let Some(serde_json::Value::Array(items)) = body.get("invite_room_state") {
+            for item in items {
+                if let Ok(bytes) = serde_json::to_vec(item) {
+                    stripped.push(bytes);
+                }
+            }
+        }
+        // Include the (stripped) invite membership event.
+        let member_stripped = serde_json::json!({
+            "type": "m.room.member",
+            "state_key": state_key.as_str(),
+            "sender": sender.as_str(),
+            "content": signed.get("content").map(|c| serde_json::Value::from(c.clone())),
+        });
+        if let Ok(bytes) = serde_json::to_vec(&member_stripped) {
+            stripped.push(bytes);
+        }
+        let event_id = saltator_core::event::event_id(&signed, version)
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        if let Err(e) = users
+            .record_remote_invite(
+                invitee.as_str(),
+                _room_id.as_str(),
+                &sender,
+                &event_id,
+                stripped,
+            )
+            .await
+        {
+            return Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            ));
+        }
+    }
+
+    Ok(axum::Json(serde_json::json!({
+        "event": CanonicalJsonValue::Object(signed),
+    })))
+}

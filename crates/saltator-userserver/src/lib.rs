@@ -412,6 +412,26 @@ impl UserServer {
         .await
     }
 
+    /// Record a pending invite to a remote room (received over federation)
+    /// so it surfaces in the invited user's `/sync`.
+    pub async fn record_remote_invite(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        sender: &str,
+        event_id: &str,
+        stripped_state: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        self.expect_ok(&UserCommand::RecordRemoteInvite {
+            user_id: user_id.to_owned(),
+            room_id: room_id.to_owned(),
+            sender: sender.to_owned(),
+            event_id: event_id.to_owned(),
+            stripped_state,
+        })
+        .await
+    }
+
     // -- internals ---------------------------------------------------------
 
     /// Canonicalize a localpart or full user ID for this server. Capitals

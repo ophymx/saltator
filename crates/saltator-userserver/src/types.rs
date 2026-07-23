@@ -35,6 +35,10 @@ pub const T_MEDIA: u8 = APP_TABLE_MIN + 9;
 /// `room_id → [1]` — rooms published to the public directory. Presence in
 /// the table is the fact; the value is a placeholder.
 pub const T_DIRECTORY: u8 = APP_TABLE_MIN + 10;
+/// `user_id ++ 0x00 ++ room_id → Vec<Vec<u8>>` — stripped-state events for
+/// a pending invite to a room we don't host (received over federation).
+/// `/sync` renders these as the invite's `invite_state`.
+pub const T_INVITE_STATE: u8 = APP_TABLE_MIN + 11;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -235,6 +239,17 @@ pub enum UserCommand {
     SetRoomVisibility {
         room_id: String,
         public: bool,
+    },
+    /// Record a pending invite to a remote room (received over
+    /// federation). Writes an `invite` membership plus its stripped state
+    /// so `/sync` surfaces it, and wakes the user's sync.
+    RecordRemoteInvite {
+        user_id: String,
+        room_id: String,
+        sender: String,
+        event_id: String,
+        /// Stripped-state event JSON, one entry per event.
+        stripped_state: Vec<Vec<u8>>,
     },
 }
 

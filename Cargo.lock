@@ -2863,6 +2863,7 @@ dependencies = [
  "saltator-roomserver",
  "saltator-shard",
  "saltator-store",
+ "saltator-userserver",
  "serde",
  "serde_json",
  "tempfile",

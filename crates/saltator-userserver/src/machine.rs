@@ -8,7 +8,7 @@ use crate::types::{
     account_data_key, user_key, Account, AccountDataEntry, AliasEntry, Device, MediaMeta,
     MembershipEntry, Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand,
     UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_DIRECTORY, T_FILTER,
-    T_MEDIA, T_MEMBERSHIP, T_PROFILE, T_TOKEN,
+    T_INVITE_STATE, T_MEDIA, T_MEMBERSHIP, T_PROFILE, T_TOKEN,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -332,6 +332,38 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             ctx.put(T_MEDIA, media_id.as_bytes(), enc("media encode", meta)?);
             Ok(UserResponse::Ok)
         }
+        UserCommand::RecordRemoteInvite {
+            user_id,
+            room_id,
+            sender,
+            event_id,
+            stripped_state,
+        } => {
+            let seq = emit_user_change(ctx, user_id)?;
+            let mkey = user_key(user_id, room_id);
+            ctx.put(
+                T_MEMBERSHIP,
+                &mkey,
+                enc(
+                    "membership encode",
+                    &MembershipEntry {
+                        membership: "invite".to_owned(),
+                        event_id: event_id.clone(),
+                        sender: sender.clone(),
+                        // No room-shard seq for a room we don't host; the
+                        // user-shard seq drives the sync window.
+                        room_seq: seq,
+                        seq,
+                    },
+                )?,
+            );
+            ctx.put(
+                T_INVITE_STATE,
+                &mkey,
+                enc("invite state encode", stripped_state)?,
+            );
+            Ok(UserResponse::Ok)
+        }
     }
 }
 
@@ -468,6 +500,14 @@ impl UserStore {
             out.push((room_id, dec("membership decode", &v)?));
         }
         Ok(out)
+    }
+
+    /// Stripped-state events for a pending federated invite, if any.
+    pub fn invite_state(&self, user_id: &str, room_id: &str) -> StoreResult<Option<Vec<Vec<u8>>>> {
+        match self.read.get(T_INVITE_STATE, &user_key(user_id, room_id))? {
+            Some(b) => Ok(Some(dec("invite state decode", &b)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn cursor(&self, source: &str) -> StoreResult<u64> {

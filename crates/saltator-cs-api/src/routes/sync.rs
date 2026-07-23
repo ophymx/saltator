@@ -472,6 +472,22 @@ fn build_invited_room(
     let store = rooms.store();
     let mut events = Vec::new();
     let Some(meta) = store.meta(room_id).map_err(internal)? else {
+        // A room we don't host: a pending invite received over federation.
+        // Its stripped state was stored on the user shard.
+        if let Some(stripped) = state
+            .users
+            .store()
+            .invite_state(auth.user_id.as_str(), room_id)
+            .map_err(internal)?
+        {
+            let mut invited = v3::InvitedRoom::new();
+            invited.invite_state.events = stripped
+                .iter()
+                .filter_map(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                .filter_map(|v| to_raw(&v).ok())
+                .collect();
+            return Ok(invited);
+        }
         return Ok(v3::InvitedRoom::new());
     };
     let current = store

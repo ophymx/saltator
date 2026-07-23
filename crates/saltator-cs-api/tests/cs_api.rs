@@ -1051,6 +1051,7 @@ async fn spawn_fed(
         old_keys: Vec::<OldVerifyKey>::new(),
         key_cache,
         rooms: None,
+        users: None,
     };
     if let Some(r) = rooms {
         state = state.with_rooms(r);
@@ -1271,4 +1272,193 @@ async fn client_joins_a_remote_room_via_federation() {
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
     a_rooms.shutdown().await.unwrap();
+}
+
+// --- Inbound federated invite --------------------------------------------
+
+#[tokio::test]
+async fn inbound_federated_invite_appears_in_sync() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Node A: just a signing identity + key server (the inviter's server).
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let (a_signer, _) = saltator_roomserver::ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let a_key_base = spawn_fed("a.test", a_signer.clone(), None, None).await;
+
+    // Node B: full CS stack + user/room shards, plus a federation surface
+    // that authenticates A and can record invites into B's user shard.
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    let b_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+
+    // B's CS router (for registration + /sync).
+    let media = MediaStore::open(b_dir.join("media")).unwrap();
+    let cs_state = CsState::new(
+        b_users.clone(),
+        b_rooms.clone(),
+        media,
+        CsConfig {
+            server_name: b_name.clone(),
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    );
+    let cs_router = saltator_cs_api::router(cs_state);
+
+    // B's federation surface: authenticates A, records invites into b_users.
+    let b_fed = Arc::new(FedState {
+        server_name: b_name.clone(),
+        signer: b_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(a_key_base),
+        rooms: Some(b_rooms.clone()),
+        users: Some(b_users.clone()),
+    });
+    let b_fed_base = {
+        let app = saltator_federation::router(b_fed);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+
+    // Register bob on B.
+    let http = |method: &'static str, path: String, token: Option<String>, body: Option<Value>| {
+        let router = cs_router.clone();
+        async move {
+            let mut b = axum::http::Request::builder().method(method).uri(path);
+            if let Some(t) = token {
+                b = b.header("Authorization", format!("Bearer {t}"));
+            }
+            let body = match body {
+                Some(v) => {
+                    b = b.header("Content-Type", "application/json");
+                    axum::body::Body::from(serde_json::to_vec(&v).unwrap())
+                }
+                None => axum::body::Body::empty(),
+            };
+            let resp = tower::ServiceExt::oneshot(router, b.body(body).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let val: Value = if bytes.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+            };
+            (status, val)
+        }
+    };
+    let (_s, ch) = http(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({"username":"bob","password":"bob-pw-1234"})),
+    )
+    .await;
+    let session = ch["session"].as_str().unwrap().to_owned();
+    let (_s, reg) = http("POST", "/_matrix/client/v3/register".into(), None, Some(json!({"username":"bob","password":"bob-pw-1234","auth":{"type":"m.login.dummy","session":session}}))).await;
+    let bob = reg["access_token"].as_str().unwrap().to_owned();
+
+    // A builds and signs an m.room.member invite for @bob:b.test.
+    let room_id = "!invroom:a.test";
+    let mut invite = match ruma::CanonicalJsonValue::try_from(json!({
+        "type": "m.room.member",
+        "room_id": room_id,
+        "sender": "@alice:a.test",
+        "state_key": "@bob:b.test",
+        "content": {"membership": "invite"},
+        "origin_server_ts": 1000,
+        "depth": 5,
+        "prev_events": [],
+        "auth_events": [],
+    }))
+    .unwrap()
+    {
+        ruma::CanonicalJsonValue::Object(o) => o,
+        _ => panic!(),
+    };
+    a_signer
+        .hash_and_sign_event(&mut invite, saltator_core::RoomVersion::V11)
+        .unwrap();
+    let create_stripped = json!({"type":"m.room.create","state_key":"","sender":"@alice:a.test","content":{"room_version":"11"}});
+    let invite_body = json!({
+        "room_version": "11",
+        "event": ruma::CanonicalJsonValue::Object(invite),
+        "invite_room_state": [create_stripped],
+    });
+
+    // A PUTs the invite to B's /invite endpoint (signed request).
+    let client = FederationClient::with_base_url(a_signer.clone(), b_fed_base);
+    let event_id_enc: String = "$placeholder"
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    let path = format!("/_matrix/federation/v2/invite/%21invroom:a.test/{event_id_enc}");
+    let resp = client
+        .put("b.test", &path, &invite_body)
+        .await
+        .expect("invite accepted");
+    let sigs = resp["event"]["signatures"]
+        .as_object()
+        .expect("signed event");
+    assert!(sigs.contains_key("a.test"), "origin signature missing");
+    assert!(sigs.contains_key("b.test"), "our co-signature missing");
+
+    // bob's /sync now shows the invite.
+    let (status, sync) = http("GET", "/_matrix/client/v3/sync".into(), Some(bob), None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let inv = sync["rooms"]["invite"].get(room_id);
+    assert!(inv.is_some(), "invite room missing from sync: {sync}");
+    let has_create = inv.unwrap()["invite_state"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["type"] == "m.room.create");
+    assert!(has_create, "invite_state missing create: {inv:?}");
+
+    projection.abort();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
 }

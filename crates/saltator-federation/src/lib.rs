@@ -59,6 +59,9 @@ pub struct FedState {
     /// The room pipeline inbound PDUs route into. `None` in key-only
     /// deployments and auth-only tests.
     pub rooms: Option<Arc<RoomServer>>,
+    /// The user shard, for recording pending remote invites. `None` when
+    /// no user server is wired.
+    pub users: Option<Arc<saltator_userserver::UserServer>>,
 }
 
 impl FedState {
@@ -74,12 +77,19 @@ impl FedState {
             old_keys,
             key_cache: KeyCache::new(),
             rooms: None,
+            users: None,
         }
     }
 
     /// Attach the room server so inbound transactions can be applied.
     pub fn with_rooms(mut self, rooms: Arc<RoomServer>) -> Self {
         self.rooms = Some(rooms);
+        self
+    }
+
+    /// Attach the user shard so inbound invites can be recorded.
+    pub fn with_users(mut self, users: Arc<saltator_userserver::UserServer>) -> Self {
+        self.users = Some(users);
         self
     }
 }
@@ -96,6 +106,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route(
             "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
             get(joins::make_join),
+        )
+        .route(
+            "/_matrix/federation/v2/invite/{room_id}/{event_id}",
+            put(joins::invite),
         )
         .route(
             "/_matrix/federation/v2/send_join/{room_id}/{event_id}",

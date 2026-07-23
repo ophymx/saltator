@@ -22,6 +22,7 @@ fn fed_state(name: &str, key_cache: KeyCache) -> Arc<FedState> {
         old_keys: Vec::<OldVerifyKey>::new(),
         key_cache,
         rooms: None,
+        users: None,
     })
 }
 

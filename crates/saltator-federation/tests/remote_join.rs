@@ -109,6 +109,7 @@ async fn remote_join_handshake_returns_room_state() {
         old_keys: Vec::new(),
         key_cache: KeyCache::with_base_url(b_key_base),
         rooms: Some(rooms.clone()),
+        users: None,
     });
     let a_base = spawn(router(a_state)).await;
 
@@ -245,6 +246,7 @@ async fn join_client_drives_the_full_handshake() {
         old_keys: Vec::new(),
         key_cache: KeyCache::with_base_url(b_key_base),
         rooms: Some(rooms.clone()),
+        users: None,
     });
     let a_base = spawn(router(a_state)).await;
 
