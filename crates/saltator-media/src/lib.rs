@@ -116,7 +116,23 @@ impl MediaStore {
         let Some(bytes) = self.read(media_id).await? else {
             return Ok(None);
         };
-        let out = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let out = Self::thumbnail_bytes(bytes, width, height, method).await?;
+        write_atomic(&cache, &out).await?;
+        Ok(Some(out))
+    }
+
+    /// Thumbnail image bytes in memory, returning PNG. Used for remote
+    /// media we fetched but don't store. `width`/`height` are clamped as in
+    /// [`Self::thumbnail`].
+    pub async fn thumbnail_bytes(
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+        method: ThumbMethod,
+    ) -> Result<Vec<u8>> {
+        let width = width.clamp(1, 1024);
+        let height = height.clamp(1, 1024);
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
             let img = image::load_from_memory(&bytes).map_err(|_| MediaError::NotAnImage)?;
             let thumb = match method {
                 ThumbMethod::Scale => img.thumbnail(width, height),
@@ -131,9 +147,7 @@ impl MediaStore {
             Ok(out)
         })
         .await
-        .map_err(|e| MediaError::Internal(format!("join: {e}")))??;
-        write_atomic(&cache, &out).await?;
-        Ok(Some(out))
+        .map_err(|e| MediaError::Internal(format!("join: {e}")))?
     }
 
     fn blob_path(&self, media_id: &str) -> Result<PathBuf> {

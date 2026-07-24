@@ -2829,6 +2829,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "http",
+ "image",
  "postcard",
  "rand 0.8.7",
  "ruma",

@@ -162,6 +162,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
             get(media::download),
         )
         .route(
+            "/_matrix/federation/v1/media/thumbnail/{media_id}",
+            get(media::thumbnail),
+        )
+        .route(
             "/_matrix/federation/v1/backfill/{room_id}",
             get(backfill::backfill),
         )

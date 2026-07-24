@@ -4,9 +4,11 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+
+use saltator_media::ThumbMethod;
 
 use crate::inbound::Authenticated;
 use crate::FedState;
@@ -51,6 +53,57 @@ pub async fn download(
         body,
     )
         .into_response()
+}
+
+/// `GET /_matrix/federation/v1/media/thumbnail/{mediaId}?width=&height=&method=`:
+/// return a thumbnail of our local media as `multipart/mixed` PNG.
+pub async fn thumbnail(
+    State(state): State<Arc<FedState>>,
+    Path(media_id): Path<String>,
+    RawQuery(query): RawQuery,
+    _auth: Authenticated,
+) -> Response {
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({ "errcode": "M_NOT_FOUND", "error": "Unknown media" })),
+        )
+            .into_response()
+    };
+    let (Some(users), Some(media)) = (&state.users, &state.media) else {
+        return not_found();
+    };
+    match users.store().media(&media_id) {
+        Ok(Some(m)) if !m.pending => {}
+        _ => return not_found(),
+    }
+    let (mut width, mut height, mut method) = (96u32, 96u32, ThumbMethod::Scale);
+    for (k, v) in parse_query(query.as_deref().unwrap_or_default()) {
+        match k.as_str() {
+            "width" => width = v.parse().unwrap_or(96),
+            "height" => height = v.parse().unwrap_or(96),
+            "method" if v == "crop" => method = ThumbMethod::Crop,
+            _ => {}
+        }
+    }
+    match media.thumbnail(&media_id, width, height, method).await {
+        Ok(Some(png)) => (
+            [(
+                header::CONTENT_TYPE,
+                format!("multipart/mixed; boundary={BOUNDARY}"),
+            )],
+            build_multipart("image/png", &png),
+        )
+            .into_response(),
+        _ => not_found(),
+    }
+}
+
+fn parse_query(q: &str) -> Vec<(String, String)> {
+    q.split('&')
+        .filter_map(|p| p.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
 }
 
 /// Build the `multipart/mixed` federation media body: an empty JSON

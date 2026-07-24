@@ -12,7 +12,7 @@ use ruma::api::client::media::{create_content, create_content_async, create_mxc_
 
 use ruma::http_headers::{ContentDisposition, ContentDispositionType};
 
-use saltator_media::ThumbMethod;
+use saltator_media::{MediaStore, ThumbMethod};
 use saltator_userserver::MediaMeta;
 
 use crate::error::ApiError;
@@ -266,21 +266,28 @@ pub async fn thumbnail(
     _auth: Auth,
     Ar(req): Ar<get_content_thumbnail::v1::Request>,
 ) -> Result<Ra<get_content_thumbnail::v1::Response>> {
-    lookup_meta(&state, &req.server_name, &req.media_id)?;
     let method = match req.method {
         Some(ruma::media::Method::Crop) => ThumbMethod::Crop,
         _ => ThumbMethod::Scale,
     };
-    let bytes = state
-        .media
-        .thumbnail(
-            &req.media_id,
-            u64::from(req.width).min(4096) as u32,
-            u64::from(req.height).min(4096) as u32,
-            method,
-        )
-        .await?
-        .ok_or_else(|| ApiError::not_found("Media content missing"))?;
+    let (width, height) = (
+        u64::from(req.width).min(4096) as u32,
+        u64::from(req.height).min(4096) as u32,
+    );
+    let bytes = if is_remote(&state, &req.server_name) {
+        // Fetch the full remote media and thumbnail it in memory.
+        let (file, _ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
+        MediaStore::thumbnail_bytes(file, width, height, method)
+            .await
+            .map_err(|e| ApiError::not_found(format!("cannot thumbnail remote media: {e}")))?
+    } else {
+        lookup_meta(&state, &req.server_name, &req.media_id)?;
+        state
+            .media
+            .thumbnail(&req.media_id, width, height, method)
+            .await?
+            .ok_or_else(|| ApiError::not_found("Media content missing"))?
+    };
     let resp = get_content_thumbnail::v1::Response::new(
         bytes,
         "image/png".to_owned(),

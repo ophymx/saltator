@@ -33,3 +33,4 @@ saltator-store.workspace = true
 tempfile.workspace = true
 anyhow.workspace = true
 tower = { version = "0.5", features = ["util"] }
+image.workspace = true

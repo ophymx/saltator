@@ -1951,8 +1951,16 @@ async fn client_downloads_remote_media_over_federation() {
     }
     let a_media = MediaStore::open(a_dir.join("media")).unwrap();
 
-    // Store a PNG on A.
-    let png = b"\x89PNG\r\n\x1a\n-fake-png-bytes-\x00\xff";
+    // Store a real 64x64 PNG on A (so it can be thumbnailed).
+    let png = {
+        let img = image::RgbImage::from_pixel(64, 64, image::Rgb([0, 128, 255]));
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    };
+    let png = png.as_slice();
     let media_id = a_media.store(png).await.unwrap();
     a_users
         .put_media(
@@ -2115,12 +2123,30 @@ async fn client_downloads_remote_media_over_federation() {
     let (status, ct, body) = http(
         "GET",
         format!("/_matrix/client/v1/media/download/a.test/{media_id}"),
-        Some(bob),
+        Some(bob.clone()),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "remote media download");
     assert_eq!(body, png, "downloaded bytes match A's media");
     assert_eq!(ct.as_deref(), Some("image/png"), "content-type preserved");
+
+    // A thumbnail of the same remote media: fetched over federation and
+    // scaled locally to a valid 32x32 PNG.
+    let (status, ct, body) = http(
+        "GET",
+        format!(
+            "/_matrix/client/v1/media/thumbnail/a.test/{media_id}?width=32&height=32&method=scale"
+        ),
+        Some(bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remote thumbnail");
+    assert_eq!(ct.as_deref(), Some("image/png"));
+    let thumb = image::load_from_memory(&body).expect("thumbnail is a valid image");
+    assert!(
+        thumb.width() <= 32 && thumb.height() <= 32,
+        "thumbnail scaled down"
+    );
 
     b_projection.abort();
     a_rooms.shutdown().await.unwrap();
