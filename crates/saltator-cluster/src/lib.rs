@@ -7,10 +7,12 @@
 
 pub mod join;
 pub mod network;
+pub mod placement;
 pub mod rpc;
 pub mod types;
 
 pub use join::join_cluster;
+pub use placement::{ClusterConfig, NodeInfo, NodeStatus, Placement, Roster};
 
 pub mod proto {
     #![allow(clippy::all)]
@@ -77,10 +79,28 @@ impl ShardApp for MetaApp {
     }
 }
 
+/// Metadata keys for the cluster control-plane records (spec.md §4.2).
+const K_CONFIG: &str = "cluster/config";
+const K_ROSTER: &str = "cluster/roster";
+const K_PLACEMENT: &str = "cluster/placement";
+
+/// postcard-decode an optional metadata value.
+fn decode_blob<T: serde::de::DeserializeOwned>(bytes: Option<Vec<u8>>) -> Result<Option<T>> {
+    match bytes {
+        Some(b) => Ok(Some(
+            postcard::from_bytes(&b).map_err(|e| ClusterError::Codec(e.to_string()))?,
+        )),
+        None => Ok(None),
+    }
+}
+
 /// Handle to the running metadata group on this node.
 #[derive(Clone)]
 pub struct MetadataHandle {
     inner: ShardHandle,
+    /// Serializes control-plane read-modify-write updates (roster/placement)
+    /// so concurrent joins on the leader can't clobber each other.
+    updates: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl MetadataHandle {
@@ -107,7 +127,10 @@ impl MetadataHandle {
             registry,
         )
         .await?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            updates: Arc::new(tokio::sync::Mutex::new(())),
+        })
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -137,14 +160,98 @@ impl MetadataHandle {
         Some((leader, addr))
     }
 
-    /// Admit `node_id` (reachable at `addr`) to the metadata group: add it as
-    /// a learner to catch it up, then promote it into the voter set. Must be
-    /// called on the leader (spec.md §4.4 "Node join").
+    /// Admit `node_id` (reachable at `addr`) to the cluster: add it as a
+    /// metadata learner and promote it into the voter set, then record it in
+    /// the roster and recompute shard placement. Must be called on the
+    /// leader (spec.md §4.4 "Node join").
     pub async fn admit_node(&self, node_id: NodeId, addr: String) -> Result<()> {
-        self.inner.add_learner(node_id, addr).await?;
+        // Serialize the whole admit so concurrent joins can't interleave the
+        // roster/placement read-modify-write.
+        let _guard = self.updates.lock().await;
+
+        self.inner.add_learner(node_id, addr.clone()).await?;
         let mut voters = self.inner.voter_ids();
         voters.insert(node_id);
         self.inner.set_voters(voters).await?;
+
+        let config = self.cluster_config().await?.unwrap_or_default();
+        let mut roster = self.roster().await?;
+        roster.insert(
+            node_id,
+            NodeInfo {
+                advertise_addr: addr,
+                status: NodeStatus::Active,
+            },
+        );
+        let placement = placement::assign(&config, &placement::active_nodes(&roster));
+        self.set_blob(K_ROSTER, &roster).await?;
+        self.set_blob(K_PLACEMENT, &placement).await?;
+        Ok(())
+    }
+
+    /// Write the control-plane records for a fresh single-node cluster: the
+    /// topology, a roster holding just this node, and its placement. Called
+    /// once at bootstrap on the founding leader.
+    pub async fn bootstrap_cluster(&self, config: ClusterConfig, self_addr: String) -> Result<()> {
+        let _guard = self.updates.lock().await;
+        let mut roster = Roster::new();
+        roster.insert(
+            self.node_id(),
+            NodeInfo {
+                advertise_addr: self_addr,
+                status: NodeStatus::Active,
+            },
+        );
+        let placement = placement::assign(&config, &placement::active_nodes(&roster));
+        self.set_blob(K_CONFIG, &config).await?;
+        self.set_blob(K_ROSTER, &roster).await?;
+        self.set_blob(K_PLACEMENT, &placement).await?;
+        Ok(())
+    }
+
+    /// The cluster topology, if the control plane has been bootstrapped.
+    pub async fn cluster_config(&self) -> Result<Option<ClusterConfig>> {
+        self.get_blob(K_CONFIG).await
+    }
+
+    /// The current node roster (linearizable read; leader only).
+    pub async fn roster(&self) -> Result<Roster> {
+        Ok(self.get_blob(K_ROSTER).await?.unwrap_or_default())
+    }
+
+    /// The current shard placement (linearizable read; leader only).
+    pub async fn placement(&self) -> Result<Placement> {
+        Ok(self.get_blob(K_PLACEMENT).await?.unwrap_or_default())
+    }
+
+    /// The shard placement from this node's applied state — may be stale on
+    /// a follower, but does not require leadership. This is how a joining or
+    /// follower node learns which groups it should host.
+    pub fn placement_local(&self) -> Result<Placement> {
+        Ok(self.get_blob_local(K_PLACEMENT)?.unwrap_or_default())
+    }
+
+    /// The node roster from this node's applied state (see
+    /// [`placement_local`](Self::placement_local)).
+    pub fn roster_local(&self) -> Result<Roster> {
+        Ok(self.get_blob_local(K_ROSTER)?.unwrap_or_default())
+    }
+
+    async fn get_blob<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        decode_blob(self.read(key).await?)
+    }
+
+    fn get_blob_local<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        decode_blob(self.read_local(key)?)
+    }
+
+    async fn set_blob<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let value = postcard::to_stdvec(value).map_err(|e| ClusterError::Codec(e.to_string()))?;
+        self.write(MetaCommand::Set {
+            key: key.to_owned(),
+            value,
+        })
+        .await?;
         Ok(())
     }
 
