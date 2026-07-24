@@ -88,6 +88,7 @@ async fn send_transaction_routes_pdus_and_reports_results() {
         users: None,
         client: None,
         edu_sink: None,
+        media: None,
     });
     let base = spawn(router(state)).await;
 
@@ -237,6 +238,7 @@ async fn send_fills_dag_gap_via_get_missing_events() {
         users: None,
         client: None,
         edu_sink: None,
+        media: None,
     });
     let a_base = spawn(router(a_state)).await;
 
@@ -286,6 +288,7 @@ async fn send_fills_dag_gap_via_get_missing_events() {
             a_base.clone(),
         ))),
         edu_sink: None,
+        media: None,
     });
     let b_base = spawn(router(b_state)).await;
 

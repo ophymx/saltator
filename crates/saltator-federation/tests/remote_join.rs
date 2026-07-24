@@ -112,6 +112,7 @@ async fn remote_join_handshake_returns_room_state() {
         users: None,
         client: None,
         edu_sink: None,
+        media: None,
     });
     let a_base = spawn(router(a_state)).await;
 
@@ -251,6 +252,7 @@ async fn join_client_drives_the_full_handshake() {
         users: None,
         client: None,
         edu_sink: None,
+        media: None,
     });
     let a_base = spawn(router(a_state)).await;
 
@@ -382,6 +384,7 @@ async fn leave_client_rejects_over_federation() {
         users: None,
         client: None,
         edu_sink: None,
+        media: None,
     });
     let a_base = spawn(router(a_state)).await;
 

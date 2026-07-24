@@ -1054,6 +1054,7 @@ async fn spawn_fed(
         users: None,
         client: None,
         edu_sink: None,
+        media: None,
     };
     if let Some(r) = rooms {
         state = state.with_rooms(r);
@@ -1347,6 +1348,7 @@ async fn inbound_federated_invite_appears_in_sync() {
         users: Some(b_users.clone()),
         client: None,
         edu_sink: None,
+        media: None,
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -1601,6 +1603,7 @@ async fn outbound_federated_invite_round_trip() {
         users: Some(b_users.clone()),
         client: None,
         edu_sink: None,
+        media: None,
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -1791,6 +1794,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
         users: Some(b_users.clone()),
         client: None,
         edu_sink: Some(sink),
+        media: None,
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -1904,6 +1908,223 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
     assert_eq!(ps["status_msg"], "hi");
 
     projection.abort();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}
+
+// --- Remote media fetch over federation ----------------------------------
+
+#[tokio::test]
+async fn client_downloads_remote_media_over_federation() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Node A: hosts media + serves it over federation. Needs a user shard
+    // (media metadata) + media store + signer/key server.
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let (a_signer, _) = saltator_roomserver::ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let a_dir = dir.path().join("a");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    let a_engine = Arc::new(RocksEngine::open(&a_dir.join("db")).unwrap());
+    let a_rooms = RoomServer::start(
+        1,
+        a_engine.clone(),
+        a_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let a_users = UserServer::start(
+        1,
+        a_engine,
+        a_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [a_rooms.shard_handle(), a_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let a_media = MediaStore::open(a_dir.join("media")).unwrap();
+
+    // Store a PNG on A.
+    let png = b"\x89PNG\r\n\x1a\n-fake-png-bytes-\x00\xff";
+    let media_id = a_media.store(png).await.unwrap();
+    a_users
+        .put_media(
+            &media_id,
+            saltator_userserver::MediaMeta {
+                owner: "@alice:a.test".to_owned(),
+                content_type: Some("image/png".to_owned()),
+                filename: Some("test.png".to_owned()),
+                size: png.len() as u64,
+                created_ts: 0,
+                pending: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    // A's federation endpoint: key server + media download.
+    let a_fed = Arc::new(FedState {
+        server_name: a_name.clone(),
+        signer: a_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::new(),
+        rooms: Some(a_rooms.clone()),
+        users: Some(a_users.clone()),
+        client: None,
+        edu_sink: None,
+        media: Some(a_media.clone()),
+    });
+
+    // Node B: full CS stack, federation client aimed at A.
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    // B's key server so A can authenticate B's media request.
+    let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
+    // A authenticates B against B's keys.
+    let a_fed = Arc::new(FedState {
+        key_cache: KeyCache::with_base_url(b_key_base),
+        ..Arc::try_unwrap(a_fed).ok().unwrap()
+    });
+    let a_base = {
+        let app = saltator_federation::router(a_fed);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let b_engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_rooms = RoomServer::start(
+        1,
+        b_engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        b_engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let b_projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let b_media = MediaStore::open(b_dir.join("media")).unwrap();
+    let cs_state = CsState::new(
+        b_users.clone(),
+        b_rooms.clone(),
+        b_media,
+        CsConfig {
+            server_name: b_name.clone(),
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(b_signer.clone(), a_base)),
+        b_signer.clone(),
+    );
+    let router = saltator_cs_api::router(cs_state);
+
+    // Register bob on B, then download A's media over federation.
+    let http = |method: &'static str, path: String, token: Option<String>| {
+        let router = router.clone();
+        async move {
+            let mut rb = axum::http::Request::builder().method(method).uri(path);
+            if let Some(t) = token {
+                rb = rb.header("Authorization", format!("Bearer {t}"));
+            }
+            let resp =
+                tower::ServiceExt::oneshot(router, rb.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+            let st = resp.status();
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let by = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec();
+            (st, ct, by)
+        }
+    };
+    let reg_body = |u: &str, s: Option<&str>| {
+        let mut m = serde_json::Map::new();
+        m.insert("username".into(), json!(u));
+        m.insert("password".into(), json!("pw-12345678"));
+        if let Some(s) = s {
+            m.insert("auth".into(), json!({"type":"m.login.dummy","session":s}));
+        }
+        Value::Object(m)
+    };
+    let post = |path: String, body: Value| {
+        let router = router.clone();
+        async move {
+            let rb = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("Content-Type", "application/json");
+            let resp = tower::ServiceExt::oneshot(
+                router,
+                rb.body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let by = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&by).unwrap_or(Value::Null)
+        }
+    };
+    let ch = post("/_matrix/client/v3/register".into(), reg_body("bob", None)).await;
+    let session = ch["session"].as_str().unwrap().to_owned();
+    let reg = post(
+        "/_matrix/client/v3/register".into(),
+        reg_body("bob", Some(&session)),
+    )
+    .await;
+    let bob = reg["access_token"].as_str().unwrap().to_owned();
+
+    let (status, ct, body) = http(
+        "GET",
+        format!("/_matrix/client/v1/media/download/a.test/{media_id}"),
+        Some(bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remote media download");
+    assert_eq!(body, png, "downloaded bytes match A's media");
+    assert_eq!(ct.as_deref(), Some("image/png"), "content-type preserved");
+
+    b_projection.abort();
+    a_rooms.shutdown().await.unwrap();
+    a_users.shutdown().await.unwrap();
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
 }

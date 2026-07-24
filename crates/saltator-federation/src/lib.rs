@@ -8,6 +8,7 @@ mod inbound;
 mod join_client;
 mod joins;
 mod keys;
+mod media;
 mod outbound;
 mod resolver;
 mod sender;
@@ -20,6 +21,7 @@ pub use join_client::{
     join_remote_room, leave_remote_room, resident_of_room, JoinError, JoinResponse,
 };
 pub use keys::{KeyCache, KeyError};
+pub use media::parse_multipart_file;
 pub use outbound::{FederationClient, OutboundError};
 pub use resolver::{ResolvedServer, ServerResolver};
 pub use sender::spawn_sender;
@@ -82,6 +84,9 @@ pub struct FedState {
     pub client: Option<Arc<FederationClient>>,
     /// Where inbound EDUs (typing/presence) are applied. `None` drops them.
     pub edu_sink: Option<Arc<dyn EduSink>>,
+    /// Local blob store, for serving our media to other servers. `None`
+    /// disables the federation media endpoint.
+    pub media: Option<saltator_media::MediaStore>,
 }
 
 impl FedState {
@@ -100,12 +105,19 @@ impl FedState {
             users: None,
             client: None,
             edu_sink: None,
+            media: None,
         }
     }
 
     /// Attach the EDU sink (typing/presence) for inbound transactions.
     pub fn with_edu_sink(mut self, sink: Arc<dyn EduSink>) -> Self {
         self.edu_sink = Some(sink);
+        self
+    }
+
+    /// Attach the media store so we can serve local media to other servers.
+    pub fn with_media(mut self, media: saltator_media::MediaStore) -> Self {
+        self.media = Some(media);
         self
     }
 
@@ -144,6 +156,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route(
             "/_matrix/federation/v2/invite/{room_id}/{event_id}",
             put(joins::invite),
+        )
+        .route(
+            "/_matrix/federation/v1/media/download/{media_id}",
+            get(media::download),
         )
         .route(
             "/_matrix/federation/v1/backfill/{room_id}",

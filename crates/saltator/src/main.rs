@@ -175,6 +175,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let default_room_version = saltator_core::RoomVersion::parse(&cfg.client.default_room_version)
         .map_err(|e| anyhow::anyhow!("client.default_room_version: {e}"))?;
     let media = saltator_media::MediaStore::open(cfg.data_dir.join("media"))?;
+    let fed_media = media.clone();
     // Optional extra CA for outbound federation (test harnesses / private
     // PKI). System roots are always trusted.
     let outbound_ca =
@@ -228,6 +229,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         users: Some(users.clone()),
         client: Some(fed_client.clone()),
         edu_sink: Some(edu_sink),
+        media: Some(fed_media),
     });
     let fed_router = saltator_federation::router(fed_state);
     // Federation is served over HTTPS when a cert is configured; otherwise

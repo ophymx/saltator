@@ -2860,6 +2860,7 @@ dependencies = [
  "ruma",
  "rustls",
  "saltator-core",
+ "saltator-media",
  "saltator-roomserver",
  "saltator-shard",
  "saltator-store",

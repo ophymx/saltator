@@ -9,6 +9,7 @@ rust-version.workspace = true
 saltator-core.workspace = true
 saltator-roomserver.workspace = true
 saltator-userserver.workspace = true
+saltator-media.workspace = true
 
 axum.workspace = true
 ruma.workspace = true

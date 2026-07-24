@@ -77,6 +77,47 @@ impl FederationClient {
         self.send(destination, "POST", path, Some(body)).await
     }
 
+    /// Signed `GET` returning the raw response body and its `Content-Type`
+    /// — for non-JSON federation responses (media downloads, multipart).
+    pub async fn get_raw(
+        &self,
+        destination: &str,
+        path: &str,
+    ) -> Result<(Vec<u8>, Option<String>), OutboundError> {
+        let auth = sign_request(&self.signer, "GET", path, destination, None)
+            .map_err(|e| OutboundError::Sign(e.to_string()))?;
+        let (base, host_header) = match &self.base_url {
+            Some(base) => (base.clone(), None),
+            None => {
+                let r = self.resolver.resolve(destination).await;
+                (r.base_url, Some(r.host_header))
+            }
+        };
+        let url = format!("{base}{path}");
+        let mut req = self
+            .http
+            .get(&url)
+            .header(reqwest::header::AUTHORIZATION, auth);
+        if let Some(host) = host_header {
+            req = req.header(reqwest::header::HOST, host);
+        }
+        let resp = req.send().await.map_err(OutboundError::Http)?;
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bytes = resp.bytes().await.map_err(OutboundError::Http)?.to_vec();
+        if !status.is_success() {
+            return Err(OutboundError::Status(
+                status.as_u16(),
+                serde_json::Value::Null,
+            ));
+        }
+        Ok((bytes, content_type))
+    }
+
     async fn send(
         &self,
         destination: &str,

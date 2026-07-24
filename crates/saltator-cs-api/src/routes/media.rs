@@ -156,7 +156,7 @@ fn lookup_meta(
     media_id: &str,
 ) -> Result<MediaMeta> {
     if server_name != state.config.server_name {
-        // Remote media fetching arrives with federation (M3).
+        // Remote media is served by fetch_remote_media, not this path.
         return Err(ApiError::not_found("Remote media not available"));
     }
     let meta = state
@@ -171,11 +171,51 @@ fn lookup_meta(
     Ok(meta)
 }
 
+/// Is this media on another server?
+fn is_remote(state: &CsState, server_name: &ruma::ServerName) -> bool {
+    server_name != state.config.server_name
+}
+
+/// Fetch media hosted on `server_name` over federation, returning the file
+/// bytes and its `Content-Type`.
+async fn fetch_remote_media(
+    state: &CsState,
+    server_name: &ruma::ServerName,
+    media_id: &str,
+) -> Result<(Vec<u8>, Option<String>)> {
+    let fed = state
+        .federation
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("Remote media not available"))?;
+    let path = format!("/_matrix/federation/v1/media/download/{media_id}");
+    let (body, ct_header) = fed
+        .client
+        .get_raw(server_name.as_str(), &path)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "M_UNKNOWN",
+                format!("remote media fetch failed: {e}"),
+            )
+        })?;
+    saltator_federation::parse_multipart_file(&ct_header.unwrap_or_default(), &body)
+        .ok_or_else(|| ApiError::not_found("Malformed remote media response"))
+}
+
 pub async fn download(
     State(state): State<Arc<CsState>>,
     _auth: Auth,
     Ar(req): Ar<get_content::v1::Request>,
 ) -> Result<Ra<get_content::v1::Response>> {
+    if is_remote(&state, &req.server_name) {
+        let (bytes, ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
+        return Ok(Ra(get_content::v1::Response::new(
+            bytes,
+            ct.unwrap_or_else(|| "application/octet-stream".to_owned()),
+            ContentDisposition::new(ContentDispositionType::Inline),
+        )));
+    }
     let meta = lookup_meta(&state, &req.server_name, &req.media_id)?;
     let bytes = state
         .media
@@ -196,6 +236,15 @@ pub async fn download_named(
     _auth: Auth,
     Ar(req): Ar<get_content_as_filename::v1::Request>,
 ) -> Result<Ra<get_content_as_filename::v1::Response>> {
+    if is_remote(&state, &req.server_name) {
+        let (bytes, ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
+        return Ok(Ra(get_content_as_filename::v1::Response::new(
+            bytes,
+            ct.unwrap_or_else(|| "application/octet-stream".to_owned()),
+            ContentDisposition::new(ContentDispositionType::Inline)
+                .with_filename(Some(req.filename.clone())),
+        )));
+    }
     let meta = lookup_meta(&state, &req.server_name, &req.media_id)?;
     let bytes = state
         .media
