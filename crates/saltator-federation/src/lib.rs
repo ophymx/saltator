@@ -10,6 +10,7 @@ mod joins;
 mod keys;
 mod media;
 mod outbound;
+mod query;
 mod resolver;
 mod sender;
 mod transactions;
@@ -145,6 +146,11 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
     axum::Router::new()
         .route("/_matrix/key/v2/server", get(serve_server_keys))
         .route("/_matrix/federation/v1/version", get(serve_version))
+        .route("/_matrix/federation/v1/query/profile", get(query::profile))
+        .route(
+            "/_matrix/federation/v1/query/directory",
+            get(query::directory),
+        )
         .route(
             "/_matrix/federation/v1/send/{txn_id}",
             put(transactions::send_transaction),

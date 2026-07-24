@@ -1262,11 +1262,59 @@ pub async fn get_alias(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_alias::v3::Request>,
 ) -> Result<Ra<get_alias::v3::Response>> {
+    // An alias on another server: resolve it via that server's directory.
+    if req.room_alias.server_name() != state.config.server_name {
+        let (room_id, servers) = resolve_remote_alias(&state, req.room_alias.as_str()).await?;
+        return Ok(Ra(get_alias::v3::Response::new(room_id, servers)));
+    }
     let room_id = resolve_alias(&state, req.room_alias.as_str())?;
     Ok(Ra(get_alias::v3::Response::new(
         room_id,
         vec![state.config.server_name.clone()],
     )))
+}
+
+/// Resolve an alias hosted on another server via `GET
+/// /_matrix/federation/v1/query/directory`.
+async fn resolve_remote_alias(
+    state: &CsState,
+    alias: &str,
+) -> Result<(OwnedRoomId, Vec<ruma::OwnedServerName>)> {
+    let server = ruma::RoomAliasId::parse(alias)
+        .map_err(|_| ApiError::invalid_param("bad room alias"))?
+        .server_name()
+        .to_owned();
+    let fed = state
+        .federation
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("Unknown room alias"))?;
+    let path = format!(
+        "/_matrix/federation/v1/query/directory?room_alias={}",
+        encode_segment(alias),
+    );
+    let resp = fed.client.get(server.as_str(), &path).await.map_err(|e| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            format!("remote directory query failed: {e}"),
+        )
+    })?;
+    let room_id = resp
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| OwnedRoomId::try_from(s).ok())
+        .ok_or_else(|| ApiError::not_found("Unknown room alias"))?;
+    let servers = resp
+        .get("servers")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| ruma::OwnedServerName::try_from(s).ok())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![server]);
+    Ok((room_id, servers))
 }
 
 pub async fn create_alias(

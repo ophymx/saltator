@@ -30,8 +30,12 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 
 // -- profile ----------------------------------------------------------------
 
-fn load_profile(state: &CsState, user_id: &UserId) -> Result<Profile> {
-    // Unknown users must 404 (spec); known users without profile data
+async fn load_profile(state: &CsState, user_id: &UserId) -> Result<Profile> {
+    // A user on another server: query their homeserver over federation.
+    if user_id.server_name() != state.config.server_name {
+        return fetch_remote_profile(state, user_id).await;
+    }
+    // Unknown local users must 404 (spec); known users without profile data
     // yield the empty profile.
     let store = state.users.store();
     if store.account(user_id.as_str()).map_err(internal)?.is_none() {
@@ -43,11 +47,58 @@ fn load_profile(state: &CsState, user_id: &UserId) -> Result<Profile> {
         .unwrap_or_default())
 }
 
+/// Fetch a remote user's profile via `GET /_matrix/federation/v1/query/profile`.
+async fn fetch_remote_profile(state: &CsState, user_id: &UserId) -> Result<Profile> {
+    let fed = state
+        .federation
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("Unknown user"))?;
+    let path = format!(
+        "/_matrix/federation/v1/query/profile?user_id={}",
+        encode_component(user_id.as_str()),
+    );
+    let resp = fed
+        .client
+        .get(user_id.server_name().as_str(), &path)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "M_UNKNOWN",
+                format!("remote profile query failed: {e}"),
+            )
+        })?;
+    Ok(Profile {
+        displayname: resp
+            .get("displayname")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        avatar_url: resp
+            .get("avatar_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    })
+}
+
+/// Percent-encode a query component (user IDs contain `@` and `:`).
+fn encode_component(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 pub async fn get_profile(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_profile::v3::Request>,
 ) -> Result<Ra<get_profile::v3::Response>> {
-    let profile = load_profile(&state, &req.user_id)?;
+    let profile = load_profile(&state, &req.user_id).await?;
     let mut resp = get_profile::v3::Response::new();
     if let Some(d) = profile.displayname {
         resp.set("displayname".to_owned(), d.into());
@@ -62,7 +113,7 @@ pub async fn get_displayname(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_display_name::v3::Request>,
 ) -> Result<Ra<get_display_name::v3::Response>> {
-    let profile = load_profile(&state, &req.user_id)?;
+    let profile = load_profile(&state, &req.user_id).await?;
     Ok(Ra(get_display_name::v3::Response::new(profile.displayname)))
 }
 
@@ -86,7 +137,7 @@ pub async fn get_avatar_url(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_avatar_url::v3::Request>,
 ) -> Result<Ra<get_avatar_url::v3::Response>> {
-    let profile = load_profile(&state, &req.user_id)?;
+    let profile = load_profile(&state, &req.user_id).await?;
     Ok(Ra(get_avatar_url::v3::Response::new(
         profile.avatar_url.map(Into::into),
     )))

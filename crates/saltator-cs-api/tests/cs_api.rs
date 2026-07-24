@@ -2154,3 +2154,177 @@ async fn client_downloads_remote_media_over_federation() {
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
 }
+
+// --- Federation profile & directory queries ------------------------------
+
+#[tokio::test]
+async fn client_queries_remote_profile_and_directory() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Node A: user shard with alice (displayname) + an alias, served over
+    // federation.
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let (a_signer, _) = saltator_roomserver::ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let a_dir = dir.path().join("a");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    let a_engine = Arc::new(RocksEngine::open(&a_dir.join("db")).unwrap());
+    let a_rooms = RoomServer::start(
+        1,
+        a_engine.clone(),
+        a_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let a_users = UserServer::start(
+        1,
+        a_engine,
+        a_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [a_rooms.shard_handle(), a_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let alice = a_users
+        .register("alice", Some("pw-12345678"), None, None, false, true)
+        .await
+        .unwrap()
+        .0;
+    a_users
+        .set_profile(&alice, Some(Some("Alice A".to_owned())), None)
+        .await
+        .unwrap();
+    a_users
+        .create_alias("#lounge:a.test", "!room123:a.test", &alice)
+        .await
+        .unwrap();
+
+    let a_fed = Arc::new(FedState {
+        server_name: a_name.clone(),
+        signer: a_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::new(),
+        rooms: Some(a_rooms.clone()),
+        users: Some(a_users.clone()),
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+
+    // B key server so A can authenticate B's queries.
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
+    let a_fed = Arc::new(FedState {
+        key_cache: KeyCache::with_base_url(b_key_base),
+        ..Arc::try_unwrap(a_fed).ok().unwrap()
+    });
+    let a_base = {
+        let app = saltator_federation::router(a_fed);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+
+    // Node B: full CS stack, federation client aimed at A.
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let b_engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_rooms = RoomServer::start(
+        1,
+        b_engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        b_engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let b_projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let b_media = MediaStore::open(b_dir.join("media")).unwrap();
+    let cs_state = CsState::new(
+        b_users.clone(),
+        b_rooms.clone(),
+        b_media,
+        CsConfig {
+            server_name: b_name.clone(),
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(b_signer.clone(), a_base)),
+        b_signer.clone(),
+    );
+    let router = saltator_cs_api::router(cs_state);
+
+    let get = |path: String| {
+        let router = router.clone();
+        async move {
+            let rb = axum::http::Request::builder().method("GET").uri(path);
+            let resp =
+                tower::ServiceExt::oneshot(router, rb.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+            let st = resp.status();
+            let by = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                st,
+                if by.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice::<Value>(&by).unwrap_or(Value::Null)
+                },
+            )
+        }
+    };
+
+    // Remote profile query (no auth required on the CS profile endpoint).
+    let (status, prof) = get("/_matrix/client/v3/profile/@alice:a.test".into()).await;
+    assert_eq!(status, StatusCode::OK, "remote profile: {prof}");
+    assert_eq!(prof["displayname"], "Alice A");
+
+    // Remote alias resolution.
+    let (status, dir_resp) = get("/_matrix/client/v3/directory/room/%23lounge:a.test".into()).await;
+    assert_eq!(status, StatusCode::OK, "remote alias: {dir_resp}");
+    assert_eq!(dir_resp["room_id"], "!room123:a.test");
+    assert!(dir_resp["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s == "a.test"));
+
+    b_projection.abort();
+    a_rooms.shutdown().await.unwrap();
+    a_users.shutdown().await.unwrap();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}
