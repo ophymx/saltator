@@ -3,14 +3,16 @@
 //! (see [`crate::resolver`]); tests may pin a fixed base URL to bypass
 //! resolution and TLS.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use ruma::CanonicalJsonValue;
 
 use saltator_roomserver::ServerSigner;
 
-use crate::http_client::build_http_client;
-use crate::resolver::ServerResolver;
+use crate::http_client::{build_http_client, build_http_client_with_resolve};
+use crate::resolver::{ResolvedServer, ServerResolver};
 use crate::xmatrix::sign_request;
 
 /// Signs and sends server-server requests on behalf of one homeserver.
@@ -18,26 +20,66 @@ pub struct FederationClient {
     http: reqwest::Client,
     signer: Arc<ServerSigner>,
     resolver: ServerResolver,
+    /// Retained so per-SRV-target override clients trust the same roots.
+    ca: Option<Vec<u8>>,
+    /// Override clients keyed by (host, SRV target) — built on demand.
+    overrides: Mutex<HashMap<(String, SocketAddr), reqwest::Client>>,
     /// Test override: a fixed base URL that skips resolution.
     base_url: Option<String>,
 }
 
 impl FederationClient {
     pub fn new(signer: Arc<ServerSigner>) -> Self {
-        Self::from_http(signer, build_http_client(None))
+        Self::from_http(signer, build_http_client(None), None)
     }
 
     /// Trust `ca_pem` in addition to the system roots (e.g. Complement's CA).
     pub fn with_ca(signer: Arc<ServerSigner>, ca_pem: &[u8]) -> Self {
-        Self::from_http(signer, build_http_client(Some(ca_pem)))
+        Self::from_http(
+            signer,
+            build_http_client(Some(ca_pem)),
+            Some(ca_pem.to_vec()),
+        )
     }
 
-    fn from_http(signer: Arc<ServerSigner>, http: reqwest::Client) -> Self {
+    fn from_http(signer: Arc<ServerSigner>, http: reqwest::Client, ca: Option<Vec<u8>>) -> Self {
         Self {
             resolver: ServerResolver::new(http.clone()),
             http,
             signer,
+            ca,
+            overrides: Mutex::new(HashMap::new()),
             base_url: None,
+        }
+    }
+
+    /// The client to use for `resolved`: the shared client, or an SRV
+    /// override client that dials `connect_addr` while keeping the name's
+    /// TLS/SNI.
+    fn client_for(&self, resolved: &ResolvedServer) -> reqwest::Client {
+        let Some(addr) = resolved.connect_addr else {
+            return self.http.clone();
+        };
+        let key = (resolved.host_header.clone(), addr);
+        let mut overrides = self.overrides.lock().expect("override cache poisoned");
+        overrides
+            .entry(key)
+            .or_insert_with(|| {
+                build_http_client_with_resolve(self.ca.as_deref(), &resolved.host_header, addr)
+            })
+            .clone()
+    }
+
+    /// Resolve `destination` to (client, base URL, optional Host header).
+    /// A pinned `base_url` (tests) skips resolution and uses the shared
+    /// client with no Host override.
+    async fn route(&self, destination: &str) -> (reqwest::Client, String, Option<String>) {
+        match &self.base_url {
+            Some(base) => (self.http.clone(), base.clone(), None),
+            None => {
+                let r = self.resolver.resolve(destination).await;
+                (self.client_for(&r), r.base_url, Some(r.host_header))
+            }
         }
     }
 
@@ -86,16 +128,9 @@ impl FederationClient {
     ) -> Result<(Vec<u8>, Option<String>), OutboundError> {
         let auth = sign_request(&self.signer, "GET", path, destination, None)
             .map_err(|e| OutboundError::Sign(e.to_string()))?;
-        let (base, host_header) = match &self.base_url {
-            Some(base) => (base.clone(), None),
-            None => {
-                let r = self.resolver.resolve(destination).await;
-                (r.base_url, Some(r.host_header))
-            }
-        };
+        let (client, base, host_header) = self.route(destination).await;
         let url = format!("{base}{path}");
-        let mut req = self
-            .http
+        let mut req = client
             .get(&url)
             .header(reqwest::header::AUTHORIZATION, auth);
         if let Some(host) = host_header {
@@ -137,18 +172,9 @@ impl FederationClient {
         let auth = sign_request(&self.signer, method, path, destination, content.as_ref())
             .map_err(|e| OutboundError::Sign(e.to_string()))?;
 
-        // Resolve the destination (base URL + Host header), unless a fixed
-        // base URL was pinned for tests.
-        let (base, host_header) = match &self.base_url {
-            Some(base) => (base.clone(), None),
-            None => {
-                let r = self.resolver.resolve(destination).await;
-                (r.base_url, Some(r.host_header))
-            }
-        };
+        let (client, base, host_header) = self.route(destination).await;
         let url = format!("{base}{path}");
-        let mut req = self
-            .http
+        let mut req = client
             .request(method.parse().map_err(|_| OutboundError::BadMethod)?, &url)
             .header(reqwest::header::AUTHORIZATION, auth);
         if let Some(host) = host_header {

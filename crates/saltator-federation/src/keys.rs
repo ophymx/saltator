@@ -25,27 +25,53 @@ pub struct KeyCache {
     http: reqwest::Client,
     cache: Mutex<BTreeMap<String, CachedKeys>>,
     resolver: crate::resolver::ServerResolver,
+    ca: Option<Vec<u8>>,
+    overrides: Mutex<std::collections::HashMap<(String, std::net::SocketAddr), reqwest::Client>>,
     /// Test override: a fixed base URL that skips resolution.
     base_url: Option<String>,
 }
 
 impl KeyCache {
     pub fn new() -> Self {
-        Self::from_http(crate::http_client::build_http_client(None))
+        Self::from_http(crate::http_client::build_http_client(None), None)
     }
 
     /// Trust `ca_pem` in addition to the system roots (Complement's CA).
     pub fn with_ca(ca_pem: &[u8]) -> Self {
-        Self::from_http(crate::http_client::build_http_client(Some(ca_pem)))
+        Self::from_http(
+            crate::http_client::build_http_client(Some(ca_pem)),
+            Some(ca_pem.to_vec()),
+        )
     }
 
-    fn from_http(http: reqwest::Client) -> Self {
+    fn from_http(http: reqwest::Client, ca: Option<Vec<u8>>) -> Self {
         Self {
             resolver: crate::resolver::ServerResolver::new(http.clone()),
             http,
             cache: Mutex::new(BTreeMap::new()),
+            ca,
+            overrides: Mutex::new(std::collections::HashMap::new()),
             base_url: None,
         }
+    }
+
+    fn client_for(&self, resolved: &crate::resolver::ResolvedServer) -> reqwest::Client {
+        let Some(addr) = resolved.connect_addr else {
+            return self.http.clone();
+        };
+        let key = (resolved.host_header.clone(), addr);
+        self.overrides
+            .lock()
+            .expect("override cache poisoned")
+            .entry(key)
+            .or_insert_with(|| {
+                crate::http_client::build_http_client_with_resolve(
+                    self.ca.as_deref(),
+                    &resolved.host_header,
+                    addr,
+                )
+            })
+            .clone()
     }
 
     /// Route all fetches at a fixed base URL (test doubles, no TLS).
@@ -72,15 +98,15 @@ impl KeyCache {
     }
 
     async fn fetch(&self, server: &str, now_ms: u64) -> Result<CachedKeys, KeyError> {
-        let (base, host_header) = match &self.base_url {
-            Some(base) => (base.clone(), None),
+        let (client, base, host_header) = match &self.base_url {
+            Some(base) => (self.http.clone(), base.clone(), None),
             None => {
                 let r = self.resolver.resolve(server).await;
-                (r.base_url, Some(r.host_header))
+                (self.client_for(&r), r.base_url, Some(r.host_header))
             }
         };
         let url = format!("{base}/_matrix/key/v2/server");
-        let mut req = self.http.get(&url);
+        let mut req = client.get(&url);
         if let Some(host) = host_header {
             req = req.header(reqwest::header::HOST, host);
         }

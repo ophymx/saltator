@@ -3,11 +3,10 @@
 //! requests.
 //!
 //! Implemented: IP literals, explicit ports, `.well-known/matrix/server`
-//! delegation, and the default federation port 8448. SRV records
-//! (`_matrix-fed._tcp` / deprecated `_matrix._tcp`) are not yet consulted —
-//! they need a DNS resolver dependency and rarely decide the outcome for
-//! servers that publish well-known (matrix.org) or resolve directly
-//! (Complement). Documented gap; delegation covers the common cases.
+//! delegation, SRV records (`_matrix-fed._tcp` and the deprecated
+//! `_matrix._tcp`), and the default federation port 8448. An SRV target is
+//! dialed directly while TLS/`Host` keep the delegated name, applied as a
+//! per-client DNS override (see [`ResolvedServer::connect_addr`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -20,17 +19,21 @@ const WELL_KNOWN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const WELL_KNOWN_ERR_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Where and how to reach a server: the request base (`scheme://authority`)
-/// and the `Host` header to present.
+/// and the `Host` header to present. `connect_addr`, when set, is the
+/// concrete socket to dial (an SRV result) while TLS/`Host` still use
+/// `host_header` — the client applies it as a DNS override.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedServer {
     pub base_url: String,
     pub host_header: String,
+    pub connect_addr: Option<std::net::SocketAddr>,
 }
 
 /// Resolves server names, caching well-known lookups.
 pub struct ServerResolver {
     http: reqwest::Client,
     cache: Mutex<HashMap<String, (ResolvedServer, Instant)>>,
+    dns: std::sync::OnceLock<Option<hickory_resolver::TokioResolver>>,
 }
 
 impl ServerResolver {
@@ -38,10 +41,26 @@ impl ServerResolver {
         Self {
             http,
             cache: Mutex::new(HashMap::new()),
+            dns: std::sync::OnceLock::new(),
         }
     }
 
-    /// Resolve `server_name`, consulting well-known for bare hostnames.
+    /// The DNS resolver, built from system config on first use. `None` if
+    /// it can't be initialized (SRV lookups then fall back to the default
+    /// port).
+    fn dns(&self) -> Option<&hickory_resolver::TokioResolver> {
+        self.dns
+            .get_or_init(|| {
+                hickory_resolver::TokioResolver::builder_tokio()
+                    .map(|b| b.build())
+                    .map_err(|e| tracing::warn!(error = %e, "DNS resolver init failed"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// Resolve `server_name` per the spec algorithm: IP literals, explicit
+    /// ports, well-known delegation, SRV records, and the default port.
     pub async fn resolve(&self, server_name: &str) -> ResolvedServer {
         if let Some(hit) = self.cached(server_name) {
             return hit;
@@ -49,20 +68,51 @@ impl ServerResolver {
         let (host, port, is_ip) = split_host_port(server_name);
 
         // Steps 1 & 2: IP literal, or a hostname with an explicit port —
-        // no well-known, connect directly.
+        // no well-known / SRV, connect directly.
         if is_ip || port.is_some() {
             let resolved = plan_direct(server_name, &host, port, is_ip);
             self.store(server_name, resolved.clone(), WELL_KNOWN_TTL);
             return resolved;
         }
 
-        // Step 3: bare hostname — try well-known delegation.
+        // Step 3: bare hostname — well-known delegation, else SRV, else
+        // the default port on the name itself.
         let (resolved, ttl) = match self.fetch_well_known(&host).await {
-            Some(m_server) => (plan_delegated(&m_server), WELL_KNOWN_TTL),
-            None => (plan_default(&host), WELL_KNOWN_ERR_TTL),
+            Some(m_server) => (self.resolve_delegated(&m_server).await, WELL_KNOWN_TTL),
+            None => (self.resolve_srv_or_default(&host).await, WELL_KNOWN_ERR_TTL),
         };
         self.store(server_name, resolved.clone(), ttl);
         resolved
+    }
+
+    /// A well-known `m.server` value: an explicit port connects directly;
+    /// otherwise SRV, then the default port.
+    async fn resolve_delegated(&self, m_server: &str) -> ResolvedServer {
+        let (host, port, is_ip) = split_host_port(m_server);
+        if is_ip || port.is_some() {
+            return plan_delegated(m_server);
+        }
+        self.resolve_srv_or_default(&host).await
+    }
+
+    /// Try `_matrix-fed._tcp.{host}` then the deprecated `_matrix._tcp`,
+    /// falling back to the default federation port on `host`.
+    async fn resolve_srv_or_default(&self, host: &str) -> ResolvedServer {
+        for service in ["_matrix-fed._tcp.", "_matrix._tcp."] {
+            if let Some(addr) = self.lookup_srv(&format!("{service}{host}")).await {
+                return plan_srv(host, addr);
+            }
+        }
+        plan_default(host)
+    }
+
+    /// Look up an SRV record and resolve its target to a socket address.
+    async fn lookup_srv(&self, name: &str) -> Option<std::net::SocketAddr> {
+        let dns = self.dns()?;
+        let srv = dns.srv_lookup(name).await.ok()?.into_iter().next()?;
+        let target = srv.target().to_utf8();
+        let ip = dns.lookup_ip(target).await.ok()?.into_iter().next()?;
+        Some(std::net::SocketAddr::new(ip, srv.port()))
     }
 
     fn cached(&self, name: &str) -> Option<ResolvedServer> {
@@ -135,26 +185,37 @@ fn plan_direct(server_name: &str, host: &str, port: Option<u16>, _is_ip: bool) -
     ResolvedServer {
         base_url: format!("https://{}:{port}", url_host(host)),
         host_header: server_name.to_owned(),
+        connect_addr: None,
     }
 }
 
-/// Step 3's success branch: parse `m.server` as `host[:port]` and connect.
+/// Delegated `m.server` = `host[:port]` with a direct connection. A no-port
+/// delegation only reaches here as a fallback (the resolver tries SRV
+/// first); the port defaults to 8448 and the `Host` header omits it.
 fn plan_delegated(m_server: &str) -> ResolvedServer {
-    let (host, port, is_ip) = split_host_port(m_server);
+    let (host, port, _is_ip) = split_host_port(m_server);
     match port {
-        // Delegated with explicit port: Host = delegated host:port.
         Some(p) => ResolvedServer {
             base_url: format!("https://{}:{p}", url_host(&host)),
             host_header: format!("{host}:{p}"),
+            connect_addr: None,
         },
-        // Delegated without port (SRV skipped): default 8448, Host = host.
-        None => {
-            let _ = is_ip;
-            ResolvedServer {
-                base_url: format!("https://{}:{DEFAULT_FED_PORT}", url_host(&host)),
-                host_header: host,
-            }
-        }
+        None => ResolvedServer {
+            base_url: format!("https://{}:{DEFAULT_FED_PORT}", url_host(&host)),
+            host_header: host,
+            connect_addr: None,
+        },
+    }
+}
+
+/// SRV result: connect to `addr`, but TLS/`Host` use `host` (the name the
+/// cert must be valid for). The base URL omits the port so the resolve
+/// override's port is used.
+fn plan_srv(host: &str, addr: std::net::SocketAddr) -> ResolvedServer {
+    ResolvedServer {
+        base_url: format!("https://{}", url_host(host)),
+        host_header: host.to_owned(),
+        connect_addr: Some(addr),
     }
 }
 
@@ -163,6 +224,7 @@ fn plan_default(host: &str) -> ResolvedServer {
     ResolvedServer {
         base_url: format!("https://{}:{DEFAULT_FED_PORT}", url_host(host)),
         host_header: host.to_owned(),
+        connect_addr: None,
     }
 }
 
@@ -237,5 +299,16 @@ mod tests {
         let r = plan_delegated("10.0.0.5:8448");
         assert_eq!(r.base_url, "https://10.0.0.5:8448");
         assert_eq!(r.host_header, "10.0.0.5:8448");
+    }
+
+    #[test]
+    fn srv_connects_to_target_but_tls_uses_the_name() {
+        let addr = "10.1.2.3:8500".parse().unwrap();
+        let r = plan_srv("matrix.example.com", addr);
+        // Base URL omits the port so the resolve override's port is used;
+        // TLS/Host validate against the delegated name, not the SRV target.
+        assert_eq!(r.base_url, "https://matrix.example.com");
+        assert_eq!(r.host_header, "matrix.example.com");
+        assert_eq!(r.connect_addr, Some(addr));
     }
 }
