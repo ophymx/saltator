@@ -40,6 +40,14 @@ pub async fn send_transaction(
         .cloned()
         .unwrap_or_default();
 
+    // Trust the sending server's signing keys before ingesting any PDU: the
+    // room pipeline verifies each event's signature against them, and a
+    // steady-state transaction (no gap to backfill) would otherwise reach
+    // `ingest_pdu` with no keys for the origin and reject every event.
+    if !pdus.is_empty() {
+        trust_origin_keys(&state, &auth.origin).await;
+    }
+
     let mut results = serde_json::Map::new();
     for pdu in pdus.into_iter().take(MAX_PDUS) {
         let (event_id, result) = process_pdu(&state, &auth.origin, pdu).await;
@@ -190,12 +198,7 @@ async fn fill_gap(state: &FedState, origin: &str, pdu: &CanonicalJsonObject) -> 
     };
 
     // Trust the origin's keys so the fetched events verify.
-    let now = crate::now_ms();
-    if let Ok(keys) = state.key_cache.keys_for(origin, now).await {
-        if let Some(set) = keys.get(origin) {
-            rooms.trust_keys(origin, set.clone());
-        }
-    }
+    trust_origin_keys(state, origin).await;
 
     let body = serde_json::json!({
         "earliest_events": earliest,
@@ -228,6 +231,21 @@ async fn fill_gap(state: &FedState, origin: &str, pdu: &CanonicalJsonObject) -> 
         }
     }
     ingested > 0
+}
+
+/// Load `origin`'s current signing keys into the room server's trusted set
+/// so PDUs it sends verify. Best-effort: on a failed key fetch, per-PDU
+/// verification simply fails loudly rather than silently accepting.
+async fn trust_origin_keys(state: &FedState, origin: &str) {
+    let Some(rooms) = &state.rooms else {
+        return;
+    };
+    let now = crate::now_ms();
+    if let Ok(keys) = state.key_cache.keys_for(origin, now).await {
+        if let Some(set) = keys.get(origin) {
+            rooms.trust_keys(origin, set.clone());
+        }
+    }
 }
 
 fn error_result(msg: &str) -> serde_json::Value {

@@ -331,6 +331,162 @@ async fn join_client_drives_the_full_handshake() {
     );
 }
 
+/// Regression: a steady-state `/send` transaction from a foreign origin
+/// (no DAG gap to backfill) must still verify each PDU against that origin's
+/// signing keys — which live only in the key cache until the transaction
+/// handler trusts them. Before the fix, only the gap-fill and send_join
+/// paths seeded the keys, so a plain remote message was rejected with
+/// "Could not find public keys for entity".
+#[tokio::test]
+async fn foreign_origin_transaction_verifies_against_fetched_keys() {
+    use saltator_federation::{join_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let a_name: OwnedServerName = "a.test".try_into().unwrap();
+    let b_name: OwnedServerName = "b.test".try_into().unwrap();
+    let (a_signer, _) = ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let (b_signer, _) = ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let b_signer = Arc::new(b_signer);
+
+    // A hosts a public room; alice is joined with full power.
+    let rooms_a = start_rooms("a", a_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let (room_id, _) = rooms_a
+        .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        rooms_a
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+    }
+
+    // Standalone key servers so each side can fetch the other's keys.
+    let a_key_base = spawn(router(Arc::new(FedState::new(
+        a_name.clone(),
+        a_signer.clone(),
+        Vec::<OldVerifyKey>::new(),
+    ))))
+    .await;
+    let b_key_base = spawn(router(Arc::new(FedState::new(
+        b_name.clone(),
+        b_signer.clone(),
+        Vec::<OldVerifyKey>::new(),
+    ))))
+    .await;
+
+    // A's federation surface (authenticates B) so B can join.
+    let a_state = Arc::new(FedState {
+        server_name: a_name.clone(),
+        signer: a_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(b_key_base),
+        rooms: Some(rooms_a.clone()),
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let a_base = spawn(router(a_state)).await;
+
+    // B joins A's room and imports it, so B now hosts a copy with alice's
+    // state and bob's join present.
+    let b_rooms = start_rooms("b", b_signer.clone(), dir.path()).await;
+    let client = FederationClient::with_base_url(b_signer.clone(), a_base);
+    let resp = join_remote_room(
+        &client,
+        &b_signer,
+        "a.test",
+        room_id.as_str(),
+        "@bob:b.test",
+    )
+    .await
+    .expect("join");
+    b_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import");
+
+    // A sends a message; its prev event is bob's join, which B already has,
+    // so B's ingest takes the steady-state path (no gap-fill to seed keys).
+    let msg = rooms_a
+        .send_message(
+            &room_id,
+            &alice,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "hello bob"}),
+        )
+        .await
+        .unwrap();
+    let msg_id = match msg {
+        Outcome::Accepted { event_id, .. } => event_id,
+        other => panic!("message not accepted: {other:?}"),
+    };
+    let msg_pdu: serde_json::Value =
+        serde_json::from_slice(&rooms_a.store().event(msg_id.as_str()).unwrap().unwrap().raw)
+            .unwrap();
+
+    // B's federation surface: authenticates callers against A's keys and
+    // routes PDUs to B's room server.
+    let b_state = Arc::new(FedState {
+        server_name: b_name.clone(),
+        signer: b_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(a_key_base),
+        rooms: Some(b_rooms.clone()),
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let b_base = spawn(router(b_state)).await;
+
+    // A delivers the message to B over /send. B has never trusted A's keys
+    // outside the key cache; accepting the PDU requires fetching them.
+    let body = json!({
+        "origin": "a.test",
+        "origin_server_ts": 1000,
+        "pdus": [msg_pdu],
+    });
+    let path = "/_matrix/federation/v1/send/txn-msg";
+    let content = CanonicalJsonValue::try_from(body.clone()).unwrap();
+    let auth = sign_request(&a_signer, "PUT", path, "b.test", Some(&content)).unwrap();
+    let resp = reqwest::Client::new()
+        .put(format!("{b_base}{path}"))
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let out: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        &out["pdus"][msg_id.as_str()],
+        &json!({}),
+        "foreign message should verify and ingest: {out}"
+    );
+
+    // And it actually landed in B's room.
+    assert!(
+        b_rooms.store().event(msg_id.as_str()).unwrap().is_some(),
+        "message not persisted on B"
+    );
+}
+
 #[tokio::test]
 async fn leave_client_rejects_over_federation() {
     use saltator_federation::{join_remote_room, leave_remote_room, FederationClient};
