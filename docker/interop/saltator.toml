@@ -1,0 +1,24 @@
+# saltator config for the Synapse interop test. Federation runs over HTTPS
+# on 8448 with a cert signed by the shared test CA; the client API is plain
+# HTTP on 8008 (driven from the CI runner via a mapped port).
+server_name = "saltator"
+data_dir = "/data"
+
+# Match Synapse's room version so the cross-server join negotiates cleanly
+# (our make_join advertises 11 and 12).
+[client]
+default_room_version = "11"
+
+[node]
+id = 1
+advertise = "127.0.0.1:7400"
+
+[listeners]
+internal = "127.0.0.1:7400"
+client = "0.0.0.0:8008"
+federation = "0.0.0.0:8448"
+
+[federation]
+tls_cert = "/certs/saltator.crt"
+tls_key = "/certs/saltator.key"
+ca_cert = "/certs/ca.crt"

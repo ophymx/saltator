@@ -1,0 +1,64 @@
+# Synapse config for the saltator interop test. Authored in full (rather
+# than editing `generate`'s output) so the federation-relevant settings are
+# explicit and reviewable. `generate` is still run first, but only to mint
+# the signing key and log config this file points at.
+#
+# Verified against ghcr.io/element-hq/synapse:v1.137.0.
+server_name: "synapse"
+pid_file: /data/homeserver.pid
+signing_key_path: "/data/synapse.signing.key"
+log_config: "/data/synapse.log.config"
+report_stats: false
+
+# Test-only secrets — fine to hardcode for an ephemeral CI homeserver.
+macaroon_secret_key: "interop-macaroon-secret-key"
+form_secret: "interop-form-secret"
+registration_shared_secret: "interop-registration-shared-secret"
+
+database:
+  name: sqlite3
+  args:
+    database: /data/homeserver.db
+
+media_store_path: /data/media_store
+
+listeners:
+  - port: 8008
+    type: http
+    tls: false
+    bind_addresses: ['0.0.0.0']
+    resources:
+      - names: [client]
+        compress: false
+  - port: 8448
+    type: http
+    tls: true
+    bind_addresses: ['0.0.0.0']
+    resources:
+      - names: [federation]
+        compress: false
+
+# Federation TLS: serve 8448 with a cert signed by the shared test CA, and
+# trust that CA for outbound connections to saltator. NOTE
+# federation_custom_ca_list REPLACES the system roots — acceptable here
+# because every peer in this closed test uses the shared CA.
+tls_certificate_path: "/certs/synapse.crt"
+tls_private_key_path: "/certs/synapse.key"
+federation_custom_ca_list:
+  - "/certs/ca.crt"
+
+# Docker container IPs fall in private ranges, which Synapse blocks from
+# federation by default; clear the blocklist for this closed network.
+ip_range_blacklist: []
+
+# Closed two-node test: fetch signing keys directly from the origin server
+# rather than via the matrix.org notary.
+trusted_key_servers: []
+suppress_key_server_warning: true
+
+# Open registration so the test can mint users without email/captcha.
+enable_registration: true
+enable_registration_without_verification: true
+
+# Match saltator's room version so the cross-server join negotiates cleanly.
+default_room_version: "11"

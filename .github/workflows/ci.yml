@@ -129,3 +129,31 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           jq -r 'select(.Action=="fail" and .Test != null) | "- `" + .Test + "`"' /tmp/complement-fed.json >> "$GITHUB_STEP_SUMMARY"
           echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+
+  synapse-interop:
+    name: interop (synapse)
+    # The M3 exit criterion against a real Synapse: a saltator user joins a
+    # Synapse-hosted room and messages flow both ways. Unlike the Complement
+    # jobs (tracked pass-rate), this is a binary proof and GATES — a green
+    # run means the federation loop actually works end to end.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build saltator (release)
+        run: cargo build --release -p saltator
+      - name: Build saltator interop image
+        run: |
+          cp target/release/saltator docker/complement/saltator
+          docker build -t interop-saltator:latest docker/complement
+      - name: Synapse interop round-trip
+        run: ./docker/interop/run.sh
+      - name: Result summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "## Synapse interop: ✅ PASS — federated join + bidirectional messaging" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Synapse interop: ❌ FAIL (see the interop step logs)" >> "$GITHUB_STEP_SUMMARY"
+          fi

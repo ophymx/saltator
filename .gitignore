@@ -6,3 +6,8 @@
 /spec.pdf
 # Prebuilt binary staged into the Complement image build context by CI.
 /docker/complement/saltator
+
+# Interop test scratch: CA, per-server certs, and Synapse's generated state.
+/docker/interop/ca/
+/docker/interop/certs/
+/docker/interop/synapse-data/

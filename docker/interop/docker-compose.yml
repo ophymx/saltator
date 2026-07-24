@@ -1,0 +1,38 @@
+# Two homeservers on a shared network for the interop test: a real Synapse
+# and saltator, each serving federation over HTTPS on 8448 with a cert
+# signed by the shared test CA (mounted at /certs). Their client APIs are
+# published to the runner (synapse 8008, saltator 8009) so run.sh can drive
+# them. Service names double as Matrix server names, so container DNS
+# resolves each peer's federation host directly (default port 8448).
+services:
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.137.0
+    # Run as the invoking user so files written to the bind mount (config,
+    # signing key, sqlite db) stay host-owned and editable between the
+    # `generate` step and startup.
+    user: "${HOST_UID}:${HOST_GID}"
+    environment:
+      SYNAPSE_SERVER_NAME: synapse
+      SYNAPSE_REPORT_STATS: "no"
+      HOME: /data
+    volumes:
+      - ./synapse-data:/data
+      - ./certs:/certs:ro
+    ports:
+      - "8008:8008"
+    networks: [interop]
+
+  saltator:
+    image: interop-saltator:latest
+    # Bypass the Complement entrypoint (which regenerates config); run
+    # against the mounted interop config instead.
+    entrypoint: ["/usr/local/bin/saltator", "start", "--config", "/config/saltator.toml"]
+    volumes:
+      - ./saltator.toml:/config/saltator.toml:ro
+      - ./certs:/certs:ro
+    ports:
+      - "8009:8008"
+    networks: [interop]
+
+networks:
+  interop:
