@@ -40,6 +40,20 @@ jobs:
       - name: Two-node smoke test
         run: ./scripts/two_node_smoke.sh target/release/saltator
 
+  chaos:
+    name: chaos (3-node kill -9)
+    # M4 exit criterion (spec.md §12): a 3-node cluster survives kill -9 of
+    # the room-shard leader mid-traffic with no message loss. Gates.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build saltator (release)
+        run: cargo build --release -p saltator
+      - name: Three-node chaos test
+        run: ./scripts/three_node_chaos.sh target/release/saltator
+
   complement:
     name: complement (csapi)
     # Pinned (not -latest): the saltator binary is built on this runner but
