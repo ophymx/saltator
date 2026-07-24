@@ -2,10 +2,13 @@
 //! originated events to the remote servers that share each room (spec
 //! §5.4 "Outbound").
 //!
-//! First cut: an in-memory cursor starting at the shard tip, immediate
-//! per-event delivery with bounded retry. Durable per-destination queues,
-//! backoff/health, and cursor persistence become the federation-out shard
-//! in M4 — this establishes the delivery path conversations need now.
+//! Out-queue ownership (spec.md §4.2): every replica of a room shard applies
+//! every event, so every node sees it on the change stream. To avoid N-way
+//! duplicate delivery, only the shard *leader* sends — a single owner per
+//! room that fails over automatically when leadership moves. The cursor
+//! still advances on followers so a new leader forwards from the current
+//! tip; a durable per-destination cursor for exact failover resume (no
+//! re-send, no gap) is the remaining federation-out-shard work.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,9 +59,15 @@ async fn run(
             let Some(&(last_seq, _)) = batch.last() else {
                 break;
             };
-            for (seq, entry) in &batch {
-                if let SeqEntry::Event { room_id, event_id } = entry {
-                    deliver(&rooms, &client, &server_name, room_id, event_id, *seq).await;
+            // Only the shard leader owns outbound delivery; followers advance
+            // the cursor but stay silent, so exactly one node sends and a new
+            // leader picks up from the tip on failover.
+            let owns_delivery = rooms.shard_handle().is_leader();
+            if owns_delivery {
+                for (seq, entry) in &batch {
+                    if let SeqEntry::Event { room_id, event_id } = entry {
+                        deliver(&rooms, &client, &server_name, room_id, event_id, *seq).await;
+                    }
                 }
             }
             cursor = last_seq;
