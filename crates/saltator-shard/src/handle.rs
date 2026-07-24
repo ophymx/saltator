@@ -126,6 +126,61 @@ impl ShardHandle {
         self.raft.is_initialized().await.map_err(raft_err)
     }
 
+    /// Add `node_id` (reachable at `addr`) to this group as a learner and
+    /// block until it has replicated enough log to be caught up. Must be
+    /// called on the leader (spec.md §4.4 "Node join").
+    pub async fn add_learner(&self, node_id: NodeId, addr: String) -> Result<()> {
+        self.raft
+            .add_learner(node_id, BasicNode::new(addr), true)
+            .await
+            .map_err(raft_err)?;
+        Ok(())
+    }
+
+    /// Replace this group's voter set with `voters` (a membership change).
+    /// Must be called on the leader; learners not in the set are demoted,
+    /// so callers include the existing voters plus any additions.
+    pub async fn set_voters(&self, voters: std::collections::BTreeSet<NodeId>) -> Result<()> {
+        self.raft
+            .change_membership(voters, false)
+            .await
+            .map_err(raft_err)?;
+        Ok(())
+    }
+
+    /// This group's current voter set, from the last observed metrics.
+    pub fn voter_ids(&self) -> std::collections::BTreeSet<NodeId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
+    /// The current leader this node believes in, if any.
+    pub fn current_leader(&self) -> Option<NodeId> {
+        self.raft.metrics().borrow().current_leader
+    }
+
+    /// The address the membership config records for `node_id`, if known.
+    pub fn node_addr(&self, node_id: NodeId) -> Option<String> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .nodes()
+            .find(|(id, _)| **id == node_id)
+            .map(|(_, n)| n.addr.clone())
+    }
+
+    /// Whether this node currently believes itself to be the leader.
+    pub fn is_leader(&self) -> bool {
+        self.current_leader() == Some(self.node_id)
+    }
+
     /// Wait until this shard has a leader.
     pub async fn wait_for_leader(&self, timeout: Duration) -> Result<NodeId> {
         let metrics = self

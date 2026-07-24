@@ -37,6 +37,23 @@ message StatusResponse {
   uint64 last_applied = 6;
 }
 
+// A node asking to join the cluster's metadata group (spec.md §4.4).
+message JoinRequest {
+  uint64 node_id = 1;
+  // The joining node's internal-RPC address, recorded as its Raft node
+  // address so the leader can replicate to it.
+  string advertise_addr = 2;
+}
+
+message JoinResponse {
+  // True if this node applied the membership change (it was the leader).
+  bool joined = 1;
+  // When not joined, the leader to retry against (absent if unknown yet).
+  optional uint64 leader_id = 2;
+  optional string leader_addr = 3;
+}
+
 service ControlService {
   rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Join(JoinRequest) returns (JoinResponse);
 }

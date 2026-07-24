@@ -5,9 +5,12 @@
 //! with [`MetaApp`] as its state machine; this crate owns the typed
 //! command surface and the gRPC transport that all shard groups share.
 
+pub mod join;
 pub mod network;
 pub mod rpc;
 pub mod types;
+
+pub use join::join_cluster;
 
 pub mod proto {
     #![allow(clippy::all)]
@@ -120,6 +123,31 @@ impl MetadataHandle {
         Ok(self.inner.wait_for_leader(timeout).await?)
     }
 
+    /// Whether this node is the metadata-group leader (only the leader can
+    /// admit new nodes).
+    pub fn is_leader(&self) -> bool {
+        self.inner.is_leader()
+    }
+
+    /// The current leader and its advertised address, for redirecting a join
+    /// request that reached a follower.
+    pub fn leader_hint(&self) -> Option<(NodeId, String)> {
+        let leader = self.inner.current_leader()?;
+        let addr = self.inner.node_addr(leader)?;
+        Some((leader, addr))
+    }
+
+    /// Admit `node_id` (reachable at `addr`) to the metadata group: add it as
+    /// a learner to catch it up, then promote it into the voter set. Must be
+    /// called on the leader (spec.md §4.4 "Node join").
+    pub async fn admit_node(&self, node_id: NodeId, addr: String) -> Result<()> {
+        self.inner.add_learner(node_id, addr).await?;
+        let mut voters = self.inner.voter_ids();
+        voters.insert(node_id);
+        self.inner.set_voters(voters).await?;
+        Ok(())
+    }
+
     /// Linearizable write through the metadata group.
     pub async fn write(&self, cmd: MetaCommand) -> Result<MetaResponse> {
         let command = postcard::to_stdvec(&cmd).map_err(|e| ClusterError::Codec(e.to_string()))?;
@@ -130,6 +158,21 @@ impl MetadataHandle {
     /// Linearizable read: confirm leadership/lease, then read applied state.
     pub async fn read(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.inner.ensure_linearizable().await?;
+        self.inner
+            .read_ctx()
+            .get(T_KV, key.as_bytes())
+            .map_err(|e| ClusterError::Storage(e.to_string()))
+    }
+
+    /// This node's current view of the metadata voter set.
+    pub fn voter_ids(&self) -> std::collections::BTreeSet<NodeId> {
+        self.inner.voter_ids()
+    }
+
+    /// Read applied state on this node without a linearizability check — may
+    /// be stale on a follower. For diagnostics and intra-cluster convergence
+    /// checks, not for serving clients.
+    pub fn read_local(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.inner
             .read_ctx()
             .get(T_KV, key.as_bytes())

@@ -11,7 +11,7 @@ use saltator_shard::{ShardRegistry, TypeConfig};
 
 use crate::proto::control_service_server::ControlService;
 use crate::proto::raft_service_server::RaftService;
-use crate::proto::{RaftPayload, StatusRequest, StatusResponse};
+use crate::proto::{JoinRequest, JoinResponse, RaftPayload, StatusRequest, StatusResponse};
 use crate::types::CODEC_VERSION;
 use crate::MetadataHandle;
 
@@ -113,5 +113,33 @@ impl ControlService for InternalRpc {
             leader: metrics.current_leader,
             last_applied: metrics.last_applied.map(|l| l.index).unwrap_or(0),
         }))
+    }
+
+    /// Admit a node to the metadata group. Only the leader can apply the
+    /// change; a follower answers with a redirect to the leader so the
+    /// caller can retry there.
+    async fn join(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
+        let req = request.into_inner();
+        if self.handle.is_leader() {
+            self.handle
+                .admit_node(req.node_id, req.advertise_addr)
+                .await
+                .map_err(|e| Status::internal(format!("admit node: {e}")))?;
+            Ok(Response::new(JoinResponse {
+                joined: true,
+                leader_id: Some(self.handle.node_id()),
+                leader_addr: None,
+            }))
+        } else {
+            let (leader_id, leader_addr) = match self.handle.leader_hint() {
+                Some((id, addr)) => (Some(id), Some(addr)),
+                None => (None, None),
+            };
+            Ok(Response::new(JoinResponse {
+                joined: false,
+                leader_id,
+                leader_addr,
+            }))
+        }
     }
 }
