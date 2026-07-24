@@ -25,6 +25,21 @@ jobs:
       - name: tests
         run: cargo test --workspace
 
+  cluster-smoke:
+    name: cluster (2-node)
+    # Two real saltator binaries form a cluster: node 2 joins node 1 and the
+    # reconciler admits it as a voter of both shard groups. Gates — a broken
+    # join/placement/reconcile path fails the build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build saltator (release)
+        run: cargo build --release -p saltator
+      - name: Two-node smoke test
+        run: ./scripts/two_node_smoke.sh target/release/saltator
+
   complement:
     name: complement (csapi)
     # Pinned (not -latest): the saltator binary is built on this runner but

@@ -123,11 +123,13 @@ pub async fn load_signing_key(
     data_dir: &Path,
     server_name: ruma::OwnedServerName,
 ) -> anyhow::Result<ServerSigner> {
-    if let Some(version) = meta.read(CURRENT_KEY).await? {
+    // Startup reads of applied state: follower-safe (a joiner is a metadata
+    // follower and cannot do a linearizable read, but has caught up via the
+    // blocking add-learner before reaching here).
+    if let Some(version) = meta.read_local(CURRENT_KEY)? {
         let version = String::from_utf8(version).context("signing_key_current not UTF-8")?;
         let blob = meta
-            .read(&version_key(&version))
-            .await?
+            .read_local(&version_key(&version))?
             .with_context(|| format!("signing key version {version} missing from metadata"))?;
         let der = decrypt(kek, &version, &blob)?;
         return Ok(ServerSigner::from_der(server_name, &der, version)?);
@@ -208,7 +210,7 @@ pub async fn old_verify_keys(
     kek: &[u8; 32],
     server_name: ruma::OwnedServerName,
 ) -> anyhow::Result<Vec<saltator_federation::OldVerifyKey>> {
-    let Some(current) = meta.read(CURRENT_KEY).await? else {
+    let Some(current) = meta.read_local(CURRENT_KEY)? else {
         return Ok(Vec::new());
     };
     let current: u64 = String::from_utf8(current)
@@ -218,10 +220,10 @@ pub async fn old_verify_keys(
     let mut out = Vec::new();
     for version in 0..current {
         let version = version.to_string();
-        let Some(blob) = meta.read(&version_key(&version)).await? else {
+        let Some(blob) = meta.read_local(&version_key(&version))? else {
             continue;
         };
-        let Some(key_meta) = meta.read(&meta_key(&version)).await? else {
+        let Some(key_meta) = meta.read_local(&meta_key(&version))? else {
             continue;
         };
         let key_meta: KeyMeta = serde_json::from_slice(&key_meta)

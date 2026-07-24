@@ -8,11 +8,13 @@
 pub mod join;
 pub mod network;
 pub mod placement;
+pub mod reconcile;
 pub mod rpc;
 pub mod types;
 
 pub use join::join_cluster;
 pub use placement::{ClusterConfig, NodeInfo, NodeStatus, Placement, Roster};
+pub use reconcile::{reconcile_once, spawn_reconciler, LocalGroup};
 
 pub mod proto {
     #![allow(clippy::all)]

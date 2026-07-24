@@ -108,49 +108,96 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION"),
     );
 
-    // Minting a KEK is only legitimate when this start will bootstrap a
-    // cluster; an existing db with no master.key is a provisioning mistake.
     let fresh_bootstrap = !cfg.data_dir.join("db").exists();
     std::fs::create_dir_all(&cfg.data_dir)?;
     let engine = Arc::new(saltator_store::RocksEngine::open(&cfg.data_dir.join("db"))?);
 
-    // Joining via seeds is M4 (placement controller + add-learner flow);
-    // fresh bootstrap and restart-recovery only until then.
-    if !cfg.cluster.seeds.is_empty() {
-        anyhow::bail!("cluster.seeds is not supported yet (M4); run with empty seeds");
-    }
+    // A node *founds* a new cluster only on a fresh data dir with no seeds;
+    // with seeds it *joins* an existing one. A restart (non-fresh) recovers
+    // persisted membership either way. Minting a KEK, and initializing the
+    // metadata group single-voter, are legitimate only when founding.
+    let founding = fresh_bootstrap && cfg.cluster.seeds.is_empty();
+
+    // Shutdown is signalled early: the internal RPC server must be up before
+    // join/reconciliation so a joining node can receive replication.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let registry = saltator_shard::ShardRegistry::new();
     let meta = saltator_cluster::MetadataHandle::start(
         cfg.node.id,
         engine.clone(),
-        Some(cfg.node.advertise.clone()),
+        founding.then(|| cfg.node.advertise.clone()),
         Some(&registry),
     )
     .await?;
-    let leader = meta.wait_for_leader(Duration::from_secs(10)).await?;
+
+    // Serve the internal gRPC surface now (a joiner needs it to receive
+    // replication; every node needs it for cross-node Raft traffic).
+    let internal_task = {
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(saltator_cluster::serve_internal(
+            meta.clone(),
+            registry.clone(),
+            cfg.server_name.clone(),
+            cfg.listeners.internal,
+            async move {
+                let _ = rx.wait_for(|stop| *stop).await;
+            },
+        ))
+    };
+    tracing::info!(listen = %cfg.listeners.internal, "internal RPC listening");
+
+    // A joiner asks a seed to admit it to the metadata group before anything
+    // else can be read from it.
+    if fresh_bootstrap && !cfg.cluster.seeds.is_empty() {
+        tracing::info!(seeds = ?cfg.cluster.seeds, "joining existing cluster");
+        saltator_cluster::join_cluster(
+            &cfg.cluster.seeds,
+            cfg.node.id,
+            &cfg.node.advertise,
+            Duration::from_secs(30),
+        )
+        .await?;
+    }
+
+    let leader = meta.wait_for_leader(Duration::from_secs(30)).await?;
     tracing::info!(leader, "metadata group ready");
+
+    // The founder writes the cluster control plane (topology, roster,
+    // placement); joiners read the replicated copy.
+    if founding {
+        meta.bootstrap_cluster(
+            saltator_cluster::ClusterConfig::default(),
+            cfg.node.advertise.clone(),
+        )
+        .await?;
+    }
 
     // Event-signing identity: versioned, encrypted at rest in the
     // metadata group (spec.md §5.4, §10).
     let server_name = server_name_of(&cfg)?;
-    let kek = keys::load_kek(&cfg.data_dir.join("master.key"), fresh_bootstrap)?;
+    let kek = keys::load_kek(&cfg.data_dir.join("master.key"), founding)?;
     let signer =
         Arc::new(keys::load_signing_key(&meta, &kek, &cfg.data_dir, server_name.clone()).await?);
     let old_keys = keys::old_verify_keys(&meta, &kek, server_name.clone()).await?;
 
+    // Room + user shards: the founder bootstraps each single-voter; a joiner
+    // starts them uninitialized and the reconciler folds this node in as a
+    // voter once the leader has caught it up. The wait therefore tolerates a
+    // reconciliation round or two on a joining node.
+    let shard_bootstrap = founding.then(|| cfg.node.advertise.clone());
     let rooms = saltator_roomserver::RoomServer::start(
         cfg.node.id,
         engine.clone(),
         signer.clone(),
         saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_roomserver::ROOM_SHARD),
-        Some(cfg.node.advertise.clone()),
+        shard_bootstrap.clone(),
         Some(&registry),
     )
     .await?;
     rooms
         .shard_handle()
-        .wait_for_leader(Duration::from_secs(10))
+        .wait_for_leader(Duration::from_secs(60))
         .await?;
     tracing::info!("room shard ready");
 
@@ -159,15 +206,33 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         engine.clone(),
         server_name.clone(),
         saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_userserver::USER_SHARD),
-        Some(cfg.node.advertise.clone()),
+        shard_bootstrap,
         Some(&registry),
     )
     .await?;
     users
         .shard_handle()
-        .wait_for_leader(Duration::from_secs(10))
+        .wait_for_leader(Duration::from_secs(60))
         .await?;
     tracing::info!("user shard ready");
+
+    // Drive this node's shard groups toward the placement: as a group's
+    // leader it admits new replicas; a joiner's freshly-started groups become
+    // voters here. Each group is reconciled by exactly its own leader.
+    let reconciler = saltator_cluster::spawn_reconciler(
+        meta.clone(),
+        vec![
+            saltator_cluster::LocalGroup::new(
+                saltator_roomserver::ROOM_SHARD.group(),
+                rooms.shard_handle().clone(),
+            ),
+            saltator_cluster::LocalGroup::new(
+                saltator_userserver::USER_SHARD.group(),
+                users.shard_handle().clone(),
+            ),
+        ],
+        Duration::from_secs(2),
+    );
 
     let projection = saltator_userserver::spawn_membership_projection(users.clone(), rooms.clone());
 
@@ -255,7 +320,6 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let fed_sender =
         saltator_federation::spawn_sender(rooms.clone(), fed_client, server_name.clone());
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut cs_shutdown = shutdown_rx.clone();
     let cs_task = tokio::spawn(async move {
         axum::serve(cs_listener, cs_router)
@@ -291,12 +355,6 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         });
     }
 
-    let internal_shutdown = {
-        let mut rx = shutdown_rx.clone();
-        async move {
-            let _ = rx.wait_for(|stop| *stop).await;
-        }
-    };
     tokio::spawn(async move {
         // SIGTERM matters as much as ctrl-c: it's what `docker stop` (and
         // thus Complement teardown) sends, and as PID 1 in a container the
@@ -311,19 +369,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    tracing::info!(listen = %cfg.listeners.internal, "internal RPC listening");
-    saltator_cluster::serve_internal(
-        meta.clone(),
-        registry.clone(),
-        cfg.server_name.clone(),
-        cfg.listeners.internal,
-        internal_shutdown,
-    )
-    .await?;
-
+    // Block until a shutdown signal drives the internal server to return.
+    internal_task.await??;
     cs_task.await??;
     fed_task.await??;
     fed_sender.abort();
+    reconciler.abort();
     projection.abort();
     rooms.shutdown().await?;
     users.shutdown().await?;
