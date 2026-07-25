@@ -1,10 +1,12 @@
 //! `/sync` v2 (spec.md §5.3) plus receipts, read markers, and typing.
 //!
 //! The `since` token is a compact versioned encoding of the positions of
-//! the shards backing the user's data — with M2's fixed single-shard
-//! layout that is `s{room_seq}_{user_seq}_{typing_gen}`. Long-polls
-//! subscribe to both shards' change streams (and the typing map) before
-//! computing, so nothing lands unseen between compute and wait.
+//! the shards backing the user's data — with the fixed single-shard
+//! layout that is `s{room_seq}_{user_seq}_{typing_gen}_{presence_gen}`.
+//! Long-polls subscribe to both shards' change streams (and the typing /
+//! presence maps) before computing, so nothing lands unseen between
+//! compute and wait. Presenting a since token also acknowledges the
+//! to-device messages before it, which are then dropped from the inbox.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -107,6 +109,22 @@ pub async fn sync_events(
             .set_active(auth.user_id.as_str(), req.set_presence.as_str());
     }
 
+    // A since token acknowledges everything before it: drop delivered
+    // to-device messages from the inbox (spec.md §5.5: drained by sync).
+    if let Some(s) = since {
+        let inbox = state
+            .users
+            .store()
+            .to_device_events(auth.user_id.as_str(), &auth.device_id, 0)
+            .map_err(internal)?;
+        if inbox.first().is_some_and(|(seq, _)| *seq <= s.user) {
+            state
+                .users
+                .ack_to_device(&auth.user_id, &auth.device_id, s.user)
+                .await?;
+        }
+    }
+
     // Subscribe before the first compute (no lost wakeups).
     let mut room_rx = state.rooms.subscribe();
     let mut user_rx = state.users.subscribe();
@@ -121,8 +139,10 @@ pub async fn sync_events(
             presence: state.presence.generation(),
         };
         let resp = build_sync(&state, &auth, since, now_pos, limit, lazy, req.full_state)?;
-        let empty =
-            resp.rooms.is_empty() && resp.account_data.is_empty() && resp.presence.is_empty();
+        let empty = resp.rooms.is_empty()
+            && resp.account_data.is_empty()
+            && resp.presence.is_empty()
+            && resp.to_device.events.is_empty();
         if since.is_none() || !empty || timeout.is_zero() {
             return Ok(Ra(resp));
         }
@@ -264,6 +284,33 @@ fn build_sync(
             .events
             .push(to_raw(&account_data_event(&data_type, &entry.json)?)?);
     }
+
+    // To-device inbox: pending messages in the window, oldest first.
+    // Rows past `now` wait for the next window or they'd be served twice.
+    let to_device_since = if initial { 0 } else { since.user };
+    for (seq, json) in store
+        .to_device_events(user_id, &auth.device_id, to_device_since)
+        .map_err(internal)?
+    {
+        if seq > now.user {
+            break;
+        }
+        let event: serde_json::Value = serde_json::from_slice(&json).map_err(internal)?;
+        resp.to_device.events.push(to_raw(&event)?);
+    }
+
+    // One-time-key counts for this device; clients replenish from these.
+    resp.device_one_time_keys_count = store
+        .one_time_key_counts(user_id, &auth.device_id)
+        .map_err(internal)?
+        .into_iter()
+        .map(|(algo, n)| {
+            (
+                algo.as_str().into(),
+                ruma::UInt::try_from(n).unwrap_or(ruma::UInt::MAX),
+            )
+        })
+        .collect();
 
     // Presence: users the caller shares a room with (and the caller) whose
     // presence changed inside the window.

@@ -5,11 +5,11 @@ use saltator_shard::{ApplyCtx, ReadCtx, ShardApp};
 use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
-    account_data_key, device_scoped_key, prefix_end, user_key, Account, AccountDataEntry,
-    AliasEntry, ClaimedKey, Device, MediaMeta, MembershipEntry, Profile, SessionCmd, TokenEntry,
-    TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS,
-    T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER, T_INVITE_STATE, T_MEDIA,
-    T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_TOKEN,
+    account_data_key, device_scoped_key, prefix_end, to_device_key, user_key, Account,
+    AccountDataEntry, AliasEntry, ClaimedKey, Device, MediaMeta, MembershipEntry, Profile,
+    SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT,
+    T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER,
+    T_INVITE_STATE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_TOKEN, T_TO_DEVICE,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -450,6 +450,54 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
             Ok(UserResponse::ClaimedKeys(claimed))
         }
+        UserCommand::SendToDevice { messages } => {
+            for m in messages {
+                // `"*"` fans out to every registered device; an explicit
+                // device must exist (a row nobody will ever drain is
+                // dropped, per spec).
+                let device_ids: Vec<String> = if m.device_id == "*" {
+                    let start = user_key(&m.user_id, "");
+                    ctx.range(T_DEVICE, &start, &user_end(&m.user_id))?
+                        .into_iter()
+                        .map(|(k, _)| String::from_utf8_lossy(&k[start.len()..]).into_owned())
+                        .collect()
+                } else if ctx
+                    .get(T_DEVICE, &user_key(&m.user_id, &m.device_id))?
+                    .is_some()
+                {
+                    vec![m.device_id.clone()]
+                } else {
+                    Vec::new()
+                };
+                if device_ids.is_empty() {
+                    continue;
+                }
+                // One emit per message: the seq both wakes the recipient's
+                // sync and keys the inbox rows (unique per message).
+                let seq = emit_user_change(ctx, &m.user_id)?;
+                for device_id in device_ids {
+                    ctx.put(
+                        T_TO_DEVICE,
+                        &to_device_key(&m.user_id, &device_id, seq),
+                        m.json.clone(),
+                    );
+                }
+            }
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::AckToDevice {
+            user_id,
+            device_id,
+            up_to,
+        } => {
+            let prefix = device_scoped_key(user_id, device_id, "");
+            let mut end = prefix.clone();
+            end.extend_from_slice(&up_to.saturating_add(1).to_be_bytes());
+            for (k, _) in ctx.range(T_TO_DEVICE, &prefix, &end)? {
+                ctx.delete(T_TO_DEVICE, &k);
+            }
+            Ok(UserResponse::Ok)
+        }
     }
 }
 
@@ -536,6 +584,47 @@ impl UserStore {
             out.push((device_id, v));
         }
         Ok(out)
+    }
+
+    /// Pending to-device events for a device at inbox seq > `since`:
+    /// `(seq, raw event JSON)`, oldest first.
+    pub fn to_device_events(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        since: u64,
+    ) -> StoreResult<Vec<(u64, Vec<u8>)>> {
+        let prefix = device_scoped_key(user_id, device_id, "");
+        let mut start = prefix.clone();
+        start.extend_from_slice(&since.saturating_add(1).to_be_bytes());
+        let mut out = Vec::new();
+        for (k, v) in self.read.range(T_TO_DEVICE, &start, &prefix_end(&prefix))? {
+            let seq: [u8; 8] = k[prefix.len()..]
+                .try_into()
+                .map_err(|_| StoreError::Engine("to-device key shape".into()))?;
+            out.push((u64::from_be_bytes(seq), v));
+        }
+        Ok(out)
+    }
+
+    /// One-time-key counts per algorithm for a device (`/sync`'s
+    /// `device_one_time_keys_count`).
+    pub fn one_time_key_counts(
+        &self,
+        user_id: &str,
+        device_id: &str,
+    ) -> StoreResult<std::collections::BTreeMap<String, u64>> {
+        let prefix = device_scoped_key(user_id, device_id, "");
+        let mut counts = std::collections::BTreeMap::new();
+        for (k, _) in self
+            .read
+            .range(T_ONE_TIME_KEY, &prefix, &prefix_end(&prefix))?
+        {
+            let key_id = String::from_utf8_lossy(&k[prefix.len()..]).into_owned();
+            let algo = key_id.split(':').next().unwrap_or_default().to_owned();
+            *counts.entry(algo).or_insert(0u64) += 1;
+        }
+        Ok(counts)
     }
 
     pub fn account_data(

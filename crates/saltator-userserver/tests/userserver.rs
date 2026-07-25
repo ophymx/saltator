@@ -10,7 +10,8 @@ use saltator_roomserver::{Outcome, RoomServer, ServerSigner};
 use saltator_shard::NoopNetworkFactory;
 use saltator_store::RocksEngine;
 use saltator_userserver::{
-    spawn_membership_projection, wait_for_projection, ClaimRequest, UserError, UserServer,
+    spawn_membership_projection, wait_for_projection, ClaimRequest, ToDeviceMessage, UserError,
+    UserServer,
 };
 
 const SERVER: &str = "hs.test";
@@ -206,6 +207,94 @@ async fn e2ee_key_upload_query_claim() {
     assert!(third.is_empty());
     let counts = u.upload_keys(&uid, &dev, None, vec![]).await.unwrap();
     assert_eq!(counts.get("signed_curve25519").copied().unwrap_or(0), 0);
+
+    env.rooms.shutdown().await.unwrap();
+    u.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn to_device_inbox_send_and_ack() {
+    let env = start_env().await;
+    let u = &env.users;
+
+    let (_, s) = u
+        .register("alice", Some("p"), None, None, false, false)
+        .await
+        .unwrap();
+    let s = s.unwrap();
+    let uid = s.user_id.clone();
+    let dev1 = s.device_id.to_string();
+    let dev2 = u
+        .login_password("alice", "p", None, None, false)
+        .await
+        .unwrap()
+        .device_id
+        .to_string();
+
+    let msg = |device: &str, body: &str| ToDeviceMessage {
+        user_id: uid.to_string(),
+        device_id: device.to_owned(),
+        json: serde_json::to_vec(&json!({
+            "type": "m.room.encrypted", "sender": uid.as_str(),
+            "content": {"body": body},
+        }))
+        .unwrap(),
+    };
+
+    // Explicit device, wildcard fan-out, and an unknown device (dropped).
+    u.send_to_device(vec![msg(&dev1, "direct")]).await.unwrap();
+    u.send_to_device(vec![msg("*", "broadcast")]).await.unwrap();
+    u.send_to_device(vec![msg("NOSUCH", "lost")]).await.unwrap();
+
+    let inbox1 = u.store().to_device_events(uid.as_str(), &dev1, 0).unwrap();
+    let inbox2 = u.store().to_device_events(uid.as_str(), &dev2, 0).unwrap();
+    assert_eq!(inbox1.len(), 2, "direct + broadcast");
+    assert_eq!(inbox2.len(), 1, "broadcast only");
+    assert!(u
+        .store()
+        .to_device_events(uid.as_str(), "NOSUCH", 0)
+        .unwrap()
+        .is_empty());
+
+    // Inbox rows sit in queue order; `since` windows past them.
+    assert!(inbox1[0].0 < inbox1[1].0);
+    let after_first = u
+        .store()
+        .to_device_events(uid.as_str(), &dev1, inbox1[0].0)
+        .unwrap();
+    assert_eq!(after_first.len(), 1);
+
+    // Ack drains one device's inbox without touching the other's.
+    u.ack_to_device(&uid, &dev1, inbox1[1].0).await.unwrap();
+    assert!(u
+        .store()
+        .to_device_events(uid.as_str(), &dev1, 0)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        u.store().to_device_events(uid.as_str(), &dev2, 0).unwrap(),
+        inbox2
+    );
+
+    // One-time-key counts read straight off the store.
+    u.upload_keys(
+        &uid,
+        &dev1,
+        None,
+        vec![(
+            "signed_curve25519:AAAAAQ".to_owned(),
+            serde_json::to_vec(&json!({"key": "aaa"})).unwrap(),
+        )],
+    )
+    .await
+    .unwrap();
+    let counts = u.store().one_time_key_counts(uid.as_str(), &dev1).unwrap();
+    assert_eq!(counts.get("signed_curve25519"), Some(&1));
+    assert!(u
+        .store()
+        .one_time_key_counts(uid.as_str(), &dev2)
+        .unwrap()
+        .is_empty());
 
     env.rooms.shutdown().await.unwrap();
     u.shutdown().await.unwrap();

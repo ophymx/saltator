@@ -6,3 +6,4 @@ pub mod rooms;
 pub mod search;
 pub mod session;
 pub mod sync;
+pub mod to_device;

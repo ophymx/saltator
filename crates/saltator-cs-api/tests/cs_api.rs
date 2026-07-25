@@ -719,6 +719,128 @@ async fn account_data_filters_and_devices() {
     env.shutdown().await;
 }
 
+/// The E2EE transport surface: `/sendToDevice` queues into the recipient
+/// device's inbox, `/sync` delivers it (with one-time-key counts) and a
+/// later since token drains it.
+#[tokio::test]
+async fn to_device_messages_and_otk_counts_via_sync() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+
+    let (_, whoami) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(&alice),
+            None,
+        )
+        .await;
+    let alice_dev = whoami["device_id"].as_str().unwrap().to_owned();
+
+    // Alice publishes one-time keys; her sync reports the counts.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            Some(&alice),
+            Some(json!({
+                "one_time_keys": {
+                    "signed_curve25519:AAAAAQ": {"key": "aaa"},
+                    "signed_curve25519:AAAAAg": {"key": "bbb"},
+                }
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, sync0) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sync0}");
+    assert_eq!(sync0["device_one_time_keys_count"]["signed_curve25519"], 2);
+    let before = sync0["next_batch"].as_str().unwrap().to_owned();
+
+    // Bob addresses Alice's device; retransmitting the same transaction
+    // must not queue a second copy.
+    for _ in 0..2 {
+        let (status, body) = env
+            .req(
+                "PUT",
+                "/_matrix/client/v3/sendToDevice/m.room.encrypted/td-txn-1",
+                Some(&bob),
+                Some(json!({
+                    "messages": {"@alice:hs.test": {&alice_dev: {"ciphertext": "xyz"}}}
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    // The proposal committed before the PUT returned, so an incremental
+    // sync sees the message immediately.
+    let (status, delivered) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={before}&timeout=0"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{delivered}");
+    let events = delivered["to_device"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "retransmission queued a duplicate");
+    assert_eq!(events[0]["type"], "m.room.encrypted");
+    assert_eq!(events[0]["sender"], "@bob:hs.test");
+    assert_eq!(events[0]["content"]["ciphertext"], "xyz");
+    let after = delivered["next_batch"].as_str().unwrap().to_owned();
+
+    // Syncing past the message acknowledges it, and the inbox is drained
+    // for good: even rewinding to the pre-message token finds nothing.
+    for since in [&after, &before] {
+        let (status, resp) = env
+            .req(
+                "GET",
+                &format!("/_matrix/client/v3/sync?since={since}&timeout=0"),
+                Some(&alice),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        assert!(
+            resp["to_device"]["events"]
+                .as_array()
+                .is_none_or(|a| a.is_empty()),
+            "inbox not drained at since={since}: {resp}"
+        );
+    }
+
+    // Wildcard addressing reaches every device of the user.
+    let (status, body) = env
+        .req(
+            "PUT",
+            "/_matrix/client/v3/sendToDevice/m.key.verification.request/td-txn-2",
+            Some(&bob),
+            Some(json!({
+                "messages": {"@alice:hs.test": {"*": {"body": "verify"}}}
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={after}&timeout=0"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    let events = resp["to_device"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "m.key.verification.request");
+
+    env.shutdown().await;
+}
+
 /// Regressions surfaced by the first Complement run: trailing-slash state
 /// URLs, username case handling, directory visibility, size/encoding
 /// rejections, history visibility, MSC4115 annotations, and the

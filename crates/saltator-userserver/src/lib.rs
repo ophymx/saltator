@@ -28,7 +28,7 @@ use saltator_store::{Keyspace, KvEngine};
 pub use machine::{UserApp, UserStore};
 pub use types::{
     Account, AccountDataEntry, AliasEntry, ClaimRequest, ClaimedKey, Device, MediaMeta,
-    MembershipChange, MembershipEntry, Profile, SessionCmd, TokenEntry, TokenKind,
+    MembershipChange, MembershipEntry, Profile, SessionCmd, ToDeviceMessage, TokenEntry, TokenKind,
     UserChangePayload, UserCommand, UserResponse,
 };
 
@@ -347,6 +347,28 @@ impl UserServer {
             UserResponse::ClaimedKeys(keys) => Ok(keys),
             other => Err(unexpected(other)),
         }
+    }
+
+    /// Queue to-device messages into recipients' inboxes (`/sendToDevice`),
+    /// waking their syncs. A `device_id` of `"*"` fans out to all of the
+    /// user's devices.
+    pub async fn send_to_device(&self, messages: Vec<ToDeviceMessage>) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        self.expect_ok(&UserCommand::SendToDevice { messages })
+            .await
+    }
+
+    /// Drop delivered to-device messages: everything at inbox seq
+    /// `<= up_to` for the device.
+    pub async fn ack_to_device(&self, user_id: &UserId, device_id: &str, up_to: u64) -> Result<()> {
+        self.expect_ok(&UserCommand::AckToDevice {
+            user_id: user_id.to_string(),
+            device_id: device_id.to_owned(),
+            up_to,
+        })
+        .await
     }
 
     // -- profile / account data / filters / aliases / media ---------------

@@ -46,6 +46,11 @@ pub const T_DEVICE_KEYS: u8 = APP_TABLE_MIN + 12;
 /// Claiming one is a Raft-serialized delete, so an OTK is never handed out
 /// twice (spec.md §5.5, §9).
 pub const T_ONE_TIME_KEY: u8 = APP_TABLE_MIN + 13;
+/// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ seq (u64 BE) → to-device event
+/// JSON` — the durable per-device to-device inbox, drained by `/sync`
+/// (spec.md §5.5). `seq` is the user-shard seq at which the message was
+/// queued; sync windows on it like account data.
+pub const T_TO_DEVICE: u8 = APP_TABLE_MIN + 14;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -80,6 +85,14 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Vec<u8> {
         end.pop();
     }
     end
+}
+
+/// To-device inbox key: `user_id ++ 0x00 ++ device_id ++ 0x00 ++ seq BE`.
+/// Big-endian seq keeps the inbox in queue order under lexicographic scan.
+pub(crate) fn to_device_key(user_id: &str, device_id: &str, seq: u64) -> Vec<u8> {
+    let mut k = device_scoped_key(user_id, device_id, "");
+    k.extend_from_slice(&seq.to_be_bytes());
+    k
 }
 
 /// Account-data key: `user_id ++ 0x00 ++ room_id ++ 0x00 ++ type`.
@@ -308,6 +321,30 @@ pub enum UserCommand {
     ClaimKeys {
         claims: Vec<ClaimRequest>,
     },
+    /// Queue to-device events into recipients' inboxes (`/sendToDevice`,
+    /// later the `m.direct_to_device` federation EDU). Wakes each
+    /// recipient's sync.
+    SendToDevice {
+        messages: Vec<ToDeviceMessage>,
+    },
+    /// Drop delivered to-device messages: everything at inbox seq
+    /// `<= up_to` for the device, once a sync past them acknowledged
+    /// delivery.
+    AckToDevice {
+        user_id: String,
+        device_id: String,
+        up_to: u64,
+    },
+}
+
+/// One to-device message: the full event JSON (`type`, `sender`,
+/// `content`) bound for a recipient device. A `device_id` of `"*"` fans
+/// out to every device the user has registered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToDeviceMessage {
+    pub user_id: String,
+    pub device_id: String,
+    pub json: Vec<u8>,
 }
 
 /// One `(user, device, algorithm)` one-time-key claim.
