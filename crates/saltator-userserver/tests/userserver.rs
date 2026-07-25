@@ -503,7 +503,8 @@ async fn membership_projection_tracks_room_shard() {
         }
     };
     join(alice.clone(), "join", None).await;
-    // Invite a local and a remote user; remote must not be indexed.
+    // Invite a local and a remote user; both are indexed — device-list
+    // and presence visibility need remote members' rows too.
     join(alice.clone(), "invite", Some(bob.as_str())).await;
     let last = match join(alice.clone(), "invite", Some(remote.as_str())).await {
         Outcome::Accepted { seq, .. } => seq,
@@ -526,10 +527,11 @@ async fn membership_projection_tracks_room_shard() {
         .unwrap();
     assert_eq!(m.membership, "invite");
     assert_eq!(m.sender, alice.as_str());
-    assert!(store
+    let m = store
         .membership(remote.as_str(), room_id.as_str())
         .unwrap()
-        .is_none());
+        .unwrap();
+    assert_eq!(m.membership, "invite");
 
     // Bob joins; the projection catches up incrementally.
     let last = match join(bob.clone(), "join", None).await {

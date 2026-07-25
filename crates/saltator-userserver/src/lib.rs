@@ -589,10 +589,10 @@ fn unexpected(resp: UserResponse) -> UserError {
 const PROJECTION_BATCH: usize = 512;
 
 /// Drive the membership projection: consume the room shard's change
-/// stream and index local users' memberships in the user shard. Replays
-/// from the persisted cursor on startup; ends when the room shard's
-/// change stream closes (spec.md §9: eventually consistent, monotonic per
-/// source shard).
+/// stream and index members' memberships (local and remote) in the user
+/// shard. Replays from the persisted cursor on startup; ends when the
+/// room shard's change stream closes (spec.md §9: eventually consistent,
+/// monotonic per source shard).
 pub fn spawn_membership_projection(
     users: Arc<UserServer>,
     rooms: Arc<RoomServer>,
@@ -605,7 +605,6 @@ pub fn spawn_membership_projection(
 }
 
 async fn run_membership_projection(users: &UserServer, rooms: &RoomServer) -> Result<()> {
-    let server_name = users.server_name.clone();
     // Subscribe before catching up, so nothing lands unseen between scan
     // and subscription. Lag/overflow just triggers another catch-up.
     let mut changes = rooms.subscribe();
@@ -625,9 +624,7 @@ async fn run_membership_projection(users: &UserServer, rooms: &RoomServer) -> Re
                 let SeqEntry::Event { room_id, event_id } = entry else {
                     continue;
                 };
-                if let Some(change) =
-                    membership_change(rooms, &server_name, room_id, event_id, *room_seq)?
-                {
+                if let Some(change) = membership_change(rooms, room_id, event_id, *room_seq)? {
                     changes_out.push(change);
                 }
             }
@@ -644,10 +641,12 @@ async fn run_membership_projection(users: &UserServer, rooms: &RoomServer) -> Re
     }
 }
 
-/// Extract a local user's membership change from one accepted room event.
+/// Extract a membership change from one accepted room event. Remote
+/// users' memberships are indexed too — `/sync` only reads the caller's
+/// rows, but device-list and presence visibility ("do they share a
+/// room?") need every member.
 fn membership_change(
     rooms: &RoomServer,
-    server_name: &ruma::ServerName,
     room_id: &str,
     event_id: &str,
     room_seq: u64,
@@ -663,10 +662,7 @@ fn membership_change(
     let Some(state_key) = raw.get("state_key").and_then(|v| v.as_str()) else {
         return Ok(None);
     };
-    let Ok(target) = <&UserId>::try_from(state_key) else {
-        return Ok(None);
-    };
-    if target.server_name() != server_name {
+    if <&UserId>::try_from(state_key).is_err() {
         return Ok(None);
     }
     let Some(membership) = raw

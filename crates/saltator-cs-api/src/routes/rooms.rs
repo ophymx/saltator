@@ -480,6 +480,48 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId) -> Result<(
         std::time::Duration::from_secs(5),
     )
     .await;
+    project_imported_members(state, room_id.as_str(), seq).await?;
+    Ok(())
+}
+
+/// Seed the membership projection with an imported room's current members:
+/// the import stores them off-timeline (seq 0), where the change-stream
+/// projection never sees them, yet device-list and presence visibility
+/// ("do they share a room?") depend on their rows existing.
+async fn project_imported_members(state: &CsState, room_id: &str, upto: u64) -> Result<()> {
+    let current = crate::room_util::current_state(&state.rooms, room_id)?;
+    let mut changes = Vec::new();
+    for ((event_type, state_key), event_id) in &current {
+        if event_type != "m.room.member" {
+            continue;
+        }
+        let Some(raw) = crate::room_util::raw_event(&state.rooms, event_id)? else {
+            continue;
+        };
+        let membership = match raw.get("content") {
+            Some(ruma::CanonicalJsonValue::Object(c)) => match c.get("membership") {
+                Some(ruma::CanonicalJsonValue::String(m)) => m.clone(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let sender = match raw.get("sender") {
+            Some(ruma::CanonicalJsonValue::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        changes.push(saltator_userserver::MembershipChange {
+            user_id: state_key.clone(),
+            room_id: room_id.to_owned(),
+            membership,
+            event_id: event_id.clone(),
+            sender,
+            room_seq: upto,
+        });
+    }
+    state
+        .users
+        .apply_room_changes(&format!("import/{room_id}"), upto, changes)
+        .await?;
     Ok(())
 }
 
