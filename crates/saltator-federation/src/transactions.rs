@@ -3,8 +3,9 @@
 //! per-PDU results are aggregated and always returned with 200. A PDU that
 //! references events we don't have triggers a `/get_missing_events` fetch
 //! to fill the gap, then a retry. `m.typing` / `m.presence` EDUs are
-//! applied to the shared ephemeral maps; other EDU types (to-device,
-//! device-list) are dropped until M5.
+//! applied to the shared ephemeral maps and `m.direct_to_device` messages
+//! are queued into local users' inboxes; other EDU types (device-list)
+//! are dropped until their M5 brick.
 
 use std::sync::Arc;
 
@@ -56,17 +57,79 @@ pub async fn send_transaction(
         }
     }
 
-    // Ephemeral EDUs (typing/presence): applied best-effort, no per-EDU
-    // result. Device-list and to-device EDUs are ignored until M5.
-    if let Some(sink) = &state.edu_sink {
-        if let Some(edus) = body.get("edus").and_then(|e| e.as_array()) {
-            for edu in edus.iter().take(MAX_EDUS) {
+    // EDUs: applied best-effort, no per-EDU result. To-device messages go
+    // into the user shard's durable inboxes; typing/presence into the
+    // shared ephemeral maps. Device-list EDUs are ignored until their
+    // M5 brick.
+    if let Some(edus) = body.get("edus").and_then(|e| e.as_array()) {
+        for edu in edus.iter().take(MAX_EDUS) {
+            if edu.get("edu_type").and_then(|t| t.as_str()) == Some("m.direct_to_device") {
+                if let Some(users) = &state.users {
+                    apply_to_device_edu(users, state.server_name.as_str(), &auth.origin, edu).await;
+                }
+            } else if let Some(sink) = &state.edu_sink {
                 apply_edu(sink.as_ref(), &auth.origin, edu);
             }
         }
     }
 
     Ok(axum::Json(serde_json::json!({ "pdus": results })))
+}
+
+/// Queue an `m.direct_to_device` EDU's messages into local users' durable
+/// inboxes (spec.md §5.5), waking their syncs. The claimed sender must
+/// live on the origin server; non-local recipients are ignored.
+async fn apply_to_device_edu(
+    users: &Arc<saltator_userserver::UserServer>,
+    server_name: &str,
+    origin: &str,
+    edu: &serde_json::Value,
+) {
+    let content = edu.get("content");
+    let (Some(sender), Some(event_type), Some(messages)) = (
+        content
+            .and_then(|c| c.get("sender"))
+            .and_then(|v| v.as_str()),
+        content.and_then(|c| c.get("type")).and_then(|v| v.as_str()),
+        content
+            .and_then(|c| c.get("messages"))
+            .and_then(|v| v.as_object()),
+    ) else {
+        return;
+    };
+    if !ruma::UserId::parse(sender)
+        .map(|u| u.server_name().as_str() == origin)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let mut batch = Vec::new();
+    for (user_id, per_device) in messages {
+        let local = ruma::UserId::parse(user_id.as_str())
+            .map(|u| u.server_name().as_str() == server_name)
+            .unwrap_or(false);
+        let Some(per_device) = per_device.as_object().filter(|_| local) else {
+            continue;
+        };
+        for (device_id, message) in per_device {
+            let event = serde_json::json!({
+                "type": event_type,
+                "sender": sender,
+                "content": message,
+            });
+            let Ok(json) = serde_json::to_vec(&event) else {
+                continue;
+            };
+            batch.push(saltator_userserver::ToDeviceMessage {
+                user_id: user_id.clone(),
+                device_id: device_id.clone(),
+                json,
+            });
+        }
+    }
+    if let Err(e) = users.send_to_device(batch).await {
+        tracing::warn!(error = %e, origin, "to-device EDU apply failed");
+    }
 }
 
 /// Apply one EDU to the sink. Only `m.typing` and `m.presence` are handled;

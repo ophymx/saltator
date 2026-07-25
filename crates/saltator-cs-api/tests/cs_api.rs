@@ -1844,6 +1844,140 @@ async fn outbound_federated_invite_round_trip() {
     b_users.shutdown().await.unwrap();
 }
 
+/// Alice on A `/sendToDevice`s to @bob:b.test; the message rides an
+/// `m.direct_to_device` EDU to B and lands in bob's `/sync`.
+#[tokio::test]
+async fn to_device_over_federation_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Node B: full stack; its fed endpoint queues to-device messages into
+    // b_users. A's key server lets B authenticate A's requests.
+    let (b_rooms, b_users, b_signer, b_router, b_proj) = cs_stack("b.test", dir.path(), None).await;
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let (a_signer, _) = saltator_roomserver::ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let a_key_base = spawn_fed("a.test", a_signer.clone(), None, None).await;
+
+    let b_fed = Arc::new(FedState {
+        server_name: ruma::OwnedServerName::try_from("b.test").unwrap(),
+        signer: b_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(a_key_base),
+        rooms: Some(b_rooms.clone()),
+        users: Some(b_users.clone()),
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let b_fed_base = {
+        let app = saltator_federation::router(b_fed);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+
+    // Node A: full stack, CS federation client aimed at B's fed endpoint.
+    let a_engine = Arc::new(RocksEngine::open(&dir.path().join("a.test")).unwrap());
+    let a_rooms = RoomServer::start(
+        1,
+        a_engine.clone(),
+        a_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let a_users = UserServer::start(
+        1,
+        a_engine,
+        a_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [a_rooms.shard_handle(), a_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let a_media = MediaStore::open(dir.path().join("a-media")).unwrap();
+    let a_cs = CsState::new(
+        a_users.clone(),
+        a_rooms.clone(),
+        a_media,
+        CsConfig {
+            server_name: a_name,
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(
+            a_signer.clone(),
+            b_fed_base,
+        )),
+        a_signer.clone(),
+    );
+    let a_router = saltator_cs_api::router(a_cs);
+
+    let bob = reg(&b_router, "bob").await;
+    let alice = reg(&a_router, "alice").await;
+
+    // Alice addresses all of bob's devices on the remote server.
+    let (status, body) = oneshot(
+        &a_router,
+        "PUT",
+        "/_matrix/client/v3/sendToDevice/m.room.encrypted/fed-td-1",
+        Some(&alice),
+        Some(json!({
+            "messages": {"@bob:b.test": {"*": {"ciphertext": "remote"}}}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The EDU is delivered in the background; poll bob's sync for it.
+    let mut delivered = Value::Null;
+    for _ in 0..100 {
+        let (status, sync) = oneshot(
+            &b_router,
+            "GET",
+            "/_matrix/client/v3/sync",
+            Some(&bob),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sync}");
+        if sync["to_device"]["events"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+        {
+            delivered = sync;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let events = delivered["to_device"]["events"]
+        .as_array()
+        .expect("to-device message never arrived over federation");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "m.room.encrypted");
+    assert_eq!(events[0]["sender"], "@alice:a.test");
+    assert_eq!(events[0]["content"]["ciphertext"], "remote");
+
+    b_proj.abort();
+    a_rooms.shutdown().await.unwrap();
+    a_users.shutdown().await.unwrap();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}
+
 // --- Inbound EDUs (typing/presence over federation) ----------------------
 
 #[tokio::test]

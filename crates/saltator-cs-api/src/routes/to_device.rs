@@ -1,9 +1,10 @@
 //! `PUT /sendToDevice/{eventType}/{txnId}` (spec.md §5.5): queue to-device
-//! events into each recipient device's durable inbox on the user shard;
-//! recipients drain them through `/sync`. Remote recipients ride the
-//! `m.direct_to_device` federation EDU — a later brick; they are skipped
-//! here.
+//! events into each local recipient device's durable inbox on the user
+//! shard — recipients drain them through `/sync` — and forward remote
+//! recipients' messages as one `m.direct_to_device` EDU per destination
+//! server.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -32,10 +33,10 @@ pub async fn send_to_device(
     }
 
     let mut messages = Vec::new();
+    let mut remote: BTreeMap<String, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
     for (user_id, per_device) in &req.messages {
-        if user_id.server_name() != state.config.server_name {
-            continue;
-        }
+        let mut devices = serde_json::Map::new();
+        let local = user_id.server_name() == state.config.server_name;
         for (target, content) in per_device {
             let device_id = match target {
                 DeviceIdOrAllDevices::DeviceId(d) => d.to_string(),
@@ -43,6 +44,10 @@ pub async fn send_to_device(
             };
             let content: serde_json::Value =
                 serde_json::from_str(content.json().get()).map_err(ApiError::internal)?;
+            if !local {
+                devices.insert(device_id, content);
+                continue;
+            }
             let event = serde_json::json!({
                 "type": req.event_type.to_string(),
                 "sender": auth.user_id.as_str(),
@@ -54,8 +59,28 @@ pub async fn send_to_device(
                 json: serde_json::to_vec(&event).map_err(ApiError::internal)?,
             });
         }
+        if !devices.is_empty() {
+            remote
+                .entry(user_id.server_name().to_string())
+                .or_default()
+                .insert(user_id.to_string(), serde_json::Value::Object(devices));
+        }
     }
     state.users.send_to_device(messages).await?;
+
+    // One m.direct_to_device EDU per destination server.
+    for (dest, msgs) in remote {
+        let edu = serde_json::json!({
+            "edu_type": "m.direct_to_device",
+            "content": {
+                "sender": auth.user_id.as_str(),
+                "type": req.event_type.to_string(),
+                "message_id": req.txn_id.as_str(),
+                "messages": msgs,
+            },
+        });
+        crate::routes::edu::send_edu(&state, vec![dest], edu);
+    }
 
     state
         .txns
