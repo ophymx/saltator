@@ -139,7 +139,7 @@ impl CsState {
 
 /// Build the client-server router. Serve this on the client listener.
 pub fn router(state: Arc<CsState>) -> axum::Router {
-    use routes::{account, media, rooms, search, session, sync};
+    use routes::{account, keys, media, rooms, search, session, sync};
 
     let mut app = axum::Router::new()
         .route(
@@ -200,6 +200,10 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
                 &p("/presence/{user_id}/status"),
                 get(account::get_presence).put(account::set_presence),
             )
+            // -- e2ee device keys
+            .route(&p("/keys/upload"), post(keys::upload_keys))
+            .route(&p("/keys/query"), post(keys::query_keys))
+            .route(&p("/keys/claim"), post(keys::claim_keys))
             // -- rooms
             .route(&p("/search"), post(search::search))
             .route(&p("/createRoom"), post(rooms::create_room))

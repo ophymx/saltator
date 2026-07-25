@@ -5,10 +5,11 @@ use saltator_shard::{ApplyCtx, ReadCtx, ShardApp};
 use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
-    account_data_key, user_key, Account, AccountDataEntry, AliasEntry, Device, MediaMeta,
-    MembershipEntry, Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand,
-    UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_DIRECTORY, T_FILTER,
-    T_INVITE_STATE, T_MEDIA, T_MEMBERSHIP, T_PROFILE, T_TOKEN,
+    account_data_key, device_scoped_key, prefix_end, user_key, Account, AccountDataEntry,
+    AliasEntry, ClaimedKey, Device, MediaMeta, MembershipEntry, Profile, SessionCmd, TokenEntry,
+    TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS,
+    T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER, T_INVITE_STATE, T_MEDIA,
+    T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_TOKEN,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -384,6 +385,71 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             ctx.delete(T_INVITE_STATE, &mkey);
             Ok(UserResponse::Ok)
         }
+        UserCommand::UploadKeys {
+            user_id,
+            device_id,
+            device_keys,
+            one_time_keys,
+        } => {
+            if let Some(dk) = device_keys {
+                ctx.put(T_DEVICE_KEYS, &user_key(user_id, device_id), dk.clone());
+            }
+            // Existing OTK key_ids for this device (the range does not see
+            // this batch's own puts, so union the new ids in explicitly).
+            let mut prefix = user_key(user_id, device_id);
+            prefix.push(0);
+            let mut ids: std::collections::BTreeSet<String> = ctx
+                .range(T_ONE_TIME_KEY, &prefix, &prefix_end(&prefix))?
+                .into_iter()
+                .filter_map(|(k, _)| {
+                    k.strip_prefix(prefix.as_slice())
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                })
+                .collect();
+            for (key_id, json) in one_time_keys {
+                ctx.put(
+                    T_ONE_TIME_KEY,
+                    &device_scoped_key(user_id, device_id, key_id),
+                    json.clone(),
+                );
+                ids.insert(key_id.clone());
+            }
+            let mut counts = std::collections::BTreeMap::new();
+            for id in ids {
+                let algo = id.split(':').next().unwrap_or_default().to_owned();
+                *counts.entry(algo).or_insert(0) += 1;
+            }
+            Ok(UserResponse::OneTimeKeyCounts(counts))
+        }
+        UserCommand::ClaimKeys { claims } => {
+            let mut claimed = Vec::new();
+            for req in claims {
+                // Scan `user\0device\0algorithm:` and take the first key.
+                let mut scope = user_key(&req.user_id, &req.device_id);
+                scope.push(0);
+                let mut algo_prefix =
+                    device_scoped_key(&req.user_id, &req.device_id, &req.algorithm);
+                algo_prefix.push(b':');
+                let hit = ctx
+                    .range(T_ONE_TIME_KEY, &algo_prefix, &prefix_end(&algo_prefix))?
+                    .into_iter()
+                    .next();
+                if let Some((full_key, json)) = hit {
+                    let key_id = full_key
+                        .strip_prefix(scope.as_slice())
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                        .unwrap_or_default();
+                    ctx.delete(T_ONE_TIME_KEY, &full_key);
+                    claimed.push(ClaimedKey {
+                        user_id: req.user_id.clone(),
+                        device_id: req.device_id.clone(),
+                        key_id,
+                        key_json: json,
+                    });
+                }
+            }
+            Ok(UserResponse::ClaimedKeys(claimed))
+        }
     }
 }
 
@@ -455,6 +521,19 @@ impl UserStore {
             let device_id = String::from_utf8(k[start.len()..].to_vec())
                 .map_err(|_| StoreError::Engine("device id not UTF-8".into()))?;
             out.push((device_id, dec("device decode", &v)?));
+        }
+        Ok(out)
+    }
+
+    /// Published E2EE identity keys for a user's devices: `(device_id, raw
+    /// device_keys JSON)`, for `/keys/query`.
+    pub fn device_keys(&self, user_id: &str) -> StoreResult<Vec<(String, Vec<u8>)>> {
+        let start = user_key(user_id, "");
+        let mut out = Vec::new();
+        for (k, v) in self.read.range(T_DEVICE_KEYS, &start, &user_end(user_id))? {
+            let device_id = String::from_utf8(k[start.len()..].to_vec())
+                .map_err(|_| StoreError::Engine("device id not UTF-8".into()))?;
+            out.push((device_id, v));
         }
         Ok(out)
     }

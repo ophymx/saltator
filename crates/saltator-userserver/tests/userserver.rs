@@ -10,7 +10,7 @@ use saltator_roomserver::{Outcome, RoomServer, ServerSigner};
 use saltator_shard::NoopNetworkFactory;
 use saltator_store::RocksEngine;
 use saltator_userserver::{
-    spawn_membership_projection, wait_for_projection, UserError, UserServer,
+    spawn_membership_projection, wait_for_projection, ClaimRequest, UserError, UserServer,
 };
 
 const SERVER: &str = "hs.test";
@@ -130,6 +130,82 @@ async fn sessions_lifecycle() {
     u.delete_all_devices(&s.user_id).await.unwrap();
     assert!(u.authenticate(&s3.access_token).unwrap().is_none());
     assert!(u.store().devices("@alice:hs.test").unwrap().is_empty());
+
+    env.rooms.shutdown().await.unwrap();
+    u.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn e2ee_key_upload_query_claim() {
+    let env = start_env().await;
+    let u = &env.users;
+
+    let (_, s) = u
+        .register("alice", Some("p"), None, None, false, false)
+        .await
+        .unwrap();
+    let s = s.unwrap();
+    let uid = s.user_id.clone();
+    let dev = s.device_id.to_string();
+
+    let claim = |id: &str| ClaimRequest {
+        user_id: uid.to_string(),
+        device_id: dev.clone(),
+        algorithm: id.to_owned(),
+    };
+
+    // Upload identity keys + two one-time keys.
+    let device_keys = serde_json::to_vec(&json!({
+        "user_id": uid.as_str(), "device_id": dev,
+        "algorithms": ["m.olm.v1.curve25519-aes-sha2"], "keys": {}, "signatures": {},
+    }))
+    .unwrap();
+    let otks = vec![
+        (
+            "signed_curve25519:AAAAAQ".to_owned(),
+            serde_json::to_vec(&json!({"key": "aaa"})).unwrap(),
+        ),
+        (
+            "signed_curve25519:AAAAAg".to_owned(),
+            serde_json::to_vec(&json!({"key": "bbb"})).unwrap(),
+        ),
+    ];
+    let counts = u
+        .upload_keys(&uid, &dev, Some(device_keys), otks)
+        .await
+        .unwrap();
+    assert_eq!(counts.get("signed_curve25519"), Some(&2));
+
+    // Query returns the published identity keys.
+    let dks = u.store().device_keys(uid.as_str()).unwrap();
+    assert_eq!(dks.len(), 1);
+    assert_eq!(dks[0].0, dev);
+
+    // Claim hands out one key; a second claim hands out the *other* one —
+    // never the same key twice.
+    let first = u
+        .claim_keys(vec![claim("signed_curve25519")])
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let second = u
+        .claim_keys(vec![claim("signed_curve25519")])
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_ne!(
+        first[0].key_id, second[0].key_id,
+        "an OTK was claimed twice"
+    );
+
+    // Both are now spent: a third claim finds nothing, and the count is zero.
+    let third = u
+        .claim_keys(vec![claim("signed_curve25519")])
+        .await
+        .unwrap();
+    assert!(third.is_empty());
+    let counts = u.upload_keys(&uid, &dev, None, vec![]).await.unwrap();
+    assert_eq!(counts.get("signed_curve25519").copied().unwrap_or(0), 0);
 
     env.rooms.shutdown().await.unwrap();
     u.shutdown().await.unwrap();

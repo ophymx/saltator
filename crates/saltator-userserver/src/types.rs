@@ -39,6 +39,13 @@ pub const T_DIRECTORY: u8 = APP_TABLE_MIN + 10;
 /// a pending invite to a room we don't host (received over federation).
 /// `/sync` renders these as the invite's `invite_state`.
 pub const T_INVITE_STATE: u8 = APP_TABLE_MIN + 11;
+/// `user_id ++ 0x00 ++ device_id → device_keys JSON` — a device's published
+/// identity keys for E2EE (`/keys/upload`, spec.md §5.5).
+pub const T_DEVICE_KEYS: u8 = APP_TABLE_MIN + 12;
+/// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ key_id → one-time-key JSON`.
+/// Claiming one is a Raft-serialized delete, so an OTK is never handed out
+/// twice (spec.md §5.5, §9).
+pub const T_ONE_TIME_KEY: u8 = APP_TABLE_MIN + 13;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -47,6 +54,32 @@ pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
     k.push(0);
     k.extend_from_slice(rest.as_bytes());
     k
+}
+
+/// Device-scoped key: `user_id ++ 0x00 ++ device_id ++ 0x00 ++ rest`
+/// (device IDs, like user IDs, cannot contain NUL).
+pub(crate) fn device_scoped_key(user_id: &str, device_id: &str, rest: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(user_id.len() + device_id.len() + rest.len() + 2);
+    k.extend_from_slice(user_id.as_bytes());
+    k.push(0);
+    k.extend_from_slice(device_id.as_bytes());
+    k.push(0);
+    k.extend_from_slice(rest.as_bytes());
+    k
+}
+
+/// The lexicographic upper bound for a prefix scan (`[prefix, prefix_end)`):
+/// increment the last non-`0xff` byte, dropping trailing `0xff`s.
+pub(crate) fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(&last) = end.last() {
+        if last < 0xff {
+            *end.last_mut().expect("non-empty") = last + 1;
+            break;
+        }
+        end.pop();
+    }
+    end
 }
 
 /// Account-data key: `user_id ++ 0x00 ++ room_id ++ 0x00 ++ type`.
@@ -257,6 +290,42 @@ pub enum UserCommand {
         user_id: String,
         room_id: String,
     },
+    /// Publish a device's E2EE keys: its identity `device_keys` (when
+    /// present) and any new one-time keys. Returns the resulting one-time-key
+    /// counts per algorithm (`/keys/upload`).
+    UploadKeys {
+        user_id: String,
+        device_id: String,
+        /// Raw JSON of the signed `device_keys` object; `None` to leave the
+        /// stored identity keys unchanged.
+        device_keys: Option<Vec<u8>>,
+        /// `(key_id, raw JSON)` one-time keys to add, e.g.
+        /// `("signed_curve25519:AAAAAQ", {...})`.
+        one_time_keys: Vec<(String, Vec<u8>)>,
+    },
+    /// Claim one one-time key per requested `(user, device, algorithm)`,
+    /// removing it so it is never claimed twice (`/keys/claim`).
+    ClaimKeys {
+        claims: Vec<ClaimRequest>,
+    },
+}
+
+/// One `(user, device, algorithm)` one-time-key claim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimRequest {
+    pub user_id: String,
+    pub device_id: String,
+    pub algorithm: String,
+}
+
+/// A one-time key handed out by a claim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimedKey {
+    pub user_id: String,
+    pub device_id: String,
+    pub key_id: String,
+    /// Raw JSON of the one-time-key object.
+    pub key_json: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +341,10 @@ pub enum UserResponse {
     NotFound,
     /// Projection batch at or behind the stored cursor; nothing applied.
     Stale,
+    /// One-time-key counts per algorithm after an `UploadKeys`.
+    OneTimeKeyCounts(std::collections::BTreeMap<String, u64>),
+    /// The keys handed out by a `ClaimKeys`.
+    ClaimedKeys(Vec<ClaimedKey>),
 }
 
 /// Change-stream payload of the user shard: something about `user_id`

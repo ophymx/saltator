@@ -27,8 +27,9 @@ use saltator_store::{Keyspace, KvEngine};
 
 pub use machine::{UserApp, UserStore};
 pub use types::{
-    Account, AccountDataEntry, AliasEntry, Device, MediaMeta, MembershipChange, MembershipEntry,
-    Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse,
+    Account, AccountDataEntry, AliasEntry, ClaimRequest, ClaimedKey, Device, MediaMeta,
+    MembershipChange, MembershipEntry, Profile, SessionCmd, TokenEntry, TokenKind,
+    UserChangePayload, UserCommand, UserResponse,
 };
 
 /// M2 runs a single user shard; the fixed shard count and placement land
@@ -311,6 +312,39 @@ impl UserServer {
         {
             UserResponse::Ok => Ok(()),
             UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Publish a device's E2EE keys (`/keys/upload`): store its identity
+    /// `device_keys` (when present) and add `one_time_keys`; returns the
+    /// resulting one-time-key counts per algorithm.
+    pub async fn upload_keys(
+        &self,
+        user_id: &UserId,
+        device_id: &str,
+        device_keys: Option<Vec<u8>>,
+        one_time_keys: Vec<(String, Vec<u8>)>,
+    ) -> Result<std::collections::BTreeMap<String, u64>> {
+        match self
+            .propose(&UserCommand::UploadKeys {
+                user_id: user_id.to_string(),
+                device_id: device_id.to_owned(),
+                device_keys,
+                one_time_keys,
+            })
+            .await?
+        {
+            UserResponse::OneTimeKeyCounts(counts) => Ok(counts),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Claim one one-time key per request (`/keys/claim`) — a linearizable
+    /// removal, so no key is claimed twice.
+    pub async fn claim_keys(&self, claims: Vec<ClaimRequest>) -> Result<Vec<ClaimedKey>> {
+        match self.propose(&UserCommand::ClaimKeys { claims }).await? {
+            UserResponse::ClaimedKeys(keys) => Ok(keys),
             other => Err(unexpected(other)),
         }
     }
