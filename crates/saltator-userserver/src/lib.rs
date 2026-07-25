@@ -402,6 +402,46 @@ impl UserServer {
         .await
     }
 
+    /// Change the account password (`/account/password`); when
+    /// `logout_others`, every device except `keep_device` is deleted.
+    pub async fn change_password(
+        &self,
+        user_id: &UserId,
+        new_password: &str,
+        logout_others: bool,
+        keep_device: &str,
+    ) -> Result<()> {
+        let password_hash = hash_password(new_password).await?;
+        match self
+            .propose(&UserCommand::ChangePassword {
+                user_id: user_id.to_string(),
+                password_hash,
+                logout_others,
+                keep_device: keep_device.to_owned(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Deactivate the account (`/account/deactivate`): permanent — blocks
+    /// future logins and kills every session.
+    pub async fn deactivate(&self, user_id: &UserId) -> Result<()> {
+        match self
+            .propose(&UserCommand::Deactivate {
+                user_id: user_id.to_string(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
     // -- profile / account data / filters / aliases / media ---------------
 
     /// `None` = leave unchanged; `Some(None)` = unset.

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use ruma::api::client::account::{change_password, deactivate, ThirdPartyIdRemovalStatus};
 use ruma::api::client::config::{
     get_global_account_data, get_room_account_data, set_global_account_data, set_room_account_data,
 };
@@ -398,17 +399,17 @@ pub async fn update_device(
     Ok(Ra(update_device::v3::Response::new()))
 }
 
-pub async fn delete_device(
-    State(state): State<Arc<CsState>>,
-    auth: Auth,
-    Ar(req): Ar<delete_device::v3::Request>,
-) -> Result<Ra<delete_device::v3::Response>> {
-    // UIA: a single password stage.
-    let Some(AuthData::Password(pw)) = &req.auth else {
-        return Err(ApiError::uiaa(
-            &[&["m.login.password"]],
-            saltator_userserver::generate_token(),
-        ));
+/// The single-password UIA stage shared by destructive account
+/// endpoints: challenge when auth is absent, 401 `M_FORBIDDEN` (with the
+/// flows) on a wrong password.
+async fn require_password_uia(
+    state: &CsState,
+    auth: &Auth,
+    req_auth: &Option<AuthData>,
+) -> Result<()> {
+    const FLOWS: &[&[&str]] = &[&["m.login.password"]];
+    let Some(AuthData::Password(pw)) = req_auth else {
+        return Err(ApiError::uiaa(FLOWS, saltator_userserver::generate_token()));
     };
     if let UserIdentifier::Matrix(m) = &pw.identifier {
         let claimed = m.user.trim_start_matches('@');
@@ -422,8 +423,20 @@ pub async fn delete_device(
         .verify_user_password(&auth.user_id, &pw.password)
         .await?
     {
-        return Err(ApiError::forbidden("Bad password"));
+        return Err(ApiError::uiaa_forbidden(
+            FLOWS,
+            saltator_userserver::generate_token(),
+        ));
     }
+    Ok(())
+}
+
+pub async fn delete_device(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<delete_device::v3::Request>,
+) -> Result<Ra<delete_device::v3::Response>> {
+    require_password_uia(&state, &auth, &req.auth).await?;
     state
         .users
         .delete_device(&auth.user_id, req.device_id.as_str())
@@ -435,6 +448,78 @@ pub async fn delete_device(
         true,
     );
     Ok(Ra(delete_device::v3::Response::new()))
+}
+
+/// `POST /account/password`: replace the password behind a UIA password
+/// stage; by default every *other* session is logged out.
+pub async fn change_password(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<change_password::v3::Request>,
+) -> Result<Ra<change_password::v3::Response>> {
+    require_password_uia(&state, &auth, &req.auth).await?;
+    // Capture the devices about to die so their deletion is announced.
+    let others: Vec<String> = if req.logout_devices {
+        state
+            .users
+            .store()
+            .devices(auth.user_id.as_str())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| *id != auth.device_id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    state
+        .users
+        .change_password(
+            &auth.user_id,
+            &req.new_password,
+            req.logout_devices,
+            &auth.device_id,
+        )
+        .await?;
+    for device_id in others {
+        crate::routes::edu::broadcast_device_list_update(
+            &state,
+            auth.user_id.as_str(),
+            &device_id,
+            true,
+        );
+    }
+    Ok(Ra(change_password::v3::Response::new()))
+}
+
+/// `POST /account/deactivate`: permanently deactivate the account behind
+/// a UIA password stage — logins blocked, every session killed.
+pub async fn deactivate(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<deactivate::v3::Request>,
+) -> Result<Ra<deactivate::v3::Response>> {
+    require_password_uia(&state, &auth, &req.auth).await?;
+    let devices: Vec<String> = state
+        .users
+        .store()
+        .devices(auth.user_id.as_str())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    state.users.deactivate(&auth.user_id).await?;
+    for device_id in devices {
+        crate::routes::edu::broadcast_device_list_update(
+            &state,
+            auth.user_id.as_str(),
+            &device_id,
+            true,
+        );
+    }
+    Ok(Ra(deactivate::v3::Response::new(
+        ThirdPartyIdRemovalStatus::Success,
+    )))
 }
 
 // -- push rules / presence ----------------------------------------------------

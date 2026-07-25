@@ -74,6 +74,16 @@ impl ApiError {
         )
     }
 
+    /// A 401 UIA challenge after a *failed* auth attempt: the challenge
+    /// shape plus `errcode`/`error` (spec: wrong credentials during UIA
+    /// are 401 `M_FORBIDDEN` with the flows, not 403).
+    pub fn uiaa_forbidden(flows: &[&[&str]], session: String) -> Self {
+        let mut e = Self::uiaa(flows, session);
+        e.extra.insert("errcode".into(), "M_FORBIDDEN".into());
+        e.extra.insert("error".into(), "Invalid password".into());
+        e
+    }
+
     /// A 401 User-Interactive Authentication challenge.
     pub fn uiaa(flows: &[&[&str]], session: String) -> Self {
         let mut e = Self::new(

@@ -347,6 +347,20 @@ pub enum UserCommand {
     RecordKeyChange {
         user_id: String,
     },
+    /// Replace the account password (`/account/password`) and, when
+    /// `logout_others`, delete every device except `keep_device` — the
+    /// session that made the change survives.
+    ChangePassword {
+        user_id: String,
+        password_hash: String,
+        logout_others: bool,
+        keep_device: String,
+    },
+    /// Deactivate the account (`/account/deactivate`): permanent — blocks
+    /// future logins and deletes every device and session.
+    Deactivate {
+        user_id: String,
+    },
 }
 
 /// One to-device message: the full event JSON (`type`, `sender`,

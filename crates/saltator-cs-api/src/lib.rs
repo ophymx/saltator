@@ -165,6 +165,8 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             .route(&p("/logout/all"), post(session::logout_all))
             .route(&p("/refresh"), post(session::refresh))
             .route(&p("/account/whoami"), get(session::whoami))
+            .route(&p("/account/password"), post(account::change_password))
+            .route(&p("/account/deactivate"), post(account::deactivate))
             // -- profile / account data / filters / devices / push
             .route(&p("/profile/{user_id}"), get(account::get_profile))
             .route(

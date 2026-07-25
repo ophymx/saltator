@@ -127,6 +127,27 @@ fn delete_device(ctx: &mut ApplyCtx<'_>, user_id: &str, device_id: &str) -> Stor
     Ok(true)
 }
 
+/// Delete every device of a user except `keep` (with its tokens and E2EE
+/// material); returns whether anything was deleted. The range does not
+/// see this batch's staged writes — fine, this only deletes.
+fn delete_devices_except(
+    ctx: &mut ApplyCtx<'_>,
+    user_id: &str,
+    keep: Option<&str>,
+) -> StoreResult<bool> {
+    let start = user_key(user_id, "");
+    let mut any = false;
+    for (k, _) in ctx.range(T_DEVICE, &start, &user_end(user_id))? {
+        let device_id = String::from_utf8(k[start.len()..].to_vec())
+            .map_err(|_| StoreError::Engine("device id not UTF-8".into()))?;
+        if keep == Some(device_id.as_str()) {
+            continue;
+        }
+        any |= delete_device(ctx, user_id, &device_id)?;
+    }
+    Ok(any)
+}
+
 /// Log a device-list change for `user_id` so peers' `/sync` and
 /// `/keys/changes` tell them to re-query the user's keys.
 fn log_key_change(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<()> {
@@ -216,16 +237,7 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
         }
         UserCommand::DeleteAllDevices { user_id } => {
-            let start = user_key(user_id, "");
-            // range does not see writes staged in this batch — fine here,
-            // this command only deletes.
-            let mut any = false;
-            for (k, _) in ctx.range(T_DEVICE, &start, &user_end(user_id))? {
-                let device_id = String::from_utf8(k[start.len()..].to_vec())
-                    .map_err(|_| StoreError::Engine("device id not UTF-8".into()))?;
-                any |= delete_device(ctx, user_id, &device_id)?;
-            }
-            if any {
+            if delete_devices_except(ctx, user_id, None)? {
                 log_key_change(ctx, user_id)?;
             }
             Ok(UserResponse::Ok)
@@ -545,6 +557,40 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
         }
         UserCommand::RecordKeyChange { user_id } => {
             log_key_change(ctx, user_id)?;
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::ChangePassword {
+            user_id,
+            password_hash,
+            logout_others,
+            keep_device,
+        } => {
+            let ukey = user_id.as_bytes();
+            let Some(mut account): Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            account.password_hash = Some(password_hash.clone());
+            ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+            if *logout_others && delete_devices_except(ctx, user_id, Some(keep_device))? {
+                log_key_change(ctx, user_id)?;
+            }
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::Deactivate { user_id } => {
+            let ukey = user_id.as_bytes();
+            let Some(mut account): Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            account.deactivated = true;
+            account.password_hash = None;
+            ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+            if delete_devices_except(ctx, user_id, None)? {
+                log_key_change(ctx, user_id)?;
+            }
             Ok(UserResponse::Ok)
         }
         UserCommand::AckToDevice {
