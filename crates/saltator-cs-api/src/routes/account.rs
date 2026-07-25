@@ -428,6 +428,12 @@ pub async fn delete_device(
         .users
         .delete_device(&auth.user_id, req.device_id.as_str())
         .await?;
+    crate::routes::edu::broadcast_device_list_update(
+        &state,
+        auth.user_id.as_str(),
+        req.device_id.as_str(),
+        true,
+    );
     Ok(Ra(delete_device::v3::Response::new()))
 }
 

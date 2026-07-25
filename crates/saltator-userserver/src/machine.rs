@@ -543,6 +543,10 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
             Ok(UserResponse::Ok)
         }
+        UserCommand::RecordKeyChange { user_id } => {
+            log_key_change(ctx, user_id)?;
+            Ok(UserResponse::Ok)
+        }
         UserCommand::AckToDevice {
             user_id,
             device_id,

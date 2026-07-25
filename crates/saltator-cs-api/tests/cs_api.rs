@@ -2195,6 +2195,192 @@ async fn to_device_over_federation_round_trip() {
     b_users.shutdown().await.unwrap();
 }
 
+/// Federated E2EE keys: alice on A queries and claims @bob:b.test's keys
+/// through her own server (proxied over federation), and an inbound
+/// m.device_list_update EDU logs a device-list change for its user.
+#[tokio::test]
+async fn federated_key_query_claim_and_device_list_update() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let (b_rooms, b_users, b_signer, b_router, b_proj) = cs_stack("b.test", dir.path(), None).await;
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let (a_signer, _) = saltator_roomserver::ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let a_key_base = spawn_fed("a.test", a_signer.clone(), None, None).await;
+
+    let b_fed = Arc::new(FedState {
+        server_name: ruma::OwnedServerName::try_from("b.test").unwrap(),
+        signer: b_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(a_key_base),
+        rooms: Some(b_rooms.clone()),
+        users: Some(b_users.clone()),
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let b_fed_base = {
+        let app = saltator_federation::router(b_fed);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+
+    // Node A: full stack, CS federation client aimed at B's fed endpoint.
+    let a_engine = Arc::new(RocksEngine::open(&dir.path().join("a.test")).unwrap());
+    let a_rooms = RoomServer::start(
+        1,
+        a_engine.clone(),
+        a_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let a_users = UserServer::start(
+        1,
+        a_engine,
+        a_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [a_rooms.shard_handle(), a_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let a_media = MediaStore::open(dir.path().join("a-media")).unwrap();
+    let a_cs = CsState::new(
+        a_users.clone(),
+        a_rooms.clone(),
+        a_media,
+        CsConfig {
+            server_name: a_name,
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(
+            a_signer.clone(),
+            b_fed_base.clone(),
+        )),
+        a_signer.clone(),
+    );
+    let a_router = saltator_cs_api::router(a_cs);
+
+    let bob = reg(&b_router, "bob").await;
+    let alice = reg(&a_router, "alice").await;
+    let (_, whoami) = oneshot(
+        &b_router,
+        "GET",
+        "/_matrix/client/v3/account/whoami",
+        Some(&bob),
+        None,
+    )
+    .await;
+    let bob_dev = whoami["device_id"].as_str().unwrap().to_owned();
+
+    // Bob publishes identity keys + two OTKs on his own server.
+    let (status, body) = oneshot(
+        &b_router,
+        "POST",
+        "/_matrix/client/v3/keys/upload",
+        Some(&bob),
+        Some(json!({
+            "device_keys": {"user_id": "@bob:b.test", "device_id": bob_dev,
+                             "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                             "keys": {"curve25519:BOB": "bobkey"}, "signatures": {}},
+            "one_time_keys": {
+                "signed_curve25519:AAAAAQ": {"key": "aaa"},
+                "signed_curve25519:AAAAAg": {"key": "bbb"},
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Alice queries bob's keys through HER server: proxied over federation.
+    let (status, resp) = oneshot(
+        &a_router,
+        "POST",
+        "/_matrix/client/v3/keys/query",
+        Some(&alice),
+        Some(json!({"device_keys": {"@bob:b.test": []}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(
+        resp["device_keys"]["@bob:b.test"][&bob_dev]["keys"]["curve25519:BOB"], "bobkey",
+        "federated key query: {resp}"
+    );
+
+    // Claims forward too, and never hand out the same OTK twice.
+    let claim = |token: String| {
+        let a_router = a_router.clone();
+        let bob_dev = bob_dev.clone();
+        async move {
+            let (status, resp) = oneshot(
+                &a_router,
+                "POST",
+                "/_matrix/client/v3/keys/claim",
+                Some(&token),
+                Some(json!({"one_time_keys": {"@bob:b.test": {&bob_dev: "signed_curve25519"}}})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            resp["one_time_keys"]["@bob:b.test"][&bob_dev]
+                .as_object()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        }
+    };
+    let first = claim(alice.clone()).await;
+    let second = claim(alice.clone()).await;
+    assert_eq!(first.len(), 1, "first federated claim");
+    assert_eq!(second.len(), 1, "second federated claim");
+    assert_ne!(first[0], second[0], "an OTK crossed federation twice");
+    let third = claim(alice.clone()).await;
+    assert!(
+        third.is_empty(),
+        "exhausted OTKs still handed out: {third:?}"
+    );
+
+    // An inbound m.device_list_update EDU logs a change for its user.
+    let edu_client = FederationClient::with_base_url(a_signer.clone(), b_fed_base);
+    let txn = json!({
+        "origin": "a.test", "origin_server_ts": 1000, "pdus": [],
+        "edus": [{"edu_type": "m.device_list_update",
+                   "content": {"user_id": "@zed:a.test", "device_id": "ZED", "stream_id": 1}}],
+    });
+    edu_client
+        .put("b.test", "/_matrix/federation/v1/send/dltxn", &txn)
+        .await
+        .expect("EDU transaction accepted");
+    assert!(
+        b_users
+            .store()
+            .key_changes(0, u64::MAX)
+            .unwrap()
+            .iter()
+            .any(|e| e.user_id == "@zed:a.test" && e.membership.is_none()),
+        "device-list EDU not logged"
+    );
+
+    b_proj.abort();
+    a_rooms.shutdown().await.unwrap();
+    a_users.shutdown().await.unwrap();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}
+
 // --- Inbound EDUs (typing/presence over federation) ----------------------
 
 #[tokio::test]

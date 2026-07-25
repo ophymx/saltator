@@ -341,6 +341,12 @@ pub enum UserCommand {
         device_id: String,
         up_to: u64,
     },
+    /// Log a device-list change without touching key material — a remote
+    /// user's `m.device_list_update` EDU, so local syncs surface them in
+    /// `device_lists.changed` and clients re-query over federation.
+    RecordKeyChange {
+        user_id: String,
+    },
 }
 
 /// One to-device message: the full event JSON (`type`, `sender`,

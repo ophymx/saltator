@@ -392,6 +392,16 @@ impl UserServer {
         .await
     }
 
+    /// Log a device-list change for a (typically remote) user without
+    /// touching key material, waking syncs that track them
+    /// (`m.device_list_update`).
+    pub async fn record_key_change(&self, user_id: &str) -> Result<()> {
+        self.expect_ok(&UserCommand::RecordKeyChange {
+            user_id: user_id.to_owned(),
+        })
+        .await
+    }
+
     // -- profile / account data / filters / aliases / media ---------------
 
     /// `None` = leave unchanged; `Some(None)` = unset.

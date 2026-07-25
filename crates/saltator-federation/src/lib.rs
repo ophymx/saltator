@@ -14,6 +14,7 @@ mod query;
 mod resolver;
 mod sender;
 mod transactions;
+mod user_keys;
 mod xmatrix;
 
 pub use http_client::build_http_client;
@@ -190,6 +191,18 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route(
             "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
             put(joins::send_join),
+        )
+        .route(
+            "/_matrix/federation/v1/user/keys/query",
+            post(user_keys::keys_query),
+        )
+        .route(
+            "/_matrix/federation/v1/user/keys/claim",
+            post(user_keys::keys_claim),
+        )
+        .route(
+            "/_matrix/federation/v1/user/devices/{user_id}",
+            get(user_keys::user_devices),
         )
         .with_state(state)
 }

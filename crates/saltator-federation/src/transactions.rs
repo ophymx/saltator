@@ -3,9 +3,10 @@
 //! per-PDU results are aggregated and always returned with 200. A PDU that
 //! references events we don't have triggers a `/get_missing_events` fetch
 //! to fill the gap, then a retry. `m.typing` / `m.presence` EDUs are
-//! applied to the shared ephemeral maps and `m.direct_to_device` messages
-//! are queued into local users' inboxes; other EDU types (device-list)
-//! are dropped until their M5 brick.
+//! applied to the shared ephemeral maps, `m.direct_to_device` messages
+//! are queued into local users' inboxes, and `m.device_list_update`
+//! marks the sender's user for key re-query; other EDU types are
+//! dropped.
 
 use std::sync::Arc;
 
@@ -58,22 +59,60 @@ pub async fn send_transaction(
     }
 
     // EDUs: applied best-effort, no per-EDU result. To-device messages go
-    // into the user shard's durable inboxes; typing/presence into the
-    // shared ephemeral maps. Device-list EDUs are ignored until their
-    // M5 brick.
+    // into the user shard's durable inboxes; device-list updates mark
+    // their user for key re-query; typing/presence into the shared
+    // ephemeral maps.
     if let Some(edus) = body.get("edus").and_then(|e| e.as_array()) {
         for edu in edus.iter().take(MAX_EDUS) {
-            if edu.get("edu_type").and_then(|t| t.as_str()) == Some("m.direct_to_device") {
-                if let Some(users) = &state.users {
-                    apply_to_device_edu(users, state.server_name.as_str(), &auth.origin, edu).await;
+            match edu.get("edu_type").and_then(|t| t.as_str()) {
+                Some("m.direct_to_device") => {
+                    if let Some(users) = &state.users {
+                        apply_to_device_edu(users, state.server_name.as_str(), &auth.origin, edu)
+                            .await;
+                    }
                 }
-            } else if let Some(sink) = &state.edu_sink {
-                apply_edu(sink.as_ref(), &auth.origin, edu);
+                Some("m.device_list_update") => {
+                    if let Some(users) = &state.users {
+                        apply_device_list_edu(users, &auth.origin, edu).await;
+                    }
+                }
+                _ => {
+                    if let Some(sink) = &state.edu_sink {
+                        apply_edu(sink.as_ref(), &auth.origin, edu);
+                    }
+                }
             }
         }
     }
 
     Ok(axum::Json(serde_json::json!({ "pdus": results })))
+}
+
+/// Mark a remote user's device list changed (`m.device_list_update`).
+/// We keep no remote key cache — `/keys/query` proxies live — so the
+/// stream_id/prev_id gap protocol reduces to a poke that surfaces the
+/// user in local syncs' `device_lists.changed`.
+async fn apply_device_list_edu(
+    users: &Arc<saltator_userserver::UserServer>,
+    origin: &str,
+    edu: &serde_json::Value,
+) {
+    let Some(user_id) = edu
+        .get("content")
+        .and_then(|c| c.get("user_id"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+    if !ruma::UserId::parse(user_id)
+        .map(|u| u.server_name().as_str() == origin)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if let Err(e) = users.record_key_change(user_id).await {
+        tracing::warn!(error = %e, origin, "device-list EDU apply failed");
+    }
 }
 
 /// Queue an `m.direct_to_device` EDU's messages into local users' durable

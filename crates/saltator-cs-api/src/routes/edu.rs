@@ -43,6 +43,40 @@ pub(crate) fn room_destinations(state: &CsState, room_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Announce a local user's device-list change (identity keys published or
+/// a device deleted) to every remote server sharing a room with them
+/// (`m.device_list_update`). Fire-and-forget like the other EDUs; a
+/// server that misses one resyncs via `GET /user/devices`.
+pub(crate) fn broadcast_device_list_update(
+    state: &Arc<CsState>,
+    user_id: &str,
+    device_id: &str,
+    deleted: bool,
+) {
+    let dests = presence_destinations(state, user_id);
+    if dests.is_empty() {
+        return;
+    }
+    let mut content = serde_json::json!({
+        "user_id": user_id,
+        "device_id": device_id,
+        // Monotonic per sender. We do no gap tracking of our own — the
+        // receivers' resync path covers missed updates.
+        "stream_id": now_ms(),
+    });
+    if deleted {
+        content["deleted"] = true.into();
+    }
+    send_edu(
+        state,
+        dests,
+        serde_json::json!({
+            "edu_type": "m.device_list_update",
+            "content": content,
+        }),
+    );
+}
+
 /// Remote servers sharing any joined room with `user_id` — the audience
 /// for a presence update.
 pub(crate) fn presence_destinations(state: &CsState, user_id: &str) -> Vec<String> {

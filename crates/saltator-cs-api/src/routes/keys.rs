@@ -33,10 +33,20 @@ pub async fn upload_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body)
         _ => Vec::new(),
     };
 
+    let announces = device_keys.is_some();
     let counts = state
         .users
         .upload_keys(&auth.user_id, &auth.device_id, device_keys, one_time_keys)
         .await?;
+    // New identity keys are a device-list change remote peers care about.
+    if announces {
+        crate::routes::edu::broadcast_device_list_update(
+            &state,
+            auth.user_id.as_str(),
+            &auth.device_id,
+            false,
+        );
+    }
 
     // The spec requires the algorithm keys the client uploaded to appear
     // even when zero; a client that uploaded OTKs always gets its counts.
@@ -47,8 +57,65 @@ pub async fn upload_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body)
     Ok(axum::Json(json!({ "one_time_key_counts": counts })))
 }
 
+/// Whether a user ID belongs to this server. Unparseable IDs are treated
+/// as local (their store lookups simply come back empty).
+fn is_local(state: &CsState, user_id: &str) -> bool {
+    ruma::UserId::parse(user_id)
+        .map(|u| u.server_name() == state.config.server_name)
+        .unwrap_or(true)
+}
+
+/// Fan a per-destination request out over federation, merging each
+/// response's `merge_key` object into `out`; failed servers land in
+/// `failures`.
+async fn proxy_key_requests(
+    state: &CsState,
+    path: &str,
+    body_key: &str,
+    merge_key: &str,
+    remote: std::collections::BTreeMap<String, Map<String, Value>>,
+    out: &mut Map<String, Value>,
+    failures: &mut Map<String, Value>,
+) {
+    if remote.is_empty() {
+        return;
+    }
+    let Some(fed) = &state.federation else {
+        for server in remote.keys() {
+            failures.insert(
+                server.clone(),
+                json!({ "errcode": "M_UNKNOWN", "error": "Federation is disabled" }),
+            );
+        }
+        return;
+    };
+    for (server, users_map) in remote {
+        match fed
+            .client
+            .post(&server, path, &json!({ body_key: users_map }))
+            .await
+        {
+            Ok(resp) => {
+                if let Some(merged) = resp.get(merge_key).and_then(|d| d.as_object()) {
+                    for (user, value) in merged {
+                        out.insert(user.clone(), value.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                failures.insert(
+                    server,
+                    json!({ "errcode": "M_UNKNOWN", "error": e.to_string() }),
+                );
+            }
+        }
+    }
+}
+
 /// `POST /_matrix/client/v3/keys/query`: return published device keys for
-/// the requested users' devices (local users only, for now).
+/// the requested users' devices; remote users' keys are fetched live from
+/// their servers (never cached, so device-list gaps can't serve stale
+/// keys).
 pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body): Jb) -> JsonResp {
     let requested = match body.get("device_keys") {
         Some(Value::Object(m)) => m,
@@ -59,7 +126,20 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
 
     let store = state.users.store();
     let mut out = Map::new();
+    let mut failures = Map::new();
+    let mut remote: std::collections::BTreeMap<String, Map<String, Value>> = Default::default();
     for (user_id, devices) in requested {
+        if !is_local(&state, user_id) {
+            let server = ruma::UserId::parse(user_id.as_str())
+                .expect("checked by is_local")
+                .server_name()
+                .to_string();
+            remote
+                .entry(server)
+                .or_default()
+                .insert(user_id.clone(), devices.clone());
+            continue;
+        }
         // Only devices explicitly listed, or all when the list is empty.
         let wanted: Option<Vec<String>> = match devices {
             Value::Array(a) if !a.is_empty() => Some(
@@ -82,13 +162,23 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
             out.insert(user_id.clone(), Value::Object(per_user));
         }
     }
+    proxy_key_requests(
+        &state,
+        "/_matrix/federation/v1/user/keys/query",
+        "device_keys",
+        "device_keys",
+        remote,
+        &mut out,
+        &mut failures,
+    )
+    .await;
 
     Ok(axum::Json(json!({
         "device_keys": out,
         "master_keys": {},
         "self_signing_keys": {},
         "user_signing_keys": {},
-        "failures": {},
+        "failures": failures,
     })))
 }
 
@@ -191,8 +281,9 @@ pub async fn key_changes(
 }
 
 /// `POST /_matrix/client/v3/keys/claim`: claim one one-time key for each
-/// requested device (local users only, for now). The claim is a
-/// Raft-serialized removal, so an OTK is never handed out twice.
+/// requested device; remote users' claims are forwarded to their servers.
+/// The local claim is a Raft-serialized removal, so an OTK is never
+/// handed out twice.
 pub async fn claim_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body): Jb) -> JsonResp {
     let requested = match body.get("one_time_keys") {
         Some(Value::Object(m)) => m,
@@ -202,7 +293,19 @@ pub async fn claim_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
     };
 
     let mut claims = Vec::new();
+    let mut remote: std::collections::BTreeMap<String, Map<String, Value>> = Default::default();
     for (user_id, devices) in requested {
+        if !is_local(&state, user_id) {
+            let server = ruma::UserId::parse(user_id.as_str())
+                .expect("checked by is_local")
+                .server_name()
+                .to_string();
+            remote
+                .entry(server)
+                .or_default()
+                .insert(user_id.clone(), devices.clone());
+            continue;
+        }
         if let Value::Object(dm) = devices {
             for (device_id, algorithm) in dm {
                 if let Some(algo) = algorithm.as_str() {
@@ -236,8 +339,20 @@ pub async fn claim_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
             .insert(c.key_id, value);
     }
 
+    let mut failures = Map::new();
+    proxy_key_requests(
+        &state,
+        "/_matrix/federation/v1/user/keys/claim",
+        "one_time_keys",
+        "one_time_keys",
+        remote,
+        &mut out,
+        &mut failures,
+    )
+    .await;
+
     Ok(axum::Json(json!({
         "one_time_keys": out,
-        "failures": {},
+        "failures": failures,
     })))
 }
