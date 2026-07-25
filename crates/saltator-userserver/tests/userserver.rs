@@ -301,6 +301,77 @@ async fn to_device_inbox_send_and_ack() {
 }
 
 #[tokio::test]
+async fn device_list_log_and_device_cleanup() {
+    let env = start_env().await;
+    let u = &env.users;
+
+    let (_, s) = u
+        .register("alice", Some("p"), None, None, false, false)
+        .await
+        .unwrap();
+    let s = s.unwrap();
+    let uid = s.user_id.clone();
+    let dev = s.device_id.to_string();
+
+    // Publishing identity keys logs a device-list change; OTK refills don't.
+    let mark = u.shard_handle().seq().unwrap();
+    u.upload_keys(
+        &uid,
+        &dev,
+        Some(b"{}".to_vec()),
+        vec![("signed_curve25519:AAAAAQ".to_owned(), b"{}".to_vec())],
+    )
+    .await
+    .unwrap();
+    assert!(u
+        .store()
+        .key_changes(mark, u64::MAX)
+        .unwrap()
+        .contains(uid.as_str()));
+    let mark = u.shard_handle().seq().unwrap();
+    u.upload_keys(
+        &uid,
+        &dev,
+        None,
+        vec![("signed_curve25519:AAAAAg".to_owned(), b"{}".to_vec())],
+    )
+    .await
+    .unwrap();
+    assert!(u.store().key_changes(mark, u64::MAX).unwrap().is_empty());
+
+    // Deleting the device kills its E2EE material — identity keys, OTKs,
+    // undelivered inbox — and logs the change.
+    u.send_to_device(vec![ToDeviceMessage {
+        user_id: uid.to_string(),
+        device_id: dev.clone(),
+        json: b"{}".to_vec(),
+    }])
+    .await
+    .unwrap();
+    let mark = u.shard_handle().seq().unwrap();
+    u.delete_device(&uid, &dev).await.unwrap();
+    assert!(u.store().device_keys(uid.as_str()).unwrap().is_empty());
+    assert!(u
+        .store()
+        .one_time_key_counts(uid.as_str(), &dev)
+        .unwrap()
+        .is_empty());
+    assert!(u
+        .store()
+        .to_device_events(uid.as_str(), &dev, 0)
+        .unwrap()
+        .is_empty());
+    assert!(u
+        .store()
+        .key_changes(mark, u64::MAX)
+        .unwrap()
+        .contains(uid.as_str()));
+
+    env.rooms.shutdown().await.unwrap();
+    u.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn profile_account_data_filters_aliases() {
     let env = start_env().await;
     let u = &env.users;

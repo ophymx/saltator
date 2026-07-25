@@ -841,6 +841,136 @@ async fn to_device_messages_and_otk_counts_via_sync() {
     env.shutdown().await;
 }
 
+/// Device-list change tracking: publishing or deleting a device's keys
+/// surfaces the user in room-mates' `device_lists.changed` and in
+/// `/keys/changes` — the signal clients use to re-query keys.
+#[tokio::test]
+async fn device_list_changes_reach_sync_and_keys_changes() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+    let carol = env.register("carol", "carol-pw").await;
+
+    // Alice and bob share a room; carol is unrelated.
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat", "invite": [format!("@bob:{SERVER}")]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Wait until both membership projections have settled.
+    let bob_joined = |s: &Value| s["rooms"]["join"].get(&room_id).is_some();
+    env.sync_until(&bob, bob_joined).await;
+    let t1 = env.sync_until(&alice, bob_joined).await["next_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Bob publishes identity keys (carol too — but alice shares no room
+    // with her, so carol must stay invisible).
+    for token in [&bob, &carol] {
+        let (status, body) = env
+            .req(
+                "POST",
+                "/_matrix/client/v3/keys/upload",
+                Some(token),
+                Some(json!({"device_keys": {"algorithms": [], "keys": {}, "signatures": {}}})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={t1}&timeout=0"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let changed = resp["device_lists"]["changed"].as_array().unwrap();
+    assert!(
+        changed.iter().any(|u| u == &format!("@bob:{SERVER}")),
+        "bob missing from device_lists.changed: {resp}"
+    );
+    assert!(
+        !changed.iter().any(|u| u == &format!("@carol:{SERVER}")),
+        "carol leaked into device_lists.changed: {resp}"
+    );
+    let t2 = resp["next_batch"].as_str().unwrap().to_owned();
+
+    // The same window through /keys/changes.
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/keys/changes?from={t1}&to={t2}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let changed = resp["changed"].as_array().unwrap();
+    assert!(changed.iter().any(|u| u == &format!("@bob:{SERVER}")));
+    assert!(!changed.iter().any(|u| u == &format!("@carol:{SERVER}")));
+
+    // Logout deletes bob's device: his keys vanish from /keys/query and
+    // alice is told to re-query.
+    let (status, body) = env
+        .req("POST", "/_matrix/client/v3/logout", Some(&bob), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={t2}&timeout=0"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert!(
+        resp["device_lists"]["changed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == &format!("@bob:{SERVER}")),
+        "bob's logout not surfaced: {resp}"
+    );
+    let (status, resp) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/query",
+            Some(&alice),
+            Some(json!({"device_keys": {format!("@bob:{SERVER}"): []}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert!(
+        resp["device_keys"]
+            .as_object()
+            .unwrap()
+            .get(&format!("@bob:{SERVER}"))
+            .is_none(),
+        "bob's deleted device keys still served: {resp}"
+    );
+
+    env.shutdown().await;
+}
+
 /// Regressions surfaced by the first Complement run: trailing-slash state
 /// URLs, username case handling, directory visibility, size/encoding
 /// rejections, history visibility, MSC4115 annotations, and the

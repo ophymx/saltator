@@ -204,6 +204,7 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             .route(&p("/keys/upload"), post(keys::upload_keys))
             .route(&p("/keys/query"), post(keys::query_keys))
             .route(&p("/keys/claim"), post(keys::claim_keys))
+            .route(&p("/keys/changes"), get(keys::key_changes))
             .route(
                 &p("/sendToDevice/{event_type}/{txn_id}"),
                 put(to_device::send_to_device),

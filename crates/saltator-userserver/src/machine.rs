@@ -9,7 +9,8 @@ use crate::types::{
     AccountDataEntry, AliasEntry, ClaimedKey, Device, MediaMeta, MembershipEntry, Profile,
     SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT,
     T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER,
-    T_INVITE_STATE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_TOKEN, T_TO_DEVICE,
+    T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_TOKEN,
+    T_TO_DEVICE,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -114,7 +115,28 @@ fn delete_device(ctx: &mut ApplyCtx<'_>, user_id: &str, device_id: &str) -> Stor
         ctx.delete(T_TOKEN, &h);
     }
     ctx.delete(T_DEVICE, &dkey);
+    // The device's E2EE material dies with it: identity keys, unclaimed
+    // one-time keys, and the undelivered to-device inbox.
+    ctx.delete(T_DEVICE_KEYS, &dkey);
+    let prefix = device_scoped_key(user_id, device_id, "");
+    for table in [T_ONE_TIME_KEY, T_TO_DEVICE] {
+        for (k, _) in ctx.range(table, &prefix, &prefix_end(&prefix))? {
+            ctx.delete(table, &k);
+        }
+    }
     Ok(true)
+}
+
+/// Log a device-list change for `user_id` so peers' `/sync` and
+/// `/keys/changes` tell them to re-query the user's keys.
+fn log_key_change(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<()> {
+    let seq = emit_user_change(ctx, user_id)?;
+    ctx.put(
+        T_KEY_CHANGE,
+        &seq.to_be_bytes(),
+        user_id.as_bytes().to_vec(),
+    );
+    Ok(())
 }
 
 fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserResponse> {
@@ -172,6 +194,7 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
         }
         UserCommand::DeleteDevice { user_id, device_id } => {
             if delete_device(ctx, user_id, device_id)? {
+                log_key_change(ctx, user_id)?;
                 Ok(UserResponse::Ok)
             } else {
                 Ok(UserResponse::NotFound)
@@ -181,10 +204,14 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             let start = user_key(user_id, "");
             // range does not see writes staged in this batch — fine here,
             // this command only deletes.
+            let mut any = false;
             for (k, _) in ctx.range(T_DEVICE, &start, &user_end(user_id))? {
                 let device_id = String::from_utf8(k[start.len()..].to_vec())
                     .map_err(|_| StoreError::Engine("device id not UTF-8".into()))?;
-                delete_device(ctx, user_id, &device_id)?;
+                any |= delete_device(ctx, user_id, &device_id)?;
+            }
+            if any {
+                log_key_change(ctx, user_id)?;
             }
             Ok(UserResponse::Ok)
         }
@@ -393,6 +420,9 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
         } => {
             if let Some(dk) = device_keys {
                 ctx.put(T_DEVICE_KEYS, &user_key(user_id, device_id), dk.clone());
+                // Publishing identity keys is the device-list change peers
+                // care about (OTK refills are not).
+                log_key_change(ctx, user_id)?;
             }
             // Existing OTK key_ids for this device (the range does not see
             // this batch's own puts, so union the new ids in explicitly).
@@ -603,6 +633,26 @@ impl UserStore {
                 .try_into()
                 .map_err(|_| StoreError::Engine("to-device key shape".into()))?;
             out.push((u64::from_be_bytes(seq), v));
+        }
+        Ok(out)
+    }
+
+    /// Users whose device list changed at seq in `(since, upto]`, deduped,
+    /// for `/sync`'s `device_lists.changed` and `/keys/changes`.
+    pub fn key_changes(
+        &self,
+        since: u64,
+        upto: u64,
+    ) -> StoreResult<std::collections::BTreeSet<String>> {
+        let start = since.saturating_add(1).to_be_bytes();
+        let mut out = std::collections::BTreeSet::new();
+        for (_, v) in
+            self.read
+                .range(T_KEY_CHANGE, &start, &upto.saturating_add(1).to_be_bytes())?
+        {
+            out.insert(
+                String::from_utf8(v).map_err(|_| StoreError::Engine("user id not UTF-8".into()))?,
+            );
         }
         Ok(out)
     }

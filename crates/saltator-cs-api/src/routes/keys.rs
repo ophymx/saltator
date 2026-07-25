@@ -92,6 +92,47 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
     })))
 }
 
+/// `GET /_matrix/client/v3/keys/changes?from=..&to=..`: users sharing a
+/// room with the caller whose device lists changed between two sync
+/// tokens — the recovery path after a gappy sync.
+pub async fn key_changes(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> JsonResp {
+    let from = match q.get("from") {
+        Some(t) => crate::routes::sync::token_user_seq(t)?,
+        None => 0,
+    };
+    let to = match q.get("to") {
+        Some(t) => crate::routes::sync::token_user_seq(t)?,
+        None => u64::MAX,
+    };
+
+    let store = state.users.store();
+    let my_rooms: std::collections::BTreeSet<String> = store
+        .memberships(auth.user_id.as_str())
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .filter(|(_, m)| m.membership == "join")
+        .map(|(rid, _)| rid)
+        .collect();
+    let mut changed = Vec::new();
+    for user in store.key_changes(from, to).map_err(ApiError::internal)? {
+        let visible = user == auth.user_id.as_str()
+            || store
+                .memberships(&user)
+                .map_err(ApiError::internal)?
+                .iter()
+                .any(|(rid, m)| m.membership == "join" && my_rooms.contains(rid));
+        if visible {
+            changed.push(user);
+        }
+    }
+
+    Ok(axum::Json(json!({ "changed": changed, "left": [] })))
+}
+
 /// `POST /_matrix/client/v3/keys/claim`: claim one one-time key for each
 /// requested device (local users only, for now). The claim is a
 /// Raft-serialized removal, so an OTK is never handed out twice.

@@ -78,6 +78,12 @@ fn parse_token(s: &str) -> Result<SyncPos> {
     }
 }
 
+/// The user-shard position a sync token encodes, for endpoints that window
+/// user-shard data between two tokens (`/keys/changes`).
+pub(crate) fn token_user_seq(s: &str) -> Result<u64> {
+    Ok(parse_token(s)?.user)
+}
+
 /// Stripped-state event types served on invites.
 const INVITE_STATE_TYPES: &[&str] = &[
     "m.room.create",
@@ -142,7 +148,8 @@ pub async fn sync_events(
         let empty = resp.rooms.is_empty()
             && resp.account_data.is_empty()
             && resp.presence.is_empty()
-            && resp.to_device.events.is_empty();
+            && resp.to_device.events.is_empty()
+            && resp.device_lists.changed.is_empty();
         if since.is_none() || !empty || timeout.is_zero() {
             return Ok(Ra(resp));
         }
@@ -297,6 +304,26 @@ fn build_sync(
         }
         let event: serde_json::Value = serde_json::from_slice(&json).map_err(internal)?;
         resp.to_device.events.push(to_raw(&event)?);
+    }
+
+    // Device-list changes: users sharing a room with the caller (and the
+    // caller) whose E2EE device list changed inside the window, so clients
+    // re-query their keys. Initial syncs skip this — clients query fresh.
+    if !initial {
+        for changed in store.key_changes(since.user, now.user).map_err(internal)? {
+            let visible = changed == user_id
+                || store
+                    .memberships(&changed)
+                    .map_err(internal)?
+                    .iter()
+                    .any(|(rid, m)| m.membership == "join" && my_joined_rooms.contains(rid));
+            if !visible {
+                continue;
+            }
+            if let Ok(uid) = ruma::OwnedUserId::try_from(changed) {
+                resp.device_lists.changed.push(uid);
+            }
+        }
     }
 
     // One-time-key counts for this device; clients replenish from these.

@@ -51,6 +51,12 @@ pub const T_ONE_TIME_KEY: u8 = APP_TABLE_MIN + 13;
 /// (spec.md §5.5). `seq` is the user-shard seq at which the message was
 /// queued; sync windows on it like account data.
 pub const T_TO_DEVICE: u8 = APP_TABLE_MIN + 14;
+/// `seq (u64 BE) → user_id` — the device-list change log: one row whenever
+/// a user's E2EE device list changes (identity keys published, device
+/// deleted). `/sync` and `/keys/changes` window it to tell peers to
+/// re-query keys. Tiny rows, unbounded growth; pruning is a hardening
+/// brick.
+pub const T_KEY_CHANGE: u8 = APP_TABLE_MIN + 15;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
