@@ -6,9 +6,9 @@ use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
     account_data_key, device_scoped_key, prefix_end, to_device_key, user_key, Account,
-    AccountDataEntry, AliasEntry, ClaimedKey, Device, MediaMeta, MembershipEntry, Profile,
-    SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT,
-    T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER,
+    AccountDataEntry, AliasEntry, ClaimedKey, Device, KeyChangeEntry, MediaMeta, MembershipEntry,
+    Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse,
+    T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER,
     T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_TOKEN,
     T_TO_DEVICE,
 };
@@ -131,10 +131,25 @@ fn delete_device(ctx: &mut ApplyCtx<'_>, user_id: &str, device_id: &str) -> Stor
 /// `/keys/changes` tell them to re-query the user's keys.
 fn log_key_change(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<()> {
     let seq = emit_user_change(ctx, user_id)?;
+    put_key_change(ctx, seq, user_id, None)
+}
+
+fn put_key_change(
+    ctx: &mut ApplyCtx<'_>,
+    seq: u64,
+    user_id: &str,
+    membership: Option<(String, bool)>,
+) -> StoreResult<()> {
     ctx.put(
         T_KEY_CHANGE,
         &seq.to_be_bytes(),
-        user_id.as_bytes().to_vec(),
+        enc(
+            "key change encode",
+            &KeyChangeEntry {
+                user_id: user_id.to_owned(),
+                membership,
+            },
+        )?,
     );
     Ok(())
 }
@@ -296,10 +311,17 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                 let mkey = user_key(&c.user_id, &c.room_id);
                 let existing: Option<MembershipEntry> =
                     get_typed(ctx, "membership decode", T_MEMBERSHIP, &mkey)?;
-                if existing.is_some_and(|e| c.room_seq <= e.room_seq) {
+                if existing.as_ref().is_some_and(|e| c.room_seq <= e.room_seq) {
                     continue;
                 }
                 let seq = emit_user_change(ctx, &c.user_id)?;
+                // A join/leave transition changes who tracks this user's
+                // devices — log it for `device_lists.changed`/`left`.
+                let was_joined = existing.is_some_and(|e| e.membership == "join");
+                let now_joined = c.membership == "join";
+                if was_joined != now_joined {
+                    put_key_change(ctx, seq, &c.user_id, Some((c.room_id.clone(), now_joined)))?;
+                }
                 ctx.put(
                     T_MEMBERSHIP,
                     &mkey,
@@ -395,6 +417,12 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
         UserCommand::RecordRemoteLeave { user_id, room_id } => {
             let seq = emit_user_change(ctx, user_id)?;
             let mkey = user_key(user_id, room_id);
+            let was_joined =
+                get_typed::<MembershipEntry>(ctx, "membership decode", T_MEMBERSHIP, &mkey)?
+                    .is_some_and(|e| e.membership == "join");
+            if was_joined {
+                put_key_change(ctx, seq, user_id, Some((room_id.clone(), false)))?;
+            }
             ctx.put(
                 T_MEMBERSHIP,
                 &mkey,
@@ -637,22 +665,16 @@ impl UserStore {
         Ok(out)
     }
 
-    /// Users whose device list changed at seq in `(since, upto]`, deduped,
-    /// for `/sync`'s `device_lists.changed` and `/keys/changes`.
-    pub fn key_changes(
-        &self,
-        since: u64,
-        upto: u64,
-    ) -> StoreResult<std::collections::BTreeSet<String>> {
+    /// Device-list change log entries at seq in `(since, upto]`, in log
+    /// order, for `/sync`'s `device_lists` and `/keys/changes`.
+    pub fn key_changes(&self, since: u64, upto: u64) -> StoreResult<Vec<KeyChangeEntry>> {
         let start = since.saturating_add(1).to_be_bytes();
-        let mut out = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
         for (_, v) in
             self.read
                 .range(T_KEY_CHANGE, &start, &upto.saturating_add(1).to_be_bytes())?
         {
-            out.insert(
-                String::from_utf8(v).map_err(|_| StoreError::Engine("user id not UTF-8".into()))?,
-            );
+            out.push(dec("key change decode", &v)?);
         }
         Ok(out)
     }

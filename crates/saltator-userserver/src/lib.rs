@@ -27,9 +27,9 @@ use saltator_store::{Keyspace, KvEngine};
 
 pub use machine::{UserApp, UserStore};
 pub use types::{
-    Account, AccountDataEntry, AliasEntry, ClaimRequest, ClaimedKey, Device, MediaMeta,
-    MembershipChange, MembershipEntry, Profile, SessionCmd, ToDeviceMessage, TokenEntry, TokenKind,
-    UserChangePayload, UserCommand, UserResponse,
+    Account, AccountDataEntry, AliasEntry, ClaimRequest, ClaimedKey, Device, KeyChangeEntry,
+    MediaMeta, MembershipChange, MembershipEntry, Profile, SessionCmd, ToDeviceMessage, TokenEntry,
+    TokenKind, UserChangePayload, UserCommand, UserResponse,
 };
 
 /// M2 runs a single user shard; the fixed shard count and placement land
@@ -360,6 +360,27 @@ impl UserServer {
             .await
     }
 
+    /// Apply a projection batch of membership changes from a room shard
+    /// (monotonic per `source`; stale batches are ignored).
+    pub async fn apply_room_changes(
+        &self,
+        source: &str,
+        upto_seq: u64,
+        changes: Vec<MembershipChange>,
+    ) -> Result<()> {
+        match self
+            .propose(&UserCommand::ApplyRoomChanges {
+                source: source.to_owned(),
+                upto_seq,
+                changes,
+            })
+            .await?
+        {
+            UserResponse::Ok | UserResponse::Stale => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Drop delivered to-device messages: everything at inbox seq
     /// `<= up_to` for the device.
     pub async fn ack_to_device(&self, user_id: &UserId, device_id: &str, up_to: u64) -> Result<()> {
@@ -600,17 +621,9 @@ async fn run_membership_projection(users: &UserServer, rooms: &RoomServer) -> Re
                     changes_out.push(change);
                 }
             }
-            match users
-                .propose(&UserCommand::ApplyRoomChanges {
-                    source: ROOM_SOURCE.to_owned(),
-                    upto_seq,
-                    changes: changes_out,
-                })
-                .await?
-            {
-                UserResponse::Ok | UserResponse::Stale => {}
-                other => return Err(unexpected(other)),
-            }
+            users
+                .apply_room_changes(ROOM_SOURCE, upto_seq, changes_out)
+                .await?;
         }
         // Wait for more.
         match changes.recv().await {

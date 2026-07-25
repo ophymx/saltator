@@ -327,7 +327,8 @@ async fn device_list_log_and_device_cleanup() {
         .store()
         .key_changes(mark, u64::MAX)
         .unwrap()
-        .contains(uid.as_str()));
+        .iter()
+        .any(|e| e.user_id == uid.as_str() && e.membership.is_none()));
     let mark = u.shard_handle().seq().unwrap();
     u.upload_keys(
         &uid,
@@ -365,7 +366,44 @@ async fn device_list_log_and_device_cleanup() {
         .store()
         .key_changes(mark, u64::MAX)
         .unwrap()
-        .contains(uid.as_str()));
+        .iter()
+        .any(|e| e.user_id == uid.as_str() && e.membership.is_none()));
+
+    // Membership transitions land in the log too: a projected join writes
+    // a (room, joined=true) entry, a later leave (room, false); repeated
+    // same-membership updates don't.
+    let mark = u.shard_handle().seq().unwrap();
+    let change = |membership: &str, room_seq: u64| saltator_userserver::MembershipChange {
+        user_id: uid.to_string(),
+        room_id: "!r:hs.test".to_owned(),
+        membership: membership.to_owned(),
+        event_id: format!("$m{room_seq}"),
+        sender: uid.to_string(),
+        room_seq,
+    };
+    u.apply_room_changes("room/test", 1, vec![change("join", 1)])
+        .await
+        .unwrap();
+    u.apply_room_changes("room/test", 2, vec![change("join", 2)])
+        .await
+        .unwrap();
+    u.apply_room_changes("room/test", 3, vec![change("leave", 3)])
+        .await
+        .unwrap();
+    let entries: Vec<_> = u
+        .store()
+        .key_changes(mark, u64::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.membership)
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            Some(("!r:hs.test".to_owned(), true)),
+            Some(("!r:hs.test".to_owned(), false)),
+        ]
+    );
 
     env.rooms.shutdown().await.unwrap();
     u.shutdown().await.unwrap();

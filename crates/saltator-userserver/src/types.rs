@@ -51,11 +51,11 @@ pub const T_ONE_TIME_KEY: u8 = APP_TABLE_MIN + 13;
 /// (spec.md §5.5). `seq` is the user-shard seq at which the message was
 /// queued; sync windows on it like account data.
 pub const T_TO_DEVICE: u8 = APP_TABLE_MIN + 14;
-/// `seq (u64 BE) → user_id` — the device-list change log: one row whenever
-/// a user's E2EE device list changes (identity keys published, device
-/// deleted). `/sync` and `/keys/changes` window it to tell peers to
-/// re-query keys. Tiny rows, unbounded growth; pruning is a hardening
-/// brick.
+/// `seq (u64 BE) → KeyChangeEntry` — the device-list change log: one row
+/// whenever a user's E2EE device list changes (identity keys published,
+/// device deleted) or their room-sharing visibility changes (join/leave).
+/// `/sync` and `/keys/changes` window it to compute `changed`/`left`.
+/// Tiny rows, unbounded growth; pruning is a hardening brick.
 pub const T_KEY_CHANGE: u8 = APP_TABLE_MIN + 15;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
@@ -351,6 +351,17 @@ pub struct ToDeviceMessage {
     pub user_id: String,
     pub device_id: String,
     pub json: Vec<u8>,
+}
+
+/// One row of the device-list change log ([`T_KEY_CHANGE`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyChangeEntry {
+    pub user_id: String,
+    /// `None` = the device list itself changed (keys published, device
+    /// deleted). `Some((room_id, joined))` = a visibility change: the user
+    /// joined (`true`) or left (`false`) `room_id`, so peers in that room
+    /// start or stop tracking their devices.
+    pub membership: Option<(String, bool)>,
 }
 
 /// One `(user, device, algorithm)` one-time-key claim.

@@ -950,6 +950,7 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
             .any(|u| u == &format!("@bob:{SERVER}")),
         "bob's logout not surfaced: {resp}"
     );
+    let t3 = resp["next_batch"].as_str().unwrap().to_owned();
     let (status, resp) = env
         .req(
             "POST",
@@ -967,6 +968,92 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
             .is_none(),
         "bob's deleted device keys still served: {resp}"
     );
+
+    // Membership-driven changes. Carol joining the shared room makes her
+    // newly tracked (`changed`)...
+    let dl = |resp: &Value, section: &str, user: &str| -> bool {
+        resp["device_lists"][section]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|u| u == &format!("@{user}:{SERVER}")))
+    };
+    let sync_since = |since: String, token: String| {
+        let env = &env;
+        async move {
+            let (status, resp) = env
+                .req(
+                    "GET",
+                    &format!("/_matrix/client/v3/sync?since={since}&timeout=0"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            resp
+        }
+    };
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&carol),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let resp = sync_since(t3, alice.clone()).await;
+    assert!(dl(&resp, "changed", "carol"), "carol's join: {resp}");
+    let t4 = resp["next_batch"].as_str().unwrap().to_owned();
+
+    // ...and her leave lands her in `left` (no other shared room).
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+            Some(&carol),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let resp = sync_since(t4, alice.clone()).await;
+    assert!(dl(&resp, "left", "carol"), "carol's leave: {resp}");
+    let t5 = resp["next_batch"].as_str().unwrap().to_owned();
+
+    // Alice joining a room starts tracking its existing members...
+    let (status, room2) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&carol),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room2}");
+    let room2_id = room2["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room2_id}/join"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let resp = sync_since(t5, alice.clone()).await;
+    assert!(dl(&resp, "changed", "carol"), "alice's join: {resp}");
+    let t6 = resp["next_batch"].as_str().unwrap().to_owned();
+
+    // ...and leaving it stops tracking them.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room2_id}/leave"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let resp = sync_since(t6, alice.clone()).await;
+    assert!(dl(&resp, "left", "carol"), "alice's leave: {resp}");
 
     env.shutdown().await;
 }

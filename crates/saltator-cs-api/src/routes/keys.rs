@@ -92,9 +92,76 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
     })))
 }
 
-/// `GET /_matrix/client/v3/keys/changes?from=..&to=..`: users sharing a
-/// room with the caller whose device lists changed between two sync
-/// tokens — the recovery path after a gappy sync.
+/// The `device_lists` deltas for `user_id` over the user-shard window
+/// `(since, upto]`: users whose keys must be re-queried (`changed`) and
+/// users the caller no longer shares any room with (`left`). Later log
+/// entries override earlier ones, so a leave-then-rejoin nets to
+/// `changed`.
+pub(crate) fn device_list_deltas(
+    state: &CsState,
+    user_id: &str,
+    my_joined_rooms: &std::collections::BTreeSet<String>,
+    since: u64,
+    upto: u64,
+) -> Result<(
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+)> {
+    let store = state.users.store();
+    let shares_room = |other: &str| -> Result<bool> {
+        Ok(store
+            .memberships(other)
+            .map_err(ApiError::internal)?
+            .iter()
+            .any(|(rid, m)| m.membership == "join" && my_joined_rooms.contains(rid)))
+    };
+    let mut changed = std::collections::BTreeSet::new();
+    let mut left = std::collections::BTreeSet::new();
+    for entry in store.key_changes(since, upto).map_err(ApiError::internal)? {
+        match entry.membership {
+            // The device list itself changed: visible if we share a room.
+            None => {
+                if entry.user_id == user_id || shares_room(&entry.user_id)? {
+                    left.remove(&entry.user_id);
+                    changed.insert(entry.user_id);
+                }
+            }
+            Some((room_id, true)) => {
+                if entry.user_id == user_id {
+                    // We joined: everyone already there is newly tracked.
+                    for member in crate::room_util::joined_member_ids(&state.rooms, &room_id)? {
+                        if member != user_id {
+                            left.remove(&member);
+                            changed.insert(member);
+                        }
+                    }
+                } else if my_joined_rooms.contains(&room_id) {
+                    left.remove(&entry.user_id);
+                    changed.insert(entry.user_id);
+                }
+            }
+            Some((room_id, false)) => {
+                if entry.user_id == user_id {
+                    // We left: members there we share nothing else with.
+                    for member in crate::room_util::joined_member_ids(&state.rooms, &room_id)? {
+                        if member != user_id && !shares_room(&member)? {
+                            changed.remove(&member);
+                            left.insert(member);
+                        }
+                    }
+                } else if my_joined_rooms.contains(&room_id) && !shares_room(&entry.user_id)? {
+                    changed.remove(&entry.user_id);
+                    left.insert(entry.user_id);
+                }
+            }
+        }
+    }
+    Ok((changed, left))
+}
+
+/// `GET /_matrix/client/v3/keys/changes?from=..&to=..`: device-list
+/// `changed`/`left` between two sync tokens — the recovery path after a
+/// gappy sync.
 pub async fn key_changes(
     State(state): State<Arc<CsState>>,
     auth: Auth,
@@ -109,28 +176,18 @@ pub async fn key_changes(
         None => u64::MAX,
     };
 
-    let store = state.users.store();
-    let my_rooms: std::collections::BTreeSet<String> = store
+    let my_rooms: std::collections::BTreeSet<String> = state
+        .users
+        .store()
         .memberships(auth.user_id.as_str())
         .map_err(ApiError::internal)?
         .into_iter()
         .filter(|(_, m)| m.membership == "join")
         .map(|(rid, _)| rid)
         .collect();
-    let mut changed = Vec::new();
-    for user in store.key_changes(from, to).map_err(ApiError::internal)? {
-        let visible = user == auth.user_id.as_str()
-            || store
-                .memberships(&user)
-                .map_err(ApiError::internal)?
-                .iter()
-                .any(|(rid, m)| m.membership == "join" && my_rooms.contains(rid));
-        if visible {
-            changed.push(user);
-        }
-    }
+    let (changed, left) = device_list_deltas(&state, auth.user_id.as_str(), &my_rooms, from, to)?;
 
-    Ok(axum::Json(json!({ "changed": changed, "left": [] })))
+    Ok(axum::Json(json!({ "changed": changed, "left": left })))
 }
 
 /// `POST /_matrix/client/v3/keys/claim`: claim one one-time key for each

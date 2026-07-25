@@ -34,6 +34,20 @@ pub fn current_state(rooms: &RoomServer, room_id: &str) -> Result<StateMap> {
         .map_err(ApiError::internal)
 }
 
+/// User IDs currently joined to `room_id` (empty if the room is unknown).
+pub fn joined_member_ids(rooms: &RoomServer, room_id: &str) -> Result<Vec<String>> {
+    let Ok(state) = current_state(rooms, room_id) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (event_type, state_key) in state.keys() {
+        if event_type == "m.room.member" && membership_in(rooms, &state, state_key)? == "join" {
+            out.push(state_key.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// A user's membership in the room's current state (`leave` if absent).
 pub fn membership_in(rooms: &RoomServer, state: &StateMap, user_id: &str) -> Result<String> {
     let Some(event_id) = state.get(&("m.room.member".to_owned(), user_id.to_owned())) else {

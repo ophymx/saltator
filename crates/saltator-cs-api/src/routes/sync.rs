@@ -149,7 +149,8 @@ pub async fn sync_events(
             && resp.account_data.is_empty()
             && resp.presence.is_empty()
             && resp.to_device.events.is_empty()
-            && resp.device_lists.changed.is_empty();
+            && resp.device_lists.changed.is_empty()
+            && resp.device_lists.left.is_empty();
         if since.is_none() || !empty || timeout.is_zero() {
             return Ok(Ra(resp));
         }
@@ -306,22 +307,25 @@ fn build_sync(
         resp.to_device.events.push(to_raw(&event)?);
     }
 
-    // Device-list changes: users sharing a room with the caller (and the
-    // caller) whose E2EE device list changed inside the window, so clients
-    // re-query their keys. Initial syncs skip this — clients query fresh.
+    // Device-list changes in the window: whose keys to re-query
+    // (`changed`) and who stopped sharing rooms with us (`left`). Initial
+    // syncs skip this — clients query fresh.
     if !initial {
-        for changed in store.key_changes(since.user, now.user).map_err(internal)? {
-            let visible = changed == user_id
-                || store
-                    .memberships(&changed)
-                    .map_err(internal)?
-                    .iter()
-                    .any(|(rid, m)| m.membership == "join" && my_joined_rooms.contains(rid));
-            if !visible {
-                continue;
-            }
-            if let Ok(uid) = ruma::OwnedUserId::try_from(changed) {
+        let (dl_changed, dl_left) = crate::routes::keys::device_list_deltas(
+            state,
+            user_id,
+            &my_joined_rooms,
+            since.user,
+            now.user,
+        )?;
+        for user in dl_changed {
+            if let Ok(uid) = ruma::OwnedUserId::try_from(user) {
                 resp.device_lists.changed.push(uid);
+            }
+        }
+        for user in dl_left {
+            if let Ok(uid) = ruma::OwnedUserId::try_from(user) {
+                resp.device_lists.left.push(uid);
             }
         }
     }
