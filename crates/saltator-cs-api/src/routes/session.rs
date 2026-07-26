@@ -48,18 +48,24 @@ pub async fn get_capabilities(
     State(state): State<Arc<CsState>>,
     _auth: Auth,
     _req: Ar<get_capabilities::v3::Request>,
-) -> Ra<get_capabilities::v3::Response> {
-    use get_capabilities::v3::{Capabilities, RoomVersionStability, RoomVersionsCapability};
-    let mut caps = Capabilities::new();
-    // ruma's default already advertises change_password as enabled.
-    caps.room_versions = RoomVersionsCapability::new(
-        state.config.default_room_version.ruma_id(),
+) -> axum::Json<serde_json::Value> {
+    // Hand-rolled: ruma's typed response skips capabilities that equal
+    // their spec default (like change_password enabled), but clients and
+    // Complement expect the keys to be present.
+    let available: serde_json::Map<String, serde_json::Value> =
         [RoomVersion::V11, RoomVersion::V12]
             .into_iter()
-            .map(|v| (v.ruma_id(), RoomVersionStability::Stable))
-            .collect(),
-    );
-    Ra(get_capabilities::v3::Response::new(caps))
+            .map(|v| (v.ruma_id().to_string(), "stable".into()))
+            .collect();
+    axum::Json(serde_json::json!({
+        "capabilities": {
+            "m.change_password": { "enabled": true },
+            "m.room_versions": {
+                "default": state.config.default_room_version.ruma_id(),
+                "available": available,
+            },
+        }
+    }))
 }
 
 pub async fn register(
