@@ -57,6 +57,11 @@ pub const T_TO_DEVICE: u8 = APP_TABLE_MIN + 14;
 /// `/sync` and `/keys/changes` window it to compute `changed`/`left`.
 /// Tiny rows, unbounded growth; pruning is a hardening brick.
 pub const T_KEY_CHANGE: u8 = APP_TABLE_MIN + 15;
+/// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ app_id ++ 0x00 ++ pushkey →
+/// pusher JSON` — push notification targets (`/pushers`). Device-scoped:
+/// a pusher dies with the session that created it (which is what makes
+/// password-change logout drop other sessions' pushers).
+pub const T_PUSHER: u8 = APP_TABLE_MIN + 16;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -360,6 +365,16 @@ pub enum UserCommand {
     /// future logins and deletes every device and session.
     Deactivate {
         user_id: String,
+    },
+    /// Create/replace (`json` present) or delete (`None`) the pusher
+    /// identified by `(app_id, pushkey)`. A replace moves the pusher to
+    /// `device_id`'s scope regardless of which session created it.
+    SetPusher {
+        user_id: String,
+        device_id: String,
+        app_id: String,
+        pushkey: String,
+        json: Option<Vec<u8>>,
     },
 }
 

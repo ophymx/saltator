@@ -293,6 +293,21 @@ fn build_sync(
             .push(to_raw(&account_data_event(&data_type, &entry.json)?)?);
     }
 
+    // Push rules always ride the initial sync: synthesize the server
+    // defaults when the user never customized them (customized rules are
+    // real `m.push_rules` account data and flow through the loop above).
+    if initial
+        && store
+            .account_data(user_id, "", "m.push_rules")
+            .map_err(internal)?
+            .is_none()
+    {
+        resp.account_data.events.push(to_raw(&serde_json::json!({
+            "type": "m.push_rules",
+            "content": { "global": ruma::push::Ruleset::server_default(&auth.user_id) },
+        }))?);
+    }
+
     // To-device inbox: pending messages in the window, oldest first.
     // Rows past `now` wait for the next window or they'd be served twice.
     let to_device_since = if initial { 0 } else { since.user };

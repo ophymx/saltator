@@ -1058,6 +1058,216 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
     env.shutdown().await;
 }
 
+/// Push rules and pushers: defaults ride the initial sync, mutations
+/// land as `m.push_rules` account data in the next window (waking
+/// long-polls), reads are stable, and pushers die with the session that
+/// created them.
+#[tokio::test]
+async fn push_rules_and_pushers() {
+    let env = start_env().await;
+    let alice = env.register("alice", "first-pw").await;
+
+    // Server-default rules ride the initial sync.
+    let (status, sync0) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sync0}");
+    let pr = sync0["account_data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "m.push_rules")
+        .expect("push rules in initial sync")
+        .clone();
+    assert!(pr["content"]["global"]["underride"].is_array(), "{pr}");
+    let t1 = sync0["next_batch"].as_str().unwrap().to_owned();
+
+    // Adding a rule shows in GET /pushrules/ and in the next sync window.
+    let (status, body) = env
+        .req(
+            "PUT",
+            "/_matrix/client/v3/pushrules/global/room/!foo:example.com",
+            Some(&alice),
+            Some(json!({"actions": ["notify"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, rules) = env
+        .req("GET", "/_matrix/client/v3/pushrules/", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert_eq!(rules["global"]["room"][0]["rule_id"], "!foo:example.com");
+    let synced_rules = |resp: &Value| {
+        resp["account_data"]["events"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|e| e["type"] == "m.push_rules"))
+    };
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={t1}&timeout=0"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert!(synced_rules(&resp), "rule add missed the window: {resp}");
+    let t2 = resp["next_batch"].as_str().unwrap().to_owned();
+
+    // Disabling and setting actions both surface in the next window, and
+    // repeated reads are stable (the SYN-390 cache-health shape).
+    let (status, body) = env
+        .req(
+            "PUT",
+            "/_matrix/client/v3/pushrules/global/room/!foo:example.com/enabled",
+            Some(&alice),
+            Some(json!({"enabled": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "PUT",
+            "/_matrix/client/v3/pushrules/global/room/!foo:example.com/actions",
+            Some(&alice),
+            Some(json!({"actions": ["dont_notify"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for _ in 0..2 {
+        let (status, rules) = env
+            .req("GET", "/_matrix/client/v3/pushrules/", Some(&alice), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{rules}");
+        assert_eq!(rules["global"]["room"][0]["enabled"], false);
+        assert_eq!(rules["global"]["room"][0]["actions"][0], "dont_notify");
+    }
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={t2}&timeout=0"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert!(
+        synced_rules(&resp),
+        "attr changes missed the window: {resp}"
+    );
+
+    // A sender rule (the cache-health test's exact shape).
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/pushrules/global/sender/@alice:{SERVER}"),
+            Some(&alice),
+            Some(json!({"actions": ["dont_notify"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, rules) = env
+        .req("GET", "/_matrix/client/v3/pushrules/", Some(&alice), None)
+        .await;
+    assert_eq!(rules["global"]["sender"][0]["actions"][0], "dont_notify");
+
+    // Pushers: one made by another session dies on password change...
+    let (status, other) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/login",
+            None,
+            Some(json!({
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": format!("@alice:{SERVER}")},
+                "password": "first-pw",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+    let other_session = other["access_token"].as_str().unwrap().to_owned();
+    let pusher = json!({
+        "data": {"url": "https://dummy.url/_matrix/push/v1/notify"},
+        "kind": "http", "app_id": "complement", "pushkey": "a_push_key",
+        "app_display_name": "c", "device_display_name": "d", "lang": "en",
+    });
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/pushers/set",
+            Some(&other_session),
+            Some(pusher.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let count = |resp: &Value| resp["pushers"].as_array().map(Vec::len).unwrap_or(0);
+    let (_, resp) = env
+        .req("GET", "/_matrix/client/v3/pushers", Some(&alice), None)
+        .await;
+    assert_eq!(count(&resp), 1, "{resp}");
+    let uia = |password: &str| {
+        json!({
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": format!("@alice:{SERVER}")},
+            "password": password,
+        })
+    };
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/password",
+            Some(&alice),
+            Some(json!({"new_password": "second-pw", "auth": uia("first-pw")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, resp) = env
+        .req("GET", "/_matrix/client/v3/pushers", Some(&alice), None)
+        .await;
+    assert_eq!(count(&resp), 0, "other session's pusher survived: {resp}");
+
+    // ...while one made by the surviving session stays.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/pushers/set",
+            Some(&alice),
+            Some(pusher.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/password",
+            Some(&alice),
+            Some(json!({"new_password": "third-pw", "auth": uia("second-pw")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, resp) = env
+        .req("GET", "/_matrix/client/v3/pushers", Some(&alice), None)
+        .await;
+    assert_eq!(count(&resp), 1, "own pusher deleted: {resp}");
+
+    // kind: null deletes.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/pushers/set",
+            Some(&alice),
+            Some(json!({"app_id": "complement", "pushkey": "a_push_key", "kind": null})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, resp) = env
+        .req("GET", "/_matrix/client/v3/pushers", Some(&alice), None)
+        .await;
+    assert_eq!(count(&resp), 0, "{resp}");
+
+    env.shutdown().await;
+}
+
 /// Account lifecycle: password change behind a UIA password stage (other
 /// sessions die by default, optionally survive), then deactivation
 /// (permanent — all sessions dead, logins refused).

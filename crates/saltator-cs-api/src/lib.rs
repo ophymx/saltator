@@ -139,7 +139,7 @@ impl CsState {
 
 /// Build the client-server router. Serve this on the client listener.
 pub fn router(state: Arc<CsState>) -> axum::Router {
-    use routes::{account, keys, media, rooms, search, session, sync, to_device};
+    use routes::{account, keys, media, push, rooms, search, session, sync, to_device};
 
     let mut app = axum::Router::new()
         .route(
@@ -197,7 +197,17 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
                     .put(account::update_device)
                     .delete(account::delete_device),
             )
-            .route(&p("/pushrules/"), get(account::get_pushrules))
+            .route(&p("/pushrules/"), get(push::get_pushrules))
+            .route(
+                &p("/pushrules/global/{kind}/{rule_id}"),
+                put(push::put_pushrule),
+            )
+            .route(
+                &p("/pushrules/global/{kind}/{rule_id}/{attr}"),
+                put(push::put_pushrule_attr),
+            )
+            .route(&p("/pushers"), get(push::get_pushers))
+            .route(&p("/pushers/set"), post(push::set_pushers))
             .route(
                 &p("/presence/{user_id}/status"),
                 get(account::get_presence).put(account::set_presence),

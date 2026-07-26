@@ -427,6 +427,26 @@ impl UserServer {
         }
     }
 
+    /// Create/replace (`json` present) or delete (`None`) the pusher
+    /// identified by `(app_id, pushkey)` (`POST /pushers/set`).
+    pub async fn set_pusher(
+        &self,
+        user_id: &UserId,
+        device_id: &str,
+        app_id: &str,
+        pushkey: &str,
+        json: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.expect_ok(&UserCommand::SetPusher {
+            user_id: user_id.to_string(),
+            device_id: device_id.to_owned(),
+            app_id: app_id.to_owned(),
+            pushkey: pushkey.to_owned(),
+            json,
+        })
+        .await
+    }
+
     /// Deactivate the account (`/account/deactivate`): permanent — blocks
     /// future logins and kills every session.
     pub async fn deactivate(&self, user_id: &UserId) -> Result<()> {

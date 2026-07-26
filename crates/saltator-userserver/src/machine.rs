@@ -9,8 +9,8 @@ use crate::types::{
     AccountDataEntry, AliasEntry, ClaimedKey, Device, KeyChangeEntry, MediaMeta, MembershipEntry,
     Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse,
     T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER,
-    T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_TOKEN,
-    T_TO_DEVICE,
+    T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER,
+    T_TOKEN, T_TO_DEVICE,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -115,11 +115,12 @@ fn delete_device(ctx: &mut ApplyCtx<'_>, user_id: &str, device_id: &str) -> Stor
         ctx.delete(T_TOKEN, &h);
     }
     ctx.delete(T_DEVICE, &dkey);
-    // The device's E2EE material dies with it: identity keys, unclaimed
-    // one-time keys, and the undelivered to-device inbox.
+    // The device's E2EE material and pushers die with it: identity keys,
+    // unclaimed one-time keys, the undelivered to-device inbox, and any
+    // pushers this session registered.
     ctx.delete(T_DEVICE_KEYS, &dkey);
     let prefix = device_scoped_key(user_id, device_id, "");
-    for table in [T_ONE_TIME_KEY, T_TO_DEVICE] {
+    for table in [T_ONE_TIME_KEY, T_TO_DEVICE, T_PUSHER] {
         for (k, _) in ctx.range(table, &prefix, &prefix_end(&prefix))? {
             ctx.delete(table, &k);
         }
@@ -593,6 +594,37 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
             Ok(UserResponse::Ok)
         }
+        UserCommand::SetPusher {
+            user_id,
+            device_id,
+            app_id,
+            pushkey,
+            json,
+        } => {
+            // One pusher per (app_id, pushkey) across all of the user's
+            // devices: drop any existing instance first.
+            let start = user_key(user_id, "");
+            let suffix = {
+                let mut s = Vec::with_capacity(app_id.len() + pushkey.len() + 2);
+                s.push(0);
+                s.extend_from_slice(app_id.as_bytes());
+                s.push(0);
+                s.extend_from_slice(pushkey.as_bytes());
+                s
+            };
+            for (k, _) in ctx.range(T_PUSHER, &start, &user_end(user_id))? {
+                if k.ends_with(&suffix) {
+                    ctx.delete(T_PUSHER, &k);
+                }
+            }
+            if let Some(json) = json {
+                let mut key = device_scoped_key(user_id, device_id, app_id);
+                key.push(0);
+                key.extend_from_slice(pushkey.as_bytes());
+                ctx.put(T_PUSHER, &key, json.clone());
+            }
+            Ok(UserResponse::Ok)
+        }
         UserCommand::AckToDevice {
             user_id,
             device_id,
@@ -747,6 +779,16 @@ impl UserStore {
             *counts.entry(algo).or_insert(0u64) += 1;
         }
         Ok(counts)
+    }
+
+    /// All pushers of a user, as raw pusher JSON (`GET /pushers`).
+    pub fn pushers(&self, user_id: &str) -> StoreResult<Vec<Vec<u8>>> {
+        let start = user_key(user_id, "");
+        let mut out = Vec::new();
+        for (_, v) in self.read.range(T_PUSHER, &start, &user_end(user_id))? {
+            out.push(v);
+        }
+        Ok(out)
     }
 
     pub fn account_data(

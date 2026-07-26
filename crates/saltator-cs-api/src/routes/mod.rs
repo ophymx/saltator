@@ -2,6 +2,7 @@ pub mod account;
 pub mod edu;
 pub mod keys;
 pub mod media;
+pub mod push;
 pub mod rooms;
 pub mod search;
 pub mod session;

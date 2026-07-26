@@ -13,7 +13,6 @@ use ruma::api::client::presence::{get_presence, set_presence};
 use ruma::api::client::profile::{
     get_avatar_url, get_display_name, get_profile, set_avatar_url, set_display_name,
 };
-use ruma::api::client::push::get_pushrules_all;
 use ruma::api::client::uiaa::{AuthData, UserIdentifier};
 use ruma::UserId;
 
@@ -522,16 +521,7 @@ pub async fn deactivate(
     )))
 }
 
-// -- push rules / presence ----------------------------------------------------
-
-pub async fn get_pushrules(
-    auth: Auth,
-    _req: Ar<get_pushrules_all::v3::Request>,
-) -> Ra<get_pushrules_all::v3::Response> {
-    Ra(get_pushrules_all::v3::Response::new(
-        ruma::push::Ruleset::server_default(&auth.user_id),
-    ))
-}
+// -- presence -----------------------------------------------------------------
 
 pub async fn set_presence(
     State(state): State<Arc<CsState>>,
