@@ -23,6 +23,26 @@ type JsonResp = Result<axum::Json<Value>>;
 /// `POST /_matrix/client/v3/keys/upload`: publish this device's identity
 /// keys and one-time keys. Returns one-time-key counts per algorithm.
 pub async fn upload_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body): Jb) -> JsonResp {
+    // Identity keys must be well-formed and belong to the uploading
+    // session — a signed object for someone else's device is garbage at
+    // best and an impersonation attempt at worst.
+    if let Some(dk) = body.get("device_keys") {
+        let obj = dk
+            .as_object()
+            .ok_or_else(|| ApiError::bad_json("device_keys is not an object"))?;
+        for field in ["user_id", "device_id", "algorithms", "keys", "signatures"] {
+            if !obj.contains_key(field) {
+                return Err(ApiError::bad_json(format!("device_keys missing {field}")));
+            }
+        }
+        if obj.get("user_id").and_then(|v| v.as_str()) != Some(auth.user_id.as_str())
+            || obj.get("device_id").and_then(|v| v.as_str()) != Some(auth.device_id.as_str())
+        {
+            return Err(ApiError::bad_json(
+                "device_keys do not belong to this session",
+            ));
+        }
+    }
     let device_keys = body.get("device_keys").map(|v| v.to_string().into_bytes());
 
     let one_time_keys = match body.get("one_time_keys") {
@@ -141,13 +161,15 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
             continue;
         }
         // Only devices explicitly listed, or all when the list is empty.
+        // Anything but a list of device IDs is malformed.
         let wanted: Option<Vec<String>> = match devices {
             Value::Array(a) if !a.is_empty() => Some(
                 a.iter()
                     .filter_map(|v| v.as_str().map(str::to_owned))
                     .collect(),
             ),
-            _ => None,
+            Value::Array(_) => None,
+            _ => return Err(ApiError::bad_json("device_keys values must be lists")),
         };
         let mut per_user = Map::new();
         let keys = store.device_keys(user_id).map_err(ApiError::internal)?;
@@ -158,9 +180,8 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
             let value: Value = serde_json::from_slice(&raw).map_err(ApiError::internal)?;
             per_user.insert(device_id, value);
         }
-        if !per_user.is_empty() {
-            out.insert(user_id.clone(), Value::Object(per_user));
-        }
+        // Requested users always appear, empty when they have no keys.
+        out.insert(user_id.clone(), Value::Object(per_user));
     }
     proxy_key_requests(
         &state,

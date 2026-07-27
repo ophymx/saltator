@@ -421,6 +421,13 @@ async fn join_with_body(
         .map_err(internal)?
         .is_some();
     if hosted {
+        // Joining twice is a no-op: the existing membership event stands
+        // (a fresh identical join would mint a new event ID).
+        let current = current_state(&state.rooms, room_id.as_str())?;
+        if crate::room_util::membership_in(&state.rooms, &current, auth.user_id.as_str())? == "join"
+        {
+            return Ok(());
+        }
         send_membership_with(
             state,
             room_id,
@@ -935,6 +942,17 @@ pub async fn kick_user(
     auth: Auth,
     Ar(req): Ar<kick_user::v3::Request>,
 ) -> Result<Ra<kick_user::v3::Response>> {
+    // Auth rules alone would accept a redundant leave; the CS contract is
+    // that kicking someone who is not in the room (never present, or
+    // already left) is forbidden.
+    let current = current_state(&state.rooms, req.room_id.as_str())?;
+    let target_membership =
+        crate::room_util::membership_in(&state.rooms, &current, req.user_id.as_str())?;
+    if !matches!(target_membership.as_str(), "join" | "invite" | "knock") {
+        return Err(ApiError::forbidden(
+            "Cannot kick a user who is not in the room",
+        ));
+    }
     send_membership(
         &state,
         &req.room_id,
@@ -1087,6 +1105,23 @@ pub async fn send_state_event(
         .map_err(|e| ApiError::bad_json(e.to_string()))?;
     if req.event_type == ruma::events::StateEventType::RoomCanonicalAlias {
         validate_canonical_alias(&state, req.room_id.as_str(), &content)?;
+    }
+    // Setting identical state twice is idempotent: return the standing
+    // event rather than minting a duplicate.
+    if let Ok(current) = current_state(&state.rooms, req.room_id.as_str()) {
+        if let Some(event_id) = current.get(&(req.event_type.to_string(), req.state_key.clone())) {
+            if let Some(raw) = raw_event(&state.rooms, event_id)? {
+                let existing = raw
+                    .get("content")
+                    .and_then(|c| serde_json::to_value(c).ok())
+                    .unwrap_or_default();
+                if existing == content {
+                    let event_id =
+                        ruma::OwnedEventId::try_from(event_id.clone()).map_err(internal)?;
+                    return Ok(Ra(send_state_event::v3::Response::new(event_id)));
+                }
+            }
+        }
     }
     let event_id = send_state_checked(
         &state,
@@ -1329,8 +1364,16 @@ pub async fn get_messages(
     use ruma::api::Direction;
 
     // Access is checked before query validation: a caller who may not read
-    // the room gets 403 no matter how malformed the request is.
-    require_joined(&state.rooms, &room_id, auth.user_id.as_str())?;
+    // the room gets 403 no matter how malformed the request is — and an
+    // unknown room reads as 403 too (sytest: "You aren't a member"), not
+    // as an existence oracle.
+    require_joined(&state.rooms, &room_id, auth.user_id.as_str()).map_err(|e| {
+        if e.status == axum::http::StatusCode::NOT_FOUND {
+            ApiError::forbidden("You aren't a member of the room")
+        } else {
+            e
+        }
+    })?;
     let meta = room_meta(&state.rooms, &room_id)?;
     let version = room_version(&meta)?;
 
@@ -1432,6 +1475,12 @@ pub async fn get_messages(
 }
 
 fn parse_topo_token(token: &str) -> Result<u64> {
+    // Native topological tokens (`t{seq}`, what /messages and prev_batch
+    // mint) and full sync tokens (clients feed next_batch straight into
+    // /messages `from`) both resolve to a room-shard position.
+    if token.starts_with('s') {
+        return crate::routes::sync::token_room_seq(token);
+    }
     token
         .strip_prefix('t')
         .and_then(|s| s.parse().ok())

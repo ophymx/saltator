@@ -122,6 +122,15 @@ jobs:
             echo "no Complement tests passed; deployment is broken" >&2
             exit 1
           fi
+      # The raw go-test JSON (with per-test failure output) is only here —
+      # it no longer hits the step log.
+      - name: Upload results JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: complement-csapi-json
+          path: /tmp/complement.json
+          retention-days: 7
 
   complement-federation:
     name: complement (federation)

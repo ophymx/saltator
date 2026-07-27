@@ -7,10 +7,10 @@ use saltator_store::{Result as StoreResult, StoreError};
 use crate::types::{
     account_data_key, device_scoped_key, prefix_end, to_device_key, user_key, Account,
     AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimedKey, Device, KeyChangeEntry, MediaMeta,
-    MembershipEntry, Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand,
-    UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION, T_CURSOR,
-    T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
-    T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE,
+    MembershipEntry, OtkEntry, Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload,
+    UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION,
+    T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE,
+    T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -551,12 +551,19 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                 // care about (OTK refills are not).
                 log_key_change(ctx, user_id)?;
             }
-            // Existing OTK key_ids for this device (the range does not see
-            // this batch's own puts, so union the new ids in explicitly).
+            // Existing OTKs for this device (the range does not see this
+            // batch's own puts, so union the new ids in explicitly), plus
+            // the next upload slot for MSC4225 claim ordering.
             let mut prefix = user_key(user_id, device_id);
             prefix.push(0);
-            let mut ids: std::collections::BTreeSet<String> = ctx
-                .range(T_ONE_TIME_KEY, &prefix, &prefix_end(&prefix))?
+            let existing = ctx.range(T_ONE_TIME_KEY, &prefix, &prefix_end(&prefix))?;
+            let mut next_order = existing
+                .iter()
+                .filter_map(|(_, v)| dec::<OtkEntry>("otk decode", v).ok())
+                .map(|e| e.order + 1)
+                .max()
+                .unwrap_or(0);
+            let mut ids: std::collections::BTreeSet<String> = existing
                 .into_iter()
                 .filter_map(|(k, _)| {
                     k.strip_prefix(prefix.as_slice())
@@ -564,12 +571,23 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                 })
                 .collect();
             for (key_id, json) in one_time_keys {
-                ctx.put(
-                    T_ONE_TIME_KEY,
-                    &device_scoped_key(user_id, device_id, key_id),
-                    json.clone(),
-                );
-                ids.insert(key_id.clone());
+                let key = device_scoped_key(user_id, device_id, key_id);
+                // Re-uploading a key_id is a no-op (idempotent), keeping
+                // its original slot.
+                if ctx.get(T_ONE_TIME_KEY, &key)?.is_none() && ids.insert(key_id.clone()) {
+                    ctx.put(
+                        T_ONE_TIME_KEY,
+                        &key,
+                        enc(
+                            "otk encode",
+                            &OtkEntry {
+                                order: next_order,
+                                json: json.clone(),
+                            },
+                        )?,
+                    );
+                    next_order += 1;
+                }
             }
             let mut counts = std::collections::BTreeMap::new();
             for id in ids {
@@ -581,21 +599,25 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
         UserCommand::ClaimKeys { claims } => {
             let mut claimed = Vec::new();
             for req in claims {
-                // Scan `user\0device\0algorithm:` and take the first key.
+                // Oldest upload first (MSC4225), among the algorithm's keys.
                 let mut scope = user_key(&req.user_id, &req.device_id);
                 scope.push(0);
-                let mut algo_prefix =
-                    device_scoped_key(&req.user_id, &req.device_id, &req.algorithm);
-                algo_prefix.push(b':');
+                let algo_prefix = format!("{}:", req.algorithm);
                 let hit = ctx
-                    .range(T_ONE_TIME_KEY, &algo_prefix, &prefix_end(&algo_prefix))?
+                    .range(T_ONE_TIME_KEY, &scope, &prefix_end(&scope))?
                     .into_iter()
-                    .next();
-                if let Some((full_key, json)) = hit {
-                    let key_id = full_key
-                        .strip_prefix(scope.as_slice())
-                        .map(|s| String::from_utf8_lossy(s).into_owned())
-                        .unwrap_or_default();
+                    .filter_map(|(k, v)| {
+                        let key_id = k
+                            .strip_prefix(scope.as_slice())
+                            .map(|s| String::from_utf8_lossy(s).into_owned())?;
+                        if !key_id.starts_with(&algo_prefix) {
+                            return None;
+                        }
+                        let entry: OtkEntry = dec("otk decode", &v).ok()?;
+                        Some((entry.order, k, key_id, entry.json))
+                    })
+                    .min_by_key(|(order, ..)| *order);
+                if let Some((_, full_key, key_id, json)) = hit {
                     ctx.delete(T_ONE_TIME_KEY, &full_key);
                     claimed.push(ClaimedKey {
                         user_id: req.user_id.clone(),

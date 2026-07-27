@@ -426,6 +426,15 @@ pub enum UserCommand {
     },
 }
 
+/// A stored one-time key ([`T_ONE_TIME_KEY`]) with its upload slot:
+/// claims hand keys out in upload order (MSC4225), not key-ID order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtkEntry {
+    pub order: u64,
+    /// Raw one-time-key JSON.
+    pub json: Vec<u8>,
+}
+
 /// One key-backup version's metadata ([`T_BACKUP_VERSION`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupVersionMeta {

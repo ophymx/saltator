@@ -881,13 +881,25 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
 
     // Bob publishes identity keys (carol too — but alice shares no room
     // with her, so carol must stay invisible).
-    for token in [&bob, &carol] {
+    for (localpart, token) in [("bob", &bob), ("carol", &carol)] {
+        let (_, whoami) = env
+            .req(
+                "GET",
+                "/_matrix/client/v3/account/whoami",
+                Some(token),
+                None,
+            )
+            .await;
+        let device_id = whoami["device_id"].as_str().unwrap().to_owned();
         let (status, body) = env
             .req(
                 "POST",
                 "/_matrix/client/v3/keys/upload",
                 Some(token),
-                Some(json!({"device_keys": {"algorithms": [], "keys": {}, "signatures": {}}})),
+                Some(json!({"device_keys": {
+                    "user_id": format!("@{localpart}:{SERVER}"), "device_id": device_id,
+                    "algorithms": [], "keys": {}, "signatures": {},
+                }})),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -960,12 +972,11 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{resp}");
+    // Requested users always appear; bob's dict is empty post-logout.
     assert!(
-        resp["device_keys"]
+        resp["device_keys"][&format!("@bob:{SERVER}")]
             .as_object()
-            .unwrap()
-            .get(&format!("@bob:{SERVER}"))
-            .is_none(),
+            .is_some_and(|m| m.is_empty()),
         "bob's deleted device keys still served: {resp}"
     );
 
@@ -1054,6 +1065,271 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let resp = sync_since(t6, alice.clone()).await;
     assert!(dl(&resp, "left", "carol"), "alice's leave: {resp}");
+
+    env.shutdown().await;
+}
+
+/// Key-upload validation, query shape rules, and MSC4225 claim ordering.
+#[tokio::test]
+async fn key_upload_validation_and_claim_ordering() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let (_, whoami) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(&alice),
+            None,
+        )
+        .await;
+    let dev = whoami["device_id"].as_str().unwrap().to_owned();
+
+    // Incomplete identity keys are rejected...
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            Some(&alice),
+            Some(json!({"device_keys": {"user_id": format!("@alice:{SERVER}"), "device_id": dev}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_BAD_JSON");
+    // ...as are someone else's.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            Some(&alice),
+            Some(json!({"device_keys": {
+                "user_id": format!("@mallory:{SERVER}"), "device_id": dev,
+                "algorithms": [], "keys": {}, "signatures": {},
+            }})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Malformed query shape (object instead of device list) is rejected.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/query",
+            Some(&alice),
+            Some(json!({"device_keys": {format!("@alice:{SERVER}"): {"device_id": dev}}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Claims come back in upload order (MSC4225), not key-ID order: key
+    // "…:1" is uploaded before "…:0" in a separate request.
+    for key_id in ["signed_curve25519:1", "signed_curve25519:0"] {
+        let (status, body) = env
+            .req(
+                "POST",
+                "/_matrix/client/v3/keys/upload",
+                Some(&alice),
+                Some(json!({"one_time_keys": {key_id: {"key": key_id}}})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let claim = json!({"one_time_keys": {format!("@alice:{SERVER}"): {&dev: "signed_curve25519"}}});
+    let mut claimed = Vec::new();
+    for _ in 0..2 {
+        let (status, resp) = env
+            .req(
+                "POST",
+                "/_matrix/client/v3/keys/claim",
+                Some(&alice),
+                Some(claim.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let keys = resp["one_time_keys"][&format!("@alice:{SERVER}")][&dev]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        claimed.extend(keys);
+    }
+    assert_eq!(
+        claimed,
+        vec!["signed_curve25519:1", "signed_curve25519:0"],
+        "claims not in upload order"
+    );
+
+    env.shutdown().await;
+}
+
+/// Kicking a non-present user is forbidden; identical state and repeated
+/// joins are idempotent (no duplicate events).
+#[tokio::test]
+async fn kick_guards_and_idempotent_writes() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+
+    let (_, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // Kick of a never-present user: 403.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/kick"),
+            Some(&alice),
+            Some(json!({"user_id": format!("@bob:{SERVER}"), "reason": "testing"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Bob joins twice: the member event ID must not change.
+    for _ in 0..2 {
+        let (status, body) = env
+            .req(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+                Some(&bob),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let member_url = format!(
+        "/_matrix/client/v3/rooms/{room_id}/state/m.room.member/@bob:{SERVER}?format=event"
+    );
+    let (_, first) = env.req("GET", &member_url, Some(&bob), None).await;
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, second) = env.req("GET", &member_url, Some(&bob), None).await;
+    assert_eq!(
+        first["event_id"], second["event_id"],
+        "re-join minted a new member event"
+    );
+
+    // Kick of a left user: 403.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/kick"),
+            Some(&alice),
+            Some(json!({"user_id": format!("@bob:{SERVER}"), "reason": "testing"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Identical state twice returns the same event ID.
+    let put_state = |content: Value| {
+        let env = &env;
+        let alice = &alice;
+        let room_id = &room_id;
+        async move {
+            let (status, body) = env
+                .req(
+                    "PUT",
+                    &format!("/_matrix/client/v3/rooms/{room_id}/state/a.test.state/key"),
+                    Some(alice),
+                    Some(content),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["event_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let e1 = put_state(json!({"v": 1})).await;
+    let e2 = put_state(json!({"v": 1})).await;
+    assert_eq!(e1, e2, "identical state minted a new event");
+    let e3 = put_state(json!({"v": 2})).await;
+    assert_ne!(e1, e3, "changed state did not mint a new event");
+
+    env.shutdown().await;
+}
+
+/// `/messages` accepts sync tokens as pagination bounds (clients feed
+/// next_batch straight in) and answers 403, not 404, for unknown rooms.
+#[tokio::test]
+async fn messages_accept_sync_tokens_and_hide_unknown_rooms() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let (status, sync0) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = sync0["next_batch"].as_str().unwrap().to_owned();
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/m1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "after the token"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Forward from the sync token: exactly the new message.
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=f&from={token}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let chunk = resp["chunk"].as_array().unwrap();
+    assert!(
+        chunk
+            .iter()
+            .any(|e| e["content"]["body"] == "after the token"),
+        "message missing from sync-token window: {resp}"
+    );
+
+    // Unknown room: forbidden, not an existence oracle.
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/!nope:{SERVER}/messages?dir=b"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{resp}");
 
     env.shutdown().await;
 }

@@ -84,6 +84,12 @@ pub(crate) fn token_user_seq(s: &str) -> Result<u64> {
     Ok(parse_token(s)?.user)
 }
 
+/// The room-shard position a sync token encodes — clients hand `/sync`
+/// tokens to `/messages` as `from`/`to`.
+pub(crate) fn token_room_seq(s: &str) -> Result<u64> {
+    Ok(parse_token(s)?.room)
+}
+
 /// Stripped-state event types served on invites.
 const INVITE_STATE_TYPES: &[&str] = &[
     "m.room.create",
