@@ -6,11 +6,11 @@ use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
     account_data_key, device_scoped_key, prefix_end, to_device_key, user_key, Account,
-    AccountDataEntry, AliasEntry, ClaimedKey, Device, KeyChangeEntry, MediaMeta, MembershipEntry,
-    Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse,
-    T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER,
-    T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER,
-    T_TOKEN, T_TO_DEVICE,
+    AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimedKey, Device, KeyChangeEntry, MediaMeta,
+    MembershipEntry, Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload, UserCommand,
+    UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION, T_CURSOR,
+    T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
+    T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -126,6 +126,92 @@ fn delete_device(ctx: &mut ApplyCtx<'_>, user_id: &str, device_id: &str) -> Stor
         }
     }
     Ok(true)
+}
+
+/// `T_BACKUP_VERSION` row key: `user_id ++ 0x00 ++ version BE`.
+fn backup_version_key(user_id: &str, version: u64) -> Vec<u8> {
+    let mut k = user_key(user_id, "");
+    k.extend_from_slice(&version.to_be_bytes());
+    k
+}
+
+/// `T_BACKUP_KEY` key/prefix: `user\0version BE\0[room\0[session]]` —
+/// with a session it is the exact row key, otherwise a scan prefix.
+fn backup_key_prefix(
+    user_id: &str,
+    version: u64,
+    room_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Vec<u8> {
+    let mut k = backup_version_key(user_id, version);
+    k.push(0);
+    if let Some(room_id) = room_id {
+        k.extend_from_slice(room_id.as_bytes());
+        k.push(0);
+        if let Some(session_id) = session_id {
+            k.extend_from_slice(session_id.as_bytes());
+        }
+    }
+    k
+}
+
+/// A version's live metadata (`None` when absent or tombstoned).
+fn backup_meta(
+    ctx: &ApplyCtx<'_>,
+    user_id: &str,
+    version: u64,
+) -> StoreResult<Option<BackupVersionMeta>> {
+    Ok(get_typed::<BackupVersionMeta>(
+        ctx,
+        "backup meta decode",
+        T_BACKUP_VERSION,
+        &backup_version_key(user_id, version),
+    )?
+    .filter(|m| !m.deleted))
+}
+
+fn put_backup_meta(
+    ctx: &mut ApplyCtx<'_>,
+    user_id: &str,
+    version: u64,
+    meta: &BackupVersionMeta,
+) -> StoreResult<()> {
+    ctx.put(
+        T_BACKUP_VERSION,
+        &backup_version_key(user_id, version),
+        enc("backup meta encode", meta)?,
+    );
+    Ok(())
+}
+
+/// The spec's key-replacement rules: a verified key beats an unverified
+/// one; then a lower `first_message_index`; then a lower
+/// `forwarded_count`; ties keep the existing key.
+fn backup_key_wins(new: &[u8], old: &[u8]) -> bool {
+    fn fields(b: &[u8]) -> (bool, i64, i64) {
+        let v: serde_json::Value = serde_json::from_slice(b).unwrap_or_default();
+        let int = |key: &str| {
+            v.get(key)
+                .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f as i64)))
+                .unwrap_or(0)
+        };
+        (
+            v.get("is_verified")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            int("first_message_index"),
+            int("forwarded_count"),
+        )
+    }
+    let (new_verified, new_index, new_forwarded) = fields(new);
+    let (old_verified, old_index, old_forwarded) = fields(old);
+    if new_verified != old_verified {
+        return new_verified;
+    }
+    if new_index != old_index {
+        return new_index < old_index;
+    }
+    new_forwarded < old_forwarded
 }
 
 /// Delete every device of a user except `keep` (with its tokens and E2EE
@@ -594,6 +680,134 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
             Ok(UserResponse::Ok)
         }
+        UserCommand::CreateBackupVersion {
+            user_id,
+            algorithm,
+            auth_data,
+        } => {
+            // Next version = one past the highest ever minted (tombstones
+            // included, so numbers never recur).
+            let start = user_key(user_id, "");
+            let last = ctx
+                .range(T_BACKUP_VERSION, &start, &user_end(user_id))?
+                .last()
+                .and_then(|(k, _)| {
+                    k[start.len()..]
+                        .try_into()
+                        .ok()
+                        .map(|b: [u8; 8]| u64::from_be_bytes(b))
+                })
+                .unwrap_or(0);
+            let version = last + 1;
+            put_backup_meta(
+                ctx,
+                user_id,
+                version,
+                &BackupVersionMeta {
+                    algorithm: algorithm.clone(),
+                    auth_data: auth_data.clone(),
+                    count: 0,
+                    etag: 0,
+                    deleted: false,
+                },
+            )?;
+            Ok(UserResponse::BackupVersion(version))
+        }
+        UserCommand::UpdateBackupVersion {
+            user_id,
+            version,
+            algorithm,
+            auth_data,
+        } => {
+            let Some(mut meta) = backup_meta(ctx, user_id, *version)? else {
+                return Ok(UserResponse::NotFound);
+            };
+            meta.algorithm = algorithm.clone();
+            meta.auth_data = auth_data.clone();
+            put_backup_meta(ctx, user_id, *version, &meta)?;
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::DeleteBackupVersion { user_id, version } => {
+            let Some(mut meta) = backup_meta(ctx, user_id, *version)? else {
+                return Ok(UserResponse::NotFound);
+            };
+            let prefix = backup_key_prefix(user_id, *version, None, None);
+            for (k, _) in ctx.range(T_BACKUP_KEY, &prefix, &prefix_end(&prefix))? {
+                ctx.delete(T_BACKUP_KEY, &k);
+            }
+            meta.deleted = true;
+            meta.count = 0;
+            put_backup_meta(ctx, user_id, *version, &meta)?;
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::PutBackupKeys {
+            user_id,
+            version,
+            keys,
+        } => {
+            let Some(mut meta) = backup_meta(ctx, user_id, *version)? else {
+                return Ok(UserResponse::NotFound);
+            };
+            let mut changed = false;
+            for (room_id, session_id, json) in keys {
+                let key = backup_key_prefix(user_id, *version, Some(room_id), Some(session_id));
+                let replace = match ctx.get(T_BACKUP_KEY, &key)? {
+                    None => {
+                        meta.count += 1;
+                        true
+                    }
+                    Some(old) => backup_key_wins(json, &old),
+                };
+                if replace {
+                    ctx.put(T_BACKUP_KEY, &key, json.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                meta.etag += 1;
+                put_backup_meta(ctx, user_id, *version, &meta)?;
+            }
+            Ok(UserResponse::BackupStatus {
+                count: meta.count,
+                etag: meta.etag,
+            })
+        }
+        UserCommand::DeleteBackupKeys {
+            user_id,
+            version,
+            room_id,
+            session_id,
+        } => {
+            let Some(mut meta) = backup_meta(ctx, user_id, *version)? else {
+                return Ok(UserResponse::NotFound);
+            };
+            let mut removed = 0u64;
+            if session_id.is_some() {
+                // Exact session: a prefix scan would also match longer
+                // session IDs sharing the prefix.
+                let key =
+                    backup_key_prefix(user_id, *version, room_id.as_deref(), session_id.as_deref());
+                if ctx.get(T_BACKUP_KEY, &key)?.is_some() {
+                    ctx.delete(T_BACKUP_KEY, &key);
+                    removed = 1;
+                }
+            } else {
+                let prefix = backup_key_prefix(user_id, *version, room_id.as_deref(), None);
+                for (k, _) in ctx.range(T_BACKUP_KEY, &prefix, &prefix_end(&prefix))? {
+                    ctx.delete(T_BACKUP_KEY, &k);
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
+                meta.count = meta.count.saturating_sub(removed);
+                meta.etag += 1;
+                put_backup_meta(ctx, user_id, *version, &meta)?;
+            }
+            Ok(UserResponse::BackupStatus {
+                count: meta.count,
+                etag: meta.etag,
+            })
+        }
         UserCommand::SetPusher {
             user_id,
             device_id,
@@ -779,6 +993,81 @@ impl UserStore {
             *counts.entry(algo).or_insert(0u64) += 1;
         }
         Ok(counts)
+    }
+
+    /// The latest live key-backup version, if any: `(version, meta)`.
+    pub fn latest_backup_version(
+        &self,
+        user_id: &str,
+    ) -> StoreResult<Option<(u64, BackupVersionMeta)>> {
+        let start = user_key(user_id, "");
+        let mut latest = None;
+        for (k, v) in self
+            .read
+            .range(T_BACKUP_VERSION, &start, &user_end(user_id))?
+        {
+            let meta: BackupVersionMeta = dec("backup meta decode", &v)?;
+            if meta.deleted {
+                continue;
+            }
+            let version: [u8; 8] = k[start.len()..]
+                .try_into()
+                .map_err(|_| StoreError::Engine("backup version key shape".into()))?;
+            latest = Some((u64::from_be_bytes(version), meta));
+        }
+        Ok(latest)
+    }
+
+    /// A specific live key-backup version's metadata.
+    pub fn backup_version(
+        &self,
+        user_id: &str,
+        version: u64,
+    ) -> StoreResult<Option<BackupVersionMeta>> {
+        Ok(self
+            .get_typed::<BackupVersionMeta>(
+                "backup meta decode",
+                T_BACKUP_VERSION,
+                &backup_version_key(user_id, version),
+            )?
+            .filter(|m| !m.deleted))
+    }
+
+    /// Backed-up keys under a version, optionally scoped to one room or
+    /// one exact session: `(room_id, session_id, KeyBackupData JSON)`.
+    pub fn backup_keys(
+        &self,
+        user_id: &str,
+        version: u64,
+        room_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> StoreResult<Vec<(String, String, Vec<u8>)>> {
+        if let (Some(room_id), Some(session_id)) = (room_id, session_id) {
+            let key = backup_key_prefix(user_id, version, Some(room_id), Some(session_id));
+            return Ok(match self.read.get(T_BACKUP_KEY, &key)? {
+                Some(v) => vec![(room_id.to_owned(), session_id.to_owned(), v)],
+                None => Vec::new(),
+            });
+        }
+        let base = backup_key_prefix(user_id, version, None, None);
+        let prefix = backup_key_prefix(user_id, version, room_id, None);
+        let mut out = Vec::new();
+        for (k, v) in self
+            .read
+            .range(T_BACKUP_KEY, &prefix, &prefix_end(&prefix))?
+        {
+            let rest = &k[base.len()..];
+            let sep = rest
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or_else(|| StoreError::Engine("backup key shape".into()))?;
+            let room = String::from_utf8(rest[..sep].to_vec())
+                .map_err(|_| StoreError::Engine("room id not UTF-8".into()))?;
+            let session = String::from_utf8(rest[sep + 1..].to_vec())
+                .map_err(|_| StoreError::Engine("session id not UTF-8".into()))?;
+            out.push((room, session, v));
+        }
+        Ok(out)
     }
 
     /// All pushers of a user, as raw pusher JSON (`GET /pushers`).

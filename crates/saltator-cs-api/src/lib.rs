@@ -139,7 +139,7 @@ impl CsState {
 
 /// Build the client-server router. Serve this on the client listener.
 pub fn router(state: Arc<CsState>) -> axum::Router {
-    use routes::{account, keys, media, push, rooms, search, session, sync, to_device};
+    use routes::{account, backup, keys, media, push, rooms, search, session, sync, to_device};
 
     let mut app = axum::Router::new()
         .route(
@@ -217,6 +217,35 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             .route(&p("/keys/query"), post(keys::query_keys))
             .route(&p("/keys/claim"), post(keys::claim_keys))
             .route(&p("/keys/changes"), get(keys::key_changes))
+            // -- e2ee key backup
+            .route(
+                &p("/room_keys/version"),
+                post(backup::create_version).get(backup::get_latest_version),
+            )
+            .route(
+                &p("/room_keys/version/{version}"),
+                get(backup::get_version)
+                    .put(backup::put_version)
+                    .delete(backup::delete_version),
+            )
+            .route(
+                &p("/room_keys/keys"),
+                put(backup::put_keys)
+                    .get(backup::get_keys)
+                    .delete(backup::delete_keys),
+            )
+            .route(
+                &p("/room_keys/keys/{room_id}"),
+                put(backup::put_room_keys)
+                    .get(backup::get_room_keys)
+                    .delete(backup::delete_room_keys),
+            )
+            .route(
+                &p("/room_keys/keys/{room_id}/{session_id}"),
+                put(backup::put_session_keys)
+                    .get(backup::get_session_keys)
+                    .delete(backup::delete_session_keys),
+            )
             .route(
                 &p("/sendToDevice/{event_type}/{txn_id}"),
                 put(to_device::send_to_device),

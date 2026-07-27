@@ -1058,6 +1058,142 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
     env.shutdown().await;
 }
 
+/// E2EE key backup: version lifecycle, the replace rules (verified wins,
+/// then lower first_message_index, then lower forwarded_count), stale
+/// version refusal, and per-granularity reads.
+#[tokio::test]
+async fn e2ee_key_backup_lifecycle_and_replace_rules() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+
+    // No backup yet.
+    let (status, _) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/room_keys/version",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/room_keys/version",
+            Some(&alice),
+            Some(json!({"algorithm": "m.megolm_backup.v1", "auth_data": {"foo": "bar"}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v1 = body["version"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/room_keys/version",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], v1);
+    assert_eq!(body["auth_data"]["foo"], "bar");
+    assert_eq!(body["count"], 0);
+
+    // Upload a key, then confirm worse keys never replace it.
+    let key = |first: i64, fwd: i64, verified: bool| {
+        json!({
+            "first_message_index": first, "forwarded_count": fwd,
+            "is_verified": verified, "session_data": {"a": "b"},
+        })
+    };
+    let url = format!("/_matrix/client/v3/room_keys/keys/!foo:example.com/sessA?version={v1}");
+    let (status, body) = env
+        .req("PUT", &url, Some(&alice), Some(key(10, 5, false)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], 1);
+    for worse in [key(11, 5, false), key(10, 6, false), key(11, 6, false)] {
+        let (status, body) = env.req("PUT", &url, Some(&alice), Some(worse)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, got) = env.req("GET", &url, Some(&alice), None).await;
+        assert_eq!(got["first_message_index"], 10, "worse key replaced: {got}");
+        assert_eq!(got["forwarded_count"], 5);
+        assert_eq!(got["is_verified"], false);
+    }
+    // A verified key beats an unverified one regardless of indices.
+    env.req("PUT", &url, Some(&alice), Some(key(12, 9, true)))
+        .await;
+    let (_, got) = env.req("GET", &url, Some(&alice), None).await;
+    assert_eq!(got["is_verified"], true, "{got}");
+    assert_eq!(got["first_message_index"], 12);
+
+    // A newer version exists: writes to the old one are refused and name
+    // the current version.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/room_keys/version",
+            Some(&alice),
+            Some(json!({"algorithm": "m.megolm_backup.v1", "auth_data": {"v": 2}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v2 = body["version"].as_str().unwrap().to_owned();
+    assert_ne!(v1, v2);
+    let (status, body) = env
+        .req("PUT", &url, Some(&alice), Some(key(0, 0, false)))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_WRONG_ROOM_KEYS_VERSION");
+    assert_eq!(body["current_version"], v2);
+
+    // The old version's keys stay readable in bulk shape until deletion
+    // tombstones it; the latest pointer then still names v2.
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/room_keys/keys?version={v1}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(
+        got["rooms"]["!foo:example.com"]["sessions"]["sessA"]["is_verified"],
+        true
+    );
+    let (status, _) = env
+        .req(
+            "DELETE",
+            &format!("/_matrix/client/v3/room_keys/version/{v1}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/room_keys/version/{v1}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, body) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/room_keys/version",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(body["version"], v2, "{body}");
+
+    env.shutdown().await;
+}
+
 /// Room upgrade to an older version (v9): the replacement carries a
 /// predecessor pointer and migrated state, the old room gets tombstoned,
 /// and search spans both rooms (the Complement search-across-upgrade

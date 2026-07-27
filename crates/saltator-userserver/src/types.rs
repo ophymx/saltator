@@ -62,6 +62,14 @@ pub const T_KEY_CHANGE: u8 = APP_TABLE_MIN + 15;
 /// a pusher dies with the session that created it (which is what makes
 /// password-change logout drop other sessions' pushers).
 pub const T_PUSHER: u8 = APP_TABLE_MIN + 16;
+/// `user_id ++ 0x00 ++ version (u64 BE) → BackupVersionMeta` — E2EE
+/// key-backup versions (`/room_keys/version`). Versions count up per
+/// user; deleted ones keep a tombstoned row so the counter never reuses
+/// a version.
+pub const T_BACKUP_VERSION: u8 = APP_TABLE_MIN + 17;
+/// `user_id ++ 0x00 ++ version (u64 BE) ++ 0x00 ++ room_id ++ 0x00 ++
+/// session_id → KeyBackupData JSON` — the backed-up room keys.
+pub const T_BACKUP_KEY: u8 = APP_TABLE_MIN + 18;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -376,6 +384,60 @@ pub enum UserCommand {
         pushkey: String,
         json: Option<Vec<u8>>,
     },
+    /// Create the next key-backup version (`POST /room_keys/version`).
+    /// Returns [`UserResponse::BackupVersion`].
+    CreateBackupVersion {
+        user_id: String,
+        algorithm: String,
+        /// Raw `auth_data` JSON.
+        auth_data: Vec<u8>,
+    },
+    /// Update a version's algorithm/auth_data in place
+    /// (`PUT /room_keys/version/{version}`).
+    UpdateBackupVersion {
+        user_id: String,
+        version: u64,
+        algorithm: String,
+        auth_data: Vec<u8>,
+    },
+    /// Tombstone a version and drop its keys
+    /// (`DELETE /room_keys/version/{version}`).
+    DeleteBackupVersion {
+        user_id: String,
+        version: u64,
+    },
+    /// Store room keys into a backup version, applying the spec's replace
+    /// rules per session (verified wins; then lower first_message_index;
+    /// then lower forwarded_count). Returns
+    /// [`UserResponse::BackupStatus`].
+    PutBackupKeys {
+        user_id: String,
+        version: u64,
+        /// `(room_id, session_id, KeyBackupData JSON)`.
+        keys: Vec<(String, String, Vec<u8>)>,
+    },
+    /// Delete backed-up keys: everything in the version, one room's, or
+    /// one session's. Returns [`UserResponse::BackupStatus`].
+    DeleteBackupKeys {
+        user_id: String,
+        version: u64,
+        room_id: Option<String>,
+        session_id: Option<String>,
+    },
+}
+
+/// One key-backup version's metadata ([`T_BACKUP_VERSION`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupVersionMeta {
+    pub algorithm: String,
+    /// Raw `auth_data` JSON.
+    pub auth_data: Vec<u8>,
+    /// Stored session count (kept in step with [`T_BACKUP_KEY`] rows).
+    pub count: u64,
+    /// Bumped on every change to the version's keys.
+    pub etag: u64,
+    /// Deleted versions stay tombstoned so version numbers never recur.
+    pub deleted: bool,
 }
 
 /// One to-device message: the full event JSON (`type`, `sender`,
@@ -434,6 +496,13 @@ pub enum UserResponse {
     OneTimeKeyCounts(std::collections::BTreeMap<String, u64>),
     /// The keys handed out by a `ClaimKeys`.
     ClaimedKeys(Vec<ClaimedKey>),
+    /// The version number minted by a `CreateBackupVersion`.
+    BackupVersion(u64),
+    /// A backup version's key count and etag after a keys mutation.
+    BackupStatus {
+        count: u64,
+        etag: u64,
+    },
 }
 
 /// Change-stream payload of the user shard: something about `user_id`

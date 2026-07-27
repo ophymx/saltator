@@ -27,9 +27,9 @@ use saltator_store::{Keyspace, KvEngine};
 
 pub use machine::{UserApp, UserStore};
 pub use types::{
-    Account, AccountDataEntry, AliasEntry, ClaimRequest, ClaimedKey, Device, KeyChangeEntry,
-    MediaMeta, MembershipChange, MembershipEntry, Profile, SessionCmd, ToDeviceMessage, TokenEntry,
-    TokenKind, UserChangePayload, UserCommand, UserResponse,
+    Account, AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimRequest, ClaimedKey, Device,
+    KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry, Profile, SessionCmd,
+    ToDeviceMessage, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse,
 };
 
 /// M2 runs a single user shard; the fixed shard count and placement land
@@ -422,6 +422,112 @@ impl UserServer {
             .await?
         {
             UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    // -- key backup --------------------------------------------------------
+
+    /// Mint the next key-backup version (`POST /room_keys/version`).
+    pub async fn create_backup_version(
+        &self,
+        user_id: &UserId,
+        algorithm: &str,
+        auth_data: Vec<u8>,
+    ) -> Result<u64> {
+        match self
+            .propose(&UserCommand::CreateBackupVersion {
+                user_id: user_id.to_string(),
+                algorithm: algorithm.to_owned(),
+                auth_data,
+            })
+            .await?
+        {
+            UserResponse::BackupVersion(v) => Ok(v),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Update a backup version's algorithm/auth_data in place.
+    pub async fn update_backup_version(
+        &self,
+        user_id: &UserId,
+        version: u64,
+        algorithm: &str,
+        auth_data: Vec<u8>,
+    ) -> Result<()> {
+        match self
+            .propose(&UserCommand::UpdateBackupVersion {
+                user_id: user_id.to_string(),
+                version,
+                algorithm: algorithm.to_owned(),
+                auth_data,
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Tombstone a backup version and drop its keys.
+    pub async fn delete_backup_version(&self, user_id: &UserId, version: u64) -> Result<()> {
+        match self
+            .propose(&UserCommand::DeleteBackupVersion {
+                user_id: user_id.to_string(),
+                version,
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Store keys into a backup version under the spec's replace rules;
+    /// returns the resulting `(count, etag)`.
+    pub async fn put_backup_keys(
+        &self,
+        user_id: &UserId,
+        version: u64,
+        keys: Vec<(String, String, Vec<u8>)>,
+    ) -> Result<(u64, u64)> {
+        match self
+            .propose(&UserCommand::PutBackupKeys {
+                user_id: user_id.to_string(),
+                version,
+                keys,
+            })
+            .await?
+        {
+            UserResponse::BackupStatus { count, etag } => Ok((count, etag)),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Delete backed-up keys (whole version / one room / one session);
+    /// returns the resulting `(count, etag)`.
+    pub async fn delete_backup_keys(
+        &self,
+        user_id: &UserId,
+        version: u64,
+        room_id: Option<String>,
+        session_id: Option<String>,
+    ) -> Result<(u64, u64)> {
+        match self
+            .propose(&UserCommand::DeleteBackupKeys {
+                user_id: user_id.to_string(),
+                version,
+                room_id,
+                session_id,
+            })
+            .await?
+        {
+            UserResponse::BackupStatus { count, etag } => Ok((count, etag)),
             UserResponse::NotFound => Err(UserError::NotFound),
             other => Err(unexpected(other)),
         }
