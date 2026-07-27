@@ -1069,6 +1069,221 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
     env.shutdown().await;
 }
 
+/// Departed members read the room frozen at their leave — state, members,
+/// and history cap there; include_leave surfaces old leaves on initial
+/// sync; /members?at= resolves a historical snapshot.
+#[tokio::test]
+async fn departed_room_reads_frozen_at_leave() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+    let carol = env.register("carol", "carol-pw").await;
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat", "name": "N1"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // Snapshot token before bob joins, for /members?at=.
+    let (_, sync0) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    let pre_bob = sync0["next_batch"].as_str().unwrap().to_owned();
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for (txn, msg) in [("d1", "M1"), ("d2", "M2")] {
+        let (status, body) = env
+            .req(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn}"),
+                Some(&alice),
+                Some(json!({"msgtype": "m.text", "body": msg})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, bob_sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+        .await;
+    let bob_since = bob_sync["next_batch"].as_str().unwrap().to_owned();
+
+    // Life moves on without bob.
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.name/"),
+            Some(&alice),
+            Some(json!({"name": "N2"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/d3"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "M3"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&carol),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // State: bob sees the world as he left it; alice sees the present.
+    let name_url = format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.name/");
+    let (status, got) = env.req("GET", &name_url, Some(&bob), None).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["name"], "N1", "departed view leaked new state: {got}");
+    let (_, got) = env.req("GET", &name_url, Some(&alice), None).await;
+    assert_eq!(got["name"], "N2");
+
+    // Members: alice + bob's leave; carol (post-leave) invisible to bob.
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/members"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let members: Vec<(&str, &str)> = got["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["state_key"].as_str().unwrap(),
+                e["content"]["membership"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert!(members.contains(&(&format!("@alice:{SERVER}") as &str, "join")));
+    assert!(members.contains(&(&format!("@bob:{SERVER}") as &str, "leave")));
+    assert!(
+        !members.iter().any(|(u, _)| u.contains("carol")),
+        "post-leave joiner visible to departed member: {got}"
+    );
+
+    // History: backward reads end at bob's leave; forward reads are empty.
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=3&from={bob_since}"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let bodies: Vec<String> = got["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str().map(str::to_owned))
+        .collect();
+    assert!(bodies.contains(&"M1".to_owned()) && bodies.contains(&"M2".to_owned()));
+    assert!(!bodies.contains(&"M3".to_owned()), "{got}");
+    assert!(
+        got["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "m.room.member" && e["state_key"] == format!("@bob:{SERVER}")),
+        "own leave event missing from departed history: {got}"
+    );
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=f&from={bob_since}"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(
+        got["chunk"].as_array().unwrap().is_empty(),
+        "forward pagination crossed the leave: {got}"
+    );
+
+    // ?at=: members as of the pre-bob snapshot — only alice.
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/members?at={pre_bob}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let at_members: Vec<&str> = got["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["state_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(at_members, vec![format!("@alice:{SERVER}")], "{got}");
+
+    // include_leave: bob's initial sync surfaces the room in `leave`,
+    // with a timeline that never crosses his departure.
+    let filter = "%7B%22room%22%3A%7B%22include_leave%22%3Atrue%7D%7D";
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?filter={filter}"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let left = &got["rooms"]["leave"][&room_id];
+    assert!(
+        !left.is_null(),
+        "left room missing with include_leave: {got}"
+    );
+    let leave_bodies: Vec<&str> = left["timeline"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str())
+        .collect();
+    assert!(
+        !leave_bodies.contains(&"M3"),
+        "leave timeline crossed departure: {got}"
+    );
+
+    env.shutdown().await;
+}
+
 /// Key-upload validation, query shape rules, and MSC4225 claim ordering.
 #[tokio::test]
 async fn key_upload_validation_and_claim_ordering() {

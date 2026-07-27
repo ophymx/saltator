@@ -1180,7 +1180,8 @@ pub async fn get_state_events(
     auth: Auth,
     Ar(req): Ar<get_state_events::v3::Request>,
 ) -> Result<Ra<get_state_events::v3::Response>> {
-    let current = require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    let (current, _) =
+        crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
     let meta = room_meta(&state.rooms, req.room_id.as_str())?;
     let version = room_version(&meta)?;
     let mut events = Vec::new();
@@ -1203,7 +1204,8 @@ pub async fn get_state_event(
     auth: Auth,
     Ar(req): Ar<get_state_event_for_key::v3::Request>,
 ) -> Result<Ra<get_state_event_for_key::v3::Response>> {
-    let current = require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    let (current, _) =
+        crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
     let key = (req.event_type.to_string(), req.state_key.clone());
     let event_id = current
         .get(&key)
@@ -1279,7 +1281,17 @@ pub async fn get_members(
     auth: Auth,
     Ar(req): Ar<get_member_events::v3::Request>,
 ) -> Result<Ra<get_member_events::v3::Response>> {
-    let current = require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    let (mut current, cap) =
+        crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    // `?at=`: members as of a stream position (bounded by the caller's
+    // own view ceiling).
+    if let Some(at) = &req.at {
+        let mut seq = parse_topo_token(at)?;
+        if let Some(cap) = cap {
+            seq = seq.min(cap);
+        }
+        current = crate::room_util::state_at_seq(&state.rooms, req.room_id.as_str(), seq)?;
+    }
     let meta = room_meta(&state.rooms, req.room_id.as_str())?;
     let version = room_version(&meta)?;
     let mut chunk = Vec::new();
@@ -1366,14 +1378,17 @@ pub async fn get_messages(
     // Access is checked before query validation: a caller who may not read
     // the room gets 403 no matter how malformed the request is — and an
     // unknown room reads as 403 too (sytest: "You aren't a member"), not
-    // as an existence oracle.
-    require_joined(&state.rooms, &room_id, auth.user_id.as_str()).map_err(|e| {
-        if e.status == axum::http::StatusCode::NOT_FOUND {
-            ApiError::forbidden("You aren't a member of the room")
-        } else {
-            e
-        }
-    })?;
+    // as an existence oracle. Departed members read history only up to
+    // their leave (`cap`).
+    let (_, cap) = crate::room_util::member_view(&state.rooms, &room_id, auth.user_id.as_str())
+        .map_err(|e| {
+            if e.status == axum::http::StatusCode::NOT_FOUND {
+                ApiError::forbidden("You aren't a member of the room")
+            } else {
+                e
+            }
+        })?;
+    let ceiling = cap.unwrap_or(u64::MAX);
     let meta = room_meta(&state.rooms, &room_id)?;
     let version = room_version(&meta)?;
 
@@ -1419,14 +1434,23 @@ pub async fn get_messages(
             let upper = from.unwrap_or(u64::MAX);
             let lower = to.unwrap_or(0);
             let events = store
-                .room_timeline(&room_id, lower, Some(upper.saturating_sub(1)), limit, true)
+                .room_timeline(
+                    &room_id,
+                    lower,
+                    Some(upper.saturating_sub(1).min(ceiling)),
+                    limit,
+                    true,
+                )
                 .map_err(internal)?;
             let next = events.last().map(|(s, _)| *s);
             (events, next)
         }
         Direction::Forward => {
             let lower = from.unwrap_or(0);
-            let upper = to.map(|t| t.saturating_sub(1));
+            let upper = match to {
+                Some(t) => Some(t.saturating_sub(1).min(ceiling)),
+                None => cap,
+            };
             let events = store
                 .room_timeline(&room_id, lower, upper, limit, false)
                 .map_err(internal)?;

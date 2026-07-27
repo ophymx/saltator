@@ -34,6 +34,57 @@ pub fn current_state(rooms: &RoomServer, room_id: &str) -> Result<StateMap> {
         .map_err(ApiError::internal)
 }
 
+/// Read access for a current or former member: the state snapshot the
+/// caller is entitled to see, plus (for departed users) the room-shard
+/// seq of their leave — the ceiling on any history they may read. A
+/// departed user sees the room frozen at the moment they left.
+pub fn member_view(
+    rooms: &RoomServer,
+    room_id: &str,
+    user_id: &str,
+) -> Result<(StateMap, Option<u64>)> {
+    let current = current_state(rooms, room_id)?;
+    match membership_in(rooms, &current, user_id)?.as_str() {
+        "join" => Ok((current, None)),
+        "leave" | "ban" => {
+            let event_id = current
+                .get(&("m.room.member".to_owned(), user_id.to_owned()))
+                .ok_or_else(|| ApiError::forbidden("You are not in this room"))?;
+            let stored = rooms
+                .store()
+                .event(event_id)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::forbidden("You are not in this room"))?;
+            let frozen = rooms
+                .store()
+                .resolve_group(room_id, stored.state_group_after)
+                .map_err(ApiError::internal)?;
+            Ok((frozen, Some(stored.seq)))
+        }
+        _ => Err(ApiError::forbidden("You are not joined to this room")),
+    }
+}
+
+/// The room's state map as of shard seq `at` (empty before the room
+/// existed).
+pub fn state_at_seq(rooms: &RoomServer, room_id: &str, at: u64) -> Result<StateMap> {
+    let store = rooms.store();
+    let Some((_, event_id)) = store
+        .room_timeline(room_id, 0, Some(at), 1, true)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(StateMap::new());
+    };
+    let Some(stored) = store.event(&event_id).map_err(ApiError::internal)? else {
+        return Ok(StateMap::new());
+    };
+    store
+        .resolve_group(room_id, stored.state_group_after)
+        .map_err(ApiError::internal)
+}
+
 /// User IDs currently joined to `room_id` (empty if the room is unknown).
 pub fn joined_member_ids(rooms: &RoomServer, room_id: &str) -> Result<Vec<String>> {
     let Ok(state) = current_state(rooms, room_id) else {

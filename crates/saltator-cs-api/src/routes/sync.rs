@@ -107,7 +107,7 @@ pub async fn sync_events(
     Ar(req): Ar<v3::Request>,
 ) -> Result<Ra<v3::Response>> {
     let since = req.since.as_deref().map(parse_token).transpose()?;
-    let (limit, lazy) = load_filter(&state, &auth, req.filter.as_ref())?;
+    let filter = load_filter(&state, &auth, req.filter.as_ref())?;
     let timeout = req
         .timeout
         .unwrap_or(Duration::ZERO)
@@ -150,7 +150,7 @@ pub async fn sync_events(
             typing: state.typing.generation(),
             presence: state.presence.generation(),
         };
-        let resp = build_sync(&state, &auth, since, now_pos, limit, lazy, req.full_state)?;
+        let resp = build_sync(&state, &auth, since, now_pos, filter, req.full_state)?;
         let empty = resp.rooms.is_empty()
             && resp.account_data.is_empty()
             && resp.presence.is_empty()
@@ -170,7 +170,25 @@ pub async fn sync_events(
     }
 }
 
-fn load_filter(state: &CsState, auth: &Auth, filter: Option<&v3::Filter>) -> Result<(usize, bool)> {
+/// The slice of a sync filter this server honors.
+#[derive(Debug, Clone, Copy)]
+struct SyncFilter {
+    limit: usize,
+    lazy: bool,
+    include_leave: bool,
+}
+
+impl Default for SyncFilter {
+    fn default() -> Self {
+        Self {
+            limit: 10,
+            lazy: false,
+            include_leave: false,
+        }
+    }
+}
+
+fn load_filter(state: &CsState, auth: &Auth, filter: Option<&v3::Filter>) -> Result<SyncFilter> {
     let definition: Option<FilterDefinition> = match filter {
         None => None,
         Some(v3::Filter::FilterDefinition(def)) => Some(def.clone()),
@@ -186,17 +204,19 @@ fn load_filter(state: &CsState, auth: &Auth, filter: Option<&v3::Filter>) -> Res
         Some(_) => None,
     };
     let Some(def) = definition else {
-        return Ok((10, false));
+        return Ok(SyncFilter::default());
     };
-    let limit = def
-        .room
-        .timeline
-        .limit
-        .map(|l| u64::from(l) as usize)
-        .unwrap_or(10)
-        .clamp(1, 100);
-    let lazy = !matches!(def.room.state.lazy_load_options, LazyLoadOptions::Disabled);
-    Ok((limit, lazy))
+    Ok(SyncFilter {
+        limit: def
+            .room
+            .timeline
+            .limit
+            .map(|l| u64::from(l) as usize)
+            .unwrap_or(10)
+            .clamp(1, 100),
+        lazy: !matches!(def.room.state.lazy_load_options, LazyLoadOptions::Disabled),
+        include_leave: def.room.include_leave,
+    })
 }
 
 fn build_sync(
@@ -204,10 +224,14 @@ fn build_sync(
     auth: &Auth,
     since: Option<SyncPos>,
     now: SyncPos,
-    limit: usize,
-    lazy: bool,
+    filter: SyncFilter,
     full_state: bool,
 ) -> Result<v3::Response> {
+    let SyncFilter {
+        limit,
+        lazy,
+        include_leave,
+    } = filter;
     let initial = since.is_none();
     let since = since.unwrap_or_default();
     let user_id = auth.user_id.as_str();
@@ -276,7 +300,12 @@ fn build_sync(
                     .invite
                     .insert(room_id, build_invited_room(state, auth, &room_id_str, &m)?);
             }
-            "leave" | "ban" if !initial && m.seq > since.user => {
+            // Newly-left rooms ride incremental syncs; older leaves are
+            // opt-in via the include_leave filter (initial or full-state).
+            "leave" | "ban"
+                if (!initial && m.seq > since.user)
+                    || (include_leave && (initial || full_state)) =>
+            {
                 resp.rooms.leave.insert(
                     room_id,
                     build_left_room(state, auth, &room_id_str, &m, since, now)?,
@@ -614,7 +643,7 @@ fn build_left_room(
     state: &CsState,
     auth: &Auth,
     room_id: &str,
-    _membership: &MembershipEntry,
+    membership: &MembershipEntry,
     since: SyncPos,
     now: SyncPos,
 ) -> Result<v3::LeftRoom> {
@@ -625,9 +654,11 @@ fn build_left_room(
         return Ok(out);
     };
     let version = RoomVersion::parse(&meta.version).map_err(internal)?;
-    // The timeline up to (and including) the leave event.
+    // The timeline up to (and including) the leave event — nothing the
+    // room did after the user left is theirs to see.
+    let ceiling = membership.room_seq.min(now.room);
     let mut window = store
-        .room_timeline(room_id, since.room, Some(now.room), 10, true)
+        .room_timeline(room_id, since.room, Some(ceiling), 10, true)
         .map_err(internal)?;
     window.reverse();
     for (_, event_id) in &window {
