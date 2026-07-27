@@ -1271,12 +1271,15 @@ pub async fn get_messages(
         .get("from")
         .cloned()
         .unwrap_or_else(|| "t0".to_owned());
-    // `end` is always present: clients (and sytest) treat its absence as an
-    // error, and paginating past the boundary just yields an empty chunk.
-    resp.end = Some(
+    // `end` is omitted once no further events are available (spec v1.12+):
+    // clients paginate until it disappears, so serving it forever traps
+    // them in an infinite loop. A limit-full batch may have more; a short
+    // one is the boundary.
+    resp.end = if batch.len() == limit {
         next.map(|s| format!("t{s}"))
-            .unwrap_or_else(|| resp.start.clone()),
-    );
+    } else {
+        None
+    };
     resp.chunk = chunk;
     Ok(Ra(resp))
 }

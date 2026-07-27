@@ -96,8 +96,10 @@ jobs:
           COMPLEMENT_BASE_IMAGE: complement-saltator:latest
         # Pass-rate is tracked, not gated (spec.md "Protocol compliance"):
         # the suite is allowed to have failures while coverage grows, so the
-        # step succeeds unless the harness itself breaks.
-        run: go test -json -timeout 30m ./tests/csapi | tee /tmp/complement.json || true
+        # step succeeds unless the harness itself breaks. The JSON stream
+        # goes only to the file — a test stuck in a retry loop once flooded
+        # the step log until the runner killed the job.
+        run: go test -json -timeout 30m ./tests/csapi > /tmp/complement.json || true
       - name: Pass-rate summary
         run: |
           pass=$(jq -r 'select(.Action=="pass" and .Test != null) | .Test' /tmp/complement.json | wc -l)
