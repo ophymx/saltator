@@ -46,6 +46,9 @@ impl Room {
         if version == V12 {
             create_content["additional_creators"] = serde_json::json!(["@cofounder:hs1"]);
         }
+        if version.creator_in_create_content() {
+            create_content["creator"] = "@creator:hs1".into();
+        }
         let mut create = serde_json::json!({
             "sender": "@creator:hs1",
             "origin_server_ts": 1_u64,
@@ -56,7 +59,7 @@ impl Room {
             "prev_events": [],
             "depth": 1
         });
-        if version == V11 {
+        if !version.room_id_is_create_event_id() {
             create["room_id"] = "!r:hs1".into();
         }
         room.insert(ev("$create", create));
@@ -84,9 +87,10 @@ impl Room {
     }
 
     fn room_id(&self) -> &'static str {
-        match self.version {
-            V11 => "!r:hs1",
-            V12 => "!create",
+        if self.version.room_id_is_create_event_id() {
+            "!create"
+        } else {
+            "!r:hs1"
         }
     }
 
@@ -420,8 +424,55 @@ fn v12_room_id_must_match_create() {
 }
 
 #[test]
+fn create_old_versions_require_creator() {
+    for version in [RoomVersion::V9, RoomVersion::V10] {
+        let mut room = Room::new(version);
+        let mut create = room.ev(
+            "@creator:hs1",
+            "m.room.create",
+            Some(""),
+            serde_json::json!({"room_version": version.as_str()}),
+        );
+        create.pdu.prev_events.clear();
+        // ≤v10 1.4: content must name a creator.
+        assert_rejected(room.check(&create), "create.creator");
+
+        let mut ok = create.clone();
+        ok.pdu
+            .content
+            .insert("creator".into(), "@creator:hs1".to_owned().into());
+        assert!(room.check(&ok).is_ok());
+    }
+}
+
+#[test]
+fn string_power_levels_lenient_only_in_v9() {
+    // v9 accepts string-encoded integers; v10 introduced strict integers.
+    let mut v9 = Room::new(RoomVersion::V9);
+    let pl = v9.ev(
+        "@creator:hs1",
+        "m.room.power_levels",
+        Some(""),
+        serde_json::json!({
+            "users": {"@creator:hs1": "100", "@mod:hs1": 50},
+            "ban": "75",
+        }),
+    );
+    assert!(v9.check(&pl).is_ok());
+
+    let mut v10 = Room::new(RoomVersion::V10);
+    let pl = v10.ev(
+        "@creator:hs1",
+        "m.room.power_levels",
+        Some(""),
+        serde_json::json!({"users": {"@creator:hs1": "100"}}),
+    );
+    assert_rejected(v10.check(&pl), "power_levels.int");
+}
+
+#[test]
 fn federate_false_blocks_remote_senders() {
-    for version in [V11, V12] {
+    for &version in RoomVersion::ALL {
         let mut room = Room::new(version);
         // Rebuild the create event with m.federate: false.
         let mut create = room
@@ -458,7 +509,7 @@ fn federate_false_blocks_remote_senders() {
 
 #[test]
 fn first_join_shortcut() {
-    for version in [V11, V12] {
+    for &version in RoomVersion::ALL {
         let mut room = Room::new(version);
         let mut join = room.ev(
             "@creator:hs1",

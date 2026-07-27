@@ -1058,6 +1058,115 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
     env.shutdown().await;
 }
 
+/// Room upgrade to an older version (v9): the replacement carries a
+/// predecessor pointer and migrated state, the old room gets tombstoned,
+/// and search spans both rooms (the Complement search-across-upgrade
+/// shape).
+#[tokio::test]
+async fn room_upgrade_to_v9_and_search_across() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "private_chat", "name": "Old Room"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/up1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "Message before upgrade"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, resp) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/upgrade"),
+            Some(&alice),
+            Some(json!({"new_version": "9"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let new_room_id = resp["replacement_room"].as_str().unwrap().to_owned();
+
+    // The replacement is a v9 room pointing back at the predecessor, with
+    // the transferable state migrated.
+    let (status, create) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{new_room_id}/state/m.room.create"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{create}");
+    assert_eq!(create["room_version"], "9");
+    assert_eq!(create["creator"], format!("@alice:{SERVER}"));
+    assert_eq!(create["predecessor"]["room_id"], room_id);
+    let (status, name) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{new_room_id}/state/m.room.name"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{name}");
+    assert_eq!(name["name"], "Old Room");
+
+    // The old room is tombstoned toward the replacement.
+    let (status, tomb) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.tombstone"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{tomb}");
+    assert_eq!(tomb["replacement_room"], new_room_id);
+
+    // Life continues in the v9 room, and search spans both.
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{new_room_id}/send/m.room.message/up2"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "Message after upgrade"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, results) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/search",
+            Some(&alice),
+            Some(json!({
+                "search_categories": {"room_events": {
+                    "keys": ["content.body"],
+                    "search_term": "upgrade",
+                }}
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{results}");
+    assert_eq!(
+        results["search_categories"]["room_events"]["count"], 2,
+        "search should span predecessor and replacement: {results}"
+    );
+
+    env.shutdown().await;
+}
+
 /// Push rules and pushers: defaults ride the initial sync, mutations
 /// land as `m.push_rules` account data in the next window (waking
 /// long-polls), reads are stable, and pushers die with the session that

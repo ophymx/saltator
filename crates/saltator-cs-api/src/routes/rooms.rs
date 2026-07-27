@@ -484,6 +484,153 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId) -> Result<(
     Ok(())
 }
 
+/// `POST /rooms/{roomId}/upgrade`: replace a room with a new-version copy
+/// (spec "Room upgrades"). Creates the replacement with a `predecessor`
+/// pointer, migrates the transferable state, and tombstones the old room.
+pub async fn upgrade_room(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Path(room_id): Path<String>,
+    Jb(body): Jb,
+) -> Result<axum::Json<serde_json::Value>> {
+    let new_version = body
+        .get("new_version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::invalid_param("Missing new_version"))?;
+    let version = RoomVersion::parse(new_version).map_err(|_| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "M_UNSUPPORTED_ROOM_VERSION",
+            "This server does not support that room version",
+        )
+    })?;
+    let current = require_joined(&state.rooms, &room_id, auth.user_id.as_str())?;
+    let old_version = room_version(&room_meta(&state.rooms, &room_id)?)?;
+    if !can_send_state(
+        &state.rooms,
+        &current,
+        old_version,
+        auth.user_id.as_str(),
+        "m.room.tombstone",
+    )? {
+        return Err(ApiError::forbidden("Not permitted to tombstone this room"));
+    }
+
+    // The replacement's create event: preserve the old room's type (and
+    // other creation content) and point back at the predecessor.
+    let mut creation_content =
+        crate::room_util::state_content_in(&state.rooms, &current, "m.room.create")?
+            .and_then(|c| c.as_object().cloned())
+            .unwrap_or_default();
+    for server_managed in [
+        "room_version",
+        "creator",
+        "predecessor",
+        "additional_creators",
+    ] {
+        creation_content.remove(server_managed);
+    }
+    let last_event = state
+        .rooms
+        .store()
+        .room_timeline(&room_id, 0, None, 1, true)
+        .map_err(internal)?
+        .into_iter()
+        .next()
+        .map(|(_, event_id)| event_id);
+    let mut predecessor = serde_json::Map::new();
+    predecessor.insert("room_id".into(), room_id.clone().into());
+    if let Some(event_id) = last_event {
+        predecessor.insert("event_id".into(), event_id.into());
+    }
+    creation_content.insert("predecessor".into(), predecessor.into());
+
+    let (new_room_id, outcome) = state
+        .rooms
+        .create_room(&auth.user_id, version, creation_content)
+        .await?;
+    accepted_event_id(outcome)?;
+    send_membership(
+        &state,
+        &new_room_id,
+        &auth.user_id,
+        &auth.user_id,
+        "join",
+        None,
+    )
+    .await?;
+
+    // Transferable state (spec's list), power levels first so the copied
+    // settings land under the upgrader's still-elevated defaults.
+    const TRANSFERABLE: &[&str] = &[
+        "m.room.power_levels",
+        "m.room.join_rules",
+        "m.room.history_visibility",
+        "m.room.guest_access",
+        "m.room.name",
+        "m.room.topic",
+        "m.room.avatar",
+        "m.room.encryption",
+        "m.room.server_acl",
+    ];
+    for event_type in TRANSFERABLE {
+        let Some(mut content) =
+            crate::room_util::state_content_in(&state.rooms, &current, event_type)?
+        else {
+            continue;
+        };
+        // Power levels cross the version boundary: v12+ replacements must
+        // not list creators in `users`; pre-v12 replacements must list the
+        // upgrader at creator level (a v12 source omitted them entirely —
+        // copying that verbatim would lock the upgrader out of their own
+        // new room mid-migration).
+        if *event_type == "m.room.power_levels" {
+            if !content.is_object() {
+                content = serde_json::json!({});
+            }
+            let users = content
+                .as_object_mut()
+                .expect("checked object")
+                .entry("users")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(users) = users.as_object_mut() {
+                if version.privileged_creators() {
+                    users.remove(auth.user_id.as_str());
+                } else {
+                    let current = users
+                        .get(auth.user_id.as_str())
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    if current < 100 {
+                        users.insert(auth.user_id.to_string(), 100.into());
+                    }
+                }
+            }
+        }
+        send_state_checked(&state, &new_room_id, &auth.user_id, event_type, "", content).await?;
+    }
+
+    // Tombstone the old room; its rendering in clients points forward.
+    let old_room_id = OwnedRoomId::try_from(room_id.clone())
+        .map_err(|e| ApiError::invalid_param(format!("room_id: {e}")))?;
+    send_state_checked(
+        &state,
+        &old_room_id,
+        &auth.user_id,
+        "m.room.tombstone",
+        "",
+        serde_json::json!({
+            "body": "This room has been replaced",
+            "replacement_room": new_room_id.as_str(),
+        }),
+    )
+    .await?;
+
+    Ok(axum::Json(serde_json::json!({
+        "replacement_room": new_room_id.as_str(),
+    })))
+}
+
 /// Seed the membership projection with an imported room's current members:
 /// the import stores them off-timeline (seq 0), where the change-stream
 /// projection never sees them, yet device-list and presence visibility

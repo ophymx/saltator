@@ -8,7 +8,6 @@ use saltator_core::event::IdentifiedPdu;
 use saltator_core::state_res::{resolve, StateIds};
 use saltator_core::{Pdu, RoomVersion};
 
-const V11: RoomVersion = RoomVersion::V11;
 const V12: RoomVersion = RoomVersion::V12;
 
 /// A power-levels `users` map. v12 forbids listing creators (rule 10.4);
@@ -38,12 +37,16 @@ impl Dag {
             version,
             events: BTreeMap::new(),
         };
+        let mut create_content = serde_json::json!({"room_version": version.as_str()});
+        if version.creator_in_create_content() {
+            create_content["creator"] = "@creator:hs1".into();
+        }
         dag.add(
             "$CREATE",
             "@creator:hs1",
             "m.room.create",
             Some(""),
-            serde_json::json!({"room_version": version.as_str()}),
+            create_content,
             &[],
             &[],
         );
@@ -123,17 +126,17 @@ impl Dag {
         if let Some(sk) = state_key {
             json["state_key"] = sk.into();
         }
-        // v11: room_id domain-based, create listed in auth_events.
+        // ≤v11: room_id domain-based, create listed in auth_events.
         // v12: room_id = create event ID with `!`, create never in auth.
-        match self.version {
-            V11 => {
+        match self.version.room_id_is_create_event_id() {
+            false => {
                 json["room_id"] = "!r:hs1".into();
                 if !is_create {
                     let list = json["auth_events"].as_array_mut().unwrap();
                     list.insert(0, "$CREATE".into());
                 }
             }
-            V12 => {
+            true => {
                 if !is_create {
                     json["room_id"] = "!CREATE".into();
                 }
@@ -184,7 +187,7 @@ fn id(s: &str) -> OwnedEventId {
 
 #[test]
 fn no_conflict_returns_unconflicted() {
-    for version in [V11, V12] {
+    for &version in RoomVersion::ALL {
         let dag = Dag::base(version);
         let set = dag.state(BASE);
         let resolved = resolve(version, &[set.clone(), set.clone()], &dag.fetch()).unwrap();
@@ -194,7 +197,7 @@ fn no_conflict_returns_unconflicted() {
 
 #[test]
 fn topic_duel_latest_wins() {
-    for version in [V11, V12] {
+    for &version in RoomVersion::ALL {
         let mut dag = Dag::base(version);
         // Two competing topics on separate forks; both authorized. T2 has
         // the later origin_server_ts, so it is applied last and wins.
@@ -230,7 +233,7 @@ fn topic_duel_latest_wins() {
 
 #[test]
 fn power_events_resolve_before_others() {
-    for version in [V11, V12] {
+    for &version in RoomVersion::ALL {
         let mut dag = Dag::base(version);
         // Fork 1: creator demotes alice to 0 (later timestamp).
         // Fork 2: alice sets a topic (earlier timestamp, was allowed at 50).
@@ -274,7 +277,7 @@ fn power_events_resolve_before_others() {
 
 #[test]
 fn ban_wins_over_concurrent_message_state() {
-    for version in [V11, V12] {
+    for &version in RoomVersion::ALL {
         let mut dag = Dag::base(version);
         // Fork 1: creator bans bob. Fork 2: bob (still joined there) sets
         // his profile-ish member event... use a name change via member is
@@ -338,7 +341,7 @@ fn ban_wins_over_concurrent_message_state() {
 
 #[test]
 fn resolution_is_order_independent() {
-    for version in [V11, V12] {
+    for &version in RoomVersion::ALL {
         let mut dag = Dag::base(version);
         dag.add(
             "$T1",

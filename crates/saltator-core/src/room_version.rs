@@ -1,4 +1,4 @@
-//! Room-version gates (spec.md §3): versions 11 and 12.
+//! Room-version gates (spec.md §3): versions 9–12.
 //!
 //! Every version-dependent behavior in this crate is expressed as a method
 //! here, so adding older versions later (for federation reach) means adding
@@ -8,11 +8,17 @@ use serde::{Deserialize, Serialize};
 
 /// A room version supported by Saltator.
 ///
-/// Only versions 11 and 12 are implemented (spec.md §3). Older versions
-/// (needed in practice to participate in long-lived federated rooms) land
-/// incrementally as new variants, prioritizing 9/10.
+/// Versions 9–12 are implemented (spec.md §3; 9/10 for federation reach —
+/// they share v11's event format, differing only in the create event's
+/// `creator` field, power-level strictness, and redaction rules).
+/// Versions ≤8 (and the pre-reference-hash formats of 1/2) are out of
+/// scope for v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RoomVersion {
+    #[serde(rename = "9")]
+    V9,
+    #[serde(rename = "10")]
+    V10,
     #[serde(rename = "11")]
     V11,
     #[serde(rename = "12")]
@@ -41,6 +47,8 @@ impl RoomVersion {
 
     pub fn parse(s: &str) -> Result<Self, UnsupportedRoomVersion> {
         match s {
+            "9" => Ok(Self::V9),
+            "10" => Ok(Self::V10),
             "11" => Ok(Self::V11),
             "12" => Ok(Self::V12),
             other => Err(UnsupportedRoomVersion(other.to_owned())),
@@ -49,10 +57,15 @@ impl RoomVersion {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::V9 => "9",
+            Self::V10 => "10",
             Self::V11 => "11",
             Self::V12 => "12",
         }
     }
+
+    /// Every supported version, oldest first (capabilities, `?ver=`).
+    pub const ALL: &'static [Self] = &[Self::V9, Self::V10, Self::V11, Self::V12];
 
     /// v12+: the room ID is the create event's reference hash with a `!`
     /// sigil, and the create event itself carries no `room_id` property.
@@ -61,9 +74,23 @@ impl RoomVersion {
     }
 
     /// Whether the `m.room.create` event is selected into `auth_events`.
-    /// v11 requires it; v12 forbids it (the `room_id` implies it instead).
+    /// v11 and earlier require it; v12 forbids it (the `room_id` implies
+    /// it instead).
     pub fn create_event_in_auth_events(self) -> bool {
-        self == Self::V11
+        self <= Self::V11
+    }
+
+    /// ≤v10: the create event's content must carry a `creator` field, and
+    /// it (not the event's sender) names the room creator. v11 removed the
+    /// field; the sender is the creator.
+    pub fn creator_in_create_content(self) -> bool {
+        self <= Self::V10
+    }
+
+    /// ≤v9: power-level values may be strings interpretable as integers.
+    /// v10 introduced strict integer enforcement.
+    pub fn lenient_power_levels(self) -> bool {
+        self <= Self::V9
     }
 
     /// v12+: room creators (the create event's `sender` plus any
@@ -75,7 +102,7 @@ impl RoomVersion {
 
     pub fn state_res(self) -> StateResVersion {
         match self {
-            Self::V11 => StateResVersion::V2,
+            Self::V9 | Self::V10 | Self::V11 => StateResVersion::V2,
             Self::V12 => StateResVersion::V2_1,
         }
     }
@@ -83,6 +110,8 @@ impl RoomVersion {
     /// The corresponding ruma identifier.
     pub fn ruma_id(self) -> ruma::RoomVersionId {
         match self {
+            Self::V9 => ruma::RoomVersionId::V9,
+            Self::V10 => ruma::RoomVersionId::V10,
             Self::V11 => ruma::RoomVersionId::V11,
             Self::V12 => ruma::RoomVersionId::V12,
         }
@@ -104,11 +133,13 @@ mod tests {
 
     #[test]
     fn parse_and_roundtrip() {
+        assert_eq!(RoomVersion::parse("9").unwrap(), RoomVersion::V9);
+        assert_eq!(RoomVersion::parse("10").unwrap(), RoomVersion::V10);
         assert_eq!(RoomVersion::parse("11").unwrap(), RoomVersion::V11);
         assert_eq!(RoomVersion::parse("12").unwrap(), RoomVersion::V12);
-        assert!(RoomVersion::parse("10").is_err());
+        assert!(RoomVersion::parse("8").is_err());
         assert!(RoomVersion::parse("org.example.custom").is_err());
-        for v in [RoomVersion::V11, RoomVersion::V12] {
+        for &v in RoomVersion::ALL {
             assert_eq!(RoomVersion::parse(v.as_str()).unwrap(), v);
         }
     }
@@ -126,12 +157,21 @@ mod tests {
     fn gates() {
         assert!(!RoomVersion::V11.room_id_is_create_event_id());
         assert!(RoomVersion::V12.room_id_is_create_event_id());
+        assert!(RoomVersion::V9.create_event_in_auth_events());
         assert!(RoomVersion::V11.create_event_in_auth_events());
         assert!(!RoomVersion::V12.create_event_in_auth_events());
         assert!(!RoomVersion::V11.privileged_creators());
         assert!(RoomVersion::V12.privileged_creators());
+        assert_eq!(RoomVersion::V9.state_res(), StateResVersion::V2);
         assert_eq!(RoomVersion::V11.state_res(), StateResVersion::V2);
         assert_eq!(RoomVersion::V12.state_res(), StateResVersion::V2_1);
         assert_eq!(RoomVersion::DEFAULT, RoomVersion::V12);
+        assert!(RoomVersion::V9.creator_in_create_content());
+        assert!(RoomVersion::V10.creator_in_create_content());
+        assert!(!RoomVersion::V11.creator_in_create_content());
+        assert!(RoomVersion::V9.lenient_power_levels());
+        assert!(!RoomVersion::V10.lenient_power_levels());
+        assert!(!RoomVersion::V9.room_id_is_create_event_id());
+        assert!(!RoomVersion::V10.privileged_creators());
     }
 }

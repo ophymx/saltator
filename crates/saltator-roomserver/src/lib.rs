@@ -278,6 +278,11 @@ impl RoomServer {
     ) -> Result<(OwnedRoomId, Outcome)> {
         let mut content = content;
         content.insert("room_version".into(), version.as_str().into());
+        // ≤v10: the create content names the creator (v11 removed it —
+        // the sender is authoritative).
+        if version.creator_in_create_content() {
+            content.insert("creator".into(), creator.as_str().into());
+        }
 
         let mut obj = serde_json::json!({
             "sender": creator.as_str(),

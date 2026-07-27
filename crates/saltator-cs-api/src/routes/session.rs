@@ -52,11 +52,10 @@ pub async fn get_capabilities(
     // Hand-rolled: ruma's typed response skips capabilities that equal
     // their spec default (like change_password enabled), but clients and
     // Complement expect the keys to be present.
-    let available: serde_json::Map<String, serde_json::Value> =
-        [RoomVersion::V11, RoomVersion::V12]
-            .into_iter()
-            .map(|v| (v.ruma_id().to_string(), "stable".into()))
-            .collect();
+    let available: serde_json::Map<String, serde_json::Value> = RoomVersion::ALL
+        .iter()
+        .map(|v| (v.ruma_id().to_string(), "stable".into()))
+        .collect();
     axum::Json(serde_json::json!({
         "capabilities": {
             "m.change_password": { "enabled": true },

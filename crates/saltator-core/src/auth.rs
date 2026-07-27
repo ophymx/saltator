@@ -260,7 +260,7 @@ pub fn check_state_dependent<E: Event>(
 
     // Rule 5 (v11 rule 4): m.room.member.
     if event.event_type() == "m.room.member" {
-        return check_member(event, create, state, &power, sender_pl);
+        return check_member(version, event, create, state, &power, sender_pl);
     }
 
     // Rule 6 (v11 rule 5): sender must be joined.
@@ -335,6 +335,16 @@ fn check_create<E: Event>(version: RoomVersion, event: &E) -> AuthResult {
         Some(_) => return reject("create.room_version", "unrecognised room_version"),
     }
 
+    // ≤v10 1.4: the content must name a creator.
+    if version.creator_in_create_content()
+        && !matches!(
+            event.content().get("creator"),
+            Some(CanonicalJsonValue::String(_))
+        )
+    {
+        return reject("create.creator", "create content has no creator");
+    }
+
     // v12 1.4: additional_creators must be an array of valid user IDs.
     if version.privileged_creators() {
         match event.content().get("additional_creators") {
@@ -371,6 +381,7 @@ fn check_create<E: Event>(version: RoomVersion, event: &E) -> AuthResult {
 /// Note the v12 additional-creators list deliberately does NOT extend the
 /// first-join shortcut (5.3.1) — the spec names only the create `sender`.
 fn check_member<E: Event>(
+    version: RoomVersion,
     event: &E,
     create: &E,
     state: &impl StateView<E>,
@@ -400,10 +411,16 @@ fn check_member<E: Event>(
         // 5.3: join.
         "join" => {
             // 5.3.1: the room's very first join — sole prev event is the
-            // create and the joiner is the create's sender.
+            // create and the joiner is the creator (≤v10: the create
+            // content's `creator`; v11+: the create's sender).
+            let creator = if version.creator_in_create_content() {
+                str_prop(create.content(), "creator").unwrap_or(create.sender().as_str())
+            } else {
+                create.sender().as_str()
+            };
             if event.prev_events().len() == 1
                 && event.prev_events()[0] == *create.event_id()
-                && target == create.sender().as_str()
+                && target == creator
             {
                 return Ok(());
             }
@@ -665,6 +682,14 @@ fn check_power_levels<E: Event>(
 ) -> AuthResult {
     let content = event.content();
 
+    // ≤v9 accepts string-encoded integers; v10+ enforces real integers.
+    let lenient = version.lenient_power_levels();
+    let level_ok = |v: &CanonicalJsonValue| match v {
+        CanonicalJsonValue::Integer(_) => true,
+        CanonicalJsonValue::String(s) if lenient => s.trim().parse::<i64>().is_ok(),
+        _ => false,
+    };
+
     // 10.1: scalar level properties must be integers.
     for key in [
         "users_default",
@@ -676,7 +701,8 @@ fn check_power_levels<E: Event>(
         "invite",
     ] {
         match content.get(key) {
-            None | Some(CanonicalJsonValue::Integer(_)) => {}
+            None => {}
+            Some(v) if level_ok(v) => {}
             Some(_) => return reject("power_levels.int", format!("{key} is not an integer")),
         }
     }
@@ -684,10 +710,7 @@ fn check_power_levels<E: Event>(
     for key in ["events", "notifications"] {
         match content.get(key) {
             None => {}
-            Some(CanonicalJsonValue::Object(map))
-                if map
-                    .values()
-                    .all(|v| matches!(v, CanonicalJsonValue::Integer(_))) => {}
+            Some(CanonicalJsonValue::Object(map)) if map.values().all(&level_ok) => {}
             Some(CanonicalJsonValue::Object(_)) => {
                 return reject(
                     "power_levels.int",
@@ -705,7 +728,7 @@ fn check_power_levels<E: Event>(
                 if OwnedUserId::try_from(k.as_str()).is_err() {
                     return reject("power_levels.users", format!("{k:?} is not a user ID"));
                 }
-                if !matches!(v, CanonicalJsonValue::Integer(_)) {
+                if !level_ok(v) {
                     return reject("power_levels.int", format!("users.{k} is not an integer"));
                 }
             }
@@ -733,12 +756,15 @@ fn check_power_levels<E: Event>(
     };
     let old = previous.content();
 
-    let get_int = |obj: &CanonicalJsonObject, key: &str| -> Option<i64> {
-        match obj.get(key) {
-            Some(CanonicalJsonValue::Integer(i)) => Some(i64::from(*i)),
+    let level_of = |v: &CanonicalJsonValue| -> Option<i64> {
+        match v {
+            CanonicalJsonValue::Integer(i) => Some(i64::from(*i)),
+            CanonicalJsonValue::String(s) if lenient => s.trim().parse().ok(),
             _ => None,
         }
     };
+    let get_int =
+        |obj: &CanonicalJsonObject, key: &str| -> Option<i64> { obj.get(key).and_then(level_of) };
 
     // 10.6: scalar alterations — both old and new value must not exceed
     // the sender's level.
@@ -778,10 +804,7 @@ fn check_power_levels<E: Event>(
         match obj.get(key) {
             Some(CanonicalJsonValue::Object(map)) => map
                 .iter()
-                .filter_map(|(k, v)| match v {
-                    CanonicalJsonValue::Integer(i) => Some((k.clone(), i64::from(*i))),
-                    _ => None,
-                })
+                .filter_map(|(k, v)| level_of(v).map(|i| (k.clone(), i)))
                 .collect(),
             _ => BTreeMap::new(),
         }

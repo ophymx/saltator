@@ -47,11 +47,21 @@ impl PowerLevel {
     }
 }
 
-/// The set of room creators: the create event's `sender`, plus (v12+) any
-/// `additional_creators`. Entries in an accepted create event are valid
-/// user IDs (auth rule 1.4); unparsable ones are ignored defensively.
+/// The set of room creators: the create event's `sender` (≤v10: its
+/// content `creator`, which old versions treat as authoritative), plus
+/// (v12+) any `additional_creators`. Entries in an accepted create event
+/// are valid user IDs (auth rule 1.4); unparsable ones are ignored
+/// defensively.
 pub fn creators<E: Event>(version: RoomVersion, create: &E) -> BTreeSet<OwnedUserId> {
-    let mut set = BTreeSet::from([create.sender().to_owned()]);
+    let named = if version.creator_in_create_content() {
+        match create.content().get("creator") {
+            Some(CanonicalJsonValue::String(s)) => OwnedUserId::try_from(s.as_str()).ok(),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut set = BTreeSet::from([named.unwrap_or_else(|| create.sender().to_owned())]);
     if version.privileged_creators() {
         if let Some(CanonicalJsonValue::Array(extra)) = create.content().get("additional_creators")
         {
@@ -65,6 +75,16 @@ pub fn creators<E: Event>(version: RoomVersion, create: &E) -> BTreeSet<OwnedUse
         }
     }
     set
+}
+
+/// Interpret a power-level value: an integer, or (lenient versions ≤9) a
+/// string parseable as one.
+fn level_value(v: &CanonicalJsonValue, lenient: bool) -> Option<i64> {
+    match v {
+        CanonicalJsonValue::Integer(i) => Some(i64::from(*i)),
+        CanonicalJsonValue::String(s) if lenient => s.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 /// Power levels resolved from a state snapshot's `m.room.create` and
@@ -91,28 +111,34 @@ pub struct RoomPowerLevels {
 #[error("malformed state: {0}")]
 pub struct MalformedState(pub String);
 
-fn int_prop(content: &CanonicalJsonObject, key: &str, default: i64) -> Result<i64, MalformedState> {
+fn int_prop(
+    content: &CanonicalJsonObject,
+    key: &str,
+    default: i64,
+    lenient: bool,
+) -> Result<i64, MalformedState> {
     match content.get(key) {
         None => Ok(default),
-        Some(CanonicalJsonValue::Integer(i)) => Ok(i64::from(*i)),
-        Some(_) => Err(MalformedState(format!("power_levels.{key} not an integer"))),
+        Some(v) => level_value(v, lenient)
+            .ok_or_else(|| MalformedState(format!("power_levels.{key} not an integer"))),
     }
 }
 
 fn int_map(
     content: &CanonicalJsonObject,
     key: &str,
+    lenient: bool,
 ) -> Result<BTreeMap<String, i64>, MalformedState> {
     let mut out = BTreeMap::new();
     match content.get(key) {
         None => {}
         Some(CanonicalJsonValue::Object(obj)) => {
             for (k, v) in obj {
-                match v {
-                    CanonicalJsonValue::Integer(i) => {
-                        out.insert(k.clone(), i64::from(*i));
+                match level_value(v, lenient) {
+                    Some(i) => {
+                        out.insert(k.clone(), i);
                     }
-                    _ => {
+                    None => {
                         return Err(MalformedState(format!(
                             "power_levels.{key}.{k} not an integer"
                         )))
@@ -136,6 +162,7 @@ impl RoomPowerLevels {
         let content = power_levels.map(Event::content);
         let empty = CanonicalJsonObject::new();
         let c = content.unwrap_or(&empty);
+        let lenient = version.lenient_power_levels();
 
         let mut users = BTreeMap::new();
         match c.get("users") {
@@ -145,11 +172,11 @@ impl RoomPowerLevels {
                     let uid = OwnedUserId::try_from(k.as_str()).map_err(|_| {
                         MalformedState(format!("power_levels.users key {k:?} not a user ID"))
                     })?;
-                    match v {
-                        CanonicalJsonValue::Integer(i) => {
-                            users.insert(uid, i64::from(*i));
+                    match level_value(v, lenient) {
+                        Some(i) => {
+                            users.insert(uid, i);
                         }
-                        _ => {
+                        None => {
                             return Err(MalformedState(format!(
                                 "power_levels.users.{k} not an integer"
                             )))
@@ -165,14 +192,14 @@ impl RoomPowerLevels {
             creators: creators(version, create),
             has_pl_event: power_levels.is_some(),
             users,
-            users_default: int_prop(c, "users_default", 0)?,
-            events: int_map(c, "events")?,
-            events_default: int_prop(c, "events_default", 0)?,
-            state_default: int_prop(c, "state_default", 50)?,
-            ban: int_prop(c, "ban", 50)?,
-            kick: int_prop(c, "kick", 50)?,
-            redact: int_prop(c, "redact", 50)?,
-            invite: int_prop(c, "invite", 0)?,
+            users_default: int_prop(c, "users_default", 0, lenient)?,
+            events: int_map(c, "events", lenient)?,
+            events_default: int_prop(c, "events_default", 0, lenient)?,
+            state_default: int_prop(c, "state_default", 50, lenient)?,
+            ban: int_prop(c, "ban", 50, lenient)?,
+            kick: int_prop(c, "kick", 50, lenient)?,
+            redact: int_prop(c, "redact", 50, lenient)?,
+            invite: int_prop(c, "invite", 0, lenient)?,
         })
     }
 

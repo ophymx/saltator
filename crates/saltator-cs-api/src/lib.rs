@@ -230,6 +230,7 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             )
             .route(&p("/rooms/{room_id}/join"), post(rooms::join_room))
             .route(&p("/rooms/{room_id}/leave"), post(rooms::leave_room))
+            .route(&p("/rooms/{room_id}/upgrade"), post(rooms::upgrade_room))
             .route(&p("/rooms/{room_id}/forget"), post(rooms::forget_room))
             .route(&p("/rooms/{room_id}/invite"), post(rooms::invite_user))
             .route(&p("/rooms/{room_id}/kick"), post(rooms::kick_user))

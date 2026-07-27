@@ -106,6 +106,10 @@ jobs:
           fail=$(jq -r 'select(.Action=="fail" and .Test != null) | .Test' /tmp/complement.json | wc -l)
           skip=$(jq -r 'select(.Action=="skip" and .Test != null) | .Test' /tmp/complement.json | wc -l)
           total=$((pass + fail))
+          # Also to stdout: the step summary is not reachable through the
+          # API, and the JSON stream no longer hits the step log.
+          echo "Complement csapi: ${pass}/${total} passed (${skip} skipped)"
+          jq -r 'select(.Action=="fail" and .Test != null) | "FAILED: " + .Test' /tmp/complement.json
           echo "## Complement csapi: ${pass}/${total} passed (${skip} skipped)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "<details><summary>Failed tests</summary>" >> "$GITHUB_STEP_SUMMARY"
