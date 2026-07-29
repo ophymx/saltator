@@ -359,7 +359,9 @@ fn build_sync(
 
     // Device-list changes in the window: whose keys to re-query
     // (`changed`) and who stopped sharing rooms with us (`left`). Initial
-    // syncs skip this — clients query fresh.
+    // syncs skip this — clients query fresh. The `changed` set doubles as
+    // "newly visible users" for the presence section below.
+    let mut newly_visible: std::collections::BTreeSet<String> = Default::default();
     if !initial {
         let (dl_changed, dl_left) = crate::routes::keys::device_list_deltas(
             state,
@@ -369,6 +371,7 @@ fn build_sync(
             now.user,
         )?;
         for user in dl_changed {
+            newly_visible.insert(user.clone());
             if let Ok(uid) = ruma::OwnedUserId::try_from(user) {
                 resp.device_lists.changed.push(uid);
             }
@@ -394,7 +397,25 @@ fn build_sync(
         .collect();
 
     // Presence: users the caller shares a room with (and the caller) whose
-    // presence changed inside the window.
+    // presence changed inside the window — plus newly-visible users
+    // (someone joined a shared room, or the caller joined their room),
+    // whose standing presence must be announced even without a change.
+    let presence_event = |sender: &str, entry: &crate::presence::PresenceEntry| -> Result<_> {
+        let mut content = serde_json::json!({
+            "presence": entry.presence,
+            "last_active_ago": entry.last_active.elapsed().as_millis() as u64,
+            "currently_active": entry.presence == "online",
+        });
+        if let Some(msg) = &entry.status_msg {
+            content["status_msg"] = msg.clone().into();
+        }
+        to_raw(&serde_json::json!({
+            "type": "m.presence",
+            "sender": sender,
+            "content": content,
+        }))
+    };
+    let mut presence_seen: std::collections::BTreeSet<String> = Default::default();
     let presence_since = if initial { 0 } else { since.presence };
     for snap in state.presence.changed_since(presence_since) {
         let visible = snap.user_id == user_id
@@ -406,19 +427,18 @@ fn build_sync(
         if !visible {
             continue;
         }
-        let mut content = serde_json::json!({
-            "presence": snap.entry.presence,
-            "last_active_ago": snap.entry.last_active.elapsed().as_millis() as u64,
-            "currently_active": snap.entry.presence == "online",
-        });
-        if let Some(msg) = &snap.entry.status_msg {
-            content["status_msg"] = msg.clone().into();
+        resp.presence
+            .events
+            .push(presence_event(&snap.user_id, &snap.entry)?);
+        presence_seen.insert(snap.user_id);
+    }
+    for user in newly_visible {
+        if user == user_id || presence_seen.contains(&user) {
+            continue;
         }
-        resp.presence.events.push(to_raw(&serde_json::json!({
-            "type": "m.presence",
-            "sender": snap.user_id,
-            "content": content,
-        }))?);
+        if let Some(entry) = state.presence.get(&user) {
+            resp.presence.events.push(presence_event(&user, &entry)?);
+        }
     }
 
     Ok(resp)

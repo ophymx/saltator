@@ -1069,6 +1069,89 @@ async fn device_list_changes_reach_sync_and_keys_changes() {
     env.shutdown().await;
 }
 
+/// Presence of newly-visible users rides the incremental sync: existing
+/// members see the joiner's presence, and the joiner sees the members'.
+#[tokio::test]
+async fn presence_surfaces_on_join() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/presence/@bob:{SERVER}/status"),
+            Some(&bob),
+            Some(json!({"presence": "online"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let (_, a_sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    let a_token = a_sync["next_batch"].as_str().unwrap().to_owned();
+    let (_, b_sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+        .await;
+    let b_token = b_sync["next_batch"].as_str().unwrap().to_owned();
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let has_presence = |resp: &Value, user: &str| {
+        resp["presence"]["events"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|e| e["sender"] == format!("@{user}:{SERVER}")))
+    };
+    // Existing member sees the joiner's presence...
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={a_token}&timeout=0"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert!(
+        has_presence(&resp, "bob"),
+        "joiner presence missing: {resp}"
+    );
+    // ...and the joiner sees the existing members'.
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={b_token}&timeout=0"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert!(
+        has_presence(&resp, "alice"),
+        "members' presence missing: {resp}"
+    );
+
+    env.shutdown().await;
+}
+
 /// Departed members read the room frozen at their leave — state, members,
 /// and history cap there; include_leave surfaces old leaves on initial
 /// sync; /members?at= resolves a historical snapshot.
