@@ -1286,7 +1286,8 @@ pub async fn get_members(
     // `?at=`: members as of a stream position (bounded by the caller's
     // own view ceiling).
     if let Some(at) = &req.at {
-        let mut seq = parse_topo_token(at)?;
+        // The token as a stream position: everything at or before it.
+        let mut seq = parse_topo_token(at)?.upper();
         if let Some(cap) = cap {
             seq = seq.min(cap);
         }
@@ -1417,38 +1418,39 @@ pub async fn get_messages(
         .clamp(1, 1000);
     let from = query.get("from").map(|s| parse_topo_token(s)).transpose()?;
     let to = query.get("to").map(|s| parse_topo_token(s)).transpose()?;
-    // Room event filter: only `contains_url` is honored so far.
-    let contains_url = query
+    // Room event filter: `contains_url` and `lazy_load_members` are the
+    // honored slices so far.
+    let filter_json = query
         .get("filter")
         .map(|f| {
             serde_json::from_str::<serde_json::Value>(f)
                 .map_err(|e| ApiError::bad_json(format!("filter: {e}")))
         })
-        .transpose()?
+        .transpose()?;
+    let contains_url = filter_json
+        .as_ref()
         .and_then(|f| f.get("contains_url").and_then(|v| v.as_bool()));
+    let lazy_load_members = filter_json
+        .as_ref()
+        .and_then(|f| f.get("lazy_load_members").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
 
     // Tokens are exclusive bounds on the room-shard seq.
     let store = state.rooms.store();
     let (batch, next): (Vec<(u64, String)>, Option<u64>) = match dir {
         Direction::Backward => {
-            let upper = from.unwrap_or(u64::MAX);
-            let lower = to.unwrap_or(0);
+            let upper = from.map(PaginationBound::upper).unwrap_or(u64::MAX);
+            let lower = to.map(PaginationBound::lower).unwrap_or(0);
             let events = store
-                .room_timeline(
-                    &room_id,
-                    lower,
-                    Some(upper.saturating_sub(1).min(ceiling)),
-                    limit,
-                    true,
-                )
+                .room_timeline(&room_id, lower, Some(upper.min(ceiling)), limit, true)
                 .map_err(internal)?;
             let next = events.last().map(|(s, _)| *s);
             (events, next)
         }
         Direction::Forward => {
-            let lower = from.unwrap_or(0);
+            let lower = from.map(PaginationBound::lower).unwrap_or(0);
             let upper = match to {
-                Some(t) => Some(t.saturating_sub(1).min(ceiling)),
+                Some(t) => Some(t.upper().min(ceiling)),
                 None => cap,
             };
             let events = store
@@ -1460,6 +1462,7 @@ pub async fn get_messages(
     };
 
     let mut chunk = Vec::new();
+    let mut senders: Vec<String> = Vec::new();
     for (_, event_id) in &batch {
         if let Some(ev) = client_event(
             &state.rooms,
@@ -1477,10 +1480,37 @@ pub async fn get_messages(
                     continue;
                 }
             }
+            if let Some(sender) = ev.get("sender").and_then(|s| s.as_str()) {
+                if !senders.iter().any(|s| s == sender) {
+                    senders.push(sender.to_owned());
+                }
+            }
             chunk.push(to_raw(&ev)?);
         }
     }
     let mut resp = get_message_events::v3::Response::new();
+    // Lazy-loaded members: the member events of the chunk's senders, as of
+    // the newest returned event.
+    if lazy_load_members {
+        if let Some(at) = batch.iter().map(|(s, _)| *s).max() {
+            let snapshot = crate::room_util::state_at_seq(&state.rooms, &room_id, at)?;
+            for sender in senders {
+                let key = ("m.room.member".to_owned(), sender);
+                let Some(member_event_id) = snapshot.get(&key) else {
+                    continue;
+                };
+                if let Some(ev) = client_event(
+                    &state.rooms,
+                    version,
+                    &room_id,
+                    member_event_id,
+                    auth.user_id.as_str(),
+                )? {
+                    resp.state.push(to_raw(&ev)?);
+                }
+            }
+        }
+    }
     resp.start = query
         .get("from")
         .cloned()
@@ -1498,16 +1528,46 @@ pub async fn get_messages(
     Ok(Ra(resp))
 }
 
-fn parse_topo_token(token: &str) -> Result<u64> {
-    // Native topological tokens (`t{seq}`, what /messages and prev_batch
-    // mint) and full sync tokens (clients feed next_batch straight into
-    // /messages `from`) both resolve to a room-shard position.
+/// A pagination bound: native topological tokens (`t{seq}`, what
+/// /messages and prev_batch mint) anchor AT event `seq`; sync tokens
+/// (clients feed next_batch straight into /messages) sit AFTER their
+/// room position. The distinction matters when the token is an upper
+/// bound: `t{n}` excludes event n, `s{n}` includes it.
+#[derive(Clone, Copy)]
+struct PaginationBound {
+    seq: u64,
+    at_event: bool,
+}
+
+impl PaginationBound {
+    /// The bound as an inclusive upper limit on event seqs.
+    fn upper(self) -> u64 {
+        if self.at_event {
+            self.seq.saturating_sub(1)
+        } else {
+            self.seq
+        }
+    }
+    /// The bound as an exclusive lower limit on event seqs.
+    fn lower(self) -> u64 {
+        self.seq
+    }
+}
+
+fn parse_topo_token(token: &str) -> Result<PaginationBound> {
     if token.starts_with('s') {
-        return crate::routes::sync::token_room_seq(token);
+        return Ok(PaginationBound {
+            seq: crate::routes::sync::token_room_seq(token)?,
+            at_event: false,
+        });
     }
     token
         .strip_prefix('t')
         .and_then(|s| s.parse().ok())
+        .map(|seq| PaginationBound {
+            seq,
+            at_event: true,
+        })
         .ok_or_else(|| ApiError::invalid_param("Invalid pagination token"))
 }
 

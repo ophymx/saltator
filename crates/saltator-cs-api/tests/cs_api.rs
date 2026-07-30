@@ -1152,6 +1152,81 @@ async fn presence_surfaces_on_join() {
     env.shutdown().await;
 }
 
+/// /messages with a lazy_load_members filter returns the member events of
+/// the chunk's senders in `state` — exactly one per distinct sender.
+#[tokio::test]
+async fn messages_lazy_loads_member_state() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let charlie = env.register("charlie", "charlie-pw").await;
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&charlie),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    let before = sync["next_batch"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/ll1"),
+            Some(&charlie),
+            Some(json!({"msgtype": "m.text", "body": "test"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, sync) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={before}&timeout=0"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    let after = sync["next_batch"].as_str().unwrap().to_owned();
+
+    // {"lazy_load_members": true}, percent-encoded.
+    let filter = "%7B%22lazy_load_members%22%3Atrue%7D";
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!(
+                "/_matrix/client/v3/rooms/{room_id}/messages?dir=f&from={before}&to={after}&filter={filter}"
+            ),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let state = got["state"]
+        .as_array()
+        .unwrap_or_else(|| panic!("state array present: {got}"));
+    assert_eq!(state.len(), 1, "one member event expected: {got}");
+    assert_eq!(state[0]["type"], "m.room.member");
+    assert_eq!(state[0]["state_key"], format!("@charlie:{SERVER}"));
+    assert_eq!(state[0]["content"]["membership"], "join");
+
+    env.shutdown().await;
+}
+
 /// Sync filters shape the response: timeline/state `types` narrow events,
 /// `limit: 0` empties the timeline and moves pre-leave state (including
 /// the leave itself) into `state.events`, and `timeline.limited` is always
