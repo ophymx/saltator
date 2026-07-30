@@ -1134,6 +1134,10 @@ async fn presence_surfaces_on_join() {
         has_presence(&resp, "bob"),
         "joiner presence missing: {resp}"
     );
+    // ...along with the room summary counts (TestRoomSummary shape).
+    let summary = &resp["rooms"]["join"][&room_id]["summary"];
+    assert_eq!(summary["m.joined_member_count"], 2, "{resp}");
+    assert_eq!(summary["m.invited_member_count"], 0, "{resp}");
     // ...and the joiner sees the existing members'.
     let (status, resp) = env
         .req(

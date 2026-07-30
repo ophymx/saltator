@@ -664,6 +664,24 @@ fn build_joined_room(
             .push(to_raw(&account_data_event(&data_type, &entry.json)?)?);
     }
 
+    // Room summary: joined/invited member counts from current state.
+    let mut joined_count = 0u32;
+    let mut invited_count = 0u32;
+    if let Ok(current) = crate::room_util::current_state(rooms, room_id.as_str()) {
+        for (event_type, state_key) in current.keys() {
+            if event_type != "m.room.member" {
+                continue;
+            }
+            match crate::room_util::membership_in(rooms, &current, state_key)?.as_str() {
+                "join" => joined_count += 1,
+                "invite" => invited_count += 1,
+                _ => {}
+            }
+        }
+    }
+    out.summary.joined_member_count = Some(joined_count.into());
+    out.summary.invited_member_count = Some(invited_count.into());
+
     // Unread counts: messages after the user's read receipt.
     out.unread_notifications.notification_count =
         Some(unread_count(state, room_id.as_str(), auth.user_id.as_str(), now.room)?.into());
