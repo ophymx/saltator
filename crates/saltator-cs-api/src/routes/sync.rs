@@ -105,7 +105,7 @@ pub async fn sync_events(
     State(state): State<Arc<CsState>>,
     auth: Auth,
     Ar(req): Ar<v3::Request>,
-) -> Result<Ra<v3::Response>> {
+) -> Result<axum::response::Response> {
     let since = req.since.as_deref().map(parse_token).transpose()?;
     let filter = load_filter(&state, &auth, req.filter.as_ref())?;
     let timeout = req
@@ -150,7 +150,7 @@ pub async fn sync_events(
             typing: state.typing.generation(),
             presence: state.presence.generation(),
         };
-        let resp = build_sync(&state, &auth, since, now_pos, filter, req.full_state)?;
+        let resp = build_sync(&state, &auth, since, now_pos, &filter, req.full_state)?;
         let empty = resp.rooms.is_empty()
             && resp.account_data.is_empty()
             && resp.presence.is_empty()
@@ -158,24 +158,53 @@ pub async fn sync_events(
             && resp.device_lists.changed.is_empty()
             && resp.device_lists.left.is_empty();
         if since.is_none() || !empty || timeout.is_zero() {
-            return Ok(Ra(resp));
+            return respond(resp);
         }
         tokio::select! {
             _ = room_rx.recv() => {}
             _ = user_rx.recv() => {}
             _ = typing_rx.recv() => {}
             _ = presence_rx.recv() => {}
-            _ = tokio::time::sleep_until(deadline) => return Ok(Ra(resp)),
+            _ = tokio::time::sleep_until(deadline) => return respond(resp),
         }
     }
 }
 
+/// Serialize the sync response, forcing `timeline.limited` to be present:
+/// ruma elides fields equal to their serde default (`limited: false`), but
+/// clients and Complement treat the key as required whenever a timeline
+/// object exists.
+fn respond(resp: v3::Response) -> Result<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let http = ruma::api::OutgoingResponse::try_into_http_response::<Vec<u8>>(resp)
+        .map_err(|e| internal(format!("response encode: {e}")))?;
+    let mut v: serde_json::Value = serde_json::from_slice(http.body()).map_err(internal)?;
+    for section in ["join", "leave"] {
+        let rooms = v
+            .get_mut("rooms")
+            .and_then(|r| r.get_mut(section))
+            .and_then(|s| s.as_object_mut());
+        for room in rooms.into_iter().flat_map(|r| r.values_mut()) {
+            if let Some(timeline) = room.get_mut("timeline").and_then(|t| t.as_object_mut()) {
+                timeline
+                    .entry("limited")
+                    .or_insert(serde_json::Value::Bool(false));
+            }
+        }
+    }
+    Ok(axum::Json(v).into_response())
+}
+
 /// The slice of a sync filter this server honors.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SyncFilter {
     limit: usize,
     lazy: bool,
     include_leave: bool,
+    timeline_types: Option<Vec<String>>,
+    timeline_not_types: Vec<String>,
+    state_types: Option<Vec<String>>,
+    state_not_types: Vec<String>,
 }
 
 impl Default for SyncFilter {
@@ -184,7 +213,41 @@ impl Default for SyncFilter {
             limit: 10,
             lazy: false,
             include_leave: false,
+            timeline_types: None,
+            timeline_not_types: Vec::new(),
+            state_types: None,
+            state_not_types: Vec::new(),
         }
+    }
+}
+
+/// Event-type match per the spec's filter rules: `types` is an allowlist
+/// (absent = everything), `not_types` wins over it, and `*` in a pattern
+/// matches any sequence of characters.
+fn type_matches(types: &Option<Vec<String>>, not_types: &[String], ty: &str) -> bool {
+    fn glob(pat: &str, s: &str) -> bool {
+        if !pat.contains('*') {
+            return pat == s;
+        }
+        let segs: Vec<&str> = pat.split('*').collect();
+        let Some(rest) = s.strip_prefix(segs[0]) else {
+            return false;
+        };
+        let mut rest = rest;
+        for seg in &segs[1..segs.len() - 1] {
+            match rest.find(seg) {
+                Some(i) => rest = &rest[i + seg.len()..],
+                None => return false,
+            }
+        }
+        rest.ends_with(segs[segs.len() - 1])
+    }
+    if not_types.iter().any(|p| glob(p, ty)) {
+        return false;
+    }
+    match types {
+        None => true,
+        Some(allow) => allow.iter().any(|p| glob(p, ty)),
     }
 }
 
@@ -207,15 +270,21 @@ fn load_filter(state: &CsState, auth: &Auth, filter: Option<&v3::Filter>) -> Res
         return Ok(SyncFilter::default());
     };
     Ok(SyncFilter {
+        // limit 0 is meaningful: an empty timeline with the room's state
+        // carried entirely in `state.events`.
         limit: def
             .room
             .timeline
             .limit
             .map(|l| u64::from(l) as usize)
             .unwrap_or(10)
-            .clamp(1, 100),
+            .min(100),
         lazy: !matches!(def.room.state.lazy_load_options, LazyLoadOptions::Disabled),
         include_leave: def.room.include_leave,
+        timeline_types: def.room.timeline.types.clone(),
+        timeline_not_types: def.room.timeline.not_types.clone(),
+        state_types: def.room.state.types.clone(),
+        state_not_types: def.room.state.not_types.clone(),
     })
 }
 
@@ -224,14 +293,10 @@ fn build_sync(
     auth: &Auth,
     since: Option<SyncPos>,
     now: SyncPos,
-    filter: SyncFilter,
+    filter: &SyncFilter,
     full_state: bool,
 ) -> Result<v3::Response> {
-    let SyncFilter {
-        limit,
-        lazy,
-        include_leave,
-    } = filter;
+    let include_leave = filter.include_leave;
     let initial = since.is_none();
     let since = since.unwrap_or_default();
     let user_id = auth.user_id.as_str();
@@ -277,8 +342,7 @@ fn build_sync(
                     &m,
                     room_since,
                     now,
-                    limit,
-                    lazy,
+                    filter,
                     full_state,
                     room_initial,
                 )?;
@@ -308,7 +372,16 @@ fn build_sync(
             {
                 resp.rooms.leave.insert(
                     room_id,
-                    build_left_room(state, auth, &room_id_str, &m, since, now)?,
+                    build_left_room(
+                        state,
+                        auth,
+                        &room_id_str,
+                        &m,
+                        since,
+                        now,
+                        filter,
+                        initial || full_state,
+                    )?,
                 );
             }
             _ => {}
@@ -452,11 +525,11 @@ fn build_joined_room(
     membership: &MembershipEntry,
     since: SyncPos,
     now: SyncPos,
-    limit: usize,
-    lazy: bool,
+    filter: &SyncFilter,
     full_state: bool,
     initial: bool,
 ) -> Result<v3::JoinedRoom> {
+    let SyncFilter { limit, lazy, .. } = *filter;
     let rooms = &state.rooms;
     let store = rooms.store();
     let Some(meta) = store.meta(room_id.as_str()).map_err(internal)? else {
@@ -492,6 +565,10 @@ fn build_joined_room(
             event_id,
             auth.user_id.as_str(),
         )? {
+            let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if !type_matches(&filter.timeline_types, &filter.timeline_not_types, ty) {
+                continue;
+            }
             if let Some(sender) = ev.get("sender").and_then(|s| s.as_str()) {
                 timeline_senders.push(sender.to_owned());
             }
@@ -512,6 +589,9 @@ fn build_joined_room(
     let mut state_events = Vec::new();
     for (key, event_id) in &timeline_start_state {
         if base_state.get(key) == Some(event_id) {
+            continue;
+        }
+        if !type_matches(&filter.state_types, &filter.state_not_types, &key.0) {
             continue;
         }
         if lazy && key.0 == "m.room.member" && !timeline_senders.contains(&key.1) {
@@ -659,6 +739,7 @@ fn build_invited_room(
     Ok(invited)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_left_room(
     state: &CsState,
     auth: &Auth,
@@ -666,6 +747,8 @@ fn build_left_room(
     membership: &MembershipEntry,
     since: SyncPos,
     now: SyncPos,
+    filter: &SyncFilter,
+    fresh: bool,
 ) -> Result<v3::LeftRoom> {
     let rooms = &state.rooms;
     let store = rooms.store();
@@ -677,15 +760,51 @@ fn build_left_room(
     // The timeline up to (and including) the leave event — nothing the
     // room did after the user left is theirs to see.
     let ceiling = membership.room_seq.min(now.room);
+    let window_start = if fresh { 0 } else { since.room };
     let mut window = store
-        .room_timeline(room_id, since.room, Some(ceiling), 10, true)
+        .room_timeline(room_id, window_start, Some(ceiling), filter.limit + 1, true)
         .map_err(internal)?;
+    out.timeline.limited = window.len() > filter.limit;
+    window.truncate(filter.limit);
     window.reverse();
+    if let Some((first_seq, _)) = window.first() {
+        out.timeline.prev_batch = Some(format!("t{first_seq}"));
+    }
     for (_, event_id) in &window {
         if let Some(ev) = client_event(rooms, version, room_id, event_id, auth.user_id.as_str())? {
+            let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if !type_matches(&filter.timeline_types, &filter.timeline_not_types, ty) {
+                continue;
+            }
             out.timeline.events.push(to_raw(&ev)?);
         }
     }
+    // State delta up to the start of the timeline; with an empty timeline
+    // that is the full state at the leave — including the leave event.
+    let timeline_start_state = match window.first() {
+        Some((first_seq, _)) => state_at(state, room_id, first_seq.saturating_sub(1))?,
+        None => state_at(state, room_id, ceiling)?,
+    };
+    let base_state: StateMap = if fresh {
+        StateMap::new()
+    } else {
+        state_at(state, room_id, since.room)?
+    };
+    let mut state_events = Vec::new();
+    for (key, event_id) in &timeline_start_state {
+        if base_state.get(key) == Some(event_id) {
+            continue;
+        }
+        if !type_matches(&filter.state_types, &filter.state_not_types, &key.0) {
+            continue;
+        }
+        if let Some(ev) = client_event(rooms, version, room_id, event_id, auth.user_id.as_str())? {
+            state_events.push(to_raw(&ev)?);
+        }
+    }
+    let mut se = v3::StateEvents::new();
+    se.events = state_events;
+    out.state = v3::State::Before(se);
     Ok(out)
 }
 

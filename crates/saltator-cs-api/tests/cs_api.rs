@@ -1152,6 +1152,235 @@ async fn presence_surfaces_on_join() {
     env.shutdown().await;
 }
 
+/// Sync filters shape the response: timeline/state `types` narrow events,
+/// `limit: 0` empties the timeline and moves pre-leave state (including
+/// the leave itself) into `state.events`, and `timeline.limited` is always
+/// present in the serialized JSON even when false.
+#[tokio::test]
+async fn sync_filters_shape_timeline_and_leave_state() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, bob_sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+        .await;
+    let bob_since = bob_sync["next_batch"].as_str().unwrap().to_owned();
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/f1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "before"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/a.madeup.test.state/"),
+            Some(&alice),
+            Some(json!({"my_key": "before"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Life moves on without bob.
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/f2"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "after"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/a.madeup.test.state/"),
+            Some(&alice),
+            Some(json!({"my_key": "after"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let make_filter = |user: String, token: String, def: serde_json::Value| {
+        let env = &env;
+        async move {
+            let (status, body) = env
+                .req(
+                    "POST",
+                    &format!("/_matrix/client/v3/user/@{user}:{SERVER}/filter"),
+                    Some(&token),
+                    Some(def),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["filter_id"].as_str().unwrap().to_owned()
+        }
+    };
+
+    // Types-filtered leave section (the ArchivedRoomsHistory shape).
+    let typed = make_filter(
+        "bob".into(),
+        bob.clone(),
+        json!({"room": {
+            "timeline": {"types": ["m.room.message", "a.madeup.test.state"]},
+            "state": {"types": ["a.madeup.test.state"]},
+            "include_leave": true,
+        }}),
+    )
+    .await;
+    for since in [None, Some(&bob_since)] {
+        let url = match since {
+            None => format!("/_matrix/client/v3/sync?filter={typed}"),
+            Some(s) => format!("/_matrix/client/v3/sync?filter={typed}&since={s}&timeout=0"),
+        };
+        let (status, resp) = env.req("GET", &url, Some(&bob), None).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let left = &resp["rooms"]["leave"][&room_id];
+        let timeline: Vec<(&str, &str)> = left["timeline"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["content"]["body"]
+                        .as_str()
+                        .or(e["content"]["my_key"].as_str())
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            timeline,
+            vec![
+                ("m.room.message", "before"),
+                ("a.madeup.test.state", "before")
+            ],
+            "since={since:?}: {left}"
+        );
+        assert!(
+            left["state"]["events"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .is_empty(),
+            "state should be empty: {left}"
+        );
+    }
+
+    // limit 0: empty timeline, pre-leave state (incl. the leave) in state.
+    let empty_tl = make_filter(
+        "bob".into(),
+        bob.clone(),
+        json!({"room": {"timeline": {"limit": 0}, "include_leave": true}}),
+    )
+    .await;
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?filter={empty_tl}"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let left = &resp["rooms"]["leave"][&room_id];
+    assert!(
+        left["timeline"]["events"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .is_empty(),
+        "timeline should be empty: {left}"
+    );
+    let state_events = left["state"]["events"].as_array().unwrap();
+    let bob_membership = state_events
+        .iter()
+        .find(|e| e["type"] == "m.room.member" && e["state_key"] == format!("@bob:{SERVER}"))
+        .expect("bob's leave in state");
+    assert_eq!(bob_membership["content"]["membership"], "leave");
+    let madeup = state_events
+        .iter()
+        .find(|e| e["type"] == "a.madeup.test.state")
+        .expect("madeup state present");
+    assert_eq!(
+        madeup["content"]["my_key"], "before",
+        "post-leave state leaked: {left}"
+    );
+
+    // Joined rooms: types narrow the timeline and `limited` always
+    // serializes (checkJoinFieldsExist requires the key even when false).
+    let msgs_only = make_filter(
+        "alice".into(),
+        alice.clone(),
+        json!({"room": {"timeline": {"limit": 10, "types": ["m.room.message"]}}}),
+    )
+    .await;
+    let (status, resp) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?filter={msgs_only}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let timeline = &resp["rooms"]["join"][&room_id]["timeline"];
+    assert!(
+        timeline["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["type"] == "m.room.message"),
+        "non-message events in typed timeline: {timeline}"
+    );
+    assert!(
+        timeline.as_object().unwrap().contains_key("limited"),
+        "limited key missing: {timeline}"
+    );
+    // Unfiltered sync also serializes `limited` (false) explicitly.
+    let (_, resp) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    let timeline = &resp["rooms"]["join"][&room_id]["timeline"];
+    assert!(
+        timeline.as_object().unwrap().contains_key("limited"),
+        "limited key missing on unfiltered sync: {timeline}"
+    );
+
+    env.shutdown().await;
+}
+
 /// Departed members read the room frozen at their leave — state, members,
 /// and history cap there; include_leave surfaces old leaves on initial
 /// sync; /members?at= resolves a historical snapshot.
