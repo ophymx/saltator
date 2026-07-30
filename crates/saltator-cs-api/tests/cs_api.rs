@@ -1152,6 +1152,144 @@ async fn presence_surfaces_on_join() {
     env.shutdown().await;
 }
 
+/// Transaction IDs are scoped to device + endpoint path, and the local
+/// echo (`unsigned.transaction_id`) is stamped on /event and sync — but
+/// only for the device that sent the event.
+#[tokio::test]
+async fn txn_ids_scope_to_device_and_path() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+
+    let mut room_ids = Vec::new();
+    for _ in 0..2 {
+        let (status, room) = env
+            .req("POST", "/_matrix/client/v3/createRoom", Some(&alice), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{room}");
+        room_ids.push(room["room_id"].as_str().unwrap().to_owned());
+    }
+    let (r1, r2) = (&room_ids[0], &room_ids[1]);
+
+    let send = |room: String, token: String, body: &'static str| {
+        let env = &env;
+        async move {
+            let (status, resp) = env
+                .req(
+                    "PUT",
+                    &format!("/_matrix/client/v3/rooms/{room}/send/m.room.message/abc"),
+                    Some(&token),
+                    Some(json!({"msgtype": "m.text", "body": body})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            resp["event_id"].as_str().unwrap().to_owned()
+        }
+    };
+
+    // Idempotent per room+type even when the content changes...
+    let e1 = send(r1.clone(), alice.clone(), "first").await;
+    let e2 = send(r1.clone(), alice.clone(), "second").await;
+    assert_eq!(e1, e2, "same txn in same room must dedupe");
+    // ...but a different room is a different endpoint path.
+    let e3 = send(r2.clone(), alice.clone(), "first").await;
+    assert_ne!(e1, e3, "same txn in another room must NOT dedupe");
+
+    // Local echo on /event for the sending device.
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{r1}/event/{e1}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["unsigned"]["transaction_id"], "abc", "{got}");
+
+    // Local echo in the sync timeline for the sending device.
+    let (_, sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    let echo = sync["rooms"]["join"][r1]["timeline"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_id"] == e1.as_str())
+        .expect("event in timeline")["unsigned"]["transaction_id"]
+        .clone();
+    assert_eq!(echo, "abc", "{sync}");
+
+    // The same user on a NEW device sees no transaction_id...
+    let (status, login) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/login",
+            None,
+            Some(json!({
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": "alice"},
+                "password": "alice-pw",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{login}");
+    let alice2 = login["access_token"].as_str().unwrap().to_owned();
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{r1}/event/{e1}"),
+            Some(&alice2),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(
+        got["unsigned"].get("transaction_id").is_none(),
+        "txn id must not leak to other devices: {got}"
+    );
+
+    // ...but a second session sharing the ORIGINAL device ID sees it.
+    let (_, whoami) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(&alice),
+            None,
+        )
+        .await;
+    let device = whoami["device_id"].as_str().unwrap().to_owned();
+    let (status, login) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/login",
+            None,
+            Some(json!({
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": "alice"},
+                "password": "alice-pw",
+                "device_id": device,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{login}");
+    let alice_same_device = login["access_token"].as_str().unwrap().to_owned();
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{r1}/event/{e1}"),
+            Some(&alice_same_device),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(
+        got["unsigned"]["transaction_id"], "abc",
+        "same device id shares the txn echo: {got}"
+    );
+
+    env.shutdown().await;
+}
+
 /// /messages with a lazy_load_members filter returns the member events of
 /// the chunk's senders in `state` — exactly one per distinct sender.
 #[tokio::test]

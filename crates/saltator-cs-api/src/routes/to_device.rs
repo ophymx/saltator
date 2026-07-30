@@ -25,10 +25,13 @@ pub async fn send_to_device(
     Ar(req): Ar<send_event_to_device::v3::Request>,
 ) -> Result<Ra<send_event_to_device::v3::Response>> {
     // A retransmitted transaction was already queued; do nothing.
-    if state
-        .txns
-        .seen(auth.user_id.as_str(), &auth.device_id, req.txn_id.as_str())
-    {
+    let scope = format!("to_device\0{}", req.event_type);
+    if state.txns.seen(
+        auth.user_id.as_str(),
+        &auth.device_id,
+        &scope,
+        req.txn_id.as_str(),
+    ) {
         return Ok(Ra(send_event_to_device::v3::Response::new()));
     }
 
@@ -82,8 +85,11 @@ pub async fn send_to_device(
         crate::routes::edu::send_edu(&state, vec![dest], edu);
     }
 
-    state
-        .txns
-        .mark(auth.user_id.as_str(), &auth.device_id, req.txn_id.as_str());
+    state.txns.mark(
+        auth.user_id.as_str(),
+        &auth.device_id,
+        &scope,
+        req.txn_id.as_str(),
+    );
     Ok(Ra(send_event_to_device::v3::Response::new()))
 }

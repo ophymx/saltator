@@ -1023,11 +1023,14 @@ pub async fn send_message_event(
     auth: Auth,
     Ar(req): Ar<send_message_event::v3::Request>,
 ) -> Result<Ra<send_message_event::v3::Response>> {
-    if let Some(event_id) =
-        state
-            .txns
-            .get(auth.user_id.as_str(), &auth.device_id, req.txn_id.as_str())
-    {
+    // Txn IDs are scoped to the endpoint path: room + event type.
+    let scope = format!("send\0{}\0{}", req.room_id, req.event_type);
+    if let Some(event_id) = state.txns.get(
+        auth.user_id.as_str(),
+        &auth.device_id,
+        &scope,
+        req.txn_id.as_str(),
+    ) {
         return Ok(Ra(send_message_event::v3::Response::new(event_id)));
     }
     let content: serde_json::Value = serde_json::from_str(req.body.json().get())
@@ -1045,6 +1048,7 @@ pub async fn send_message_event(
     state.txns.put(
         auth.user_id.as_str(),
         &auth.device_id,
+        &scope,
         req.txn_id.as_str(),
         event_id.clone(),
     );
@@ -1148,11 +1152,13 @@ pub async fn redact_event(
     auth: Auth,
     Ar(req): Ar<redact_event::v3::Request>,
 ) -> Result<Ra<redact_event::v3::Response>> {
-    if let Some(event_id) =
-        state
-            .txns
-            .get(auth.user_id.as_str(), &auth.device_id, req.txn_id.as_str())
-    {
+    let scope = format!("redact\0{}\0{}", req.room_id, req.event_id);
+    if let Some(event_id) = state.txns.get(
+        auth.user_id.as_str(),
+        &auth.device_id,
+        &scope,
+        req.txn_id.as_str(),
+    ) {
         return Ok(Ra(redact_event::v3::Response::new(event_id)));
     }
     let mut content = serde_json::json!({ "redacts": req.event_id.as_str() });
@@ -1167,6 +1173,7 @@ pub async fn redact_event(
     state.txns.put(
         auth.user_id.as_str(),
         &auth.device_id,
+        &scope,
         req.txn_id.as_str(),
         event_id.clone(),
     );
@@ -1261,7 +1268,7 @@ pub async fn get_room_event(
     )? {
         return Err(ApiError::not_found("Event not found"));
     }
-    let ev = client_event(
+    let mut ev = client_event(
         &state.rooms,
         version,
         req.room_id.as_str(),
@@ -1273,6 +1280,9 @@ pub async fn get_room_event(
     if ev.get("room_id").and_then(|r| r.as_str()) != Some(req.room_id.as_str()) {
         return Err(ApiError::not_found("Event not found"));
     }
+    state
+        .txns
+        .stamp_echo(&mut ev, auth.user_id.as_str(), &auth.device_id);
     Ok(Ra(get_room_event::v3::Response::new(to_raw(&ev)?)))
 }
 

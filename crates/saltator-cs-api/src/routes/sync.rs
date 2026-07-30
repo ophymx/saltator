@@ -558,7 +558,7 @@ fn build_joined_room(
     }
     let mut timeline_senders: Vec<String> = Vec::new();
     for (_, event_id) in &window {
-        if let Some(ev) = client_event(
+        if let Some(mut ev) = client_event(
             rooms,
             version,
             room_id.as_str(),
@@ -572,6 +572,9 @@ fn build_joined_room(
             if let Some(sender) = ev.get("sender").and_then(|s| s.as_str()) {
                 timeline_senders.push(sender.to_owned());
             }
+            state
+                .txns
+                .stamp_echo(&mut ev, auth.user_id.as_str(), &auth.device_id);
             out.timeline.events.push(to_raw(&ev)?);
         }
     }
@@ -771,11 +774,16 @@ fn build_left_room(
         out.timeline.prev_batch = Some(format!("t{first_seq}"));
     }
     for (_, event_id) in &window {
-        if let Some(ev) = client_event(rooms, version, room_id, event_id, auth.user_id.as_str())? {
+        if let Some(mut ev) =
+            client_event(rooms, version, room_id, event_id, auth.user_id.as_str())?
+        {
             let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if !type_matches(&filter.timeline_types, &filter.timeline_not_types, ty) {
                 continue;
             }
+            state
+                .txns
+                .stamp_echo(&mut ev, auth.user_id.as_str(), &auth.device_id);
             out.timeline.events.push(to_raw(&ev)?);
         }
     }
