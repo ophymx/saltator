@@ -196,3 +196,49 @@ pub async fn set_pushers(State(state): State<Arc<CsState>>, auth: Auth, Jb(body)
         .await?;
     Ok(axum::Json(json!({})))
 }
+
+/// Room-upgrade carry-over (Synapse-compatible behavior, not spec'd):
+/// when a local user joins a room that declares a predecessor, copies of
+/// their push rules referencing the old room are re-pointed at the new
+/// one. The old rules stay — they still apply to the tombstoned room.
+pub(crate) async fn copy_rules_from_predecessor(
+    state: &CsState,
+    user_id: &UserId,
+    room_id: &str,
+) -> Result<()> {
+    // Nothing stored means nothing can reference the old room.
+    if state
+        .users
+        .store()
+        .account_data(user_id.as_str(), "", "m.push_rules")
+        .map_err(internal)?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let Some(predecessor) = crate::room_util::predecessor_of(&state.rooms, room_id)? else {
+        return Ok(());
+    };
+    let Ok(new_room_id) = ruma::OwnedRoomId::try_from(room_id.to_owned()) else {
+        return Ok(());
+    };
+    let mut ruleset = load_ruleset(state, user_id)?;
+    let copied: Vec<NewPushRule> = ruleset
+        .room
+        .iter()
+        .filter(|r| r.rule_id.as_str() == predecessor)
+        .map(|r| {
+            NewPushRule::Room(NewSimplePushRule::new(
+                new_room_id.clone(),
+                r.actions.clone(),
+            ))
+        })
+        .collect();
+    if copied.is_empty() {
+        return Ok(());
+    }
+    for rule in copied {
+        let _ = ruleset.insert(rule, None, None);
+    }
+    save_ruleset(state, user_id, &ruleset).await
+}

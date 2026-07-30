@@ -1152,6 +1152,124 @@ async fn presence_surfaces_on_join() {
     env.shutdown().await;
 }
 
+/// Upgrading a room (or joining/creating its replacement) carries each
+/// local user's room-scoped push rules over to the new room.
+#[tokio::test]
+async fn push_rules_carry_over_room_upgrade() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+
+    let create = |token: String, body: serde_json::Value| {
+        let env = &env;
+        async move {
+            let (status, room) = env
+                .req(
+                    "POST",
+                    "/_matrix/client/v3/createRoom",
+                    Some(&token),
+                    Some(body),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{room}");
+            room["room_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let set_room_rule = |token: String, room: String| {
+        let env = &env;
+        async move {
+            let (status, body) = env
+                .req(
+                    "PUT",
+                    &format!("/_matrix/client/v3/pushrules/global/room/{room}"),
+                    Some(&token),
+                    Some(json!({"actions": ["dont_notify"]})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    };
+    let room_rules = |token: String| {
+        let env = &env;
+        async move {
+            let (status, rules) = env
+                .req("GET", "/_matrix/client/v3/pushrules/", Some(&token), None)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{rules}");
+            rules["global"]["room"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["rule_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // /upgrade path: both the upgrader and a later joiner carry over.
+    let old = create(alice.clone(), json!({"preset": "public_chat"})).await;
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{old}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    set_room_rule(alice.clone(), old.clone()).await;
+    set_room_rule(bob.clone(), old.clone()).await;
+
+    let (status, upgraded) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{old}/upgrade"),
+            Some(&alice),
+            Some(json!({"new_version": "11"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{upgraded}");
+    let new_room = upgraded["replacement_room"].as_str().unwrap().to_owned();
+
+    let alice_rules = room_rules(alice.clone()).await;
+    assert!(
+        alice_rules.contains(&old) && alice_rules.contains(&new_room),
+        "upgrader rules not carried: {alice_rules:?}"
+    );
+    // Bob's copy happens at his join of the replacement.
+    assert!(!room_rules(bob.clone()).await.contains(&new_room));
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{new_room}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let bob_rules = room_rules(bob.clone()).await;
+    assert!(
+        bob_rules.contains(&old) && bob_rules.contains(&new_room),
+        "joiner rules not carried: {bob_rules:?}"
+    );
+
+    // Manual upgrade path: createRoom with creation_content.predecessor.
+    let manual = create(
+        alice.clone(),
+        json!({
+            "preset": "public_chat",
+            "creation_content": {"predecessor": {"room_id": new_room}},
+        }),
+    )
+    .await;
+    let alice_rules = room_rules(alice.clone()).await;
+    assert!(
+        alice_rules.contains(&manual),
+        "manual-upgrade creator rules not carried: {alice_rules:?}"
+    );
+
+    env.shutdown().await;
+}
+
 /// /relations filters by target, rel_type, and event type, paginates in
 /// both directions accepting sync tokens, and /threads orders roots by
 /// latest activity with the m.thread aggregation attached.

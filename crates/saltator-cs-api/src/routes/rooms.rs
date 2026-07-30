@@ -281,6 +281,11 @@ pub async fn create_room(
             .await?;
     }
 
+    // A replacement room (manual upgrade: creation_content.predecessor)
+    // carries the creator's push rules over from the old room.
+    crate::routes::push::copy_rules_from_predecessor(&state, &auth.user_id, room_id.as_str())
+        .await?;
+
     Ok(Ra(create_room::v3::Response::new(room_id)))
 }
 
@@ -438,10 +443,14 @@ async fn join_with_body(
             body,
         )
         .await?;
-        return Ok(());
+    } else {
+        join_remote(state, auth, room_id).await?;
     }
 
-    join_remote(state, auth, room_id).await
+    // Joining an upgraded room carries the old room's push rules over.
+    crate::routes::push::copy_rules_from_predecessor(state, &auth.user_id, room_id.as_str())
+        .await?;
+    Ok(())
 }
 
 /// Join a room hosted on another server: run the make_join/send_join
@@ -632,6 +641,11 @@ pub async fn upgrade_room(
         }),
     )
     .await?;
+
+    // The upgrader joined the replacement inside the upgrade flow, so the
+    // push-rule carry-over runs here rather than via /join.
+    crate::routes::push::copy_rules_from_predecessor(&state, &auth.user_id, new_room_id.as_str())
+        .await?;
 
     Ok(axum::Json(serde_json::json!({
         "replacement_room": new_room_id.as_str(),

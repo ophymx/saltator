@@ -291,3 +291,26 @@ pub fn accepted_event_id(
         saltator_roomserver::Outcome::Duplicate { event_id } => Ok((event_id, 0)),
     }
 }
+
+/// The predecessor room declared by `room_id`'s create event, if any.
+pub fn predecessor_of(rooms: &RoomServer, room_id: &str) -> Result<Option<String>> {
+    let Ok(state) = current_state(rooms, room_id) else {
+        return Ok(None);
+    };
+    let Some(create_id) = state.get(&("m.room.create".to_owned(), String::new())) else {
+        return Ok(None);
+    };
+    let Some(raw) = raw_event(rooms, create_id)? else {
+        return Ok(None);
+    };
+    let Some(CanonicalJsonValue::Object(content)) = raw.get("content") else {
+        return Ok(None);
+    };
+    let Some(CanonicalJsonValue::Object(pred)) = content.get("predecessor") else {
+        return Ok(None);
+    };
+    match pred.get("room_id") {
+        Some(CanonicalJsonValue::String(id)) => Ok(Some(id.clone())),
+        _ => Ok(None),
+    }
+}
