@@ -252,6 +252,7 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             )
             // -- rooms
             .route(&p("/search"), post(search::search))
+            .route(&p("/user_directory/search"), post(search::user_directory))
             .route(&p("/createRoom"), post(rooms::create_room))
             .route(
                 &p("/join/{room_id_or_alias}"),

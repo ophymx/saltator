@@ -182,3 +182,69 @@ pub async fn search(
     }
     respond(room_events)
 }
+
+/// `POST /user_directory/search`: match on global profile displayname or
+/// user ID, over users the caller can see — sharing a room, or members of
+/// a publicly-listed room. Per-room member displaynames are deliberately
+/// not indexed: a name revealed inside a private room must not leak
+/// through the directory (synapse#5677's bug).
+pub async fn user_directory(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    crate::extract::Jb(body): crate::extract::Jb,
+) -> Result<axum::Json<serde_json::Value>> {
+    let term = body
+        .get("search_term")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::invalid_param("search_term is required"))?
+        .to_lowercase();
+    let limit = body
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .min(100) as usize;
+
+    let store = state.users.store();
+    let mut visible: std::collections::BTreeSet<String> = Default::default();
+    let mut rooms: Vec<String> = store.public_rooms().map_err(internal)?;
+    for (room_id, m) in store.memberships(auth.user_id.as_str()).map_err(internal)? {
+        if m.membership == "join" {
+            rooms.push(room_id);
+        }
+    }
+    for room_id in rooms {
+        for member in crate::room_util::joined_member_ids(&state.rooms, &room_id)? {
+            if member != auth.user_id.as_str() {
+                visible.insert(member);
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    let mut limited = false;
+    for user_id in visible {
+        let profile = store
+            .profile(&user_id)
+            .map_err(internal)?
+            .unwrap_or_default();
+        let name_hit = profile
+            .displayname
+            .as_deref()
+            .is_some_and(|n| n.to_lowercase().contains(&term));
+        if term.is_empty() || !(name_hit || user_id.to_lowercase().contains(&term)) {
+            continue;
+        }
+        if results.len() == limit {
+            limited = true;
+            break;
+        }
+        results.push(serde_json::json!({
+            "user_id": user_id,
+            "display_name": profile.displayname,
+            "avatar_url": profile.avatar_url,
+        }));
+    }
+    Ok(axum::Json(
+        serde_json::json!({ "results": results, "limited": limited }),
+    ))
+}

@@ -1152,6 +1152,104 @@ async fn presence_surfaces_on_join() {
     env.shutdown().await;
 }
 
+/// /user_directory/search matches global profile names and mxids for
+/// users visible to the caller (shared room or public directory), and
+/// never leaks room-specific member displaynames.
+#[tokio::test]
+async fn user_directory_search_scopes_visibility() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+    let eve = env.register("eve", "eve-pw").await;
+    let alice_id = format!("@alice:{SERVER}");
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/profile/{alice_id}/displayname"),
+            Some(&alice),
+            Some(json!({"displayname": "Alice Cooper"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Alice is discoverable through a publicly-listed room.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"visibility": "public"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Bob's private room, where alice reveals a room-specific name.
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&bob),
+            Some(json!({"visibility": "private", "invite": [alice_id.clone()], "preset": "private_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let private_room = room["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{private_room}/join"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{private_room}/state/m.room.member/{alice_id}"),
+            Some(&alice),
+            Some(json!({"membership": "join", "displayname": "Freddy"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let search = |token: String, term: &'static str| {
+        let env = &env;
+        async move {
+            let (status, resp) = env
+                .req(
+                    "POST",
+                    "/_matrix/client/v3/user_directory/search",
+                    Some(&token),
+                    Some(json!({"search_term": term})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            resp["results"].as_array().unwrap().clone()
+        }
+    };
+
+    // Eve finds alice by public name and mxid — and only alice.
+    for term in ["Alice Cooper", "alice"] {
+        let results = search(eve.clone(), term).await;
+        assert_eq!(results.len(), 1, "term {term}: {results:?}");
+        assert_eq!(results[0]["user_id"], alice_id.as_str());
+        assert_eq!(results[0]["display_name"], "Alice Cooper");
+    }
+    // The room-specific name is invisible to eve AND unindexed for bob.
+    assert!(search(eve.clone(), "Freddy").await.is_empty());
+    assert!(search(bob.clone(), "Freddy").await.is_empty());
+    // Bob sees alice through the shared room, by name and mxid.
+    for term in ["Alice Cooper", "alice"] {
+        let results = search(bob.clone(), term).await;
+        assert_eq!(results.len(), 1, "term {term}: {results:?}");
+        assert_eq!(results[0]["user_id"], alice_id.as_str());
+    }
+    // Bob is invisible to eve: no shared room, no public listing.
+    assert!(search(eve.clone(), "bob").await.is_empty());
+
+    env.shutdown().await;
+}
+
 /// Transaction IDs are scoped to device + endpoint path, and the local
 /// echo (`unsigned.transaction_id`) is stamped on /event and sync — but
 /// only for the device that sent the event.
