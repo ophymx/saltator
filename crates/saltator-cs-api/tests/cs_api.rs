@@ -1152,6 +1152,194 @@ async fn presence_surfaces_on_join() {
     env.shutdown().await;
 }
 
+/// /relations filters by target, rel_type, and event type, paginates in
+/// both directions accepting sync tokens, and /threads orders roots by
+/// latest activity with the m.thread aggregation attached.
+#[tokio::test]
+async fn relations_and_threads_endpoints() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let send = |txn: String, ty: &'static str, content: serde_json::Value| {
+        let env = &env;
+        let alice = alice.clone();
+        let room_id = room_id.clone();
+        async move {
+            let (status, resp) = env
+                .req(
+                    "PUT",
+                    &format!("/_matrix/client/v3/rooms/{room_id}/send/{ty}/{txn}"),
+                    Some(&alice),
+                    Some(content),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            resp["event_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let thread_reply = |root: String, body: String| {
+        json!({
+            "msgtype": "m.text", "body": body,
+            "m.relates_to": {"event_id": root, "rel_type": "m.thread"},
+        })
+    };
+
+    let root = send(
+        "t1".into(),
+        "m.room.message",
+        json!({"msgtype": "m.text", "body": "root"}),
+    )
+    .await;
+    let (_, sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    let after_root = sync["next_batch"].as_str().unwrap().to_owned();
+    let reply = send(
+        "t2".into(),
+        "m.room.message",
+        thread_reply(root.clone(), "reply".into()),
+    )
+    .await;
+    let dummy = send(
+        "t3".into(),
+        "m.dummy",
+        json!({"m.relates_to": {"event_id": root, "rel_type": "m.thread"}}),
+    )
+    .await;
+    let edit = send(
+        "t4".into(),
+        "m.room.message",
+        json!({
+            "msgtype": "m.text", "body": "* edited",
+            "m.new_content": {"msgtype": "m.text", "body": "edited"},
+            "m.relates_to": {"event_id": root, "rel_type": "m.replace"},
+        }),
+    )
+    .await;
+
+    let get = |url: String| {
+        let env = &env;
+        let alice = alice.clone();
+        async move {
+            let (status, resp) = env.req("GET", &url, Some(&alice), None).await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+            resp
+        }
+    };
+    let ids = |resp: &Value| -> Vec<String> {
+        resp["chunk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["event_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // All relations; by rel_type; by rel_type + event type.
+    let all = get(format!(
+        "/_matrix/client/v1/rooms/{room_id}/relations/{root}"
+    ))
+    .await;
+    assert_eq!(ids(&all), vec![edit.clone(), dummy.clone(), reply.clone()]);
+    let threads_only = get(format!(
+        "/_matrix/client/v1/rooms/{room_id}/relations/{root}/m.thread"
+    ))
+    .await;
+    assert_eq!(ids(&threads_only), vec![dummy.clone(), reply.clone()]);
+    let msgs = get(format!(
+        "/_matrix/client/v1/rooms/{room_id}/relations/{root}/m.thread/m.room.message"
+    ))
+    .await;
+    assert_eq!(ids(&msgs), vec![reply.clone()]);
+
+    // Backward pagination with limit, then the next page via next_batch.
+    let page1 = get(format!(
+        "/_matrix/client/v1/rooms/{room_id}/relations/{root}?limit=2"
+    ))
+    .await;
+    assert_eq!(ids(&page1), vec![edit.clone(), dummy.clone()]);
+    let next = page1["next_batch"].as_str().expect("next_batch").to_owned();
+    let page2 = get(format!(
+        "/_matrix/client/v1/rooms/{room_id}/relations/{root}?limit=2&from={next}"
+    ))
+    .await;
+    assert_eq!(ids(&page2), vec![reply.clone()]);
+    assert!(page2.get("next_batch").is_none(), "{page2}");
+
+    // Forward pagination from a sync token.
+    let fwd = get(format!(
+        "/_matrix/client/v1/rooms/{room_id}/relations/{root}?dir=f&from={after_root}&limit=2"
+    ))
+    .await;
+    assert_eq!(ids(&fwd), vec![reply.clone(), dummy.clone()]);
+
+    // /threads: two threads, ordered by latest activity, with aggregation.
+    let root2 = send(
+        "t5".into(),
+        "m.room.message",
+        json!({"msgtype": "m.text", "body": "root2"}),
+    )
+    .await;
+    let reply2 = send(
+        "t6".into(),
+        "m.room.message",
+        thread_reply(root2.clone(), "r2".into()),
+    )
+    .await;
+    let threads = get(format!("/_matrix/client/v1/rooms/{room_id}/threads")).await;
+    let listed: Vec<(String, String)> = threads["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["event_id"].as_str().unwrap().to_owned(),
+                e["unsigned"]["m.relations"]["m.thread"]["latest_event"]["event_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![(root2.clone(), reply2), (root.clone(), dummy.clone())],
+        "{threads}"
+    );
+    // New reply to thread 1 reorders it to the front and moves latest_event.
+    let reply3 = send(
+        "t7".into(),
+        "m.room.message",
+        thread_reply(root.clone(), "r3".into()),
+    )
+    .await;
+    let threads = get(format!("/_matrix/client/v1/rooms/{room_id}/threads")).await;
+    let first = &threads["chunk"].as_array().unwrap()[0];
+    assert_eq!(first["event_id"], root.as_str());
+    assert_eq!(
+        first["unsigned"]["m.relations"]["m.thread"]["latest_event"]["event_id"],
+        reply3.as_str()
+    );
+    assert_eq!(first["unsigned"]["m.relations"]["m.thread"]["count"], 3);
+    assert_eq!(
+        first["unsigned"]["m.relations"]["m.thread"]["current_user_participated"],
+        true
+    );
+
+    env.shutdown().await;
+}
+
 /// /user_directory/search matches global profile names and mxids for
 /// users visible to the caller (shared room or public directory), and
 /// never leaks room-specific member displaynames.

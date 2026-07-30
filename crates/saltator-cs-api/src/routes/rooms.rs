@@ -1544,14 +1544,14 @@ pub async fn get_messages(
 /// room position. The distinction matters when the token is an upper
 /// bound: `t{n}` excludes event n, `s{n}` includes it.
 #[derive(Clone, Copy)]
-struct PaginationBound {
+pub(crate) struct PaginationBound {
     seq: u64,
     at_event: bool,
 }
 
 impl PaginationBound {
     /// The bound as an inclusive upper limit on event seqs.
-    fn upper(self) -> u64 {
+    pub(crate) fn upper(self) -> u64 {
         if self.at_event {
             self.seq.saturating_sub(1)
         } else {
@@ -1559,9 +1559,13 @@ impl PaginationBound {
         }
     }
     /// The bound as an exclusive lower limit on event seqs.
-    fn lower(self) -> u64 {
+    pub(crate) fn lower(self) -> u64 {
         self.seq
     }
+}
+
+pub(crate) fn parse_pagination_bound(token: &str) -> Result<PaginationBound> {
+    parse_topo_token(token)
 }
 
 fn parse_topo_token(token: &str) -> Result<PaginationBound> {
