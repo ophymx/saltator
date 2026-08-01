@@ -59,6 +59,11 @@ pub struct CsState {
     /// rooms.
     pub federation: Option<Federation>,
     pub(crate) txns: txn::TxnCache,
+    /// Per-user serialization of push-rule read-modify-writes: concurrent
+    /// mutations (two parallel joins both copying upgrade rules, say)
+    /// would otherwise lose one write.
+    pub(crate) push_rule_locks:
+        tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// The bits of the federation surface the CS API drives directly: a signed
@@ -111,6 +116,7 @@ impl CsState {
             presence: Arc::new(PresenceMap::new()),
             federation: None,
             txns: txn::TxnCache::new(),
+            push_rule_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -203,11 +209,13 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             .route(&p("/pushrules/"), get(push::get_pushrules))
             .route(
                 &p("/pushrules/global/{kind}/{rule_id}"),
-                put(push::put_pushrule),
+                get(push::get_pushrule)
+                    .put(push::put_pushrule)
+                    .delete(push::delete_pushrule),
             )
             .route(
                 &p("/pushrules/global/{kind}/{rule_id}/{attr}"),
-                put(push::put_pushrule_attr),
+                get(push::get_pushrule_attr).put(push::put_pushrule_attr),
             )
             .route(&p("/pushers"), get(push::get_pushers))
             .route(&p("/pushers/set"), post(push::set_pushers))

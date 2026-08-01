@@ -55,10 +55,76 @@ async fn save_ruleset(state: &CsState, user_id: &UserId, ruleset: &Ruleset) -> R
     Ok(())
 }
 
+/// Serialize this user's rule mutations: every load→mutate→save must hold
+/// this, or concurrent writers (e.g. two parallel joins copying upgrade
+/// rules) lose updates.
+async fn lock_rules(state: &CsState, user_id: &UserId) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut map = state.push_rule_locks.lock().await;
+        map.entry(user_id.to_string()).or_default().clone()
+    };
+    lock.lock_owned().await
+}
+
 /// `GET /pushrules/`: the full ruleset.
 pub async fn get_pushrules(State(state): State<Arc<CsState>>, auth: Auth) -> JsonResp {
     let ruleset = load_ruleset(&state, &auth.user_id)?;
     Ok(axum::Json(json!({ "global": ruleset })))
+}
+
+/// The serialized form of one rule, looked up by kind + id (string-level:
+/// the stored shape is what clients must see back).
+fn find_rule(ruleset: &Ruleset, kind: &str, rule_id: &str) -> Result<Value> {
+    let global = serde_json::to_value(ruleset).map_err(internal)?;
+    global
+        .get(kind)
+        .and_then(|rules| rules.as_array())
+        .and_then(|rules| {
+            rules
+                .iter()
+                .find(|r| r.get("rule_id").and_then(|i| i.as_str()) == Some(rule_id))
+        })
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("No such push rule"))
+}
+
+/// `GET /pushrules/global/{kind}/{ruleId}`: one rule, 404 when absent.
+pub async fn get_pushrule(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Path((kind, rule_id)): Path<(String, String)>,
+) -> JsonResp {
+    let ruleset = load_ruleset(&state, &auth.user_id)?;
+    Ok(axum::Json(find_rule(&ruleset, &kind, &rule_id)?))
+}
+
+/// `GET /pushrules/global/{kind}/{ruleId}/{enabled|actions}`.
+pub async fn get_pushrule_attr(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Path((kind, rule_id, attr)): Path<(String, String, String)>,
+) -> JsonResp {
+    let ruleset = load_ruleset(&state, &auth.user_id)?;
+    let rule = find_rule(&ruleset, &kind, &rule_id)?;
+    match attr.as_str() {
+        "enabled" | "actions" => Ok(axum::Json(json!({ &attr: rule[&attr] }))),
+        _ => Err(ApiError::invalid_param("Unknown rule attribute")),
+    }
+}
+
+/// `DELETE /pushrules/global/{kind}/{ruleId}`.
+pub async fn delete_pushrule(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Path((kind, rule_id)): Path<(String, String)>,
+) -> JsonResp {
+    let _guard = lock_rules(&state, &auth.user_id).await;
+    let mut ruleset = load_ruleset(&state, &auth.user_id)?;
+    ruleset
+        .remove(RuleKind::from(kind.as_str()), &rule_id)
+        .map_err(|_| ApiError::not_found("No such push rule"))?;
+    save_ruleset(&state, &auth.user_id, &ruleset).await?;
+    Ok(axum::Json(json!({})))
 }
 
 /// `PUT /pushrules/global/{kind}/{ruleId}`: create or replace a rule.
@@ -113,6 +179,7 @@ pub async fn put_pushrule(
         _ => return Err(ApiError::invalid_param("Unknown rule kind")),
     };
 
+    let _guard = lock_rules(&state, &auth.user_id).await;
     let mut ruleset = load_ruleset(&state, &auth.user_id)?;
     ruleset
         .insert(rule, None, None)
@@ -129,6 +196,7 @@ pub async fn put_pushrule_attr(
     Jb(body): Jb,
 ) -> JsonResp {
     let kind = RuleKind::from(kind.as_str());
+    let _guard = lock_rules(&state, &auth.user_id).await;
     let mut ruleset = load_ruleset(&state, &auth.user_id)?;
     match attr.as_str() {
         "enabled" => {
@@ -222,6 +290,7 @@ pub(crate) async fn copy_rules_from_predecessor(
     let Ok(new_room_id) = ruma::OwnedRoomId::try_from(room_id.to_owned()) else {
         return Ok(());
     };
+    let _guard = lock_rules(state, user_id).await;
     let mut ruleset = load_ruleset(state, user_id)?;
     let copied: Vec<NewPushRule> = ruleset
         .room

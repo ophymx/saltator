@@ -3189,6 +3189,37 @@ async fn push_rules_and_pushers() {
     assert!(pr["content"]["global"]["underride"].is_array(), "{pr}");
     let t1 = sync0["next_batch"].as_str().unwrap().to_owned();
 
+    // Single-rule GET: 404 for unknown rules and kinds (clients probe
+    // optional rules and take any other status as existence), 200 with the
+    // rule body for known ones.
+    for path in [
+        "/_matrix/client/v3/pushrules/global/postcontent/.io.element.msc4306.rule.subscribed_thread",
+        "/_matrix/client/v3/pushrules/global/override/.m.rule.does_not_exist",
+    ] {
+        let (status, body) = env.req("GET", path, Some(&alice), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
+    let (status, rule) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/pushrules/global/override/.m.rule.master",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{rule}");
+    assert_eq!(rule["rule_id"], ".m.rule.master", "{rule}");
+    let (status, attr) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/pushrules/global/override/.m.rule.master/enabled",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{attr}");
+    assert_eq!(attr["enabled"], false, "{attr}");
+
     // Adding a rule shows in GET /pushrules/ and in the next sync window.
     let (status, body) = env
         .req(
