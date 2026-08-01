@@ -382,6 +382,11 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             get(media::thumbnail),
         )
         .route("/_matrix/client/v1/media/config", get(media::config))
+        .route(
+            "/_matrix/client/v1/media/preview_url",
+            get(media::preview_url),
+        )
+        .route("/_matrix/media/v3/preview_url", get(media::preview_url))
         // Legacy unauthenticated media (deprecated pre-1.11 surface, still
         // widely used by clients).
         .route(

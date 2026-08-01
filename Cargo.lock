@@ -3013,6 +3013,7 @@ dependencies = [
  "image",
  "postcard",
  "rand 0.8.7",
+ "reqwest",
  "ruma",
  "saltator-core",
  "saltator-federation",

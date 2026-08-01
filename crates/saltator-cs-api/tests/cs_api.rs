@@ -2655,6 +2655,99 @@ async fn threaded_receipts_move_unread_counts() {
     env.shutdown().await;
 }
 
+/// URL previews (Complement TestUrlPreview): OpenGraph tags come back,
+/// and the page's image is cached into the media repo as an mxc URI with
+/// its byte size and PNG dimensions.
+#[tokio::test]
+async fn url_preview_extracts_og_tags_and_caches_image() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+
+    // A 279x129 "PNG": signature + IHDR is all the sizer reads.
+    let mut png: Vec<u8> = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(&13u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&279u32.to_be_bytes());
+    png.extend_from_slice(&129u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0]);
+    png.extend_from_slice(&[0u8; 64]);
+    let png_len = png.len();
+
+    let html = r#"<html prefix="og: http://ogp.me/ns#"><head>
+<title>The Rock (1996)</title>
+<meta property="og:title" content="The Rock" />
+<meta property="og:type" content="video.movie" />
+<meta property="og:url" content="http://www.imdb.com/title/tt0117500/" />
+<meta property="og:image" content="test.png" />
+</head><body></body></html>"#;
+
+    let web = axum::Router::new()
+        .route(
+            "/test.html",
+            axum::routing::get(move || async move { ([("content-type", "text/html")], html) }),
+        )
+        .route(
+            "/test.png",
+            axum::routing::get(move || {
+                let png = png.clone();
+                async move { ([("content-type", "image/png")], png) }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let web_base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, web).await.unwrap();
+    });
+
+    let url_enc = format!("{web_base}/test.html")
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect::<String>();
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/media/v3/preview_url?url={url_enc}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["og:title"], "The Rock", "{got}");
+    assert_eq!(got["og:type"], "video.movie", "{got}");
+    assert_eq!(
+        got["og:url"], "http://www.imdb.com/title/tt0117500/",
+        "{got}"
+    );
+    assert_eq!(got["matrix:image:size"], png_len, "{got}");
+    assert_eq!(got["og:image:width"], 279, "{got}");
+    assert_eq!(got["og:image:height"], 129, "{got}");
+    let mxc = got["og:image"].as_str().unwrap();
+    assert!(mxc.starts_with("mxc://"), "{got}");
+
+    // The cached image downloads from the media repo.
+    let (server, media_id) = mxc.strip_prefix("mxc://").unwrap().split_once('/').unwrap();
+    let (status, _) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v1/media/download/{server}/{media_id}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "cached preview image not downloadable"
+    );
+
+    env.shutdown().await;
+}
+
 /// Key-upload validation, query shape rules, and MSC4225 claim ordering.
 #[tokio::test]
 async fn key_upload_validation_and_claim_ordering() {

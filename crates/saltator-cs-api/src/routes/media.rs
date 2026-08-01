@@ -58,6 +58,195 @@ pub async fn upload(
     Ok(Ra(create_content::v3::Response::new(uri)))
 }
 
+// -- URL previews -------------------------------------------------------------
+
+/// Preview fetches are bounded: page and image reads cap here, and the
+/// whole fetch gets a timeout.
+const PREVIEW_MAX_BYTES: usize = 10 * 1024 * 1024;
+const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `GET /preview_url?url=`: fetch the page, extract its OpenGraph tags,
+/// and cache any `og:image` into the media store as an `mxc://` URI
+/// (spec "URL previews"). NOTE production hardening (private-IP/SSRF
+/// blocklists, per-user caching) is future work — spec.md keeps this
+/// endpoint disabled-by-default territory until then.
+pub async fn preview_url(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let url = query
+        .get("url")
+        .ok_or_else(|| ApiError::invalid_param("url: required parameter is missing"))?;
+    let page_url =
+        reqwest::Url::parse(url).map_err(|_| ApiError::invalid_param("url: not a valid URL"))?;
+    if !matches!(page_url.scheme(), "http" | "https") {
+        return Err(ApiError::invalid_param("url: unsupported scheme"));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(PREVIEW_TIMEOUT)
+        .build()
+        .map_err(internal)?;
+    let (content_type, body) = preview_fetch(&client, page_url.clone()).await?;
+
+    let mut out = serde_json::Map::new();
+    let mut image_url = None;
+    if content_type
+        .as_deref()
+        .is_some_and(|c| c.starts_with("text/html"))
+    {
+        let html = String::from_utf8_lossy(&body);
+        for (property, content) in og_tags(&html) {
+            if property == "og:image" {
+                image_url = Some(content);
+            } else {
+                out.insert(property, content.into());
+            }
+        }
+        if !out.contains_key("og:title") {
+            if let Some(title) = html_title(&html) {
+                out.insert("og:title".to_owned(), title.into());
+            }
+        }
+    } else if content_type
+        .as_deref()
+        .is_some_and(|c| c.starts_with("image/"))
+    {
+        // The URL itself is an image: preview it directly.
+        image_url = Some(url.clone());
+    }
+
+    // Cache the image locally; clients must never fetch the remote URL.
+    if let Some(image) = image_url {
+        if let Ok(image_abs) = page_url.join(&image) {
+            if let Ok((image_type, bytes)) = preview_fetch(&client, image_abs).await {
+                if let Some((w, h)) = png_dimensions(&bytes) {
+                    out.insert("og:image:width".to_owned(), w.into());
+                    out.insert("og:image:height".to_owned(), h.into());
+                }
+                out.insert("matrix:image:size".to_owned(), bytes.len().into());
+                if let Some(ct) = &image_type {
+                    out.insert("og:image:type".to_owned(), ct.clone().into());
+                }
+                let media_id = state.media.store(&bytes).await?;
+                state
+                    .users
+                    .put_media(
+                        &media_id,
+                        MediaMeta {
+                            owner: auth.user_id.to_string(),
+                            content_type: image_type,
+                            filename: None,
+                            size: bytes.len() as u64,
+                            created_ts: now_ms(),
+                            pending: false,
+                        },
+                    )
+                    .await?;
+                out.insert(
+                    "og:image".to_owned(),
+                    format!("mxc://{}/{media_id}", state.config.server_name).into(),
+                );
+            }
+        }
+    }
+    Ok(axum::Json(serde_json::Value::Object(out)))
+}
+
+/// Fetch a preview target, capped at [`PREVIEW_MAX_BYTES`].
+async fn preview_fetch(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+) -> Result<(Option<String>, Vec<u8>)> {
+    let gateway = |e: reqwest::Error| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            format!("preview fetch failed: {e}"),
+        )
+    };
+    let resp = client.get(url).send().await.map_err(gateway)?;
+    if !resp.status().is_success() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            format!("preview fetch failed: HTTP {}", resp.status()),
+        ));
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.split(';').next().unwrap_or(c).trim().to_owned());
+    let bytes = resp.bytes().await.map_err(gateway)?;
+    if bytes.len() > PREVIEW_MAX_BYTES {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "M_TOO_LARGE",
+            "preview target too large",
+        ));
+    }
+    Ok((content_type, bytes.to_vec()))
+}
+
+/// OpenGraph `<meta property="og:..." content="...">` pairs, in document
+/// order. A hand parser is enough here: og tags sit in well-formed heads,
+/// and a wrong parse only degrades the preview.
+fn og_tags(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let lower = html.to_lowercase();
+    let mut at = 0;
+    while let Some(pos) = lower[at..].find("<meta") {
+        let start = at + pos;
+        let Some(end) = lower[start..].find('>') else {
+            break;
+        };
+        let tag = &html[start..start + end];
+        let property = meta_attr(tag, "property").or_else(|| meta_attr(tag, "name"));
+        let content = meta_attr(tag, "content");
+        if let (Some(p), Some(c)) = (property, content) {
+            if p.starts_with("og:") {
+                out.push((p, c));
+            }
+        }
+        at = start + end;
+    }
+    out
+}
+
+/// One quoted attribute value out of a tag snippet.
+fn meta_attr(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let at = lower.find(&format!("{attr}="))? + attr.len() + 1;
+    let rest = &tag[at..];
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value = &rest[1..];
+    Some(value[..value.find(quote)?].to_owned())
+}
+
+fn html_title(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let start = lower.find("<title>")? + "<title>".len();
+    let end = lower[start..].find("</title>")? + start;
+    Some(html[start..end].trim().to_owned())
+}
+
+/// Width/height from a PNG IHDR (the only format the preview sizes;
+/// other images still get cached and measured by byte size).
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || !bytes.starts_with(SIGNATURE) || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    Some((w, h))
+}
+
 // -- async uploads (MSC2246, spec v1.7) --------------------------------------
 
 pub async fn create_async(
