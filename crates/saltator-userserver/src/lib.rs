@@ -695,6 +695,15 @@ impl UserServer {
         .await
     }
 
+    /// Mark a departed room as forgotten (`/forget`).
+    pub async fn forget_room(&self, user_id: &str, room_id: &str) -> Result<()> {
+        self.expect_ok(&UserCommand::ForgetRoom {
+            user_id: user_id.to_owned(),
+            room_id: room_id.to_owned(),
+        })
+        .await
+    }
+
     // -- internals ---------------------------------------------------------
 
     /// Canonicalize a localpart or full user ID for this server. Capitals

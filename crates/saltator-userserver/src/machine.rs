@@ -432,6 +432,7 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                             sender: c.sender.clone(),
                             room_seq: c.room_seq,
                             seq,
+                            forgotten: false,
                         },
                     )?,
                 );
@@ -503,6 +504,7 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                         // user-shard seq drives the sync window.
                         room_seq: seq,
                         seq,
+                        forgotten: false,
                     },
                 )?,
             );
@@ -533,10 +535,23 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                         sender: user_id.clone(),
                         room_seq: seq,
                         seq,
+                        forgotten: false,
                     },
                 )?,
             );
             ctx.delete(T_INVITE_STATE, &mkey);
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::ForgetRoom { user_id, room_id } => {
+            let mkey = user_key(user_id, room_id);
+            // The entry keeps its seq: forgetting must not resurface the
+            // room in incremental syncs that already saw the leave.
+            if let Some(mut entry) =
+                get_typed::<MembershipEntry>(ctx, "membership decode", T_MEMBERSHIP, &mkey)?
+            {
+                entry.forgotten = true;
+                ctx.put(T_MEMBERSHIP, &mkey, enc("membership encode", &entry)?);
+            }
             Ok(UserResponse::Ok)
         }
         UserCommand::UploadKeys {

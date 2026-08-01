@@ -21,6 +21,7 @@ fn visible_events(
     auth: &Auth,
     room_id: &str,
 ) -> Result<Vec<(u64, serde_json::Value)>> {
+    crate::routes::rooms::ensure_not_forgotten(state, auth.user_id.as_str(), room_id)?;
     let (_, cap) = member_view(&state.rooms, room_id, auth.user_id.as_str()).map_err(|e| {
         if e.status == axum::http::StatusCode::NOT_FOUND {
             ApiError::forbidden("You aren't a member of the room")

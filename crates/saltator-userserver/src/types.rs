@@ -185,6 +185,10 @@ pub struct MembershipEntry {
     pub room_seq: u64,
     /// User-shard seq at which the projection recorded it.
     pub seq: u64,
+    /// The user forgot this room (`/forget`): history reads are denied and
+    /// the room is dropped from fresh syncs. Any later membership change
+    /// overwrites the row, clearing the flag.
+    pub forgotten: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +323,13 @@ pub enum UserCommand {
     /// Reject/leave a remote room: set `leave` membership and clear the
     /// pending-invite stripped state.
     RecordRemoteLeave {
+        user_id: String,
+        room_id: String,
+    },
+    /// Mark a departed room as forgotten (`/forget`). No-op when the user
+    /// has no membership row; the flag survives until a membership change
+    /// rewrites the row.
+    ForgetRoom {
         user_id: String,
         room_id: String,
     },

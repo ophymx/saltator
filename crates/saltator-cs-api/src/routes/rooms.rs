@@ -819,8 +819,11 @@ pub async fn forget_room(
             "You must leave the room before forgetting it",
         ));
     }
-    // Forgetting hides history; with no per-user history trimming yet
-    // this is accepted as a no-op (M2).
+    state
+        .users
+        .forget_room(auth.user_id.as_str(), req.room_id.as_str())
+        .await
+        .map_err(internal)?;
     Ok(Ra(forget_room::v3::Response::new()))
 }
 
@@ -1196,11 +1199,27 @@ pub async fn redact_event(
 
 // -- reads ----------------------------------------------------------------------
 
+/// Departed members keep reading history up to their leave — unless they
+/// forgot the room, which revokes that residual access.
+pub(crate) fn ensure_not_forgotten(state: &CsState, user_id: &str, room_id: &str) -> Result<()> {
+    let forgotten = state
+        .users
+        .store()
+        .membership(user_id, room_id)
+        .map_err(internal)?
+        .is_some_and(|m| m.forgotten);
+    if forgotten {
+        return Err(ApiError::forbidden("You aren't a member of the room"));
+    }
+    Ok(())
+}
+
 pub async fn get_state_events(
     State(state): State<Arc<CsState>>,
     auth: Auth,
     Ar(req): Ar<get_state_events::v3::Request>,
 ) -> Result<Ra<get_state_events::v3::Response>> {
+    ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str())?;
     let (current, _) =
         crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
     let meta = room_meta(&state.rooms, req.room_id.as_str())?;
@@ -1225,6 +1244,7 @@ pub async fn get_state_event(
     auth: Auth,
     Ar(req): Ar<get_state_event_for_key::v3::Request>,
 ) -> Result<Ra<get_state_event_for_key::v3::Response>> {
+    ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str())?;
     let (current, _) =
         crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
     let key = (req.event_type.to_string(), req.state_key.clone());
@@ -1305,13 +1325,14 @@ pub async fn get_members(
     auth: Auth,
     Ar(req): Ar<get_member_events::v3::Request>,
 ) -> Result<Ra<get_member_events::v3::Response>> {
+    ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str())?;
     let (mut current, cap) =
         crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
     // `?at=`: members as of a stream position (bounded by the caller's
     // own view ceiling).
     if let Some(at) = &req.at {
         // The token as a stream position: everything at or before it.
-        let mut seq = parse_topo_token(at)?.upper();
+        let mut seq = parse_topo_token(at)?.at_seq();
         if let Some(cap) = cap {
             seq = seq.min(cap);
         }
@@ -1405,6 +1426,7 @@ pub async fn get_messages(
     // unknown room reads as 403 too (sytest: "You aren't a member"), not
     // as an existence oracle. Departed members read history only up to
     // their leave (`cap`).
+    ensure_not_forgotten(&state, auth.user_id.as_str(), &room_id)?;
     let (_, cap) = crate::room_util::member_view(&state.rooms, &room_id, auth.user_id.as_str())
         .map_err(|e| {
             if e.status == axum::http::StatusCode::NOT_FOUND {
@@ -1557,10 +1579,17 @@ pub async fn get_messages(
 /// (clients feed next_batch straight into /messages) sit AFTER their
 /// room position. The distinction matters when the token is an upper
 /// bound: `t{n}` excludes event n, `s{n}` includes it.
+///
+/// Sync prev_batch tokens carry a second component (`t{seq}_{stream}`):
+/// the room position when the token was minted. `/members?at=` resolves
+/// through it — "members at a point in sync" means the sync response's
+/// stream position, not the timeline-window start (matches Synapse,
+/// which reads the stream half of its tokens there).
 #[derive(Clone, Copy)]
 pub(crate) struct PaginationBound {
     seq: u64,
     at_event: bool,
+    stream: Option<u64>,
 }
 
 impl PaginationBound {
@@ -1576,6 +1605,14 @@ impl PaginationBound {
     pub(crate) fn lower(self) -> u64 {
         self.seq
     }
+    /// The stream position for `?at=` state snapshots: mint-time position
+    /// when the token carries one, else the pagination upper bound.
+    pub(crate) fn at_seq(self) -> u64 {
+        match self.stream {
+            Some(s) => s,
+            None => self.upper(),
+        }
+    }
 }
 
 pub(crate) fn parse_pagination_bound(token: &str) -> Result<PaginationBound> {
@@ -1584,19 +1621,29 @@ pub(crate) fn parse_pagination_bound(token: &str) -> Result<PaginationBound> {
 
 fn parse_topo_token(token: &str) -> Result<PaginationBound> {
     if token.starts_with('s') {
+        let seq = crate::routes::sync::token_room_seq(token)?;
         return Ok(PaginationBound {
-            seq: crate::routes::sync::token_room_seq(token)?,
+            seq,
             at_event: false,
+            stream: Some(seq),
         });
     }
-    token
+    let body = token
         .strip_prefix('t')
-        .and_then(|s| s.parse().ok())
-        .map(|seq| PaginationBound {
-            seq,
-            at_event: true,
-        })
-        .ok_or_else(|| ApiError::invalid_param("Invalid pagination token"))
+        .ok_or_else(|| ApiError::invalid_param("Invalid pagination token"))?;
+    let (seq, stream) = match body.split_once('_') {
+        Some((seq, stream)) => (seq, Some(stream)),
+        None => (body, None),
+    };
+    let parse = |s: &str| {
+        s.parse::<u64>()
+            .map_err(|_| ApiError::invalid_param("Invalid pagination token"))
+    };
+    Ok(PaginationBound {
+        seq: parse(seq)?,
+        at_event: true,
+        stream: stream.map(parse).transpose()?,
+    })
 }
 
 // -- aliases / directory ---------------------------------------------------------

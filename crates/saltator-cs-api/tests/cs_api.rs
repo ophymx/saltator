@@ -2217,6 +2217,226 @@ async fn departed_room_reads_frozen_at_leave() {
     env.shutdown().await;
 }
 
+/// Forgetting a room revokes the departed-member residual access: history
+/// reads 403 (even with malformed queries), fresh include_leave syncs drop
+/// the room, but the leave still rides incremental syncs so other devices
+/// learn of it. Rejoining clears the flag.
+#[tokio::test]
+async fn forget_revokes_departed_access() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Token from before the leave, for the incremental-sync assertion.
+    let (_, sync0) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+        .await;
+    let pre_leave = sync0["next_batch"].as_str().unwrap().to_owned();
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/f1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "hello"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/forget"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // History reads 403 — including a /messages with no dir param at all:
+    // access is judged before query validation.
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{got}");
+    assert_eq!(got["errcode"], "M_FORBIDDEN", "{got}");
+    for path in ["state", "members"] {
+        let (status, got) = env
+            .req(
+                "GET",
+                &format!("/_matrix/client/v3/rooms/{room_id}/{path}"),
+                Some(&bob),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "forgotten /{path}: {got}");
+    }
+
+    // Fresh include_leave sync: the forgotten room is gone.
+    let filter = "%7B%22room%22%3A%7B%22include_leave%22%3Atrue%7D%7D";
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?filter={filter}"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(
+        got["rooms"]["leave"][&room_id].is_null(),
+        "forgotten room in initial include_leave sync: {got}"
+    );
+
+    // Incremental sync spanning the leave still reports it (other devices
+    // must be able to observe the departure).
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={pre_leave}&filter={filter}"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(
+        !got["rooms"]["leave"][&room_id].is_null(),
+        "leave hidden from incremental sync after forget: {got}"
+    );
+
+    // Rejoining clears the flag: reads work again.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rejoin did not restore reads: {got}"
+    );
+
+    env.shutdown().await;
+}
+
+/// /members?at= with a sync prev_batch token resolves to the room position
+/// the sync was minted at — not the timeline-window start the token also
+/// anchors for /messages pagination.
+#[tokio::test]
+async fn members_at_prev_batch_snapshots_mint_position() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/p1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "Hello world!"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Initial sync covers the room's whole history; its prev_batch must
+    // still snapshot members as of sync time.
+    let (_, sync0) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    let prev_batch = sync0["rooms"]["join"][&room_id]["timeline"]["prev_batch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/members?at={prev_batch}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let at_members: Vec<&str> = got["chunk"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["state_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        at_members,
+        vec![format!("@alice:{SERVER}")],
+        "prev_batch ?at= should see alice but not the later joiner: {got}"
+    );
+
+    env.shutdown().await;
+}
+
 /// Key-upload validation, query shape rules, and MSC4225 claim ordering.
 #[tokio::test]
 async fn key_upload_validation_and_claim_ordering() {

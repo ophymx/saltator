@@ -364,11 +364,13 @@ fn build_sync(
                     .invite
                     .insert(room_id, build_invited_room(state, auth, &room_id_str, &m)?);
             }
-            // Newly-left rooms ride incremental syncs; older leaves are
-            // opt-in via the include_leave filter (initial or full-state).
+            // Newly-left rooms ride incremental syncs — even when forgotten,
+            // so other devices still learn about the leave. Older leaves are
+            // opt-in via the include_leave filter (initial or full-state),
+            // where forgotten rooms stay hidden.
             "leave" | "ban"
                 if (!initial && m.seq > since.user)
-                    || (include_leave && (initial || full_state)) =>
+                    || (!m.forgotten && include_leave && (initial || full_state)) =>
             {
                 resp.rooms.leave.insert(
                     room_id,
@@ -554,7 +556,9 @@ fn build_joined_room(
     let mut out = v3::JoinedRoom::new();
     out.timeline.limited = limited;
     if let Some((first_seq, _)) = window.first() {
-        out.timeline.prev_batch = Some(format!("t{first_seq}"));
+        // Two-part token: window-start anchor for /messages pagination,
+        // mint-time room position for /members?at= snapshots.
+        out.timeline.prev_batch = Some(format!("t{first_seq}_{}", now.room));
     }
     let mut timeline_senders: Vec<String> = Vec::new();
     for (_, event_id) in &window {
@@ -789,7 +793,8 @@ fn build_left_room(
     window.truncate(filter.limit);
     window.reverse();
     if let Some((first_seq, _)) = window.first() {
-        out.timeline.prev_batch = Some(format!("t{first_seq}"));
+        // Departed view: the mint-time position caps at the leave.
+        out.timeline.prev_batch = Some(format!("t{first_seq}_{ceiling}"));
     }
     for (_, event_id) in &window {
         if let Some(mut ev) =
