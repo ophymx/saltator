@@ -4,16 +4,47 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly unfiltered run: the federation suite executes without the
+    # deferred-bucket skip, so a deferred test that starts passing is
+    # still noticed.
+    - cron: "0 6 * * 1"
+
+# A superseded push is not worth finishing. Scheduled runs get their own
+# group so a push never cancels the weekly unfiltered suite.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  build:
+    name: build (release)
+    # One release build shared (as an artifact) by every job that runs the
+    # binary. Pinned (not -latest): the binary executes inside the
+    # ubuntu:24.04 Complement image, so builder and image glibc must stay
+    # matched.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build saltator (release)
+        run: cargo build --release -p saltator
+      - uses: actions/upload-artifact@v7
+        with:
+          name: saltator-release
+          path: target/release/saltator
+          # Consumed within this run only; don't bill storage for 90 days.
+          retention-days: 1
+
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Free disk space
         # `cargo test --workspace --all-targets` links every test binary with
         # RocksDB statically embedded; on a stock runner that can exhaust the
@@ -39,13 +70,16 @@ jobs:
     # Two real saltator binaries form a cluster: node 2 joins node 1 and the
     # reconciler admits it as a voter of both shard groups. Gates — a broken
     # join/placement/reconcile path fails the build.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    needs: build
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build saltator (release)
-        run: cargo build --release -p saltator
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: saltator-release
+          path: target/release
+      # Artifacts drop the exec bit.
+      - run: chmod +x target/release/saltator
       - name: Two-node smoke test
         run: ./scripts/two_node_smoke.sh target/release/saltator
 
@@ -53,40 +87,41 @@ jobs:
     name: chaos (3-node kill -9)
     # M4 exit criterion (spec.md §12): a 3-node cluster survives kill -9 of
     # the room-shard leader mid-traffic with no message loss. Gates.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    needs: build
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build saltator (release)
-        run: cargo build --release -p saltator
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: saltator-release
+          path: target/release
+      - run: chmod +x target/release/saltator
       - name: Three-node chaos test
         run: ./scripts/three_node_chaos.sh target/release/saltator
 
   complement:
     name: complement (csapi)
-    # Pinned (not -latest): the saltator binary is built on this runner but
-    # executed inside the ubuntu:24.04 Complement image, so builder and
-    # image glibc must stay matched.
     runs-on: ubuntu-24.04
+    needs: build
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build saltator (release)
-        run: cargo build --release -p saltator
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: saltator-release
+          path: target/release
+      - run: chmod +x target/release/saltator
       - name: Build Complement image
         run: |
           cp target/release/saltator docker/complement/saltator
           docker build -t complement-saltator:latest docker/complement
       - name: Checkout Complement
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: matrix-org/complement
           # Pinned so runs are reproducible; bump deliberately.
           ref: f002aff99e240c994231a21985546b1c16d4173c
           path: complement
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache-dependency-path: complement/go.sum
@@ -126,7 +161,7 @@ jobs:
       # it no longer hits the step log.
       - name: Upload results JSON
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: complement-csapi-json
           path: /tmp/complement.json
@@ -134,26 +169,26 @@ jobs:
 
   complement-federation:
     name: complement (federation)
-    # Same pinning rationale as the csapi job: binary built here, run inside
-    # the ubuntu:24.04 image.
     runs-on: ubuntu-24.04
+    needs: build
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build saltator (release)
-        run: cargo build --release -p saltator
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: saltator-release
+          path: target/release
+      - run: chmod +x target/release/saltator
       - name: Build Complement image
         run: |
           cp target/release/saltator docker/complement/saltator
           docker build -t complement-saltator:latest docker/complement
       - name: Checkout Complement
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: matrix-org/complement
           ref: f002aff99e240c994231a21985546b1c16d4173c
           path: complement
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache-dependency-path: complement/go.sum
@@ -161,11 +196,17 @@ jobs:
         working-directory: complement
         env:
           COMPLEMENT_BASE_IMAGE: complement-saltator:latest
+          # Deferred-feature buckets (knocking, restricted rooms/spaces,
+          # federated device-list stream tracking) are red until their
+          # milestone and burn full timeouts on every push (~6 min of the
+          # suite). Skipped per-push; the weekly scheduled run is
+          # unfiltered.
+          SKIP_DEFERRED: ${{ github.event_name != 'schedule' && '-skip=Knock|RestrictedRooms|TestDeviceListsUpdateOverFederation' || '' }}
         # The federation suite is the root `tests` package (not
         # `tests/csapi`). Tracked, not gated: federation coverage is early,
         # so this reports the pass rate and never fails the build — it exists
         # to surface which endpoints the real handshake demands next.
-        run: go test -json -timeout 30m ./tests | tee /tmp/complement-fed.json || true
+        run: go test -json -timeout 30m $SKIP_DEFERRED ./tests | tee /tmp/complement-fed.json || true
       - name: Pass-rate summary
         run: |
           pass=$(jq -r 'select(.Action=="pass" and .Test != null) | .Test' /tmp/complement-fed.json | wc -l)
@@ -190,12 +231,14 @@ jobs:
     # jobs (tracked pass-rate), this is a binary proof and GATES — a green
     # run means the federation loop actually works end to end.
     runs-on: ubuntu-24.04
+    needs: build
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build saltator (release)
-        run: cargo build --release -p saltator
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: saltator-release
+          path: target/release
+      - run: chmod +x target/release/saltator
       - name: Build saltator interop image
         run: |
           cp target/release/saltator docker/complement/saltator
