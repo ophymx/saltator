@@ -3870,6 +3870,641 @@ async fn client_joins_a_remote_room_via_federation() {
     a_rooms.shutdown().await.unwrap();
 }
 
+/// Remote join, then paginate the room's WHOLE history backwards: the
+/// messages sent before our join live on the resident and arrive via
+/// federated `GET /backfill`, continuing seamlessly past the local
+/// timeline floor until `end` disappears at the room's beginning
+/// (Complement TestMessagesOverFederation).
+#[tokio::test]
+async fn remote_join_backfills_full_history() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Node A hosts a public v11 room with pre-join history.
+    let (a_rooms, a_signer) = start_fed_rooms("a.test", dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let (room_id, _) = a_rooms
+        .create_room(
+            &alice,
+            saltator_core::RoomVersion::V11,
+            serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        a_rooms
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+    }
+    let total = 20;
+    for i in 1..=total {
+        a_rooms
+            .send_message(
+                &room_id,
+                &alice,
+                "m.room.message",
+                json!({"msgtype": "m.text", "body": format!("history {i}")}),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Node B: full CS stack + federation aimed at A.
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    let b_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+
+    let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
+    let a_base = spawn_fed(
+        "a.test",
+        a_signer.clone(),
+        Some(a_rooms.clone()),
+        Some(b_key_base),
+    )
+    .await;
+
+    let media = MediaStore::open(b_dir.join("media")).unwrap();
+    let state = CsState::new(
+        b_users.clone(),
+        b_rooms.clone(),
+        media,
+        CsConfig {
+            server_name: b_name,
+            default_room_version: saltator_core::RoomVersion::V12,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(b_signer.clone(), a_base)),
+        b_signer.clone(),
+    );
+    let router = saltator_cs_api::router(state);
+
+    let http_req =
+        |method: &'static str, path: String, token: Option<String>, body: Option<Value>| {
+            let router = router.clone();
+            async move {
+                let mut b = Request::builder().method(method).uri(path);
+                if let Some(t) = token {
+                    b = b.header("Authorization", format!("Bearer {t}"));
+                }
+                let body = match body {
+                    Some(v) => {
+                        b = b.header("Content-Type", "application/json");
+                        Body::from(serde_json::to_vec(&v).unwrap())
+                    }
+                    None => Body::empty(),
+                };
+                let resp = router.oneshot(b.body(body).unwrap()).await.unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let val: Value = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+                };
+                (status, val)
+            }
+        };
+
+    let (_s, ch) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({"username": "bob", "password": "bob-pw-1234"})),
+    )
+    .await;
+    let session = ch["session"].as_str().unwrap().to_owned();
+    let (_s, reg) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({
+            "username": "bob", "password": "bob-pw-1234",
+            "auth": {"type": "m.login.dummy", "session": session},
+        })),
+    )
+    .await;
+    let bob = reg["access_token"].as_str().unwrap().to_owned();
+
+    let room_enc: String = room_id
+        .as_str()
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let (status, body) = http_req(
+        "POST",
+        format!("/_matrix/client/v3/rooms/{room_enc}/join"),
+        Some(bob.clone()),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "join failed: {body}");
+
+    // Paginate backwards until `end` disappears, collecting everything.
+    let mut bodies: Vec<String> = Vec::new();
+    let mut saw_create = false;
+    let mut from: Option<String> = None;
+    for page in 0.. {
+        assert!(page < 12, "pagination did not terminate");
+        let path = match &from {
+            Some(f) => {
+                format!("/_matrix/client/v3/rooms/{room_enc}/messages?dir=b&limit=10&from={f}")
+            }
+            None => format!("/_matrix/client/v3/rooms/{room_enc}/messages?dir=b&limit=10"),
+        };
+        let (status, got) = http_req("GET", path, Some(bob.clone()), None).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        for ev in got["chunk"].as_array().unwrap() {
+            if ev["type"] == "m.room.create" {
+                saw_create = true;
+            }
+            if let Some(b) = ev["content"]["body"].as_str() {
+                bodies.push(b.to_owned());
+            }
+        }
+        match got["end"].as_str() {
+            Some(end) => from = Some(end.to_owned()),
+            None => break,
+        }
+    }
+    let expected: Vec<String> = (1..=total).rev().map(|i| format!("history {i}")).collect();
+    assert_eq!(
+        bodies, expected,
+        "backfilled history incomplete or out of order"
+    );
+    assert!(saw_create, "pagination never reached the room's beginning");
+
+    // Re-join: bob leaves, misses 20 messages (no local user → nothing
+    // federates to us), rejoins. The rejoin must go back through the
+    // resident (our fork is stale) and the missed span must become
+    // paginatable via the refreshed backfill frontier.
+    let (status, body) = http_req(
+        "POST",
+        format!("/_matrix/client/v3/rooms/{room_enc}/leave"),
+        Some(bob.clone()),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "leave failed: {body}");
+    for i in 1..=total {
+        a_rooms
+            .send_message(
+                &room_id,
+                &alice,
+                "m.room.message",
+                json!({"msgtype": "m.text", "body": format!("missed {i}")}),
+            )
+            .await
+            .unwrap();
+    }
+    let (status, body) = http_req(
+        "POST",
+        format!("/_matrix/client/v3/rooms/{room_enc}/join"),
+        Some(bob.clone()),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rejoin failed: {body}");
+
+    let mut bodies: Vec<String> = Vec::new();
+    let mut from: Option<String> = None;
+    for page in 0.. {
+        assert!(page < 16, "rejoin pagination did not terminate");
+        let path = match &from {
+            Some(f) => {
+                format!("/_matrix/client/v3/rooms/{room_enc}/messages?dir=b&limit=10&from={f}")
+            }
+            None => format!("/_matrix/client/v3/rooms/{room_enc}/messages?dir=b&limit=10"),
+        };
+        let (status, got) = http_req("GET", path, Some(bob.clone()), None).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        for ev in got["chunk"].as_array().unwrap() {
+            if let Some(b) = ev["content"]["body"].as_str() {
+                bodies.push(b.to_owned());
+            }
+        }
+        match got["end"].as_str() {
+            Some(end) => from = Some(end.to_owned()),
+            None => break,
+        }
+    }
+    // The missed messages appear in reverse-chronological relative order
+    // (their absolute position rides the MSC3871 gappy-timeline hole).
+    let missed: Vec<&String> = bodies.iter().filter(|b| b.starts_with("missed ")).collect();
+    let expected_missed: Vec<String> = (1..=total).rev().map(|i| format!("missed {i}")).collect();
+    assert_eq!(
+        missed,
+        expected_missed.iter().collect::<Vec<_>>(),
+        "missed span not backfilled in order: {bodies:?}"
+    );
+    for i in 1..=total {
+        assert!(
+            bodies.contains(&format!("history {i}")),
+            "pre-join history lost after rejoin"
+        );
+    }
+
+    projection.abort();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+    a_rooms.shutdown().await.unwrap();
+}
+
+/// An unfillable DAG gap (the origin truncates /get_missing_events) is
+/// anchored on fetched state; the recovered tail joins the timeline past
+/// a gap marker, and the incremental sync spanning it serves ONLY the
+/// post-gap events with `limited: true` (Complement TestSyncTimelineGap).
+#[tokio::test]
+async fn sync_gap_sets_limited_and_truncates_window() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Node A hosts the room.
+    let (a_rooms, a_signer) = start_fed_rooms("a.test", dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let (room_id, _) = a_rooms
+        .create_room(
+            &alice,
+            saltator_core::RoomVersion::V11,
+            serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        a_rooms
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+    }
+
+    // Node B: full CS stack; bob joins remotely (same shape as the
+    // backfill test).
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    let b_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+
+    let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
+    let a_base = spawn_fed(
+        "a.test",
+        a_signer.clone(),
+        Some(a_rooms.clone()),
+        Some(b_key_base),
+    )
+    .await;
+
+    let media = MediaStore::open(b_dir.join("media")).unwrap();
+    let state = CsState::new(
+        b_users.clone(),
+        b_rooms.clone(),
+        media,
+        CsConfig {
+            server_name: b_name.clone(),
+            default_room_version: saltator_core::RoomVersion::V12,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(
+            b_signer.clone(),
+            a_base.clone(),
+        )),
+        b_signer.clone(),
+    );
+    let router = saltator_cs_api::router(state);
+
+    let http_req =
+        |method: &'static str, path: String, token: Option<String>, body: Option<Value>| {
+            let router = router.clone();
+            async move {
+                let mut b = Request::builder().method(method).uri(path);
+                if let Some(t) = token {
+                    b = b.header("Authorization", format!("Bearer {t}"));
+                }
+                let body = match body {
+                    Some(v) => {
+                        b = b.header("Content-Type", "application/json");
+                        Body::from(serde_json::to_vec(&v).unwrap())
+                    }
+                    None => Body::empty(),
+                };
+                let resp = router.oneshot(b.body(body).unwrap()).await.unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let val: Value = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+                };
+                (status, val)
+            }
+        };
+
+    let (_s, ch) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({"username": "bob", "password": "bob-pw-1234"})),
+    )
+    .await;
+    let session = ch["session"].as_str().unwrap().to_owned();
+    let (_s, reg) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({
+            "username": "bob", "password": "bob-pw-1234",
+            "auth": {"type": "m.login.dummy", "session": session},
+        })),
+    )
+    .await;
+    let bob = reg["access_token"].as_str().unwrap().to_owned();
+
+    let room_enc: String = room_id
+        .as_str()
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let (status, body) = http_req(
+        "POST",
+        format!("/_matrix/client/v3/rooms/{room_enc}/join"),
+        Some(bob.clone()),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "join failed: {body}");
+
+    // Bob's sync position before any of the new traffic.
+    let (_, sync0) = http_req(
+        "GET",
+        "/_matrix/client/v3/sync".into(),
+        Some(bob.clone()),
+        None,
+    )
+    .await;
+    let since = sync0["next_batch"].as_str().unwrap().to_owned();
+
+    // On A: one message that will federate normally, then 12 that won't,
+    // then the one that triggers the gap fill.
+    let send = |body: String| {
+        let a_rooms = a_rooms.clone();
+        let room_id = room_id.clone();
+        let alice = alice.clone();
+        async move {
+            match a_rooms
+                .send_message(
+                    &room_id,
+                    &alice,
+                    "m.room.message",
+                    json!({"msgtype": "m.text", "body": body}),
+                )
+                .await
+                .unwrap()
+            {
+                saltator_roomserver::Outcome::Accepted { event_id, .. } => event_id.to_string(),
+                o => panic!("{o:?}"),
+            }
+        }
+    };
+    let pre_id = send("before the gap".to_owned()).await;
+    let mut gap_ids = Vec::new();
+    for i in 1..=12 {
+        gap_ids.push(send(format!("gap {i}")).await);
+    }
+    let last_id = send("End".to_owned()).await;
+
+    let raw_of = |id: &str| -> Value {
+        serde_json::from_slice(&a_rooms.store().event(id).unwrap().unwrap().raw).unwrap()
+    };
+
+    // The mock origin: /get_missing_events returns only the newest two
+    // gap events (a truncated response, like Synapse's default limit
+    // against a 50-event gap), /state returns A's current state.
+    let a_meta = a_rooms.store().meta(room_id.as_str()).unwrap().unwrap();
+    let state_map: std::collections::BTreeMap<(String, String), String> = a_rooms
+        .store()
+        .resolve_group(room_id.as_str(), a_meta.current_group)
+        .unwrap();
+    let state_pdus: Vec<Value> = state_map.values().map(|id| raw_of(id)).collect();
+    let tail: Vec<Value> = gap_ids[10..].iter().map(|id| raw_of(id)).collect();
+    let missing_resp = json!({ "events": tail });
+    let state_resp = json!({ "pdus": state_pdus, "auth_chain": [] });
+    let mock = axum::Router::new()
+        .route(
+            "/_matrix/federation/v1/get_missing_events/{room_id}",
+            axum::routing::post(move || {
+                let r = missing_resp.clone();
+                async move { axum::Json(r) }
+            }),
+        )
+        .route(
+            "/_matrix/federation/v1/state/{room_id}",
+            axum::routing::get(move || {
+                let r = state_resp.clone();
+                async move { axum::Json(r) }
+            }),
+        );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_base = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock).await.unwrap();
+    });
+
+    // B's inbound federation surface: authenticates A via a_base, but its
+    // outbound gap-fill client talks to the truncating mock.
+    let b_fed = Arc::new(FedState {
+        server_name: b_name.clone(),
+        signer: b_signer.clone(),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: KeyCache::with_base_url(a_base.clone()),
+        rooms: Some(b_rooms.clone()),
+        users: None,
+        client: Some(Arc::new(FederationClient::with_base_url(
+            b_signer.clone(),
+            mock_base,
+        ))),
+        edu_sink: None,
+        media: None,
+    });
+    let b_fed_router = saltator_federation::router(b_fed);
+    let b_fed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_fed_base = format!("http://{}", b_fed_listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(b_fed_listener, b_fed_router).await.unwrap();
+    });
+
+    let a_client = FederationClient::with_base_url(a_signer.clone(), b_fed_base.clone());
+    let deliver = |path: &'static str, pdu: Value, expect_id: String| {
+        let a_client = &a_client;
+        async move {
+            let txn = json!({ "origin": "a.test", "origin_server_ts": 1000, "pdus": [pdu] });
+            let out = a_client.put("b.test", path, &txn).await.unwrap();
+            assert!(
+                out["pdus"][&expect_id]
+                    .as_object()
+                    .map(|o| o.is_empty())
+                    .unwrap_or(false),
+                "PDU {expect_id} not accepted: {out}"
+            );
+        }
+    };
+    // The pre-gap message federates normally (its prev is bob's join,
+    // which B holds).
+    deliver(
+        "/_matrix/federation/v1/send/txnpre",
+        raw_of(&pre_id),
+        pre_id.clone(),
+    )
+    .await;
+    // "End" arrives with 12 missing ancestors; the origin only coughs up
+    // the last two, so B must anchor them on fetched state.
+    deliver(
+        "/_matrix/federation/v1/send/txngap",
+        raw_of(&last_id),
+        last_id.clone(),
+    )
+    .await;
+
+    // The recovered tail is on B's timeline; the unfetchable span joined
+    // the backfill frontier behind a gap marker.
+    let b_meta = b_rooms.store().meta(room_id.as_str()).unwrap().unwrap();
+    assert_eq!(b_meta.gap_markers.len(), 1, "expected one gap marker");
+    assert!(
+        b_rooms
+            .history_frontier(room_id.as_str())
+            .unwrap()
+            .contains(&gap_ids[9]),
+        "gap 10 should be on the backfill frontier"
+    );
+
+    // Incremental sync spanning the gap: only the post-gap events, with
+    // the limited flag — the pre-gap message must not ride along.
+    let (status, got) = http_req(
+        "GET",
+        format!("/_matrix/client/v3/sync?since={since}"),
+        Some(bob.clone()),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let timeline = &got["rooms"]["join"][room_id.as_str()]["timeline"];
+    assert_eq!(
+        timeline["limited"], true,
+        "gap window must be limited: {timeline}"
+    );
+    let bodies: Vec<&str> = timeline["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["content"]["body"].as_str())
+        .collect();
+    assert_eq!(
+        bodies,
+        vec!["gap 11", "gap 12", "End"],
+        "window should hold exactly the post-gap events: {timeline}"
+    );
+
+    projection.abort();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+    a_rooms.shutdown().await.unwrap();
+}
+
 // --- Inbound federated invite --------------------------------------------
 
 #[tokio::test]

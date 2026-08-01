@@ -133,7 +133,7 @@ fn auth_event_ids(obj: &CanonicalJsonObject) -> Vec<String> {
 }
 
 /// Event IDs in an event's `prev_events` (v3+ list-of-strings form).
-fn prev_event_ids(obj: &CanonicalJsonObject) -> Vec<String> {
+pub(crate) fn prev_event_ids(obj: &CanonicalJsonObject) -> Vec<String> {
     id_list(obj, "prev_events")
 }
 
@@ -681,6 +681,13 @@ impl RoomServer {
         let sender = str_of(&join, "sender")?.to_owned();
         state_map.insert(("m.room.member".to_owned(), sender), join_id.to_string());
 
+        // Everything before our join lives on the resident: the join's
+        // unheld prev_events seed the backfill frontier.
+        let history_frontier: Vec<String> = prev_event_ids(&join)
+            .into_iter()
+            .filter(|id| !seen.contains(id))
+            .collect();
+
         let create_event_id = state_map
             .get(&("m.room.create".to_owned(), String::new()))
             .cloned()
@@ -695,6 +702,7 @@ impl RoomServer {
             join_raw: raw_bytes(&join)?,
             join_depth,
             state: state_map.into_iter().collect(),
+            history_frontier,
         }));
 
         match self.propose_cmd(&cmd).await? {
@@ -711,6 +719,163 @@ impl RoomServer {
                 "unexpected import response: {other:?}"
             ))),
         }
+    }
+
+    /// Append backfilled PDUs (fetched from the room's resident server via
+    /// `GET /backfill`) to the room's history order. Events already on the
+    /// timeline or in history are skipped; the rest are stored
+    /// off-timeline and indexed newest-first by `(depth, origin_server_ts,
+    /// event_id)`. Trusted wholesale like [`Self::import_room`] — the
+    /// resident already validated its own history (per-event signature
+    /// verification is future hardening). Returns `(indexed, complete)`.
+    pub async fn import_history(
+        &self,
+        room_id: &str,
+        pdus: Vec<CanonicalJsonObject>,
+    ) -> Result<(u64, bool)> {
+        let mut events = Vec::new();
+        let mut seen = BTreeSet::new();
+        let meta = self
+            .store()
+            .meta(room_id)
+            .map_err(storage_err)?
+            .ok_or_else(|| {
+                RoomError::Malformed(format!("history import: unknown room {room_id}"))
+            })?;
+        let version = RoomVersion::parse(&meta.version)?;
+        for obj in &pdus {
+            // Only events of this room enter its history.
+            match obj.get("room_id") {
+                Some(CanonicalJsonValue::String(r)) if r != room_id => continue,
+                _ => {}
+            }
+            let Ok(id) = event::event_id(obj, version) else {
+                continue; // unhashable PDU: drop, don't fail the batch
+            };
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+            let depth = obj
+                .get("depth")
+                .and_then(|d| d.as_integer())
+                .and_then(|i| u64::try_from(i64::from(i)).ok())
+                .unwrap_or(0);
+            let ts = obj
+                .get("origin_server_ts")
+                .and_then(|d| d.as_integer())
+                .and_then(|i| u64::try_from(i64::from(i)).ok())
+                .unwrap_or(0);
+            events.push((depth, ts, id.to_string(), raw_bytes(obj)?));
+        }
+        // Newest first: history indexes grow older.
+        events.sort_by(|a, b| (b.0, b.1, &b.2).cmp(&(a.0, a.1, &a.2)));
+        let cmd = RoomCommand::ImportHistory(Box::new(types::ImportHistory {
+            room_id: room_id.to_owned(),
+            events: events
+                .into_iter()
+                .map(|(depth, _, event_id, raw)| types::ImportEvent {
+                    event_id,
+                    raw,
+                    depth,
+                })
+                .collect(),
+        }));
+        match self.propose_cmd(&cmd).await? {
+            RoomResponse::History { indexed, complete } => Ok((indexed, complete)),
+            other => Err(RoomError::Codec(format!(
+                "unexpected history response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Append a chain of events recovered past an unfillable gap: they
+    /// hang off ancestors the origin refused to return, so they anchor on
+    /// a state snapshot (fetched via `GET /state` at the chain's oldest
+    /// event) instead of resolving through the pipeline. `chain` is
+    /// oldest-first, as `/get_missing_events` returns it. Returns how many
+    /// events joined the timeline.
+    pub async fn import_segment(
+        &self,
+        room_id: &str,
+        state: Vec<CanonicalJsonObject>,
+        auth_chain: Vec<CanonicalJsonObject>,
+        chain: Vec<CanonicalJsonObject>,
+    ) -> Result<u64> {
+        let meta = self
+            .store()
+            .meta(room_id)
+            .map_err(storage_err)?
+            .ok_or_else(|| {
+                RoomError::Malformed(format!("segment import: unknown room {room_id}"))
+            })?;
+        let version = RoomVersion::parse(&meta.version)?;
+
+        let mut events = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut state_map: BTreeMap<(String, String), String> = BTreeMap::new();
+        let import_event = |obj: &CanonicalJsonObject| -> Option<types::ImportEvent> {
+            let id = event::event_id(obj, version).ok()?;
+            let depth = obj
+                .get("depth")
+                .and_then(|d| d.as_integer())
+                .and_then(|i| u64::try_from(i64::from(i)).ok())
+                .unwrap_or(0);
+            Some(types::ImportEvent {
+                event_id: id.to_string(),
+                raw: raw_bytes(obj).ok()?,
+                depth,
+            })
+        };
+        for obj in auth_chain.iter().chain(state.iter()) {
+            let Some(ev) = import_event(obj) else {
+                continue;
+            };
+            if let (Ok(ty), Some(CanonicalJsonValue::String(sk))) =
+                (str_of(obj, "type"), obj.get("state_key"))
+            {
+                state_map.insert((ty.to_owned(), sk.clone()), ev.event_id.clone());
+            }
+            if seen.insert(ev.event_id.clone()) {
+                events.push(ev);
+            }
+        }
+
+        let mut timeline = Vec::new();
+        let mut frontier_add = Vec::new();
+        for (i, obj) in chain.iter().enumerate() {
+            let Some(ev) = import_event(obj) else {
+                continue;
+            };
+            if i == 0 {
+                frontier_add = prev_event_ids(obj);
+            }
+            timeline.push(ev);
+        }
+
+        let cmd = RoomCommand::ImportSegment(Box::new(types::ImportSegment {
+            room_id: room_id.to_owned(),
+            events,
+            state: state_map.into_iter().collect(),
+            timeline,
+            frontier_add,
+        }));
+        match self.propose_cmd(&cmd).await? {
+            RoomResponse::Segment { appended } => Ok(appended),
+            other => Err(RoomError::Codec(format!(
+                "unexpected segment response: {other:?}"
+            ))),
+        }
+    }
+
+    /// The room's backward-extremity frontier: event ids known to precede
+    /// our history that we do not hold (empty = history complete).
+    pub fn history_frontier(&self, room_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .store()
+            .meta(room_id)
+            .map_err(storage_err)?
+            .map(|m| m.history_frontier)
+            .unwrap_or_default())
     }
 
     fn load_raw(&self, store: &RoomStore, event_id: &str) -> Result<Option<CanonicalJsonObject>> {
@@ -1299,9 +1464,11 @@ impl RoomServer {
             RoomResponse::Duplicate { event_id } => Outcome::Duplicate {
                 event_id: parse_id(event_id)?,
             },
-            RoomResponse::Receipt { .. } => {
+            RoomResponse::Receipt { .. }
+            | RoomResponse::History { .. }
+            | RoomResponse::Segment { .. } => {
                 return Err(RoomError::Codec(
-                    "unexpected receipt response to append".into(),
+                    "unexpected non-event response to append".into(),
                 ))
             }
         })

@@ -549,9 +549,26 @@ fn build_joined_room(
             true,
         )
         .map_err(internal)?;
-    let limited = window.len() > limit;
+    let mut limited = window.len() > limit;
     window.truncate(limit);
     window.reverse();
+
+    // A gap marker inside the window's span means these events are not
+    // contiguous with the client's position (a state-anchored segment
+    // import landed there): serve only the post-gap side and flag
+    // `limited` so the client knows to backfill.
+    if !initial {
+        if let Some(gap) = meta
+            .gap_markers
+            .iter()
+            .copied()
+            .filter(|g| *g > since.room && *g <= now.room)
+            .max()
+        {
+            window.retain(|(s, _)| *s >= gap);
+            limited = true;
+        }
+    }
 
     let mut out = v3::JoinedRoom::new();
     out.timeline.limited = limited;

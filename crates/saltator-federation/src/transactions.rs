@@ -321,18 +321,76 @@ async fn fill_gap(state: &FedState, origin: &str, pdu: &CanonicalJsonObject) -> 
     };
 
     // Ingest oldest-first (the order the endpoint returns them).
+    let chain: Vec<CanonicalJsonObject> = events
+        .iter()
+        .filter_map(|ev| match CanonicalJsonValue::try_from(ev.clone()) {
+            Ok(CanonicalJsonValue::Object(o)) => Some(o),
+            _ => None,
+        })
+        .collect();
     let mut ingested = 0usize;
-    for ev in events {
-        let obj = match CanonicalJsonValue::try_from(ev.clone()) {
-            Ok(CanonicalJsonValue::Object(o)) => o,
-            _ => continue,
-        };
-        match rooms.ingest_pdu(obj).await {
+    let mut still_missing = false;
+    for obj in &chain {
+        match rooms.ingest_pdu(obj.clone()).await {
             Ok(Outcome::Accepted { .. }) | Ok(Outcome::Duplicate { .. }) => ingested += 1,
+            Err(RoomError::MissingEvents(_)) => still_missing = true,
             _ => {}
         }
     }
-    ingested > 0
+    if !still_missing {
+        return ingested > 0;
+    }
+
+    // The origin truncated the response: the recovered events hang off
+    // ancestors it did not return, so the pipeline cannot connect them.
+    // Anchor them on a state snapshot at the chain's oldest event instead
+    // and leave a marked gap (the sync `limited` contract); the missing
+    // span joins the backfill frontier.
+    let Some(anchor) = chain.first().and_then(|e| rooms.pdu_event_id(e)) else {
+        return ingested > 0;
+    };
+    let path = format!(
+        "/_matrix/federation/v1/state/{room_id}?event_id={}",
+        anchor.as_str().replace('%', "%25").replace('&', "%26")
+    );
+    let resp = match client.get(origin, &path).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, room_id, "gap anchor: /state fetch failed");
+            return ingested > 0;
+        }
+    };
+    let pdu_objects = |key: &str| -> Vec<CanonicalJsonObject> {
+        resp.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| match CanonicalJsonValue::try_from(e.clone()) {
+                        Ok(CanonicalJsonValue::Object(o)) => Some(o),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let state = pdu_objects("pdus");
+    let auth_chain = pdu_objects("auth_chain");
+    if state.is_empty() {
+        return ingested > 0;
+    }
+    match rooms
+        .import_segment(room_id, state, auth_chain, chain)
+        .await
+    {
+        Ok(appended) => {
+            tracing::info!(room_id, appended, "gap anchored on fetched state");
+            appended > 0 || ingested > 0
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, room_id, "gap anchor: segment import failed");
+            ingested > 0
+        }
+    }
 }
 
 /// Load `origin`'s current signing keys into the room server's trusted set

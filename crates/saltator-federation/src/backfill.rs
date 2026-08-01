@@ -119,6 +119,54 @@ pub async fn get_missing_events(
     Ok(axum::Json(serde_json::json!({ "events": pdu_array(pdus) })))
 }
 
+/// Client side of `GET /backfill`: fetch up to `limit` events preceding
+/// (and including) the `v` event ids from `destination`. Returns the raw
+/// PDUs; the caller decides how far to trust them.
+pub async fn fetch_backfill(
+    client: &crate::outbound::FederationClient,
+    destination: &str,
+    room_id: &str,
+    v: &[String],
+    limit: usize,
+) -> Result<Vec<ruma::CanonicalJsonObject>, crate::outbound::OutboundError> {
+    let mut path = format!(
+        "/_matrix/federation/v1/backfill/{}?limit={limit}",
+        query_encode(room_id)
+    );
+    for id in v {
+        path.push_str("&v=");
+        path.push_str(&query_encode(id));
+    }
+    let resp = client.get(destination, &path).await?;
+    let mut pdus = Vec::new();
+    if let Some(arr) = resp.get("pdus").and_then(|p| p.as_array()) {
+        for pdu in arr {
+            if let Ok(CanonicalJsonValue::Object(obj)) = CanonicalJsonValue::try_from(pdu.clone()) {
+                pdus.push(obj);
+            }
+        }
+    }
+    Ok(pdus)
+}
+
+/// Percent-encode the characters that would break a query value; event
+/// and room ids are otherwise URL-safe.
+fn query_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '&' => out.push_str("%26"),
+            '+' => out.push_str("%2B"),
+            '#' => out.push_str("%23"),
+            '=' => out.push_str("%3D"),
+            '?' => out.push_str("%3F"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Percent-decode a query value (`+` is a space; `%XX` is a byte).
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();

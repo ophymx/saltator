@@ -17,6 +17,7 @@ mod transactions;
 mod user_keys;
 mod xmatrix;
 
+pub use backfill::fetch_backfill;
 pub use http_client::build_http_client;
 pub use inbound::{AuthRejection, Authenticated};
 pub use join_client::{

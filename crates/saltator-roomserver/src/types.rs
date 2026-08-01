@@ -26,6 +26,12 @@ pub const T_RECEIPT: u8 = APP_TABLE_MIN + 5;
 /// `event_id → redacting event_id (UTF-8)` — set when an accepted
 /// `m.room.redaction` applies to a locally known event.
 pub const T_REDACT: u8 = APP_TABLE_MIN + 6;
+/// `room_id ++ 0x00 ++ idx (u64 BE) → event_id (UTF-8)` — backfilled
+/// history in reverse-chronological order: idx 1 is the newest event
+/// older than the local timeline, higher idx is older still. Fed by
+/// [`RoomCommand::ImportHistory`]; `/messages` pagination continues here
+/// after the local timeline floor.
+pub const T_HISTORY: u8 = APP_TABLE_MIN + 7;
 
 /// Full state maps are stored every `MAX_GROUP_CHAIN` groups along a fork;
 /// deltas otherwise (spec.md §5.2, "state deltas with periodic full
@@ -67,6 +73,10 @@ pub struct StoredEvent {
     pub state_group_after: u64,
     pub depth: u64,
     pub rejected: Option<Rejected>,
+    /// Position in the backfilled-history order (`T_HISTORY`), when this
+    /// event was indexed there. Doubles as the idempotence marker for
+    /// re-applied [`RoomCommand::ImportHistory`] batches.
+    pub history_idx: Option<u64>,
 }
 
 /// A state snapshot or delta. Resolving a group walks the parent chain to
@@ -92,6 +102,20 @@ pub struct RoomMeta {
     pub next_group: u64,
     /// Forward extremities — the DAG's current leaves.
     pub extremities: Vec<String>,
+    /// Backward extremities of the known history: `prev_events` referenced
+    /// at the oldest edge that we do not hold. Non-empty only for rooms
+    /// whose older history lives on other servers (remote joins); empty
+    /// means history is complete. Federated `/backfill` requests start
+    /// from these.
+    pub history_frontier: Vec<String>,
+    /// Next unallocated `T_HISTORY` index (indexes start at 1).
+    pub next_history_idx: u64,
+    /// Seqs at which the timeline is NOT contiguous with what precedes it:
+    /// each marks the first event of a state-anchored segment import
+    /// (events recovered past an unfillable gap). Incremental syncs whose
+    /// window spans a marker truncate to the post-gap side and set
+    /// `limited`.
+    pub gap_markers: Vec<u64>,
 }
 
 /// Commands applied to the room state machine.
@@ -100,6 +124,44 @@ pub enum RoomCommand {
     Append(Box<AppendEvent>),
     Receipt(ReceiptCmd),
     Import(Box<ImportRoom>),
+    ImportHistory(Box<ImportHistory>),
+    ImportSegment(Box<ImportSegment>),
+}
+
+/// Append a recovered chain of events past an unfillable gap: when
+/// `/get_missing_events` returns events whose own ancestors are missing
+/// (the origin truncated the response), they cannot flow through the
+/// normal pipeline. Instead they are anchored on a state snapshot fetched
+/// from the origin (`GET /state` at the chain's oldest event) and appended
+/// to the timeline with real seqs, leaving a marked gap behind them.
+/// Trusted wholesale like [`ImportRoom`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportSegment {
+    pub room_id: String,
+    /// Supporting events (anchor state + auth chain), stored off-timeline.
+    pub events: Vec<ImportEvent>,
+    /// Resolved state at the segment's oldest event: the anchor snapshot
+    /// every segment event resolves against (an approximation for state
+    /// events *inside* the segment, which are rare in recovered chains).
+    pub state: Vec<((String, String), String)>,
+    /// The recovered chain, oldest first — appended to the timeline.
+    pub timeline: Vec<ImportEvent>,
+    /// Unheld `prev_events` at the segment's old edge — merged into the
+    /// backfill frontier.
+    pub frontier_add: Vec<String>,
+}
+
+/// Append a batch of backfilled events to a room's history order
+/// (`T_HISTORY`). Events arrive newest-first — the order they extend the
+/// history downward. Like [`ImportRoom`], the events are trusted wholesale
+/// (they were fetched from the room's resident server); they never touch
+/// the timeline, state, or extremities. The apply recomputes the
+/// backfill frontier deterministically from what is stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportHistory {
+    pub room_id: String,
+    /// Newest-first: index assignment order (higher index = older).
+    pub events: Vec<ImportEvent>,
 }
 
 /// Bulk-initialize a room from a `send_join` response: the state dump the
@@ -124,6 +186,9 @@ pub struct ImportRoom {
     /// The resolved room state after the join: `(type, state_key) →
     /// event_id`, forming the room's initial state-group snapshot.
     pub state: Vec<((String, String), String)>,
+    /// The join's `prev_events` we do not hold — the initial backfill
+    /// frontier (everything before our join lives on the resident).
+    pub history_frontier: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +262,18 @@ pub enum RoomResponse {
     /// recorded).
     Receipt {
         seq: u64,
+    },
+    /// An [`ImportHistory`] batch was applied: how many events entered the
+    /// history order, and whether the frontier is now empty (history
+    /// reaches the room's beginning).
+    History {
+        indexed: u64,
+        complete: bool,
+    },
+    /// An [`ImportSegment`] was applied: how many chain events joined the
+    /// timeline (0 = everything was already stored).
+    Segment {
+        appended: u64,
     },
 }
 

@@ -418,38 +418,80 @@ async fn join_with_body(
         .and_then(|v| v.as_str().map(ToOwned::to_owned));
     body.remove("third_party_signed");
 
-    // Local room: the normal pipeline. We host it iff its meta exists.
-    let hosted = state
+    // Local room: the normal pipeline. Knowing the room isn't enough —
+    // once every local user has left, our fork of the DAG is stale (we
+    // stopped receiving events), so a rejoin goes back through a resident
+    // like a fresh remote join; the handshake re-imports current state and
+    // seeds the backfill frontier with what we missed. Local-pipeline
+    // rejoin remains for rooms we still participate in and rooms with no
+    // other server to join through.
+    let meta_exists = state
         .rooms
         .store()
         .meta(room_id.as_str())
         .map_err(internal)?
         .is_some();
-    if hosted {
-        // Joining twice is a no-op: the existing membership event stands
-        // (a fresh identical join would mint a new event ID).
-        let current = current_state(&state.rooms, room_id.as_str())?;
-        if crate::room_util::membership_in(&state.rooms, &current, auth.user_id.as_str())? == "join"
-        {
-            return Ok(());
+    let hosted = meta_exists && {
+        let our_name = state.config.server_name.as_str();
+        let locally_joined = crate::room_util::joined_member_ids(&state.rooms, room_id.as_str())?
+            .iter()
+            .any(|u| u.ends_with(&format!(":{our_name}")));
+        locally_joined || {
+            let we_created = saltator_federation::resident_of_room(room_id.as_str()).as_deref()
+                == Some(our_name);
+            let no_remote_route = state
+                .rooms
+                .remote_servers_in_room(room_id.as_str(), our_name)
+                .map(|s| s.is_empty())
+                .unwrap_or(true);
+            state.federation.is_none() || we_created || no_remote_route
         }
-        send_membership_with(
-            state,
-            room_id,
-            &auth.user_id,
-            &auth.user_id,
-            "join",
-            reason,
-            body,
-        )
-        .await?;
+    };
+    if hosted {
+        local_pipeline_join(state, auth, room_id, reason, body).await?;
     } else {
-        join_remote(state, auth, room_id).await?;
+        match join_remote(state, auth, room_id).await {
+            Ok(()) => {}
+            // No route to a resident (e.g. a v12 room we created whose
+            // id names no server): rejoin our own copy rather than fail.
+            Err(e) if meta_exists && e.status == axum::http::StatusCode::NOT_FOUND => {
+                local_pipeline_join(state, auth, room_id, reason, body).await?;
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // Joining an upgraded room carries the old room's push rules over.
     crate::routes::push::copy_rules_from_predecessor(state, &auth.user_id, room_id.as_str())
         .await?;
+    Ok(())
+}
+
+/// The local half of a join: no-op when already joined, else the normal
+/// pipeline membership send.
+async fn local_pipeline_join(
+    state: &CsState,
+    auth: &Auth,
+    room_id: &RoomId,
+    reason: Option<String>,
+    body: serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    // Joining twice is a no-op: the existing membership event stands
+    // (a fresh identical join would mint a new event ID).
+    let current = current_state(&state.rooms, room_id.as_str())?;
+    if crate::room_util::membership_in(&state.rooms, &current, auth.user_id.as_str())? == "join" {
+        return Ok(());
+    }
+    send_membership_with(
+        state,
+        room_id,
+        &auth.user_id,
+        &auth.user_id,
+        "join",
+        reason,
+        body,
+    )
+    .await?;
     Ok(())
 }
 
@@ -459,26 +501,57 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId) -> Result<(
     let Some(fed) = &state.federation else {
         return Err(ApiError::not_found("Unknown room"));
     };
-    // Resolve a resident server. Room IDs before v12 carry the creating
-    // server; v12 rooms need an invite origin, which we don't track yet.
-    let destination = saltator_federation::resident_of_room(room_id.as_str())
-        .ok_or_else(|| ApiError::not_found("Cannot determine a server to join through"))?;
+    // Candidate residents: the server in the room id (pre-v12), then any
+    // server currently in our (possibly stale) copy of the room.
+    let our_name = state.config.server_name.as_str();
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(resident) = saltator_federation::resident_of_room(room_id.as_str()) {
+        if resident != our_name {
+            candidates.push(resident);
+        }
+    }
+    if let Ok(servers) = state
+        .rooms
+        .remote_servers_in_room(room_id.as_str(), our_name)
+    {
+        for server in servers {
+            if !candidates.contains(&server) {
+                candidates.push(server);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Err(ApiError::not_found(
+            "Cannot determine a server to join through",
+        ));
+    }
 
-    let resp = saltator_federation::join_remote_room(
-        &fed.client,
-        &fed.signer,
-        &destination,
-        room_id.as_str(),
-        auth.user_id.as_str(),
-    )
-    .await
-    .map_err(|e| {
-        ApiError::new(
+    let mut resp = None;
+    let mut last_err = String::new();
+    for destination in &candidates {
+        match saltator_federation::join_remote_room(
+            &fed.client,
+            &fed.signer,
+            destination,
+            room_id.as_str(),
+            auth.user_id.as_str(),
+        )
+        .await
+        {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    let Some(resp) = resp else {
+        return Err(ApiError::new(
             axum::http::StatusCode::BAD_GATEWAY,
             "M_UNKNOWN",
-            format!("remote join failed: {e}"),
-        )
-    })?;
+            format!("remote join failed: {last_err}"),
+        ));
+    };
 
     let outcome = state
         .rooms
@@ -1462,8 +1535,8 @@ pub async fn get_messages(
         .transpose()?
         .unwrap_or(10)
         .clamp(1, 1000);
-    let from = query.get("from").map(|s| parse_topo_token(s)).transpose()?;
-    let to = query.get("to").map(|s| parse_topo_token(s)).transpose()?;
+    let from = query.get("from").map(|s| parse_page_pos(s)).transpose()?;
+    let to = query.get("to").map(|s| parse_page_pos(s)).transpose()?;
     // Room event filter: `contains_url` and `lazy_load_members` are the
     // honored slices so far.
     let filter_json = query
@@ -1481,35 +1554,120 @@ pub async fn get_messages(
         .and_then(|f| f.get("lazy_load_members").and_then(|v| v.as_bool()))
         .unwrap_or(false);
 
-    // Tokens are exclusive bounds on the room-shard seq.
+    // Tokens are exclusive bounds on the room-shard seq; history tokens
+    // (`h{idx}`) address backfilled events below the local timeline floor.
     let store = state.rooms.store();
-    let (batch, next): (Vec<(u64, String)>, Option<u64>) = match dir {
+    let mut rows: Vec<(RowPos, String)> = Vec::new();
+    // Set when the page ends short but more history is known to exist
+    // upstream (frontier open, fetch failed or budget exhausted): the end
+    // token must survive so the client can resume.
+    let mut more_history = false;
+    match dir {
         Direction::Backward => {
-            let upper = from.map(PaginationBound::upper).unwrap_or(u64::MAX);
-            let lower = to.map(PaginationBound::lower).unwrap_or(0);
-            let events = store
-                .room_timeline(&room_id, lower, Some(upper.min(ceiling)), limit, true)
-                .map_err(internal)?;
-            let next = events.last().map(|(s, _)| *s);
-            (events, next)
+            // Timeline portion — skipped when `from` already sits in
+            // history.
+            if matches!(&from, None | Some(PagePos::Timeline(_))) {
+                let upper = match &from {
+                    Some(PagePos::Timeline(b)) => b.upper(),
+                    _ => u64::MAX,
+                };
+                let lower = match &to {
+                    Some(PagePos::Timeline(b)) => b.lower(),
+                    _ => 0,
+                };
+                for (seq, id) in store
+                    .room_timeline(&room_id, lower, Some(upper.min(ceiling)), limit, true)
+                    .map_err(internal)?
+                {
+                    rows.push((RowPos::Timeline(seq), id));
+                }
+            }
+            // Past the timeline floor, continue into backfilled history —
+            // unless an explicit timeline `to` bound stops us first, or
+            // the room's history visibility hides pre-join events.
+            let (allow_history, hist_until) = match &to {
+                None => (true, None),
+                Some(PagePos::History(idx)) => (true, Some(idx.saturating_sub(1))),
+                Some(PagePos::Timeline(b)) => (b.lower() == 0, None),
+            };
+            if allow_history && rows.len() < limit && history_readable(&state, &room_id)? {
+                let mut cursor = match &from {
+                    Some(PagePos::History(idx)) => *idx,
+                    _ => 0,
+                };
+                let mut fetches = 0usize;
+                // Enough round-trips to fill the page from a cold start,
+                // plus slack; each fetch asks the resident for 100 events.
+                let max_fetches = limit / 100 + 2;
+                loop {
+                    let need = limit - rows.len();
+                    if need == 0 {
+                        break;
+                    }
+                    let page = store
+                        .room_history(&room_id, cursor, hist_until, need, false)
+                        .map_err(internal)?;
+                    for (idx, id) in page {
+                        cursor = idx;
+                        rows.push((RowPos::History(idx), id));
+                    }
+                    if rows.len() >= limit || hist_until.is_some() {
+                        break;
+                    }
+                    let frontier = state.rooms.history_frontier(&room_id).map_err(internal)?;
+                    if frontier.is_empty() {
+                        break; // history reaches the room's beginning
+                    }
+                    if fetches >= max_fetches {
+                        more_history = true;
+                        break;
+                    }
+                    fetches += 1;
+                    if fetch_history(&state, &room_id, &frontier).await? == 0 {
+                        more_history = true;
+                        break;
+                    }
+                }
+            }
         }
         Direction::Forward => {
-            let lower = from.map(PaginationBound::lower).unwrap_or(0);
-            let upper = match to {
-                Some(t) => Some(t.upper().min(ceiling)),
-                None => cap,
-            };
-            let events = store
-                .room_timeline(&room_id, lower, upper, limit, false)
-                .map_err(internal)?;
-            let next = events.last().map(|(s, _)| *s);
-            (events, next)
+            // History portion first (`from` sits in history): older→newer.
+            if let Some(PagePos::History(idx)) = &from {
+                let after = match &to {
+                    Some(PagePos::History(t)) => *t,
+                    _ => 0,
+                };
+                for (i, id) in store
+                    .room_history(&room_id, after, Some(idx.saturating_sub(1)), limit, true)
+                    .map_err(internal)?
+                {
+                    rows.push((RowPos::History(i), id));
+                }
+            }
+            // Then the local timeline.
+            if rows.len() < limit && !matches!(&to, Some(PagePos::History(_))) {
+                let lower = match &from {
+                    Some(PagePos::Timeline(b)) => b.lower(),
+                    _ => 0,
+                };
+                let upper = match &to {
+                    Some(PagePos::Timeline(t)) => Some(t.upper().min(ceiling)),
+                    _ => cap,
+                };
+                let need = limit - rows.len();
+                for (seq, id) in store
+                    .room_timeline(&room_id, lower, upper, need, false)
+                    .map_err(internal)?
+                {
+                    rows.push((RowPos::Timeline(seq), id));
+                }
+            }
         }
-    };
+    }
 
     let mut chunk = Vec::new();
     let mut senders: Vec<String> = Vec::new();
-    for (_, event_id) in &batch {
+    for (_, event_id) in &rows {
         if let Some(ev) = client_event(
             &state.rooms,
             version,
@@ -1536,9 +1694,17 @@ pub async fn get_messages(
     }
     let mut resp = get_message_events::v3::Response::new();
     // Lazy-loaded members: the member events of the chunk's senders, as of
-    // the newest returned event.
+    // the newest returned event. History rows predate local state and
+    // contribute no snapshot position.
     if lazy_load_members {
-        if let Some(at) = batch.iter().map(|(s, _)| *s).max() {
+        if let Some(at) = rows
+            .iter()
+            .filter_map(|(p, _)| match p {
+                RowPos::Timeline(s) => Some(*s),
+                RowPos::History(_) => None,
+            })
+            .max()
+        {
             let snapshot = crate::room_util::state_at_seq(&state.rooms, &room_id, at)?;
             for sender in senders {
                 let key = ("m.room.member".to_owned(), sender);
@@ -1564,14 +1730,96 @@ pub async fn get_messages(
     // `end` is omitted once no further events are available (spec v1.12+):
     // clients paginate until it disappears, so serving it forever traps
     // them in an infinite loop. A limit-full batch may have more; a short
-    // one is the boundary.
-    resp.end = if batch.len() == limit {
-        next.map(|s| format!("t{s}"))
+    // one is the boundary — except when the backfill frontier is known to
+    // be open (fetch failed or budget ran out), where the token survives
+    // so the client can resume.
+    resp.end = if rows.len() == limit || more_history {
+        rows.last().map(|(p, _)| match p {
+            RowPos::Timeline(s) => format!("t{s}"),
+            RowPos::History(i) => format!("h{i}"),
+        })
     } else {
         None
     };
     resp.chunk = chunk;
     Ok(Ra(resp))
+}
+
+/// A `/messages` pagination position: on the local timeline (shard seq)
+/// or in backfilled history (`h{idx}`, older than the whole timeline).
+enum PagePos {
+    Timeline(PaginationBound),
+    History(u64),
+}
+
+/// Where a returned row came from — feeds the end-token mint.
+enum RowPos {
+    Timeline(u64),
+    History(u64),
+}
+
+fn parse_page_pos(token: &str) -> Result<PagePos> {
+    if let Some(idx) = token.strip_prefix('h') {
+        return idx
+            .parse()
+            .map(PagePos::History)
+            .map_err(|_| ApiError::invalid_param("Invalid pagination token"));
+    }
+    parse_topo_token(token).map(PagePos::Timeline)
+}
+
+/// Backfilled events predate all local state, so serving them is gated on
+/// the room's *current* history visibility rather than per-event checks.
+fn history_readable(state: &CsState, room_id: &str) -> Result<bool> {
+    let current = crate::room_util::current_state(&state.rooms, room_id)?;
+    let visibility =
+        crate::room_util::state_content_in(&state.rooms, &current, "m.room.history_visibility")?;
+    let visibility = visibility
+        .as_ref()
+        .and_then(|c| c.get("history_visibility").and_then(|v| v.as_str()))
+        .unwrap_or("shared");
+    Ok(matches!(visibility, "shared" | "world_readable"))
+}
+
+/// Fetch one `GET /backfill` batch from the room's resident (or any
+/// server in the room) and append it to the history order. Returns how
+/// many events entered history (0 = no progress: unreachable peers or an
+/// empty response).
+async fn fetch_history(state: &CsState, room_id: &str, frontier: &[String]) -> Result<u64> {
+    let Some(fed) = &state.federation else {
+        return Ok(0);
+    };
+    let mut candidates: Vec<String> = Vec::new();
+    let our_name = state.config.server_name.as_str();
+    if let Some(resident) = saltator_federation::resident_of_room(room_id) {
+        if resident != our_name {
+            candidates.push(resident);
+        }
+    }
+    for server in state
+        .rooms
+        .remote_servers_in_room(room_id, our_name)
+        .map_err(internal)?
+    {
+        if !candidates.contains(&server) {
+            candidates.push(server);
+        }
+    }
+    let v: Vec<String> = frontier.iter().take(20).cloned().collect();
+    for dest in candidates {
+        match saltator_federation::fetch_backfill(&fed.client, &dest, room_id, &v, 100).await {
+            Ok(pdus) if !pdus.is_empty() => {
+                let (indexed, _) = state
+                    .rooms
+                    .import_history(room_id, pdus)
+                    .await
+                    .map_err(internal)?;
+                return Ok(indexed);
+            }
+            _ => continue,
+        }
+    }
+    Ok(0)
 }
 
 /// A pagination bound: native topological tokens (`t{seq}`, what

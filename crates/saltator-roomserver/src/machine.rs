@@ -10,9 +10,9 @@ use saltator_shard::{ApplyCtx, ReadCtx, ShardApp};
 use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
-    AppendEvent, ChangePayload, ImportRoom, ReceiptCmd, ReceiptRecord, RoomCommand, RoomMeta,
-    RoomResponse, SeqEntry, StateGroup, StoredEvent, T_EVENT, T_GROUP, T_RECEIPT, T_REDACT, T_ROOM,
-    T_ROOM_SEQ, T_SEQ,
+    AppendEvent, ChangePayload, ImportHistory, ImportRoom, ImportSegment, ReceiptCmd,
+    ReceiptRecord, RoomCommand, RoomMeta, RoomResponse, SeqEntry, StateGroup, StoredEvent, T_EVENT,
+    T_GROUP, T_HISTORY, T_RECEIPT, T_REDACT, T_ROOM, T_ROOM_SEQ, T_SEQ,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -25,6 +25,18 @@ fn enc<T: serde::Serialize>(what: &str, v: &T) -> StoreResult<Vec<u8>> {
 
 fn dec<T: for<'de> serde::Deserialize<'de>>(what: &str, b: &[u8]) -> StoreResult<T> {
     postcard::from_bytes(b).map_err(|e| codec_err(what, e))
+}
+
+fn get_typed<T: for<'de> serde::Deserialize<'de>>(
+    ctx: &mut ApplyCtx<'_>,
+    what: &str,
+    table: u8,
+    key: &[u8],
+) -> StoreResult<Option<T>> {
+    match ctx.get(table, key)? {
+        Some(b) => Ok(Some(dec(what, &b)?)),
+        None => Ok(None),
+    }
 }
 
 /// `room_id ++ 0x00 ++ n (BE)` — key shape shared by `T_GROUP` (n = group
@@ -65,6 +77,8 @@ impl ShardApp for RoomApp {
             RoomCommand::Append(cmd) => apply_append(ctx, &cmd)?,
             RoomCommand::Receipt(cmd) => apply_receipt(ctx, &cmd)?,
             RoomCommand::Import(cmd) => apply_import(ctx, &cmd)?,
+            RoomCommand::ImportHistory(cmd) => apply_import_history(ctx, &cmd)?,
+            RoomCommand::ImportSegment(cmd) => apply_import_segment(ctx, &cmd)?,
         };
         enc("room response encode", &resp)
     }
@@ -135,6 +149,7 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
             state_group_after: cmd.state_group_after,
             depth: cmd.depth,
             rejected: Some(rejected.clone()),
+            history_idx: None,
         };
         ctx.put(
             T_EVENT,
@@ -179,6 +194,7 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
         state_group_after: cmd.state_group_after,
         depth: cmd.depth,
         rejected: None,
+        history_idx: None,
     };
     ctx.put(
         T_EVENT,
@@ -220,6 +236,10 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
             current_group: cmd.new_current_group,
             next_group: cmd.next_group,
             extremities: cmd.new_extremities.clone(),
+            // A locally created room's history is complete by construction.
+            history_frontier: Vec::new(),
+            next_history_idx: 1,
+            gap_markers: Vec::new(),
         },
         None => {
             let mut meta: RoomMeta = match ctx.get(T_ROOM, cmd.room_id.as_bytes())? {
@@ -250,8 +270,16 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
 }
 
 fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomResponse> {
-    // Idempotence: an already-known room is not re-imported.
-    if ctx.get(T_ROOM, cmd.room_id.as_bytes())?.is_some() {
+    // Re-applying the same join is a no-op. A *fresh* join into a known
+    // room is a re-import: every local user left (so our fork went
+    // stale), we re-joined through a resident, and its state dump
+    // supersedes what we hold — existing events and history stay put.
+    let existing_meta: Option<RoomMeta> =
+        get_typed(ctx, "room meta decode", T_ROOM, cmd.room_id.as_bytes())?;
+    if existing_meta.is_some()
+        && get_typed::<StoredEvent>(ctx, "event decode", T_EVENT, cmd.join_event_id.as_bytes())?
+            .is_some_and(|s| s.seq > 0)
+    {
         return Ok(RoomResponse::Duplicate {
             event_id: cmd.join_event_id.clone(),
         });
@@ -270,6 +298,7 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
             state_group_after: 0,
             depth: ev.depth,
             rejected: None,
+            history_idx: None,
         };
         ctx.put(
             T_EVENT,
@@ -278,9 +307,9 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
         );
     }
 
-    // The initial state-group snapshot: the room's resolved state after the
-    // join. Group ids start at 1.
-    const IMPORT_GROUP: u64 = 1;
+    // The state-group snapshot: the room's resolved state after the join.
+    // Group ids start at 1; a re-import allocates the next one.
+    let group_id = existing_meta.as_ref().map(|m| m.next_group).unwrap_or(1);
     let group = StateGroup {
         parent: None,
         chain_len: 0,
@@ -288,7 +317,7 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
     };
     ctx.put(
         T_GROUP,
-        &room_u64_key(&cmd.room_id, IMPORT_GROUP),
+        &room_u64_key(&cmd.room_id, group_id),
         enc("state group encode", &group)?,
     );
 
@@ -304,9 +333,10 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
     let join_stored = StoredEvent {
         raw: cmd.join_raw.clone(),
         seq,
-        state_group_after: IMPORT_GROUP,
+        state_group_after: group_id,
         depth: cmd.join_depth,
         rejected: None,
+        history_idx: None,
     };
     ctx.put(
         T_EVENT,
@@ -330,12 +360,34 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
         cmd.join_event_id.as_bytes(),
     );
 
+    // Frontier: the join's unheld prevs (an already-visible event needs no
+    // backfill); a re-import unions with whatever was already open.
+    let mut frontier: std::collections::BTreeSet<String> = existing_meta
+        .as_ref()
+        .map(|m| m.history_frontier.iter().cloned().collect())
+        .unwrap_or_default();
+    for id in &cmd.history_frontier {
+        let visible = get_typed::<StoredEvent>(ctx, "event decode", T_EVENT, id.as_bytes())?
+            .is_some_and(|s| s.seq > 0 || s.history_idx.is_some());
+        if !visible {
+            frontier.insert(id.clone());
+        }
+    }
     let meta = RoomMeta {
         version: cmd.version.clone(),
         create_event_id: cmd.create_event_id.clone(),
-        current_group: IMPORT_GROUP,
-        next_group: IMPORT_GROUP + 1,
+        current_group: group_id,
+        next_group: group_id + 1,
         extremities: vec![cmd.join_event_id.clone()],
+        history_frontier: frontier.into_iter().collect(),
+        next_history_idx: existing_meta
+            .as_ref()
+            .map(|m| m.next_history_idx)
+            .unwrap_or(1),
+        gap_markers: existing_meta
+            .as_ref()
+            .map(|m| m.gap_markers.clone())
+            .unwrap_or_default(),
     };
     ctx.put(
         T_ROOM,
@@ -347,6 +399,214 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
         event_id: cmd.join_event_id.clone(),
         seq,
     })
+}
+
+fn apply_import_segment(ctx: &mut ApplyCtx<'_>, cmd: &ImportSegment) -> StoreResult<RoomResponse> {
+    let Some(b) = ctx.get(T_ROOM, cmd.room_id.as_bytes())? else {
+        return Err(StoreError::Engine(format!(
+            "segment import to unknown room {}",
+            cmd.room_id
+        )));
+    };
+    let mut meta: RoomMeta = dec("room meta decode", &b)?;
+
+    // Supporting events (anchor state + auth chain), off-timeline.
+    for ev in &cmd.events {
+        if ctx.get(T_EVENT, ev.event_id.as_bytes())?.is_some() {
+            continue;
+        }
+        let stored = StoredEvent {
+            raw: ev.raw.clone(),
+            seq: 0,
+            state_group_after: 0,
+            depth: ev.depth,
+            rejected: None,
+            history_idx: None,
+        };
+        ctx.put(
+            T_EVENT,
+            ev.event_id.as_bytes(),
+            enc("event encode", &stored)?,
+        );
+    }
+
+    // The anchor snapshot every segment event resolves against.
+    let group_id = meta.next_group;
+    let group = StateGroup {
+        parent: None,
+        chain_len: 0,
+        entries: cmd.state.clone(),
+    };
+    ctx.put(
+        T_GROUP,
+        &room_u64_key(&cmd.room_id, group_id),
+        enc("state group encode", &group)?,
+    );
+    meta.next_group = group_id + 1;
+
+    // The recovered chain joins the timeline, oldest first.
+    let mut appended = 0u64;
+    let mut first_seq = None;
+    let mut last_id = None;
+    for ev in &cmd.timeline {
+        if get_typed::<StoredEvent>(ctx, "event decode", T_EVENT, ev.event_id.as_bytes())?
+            .is_some_and(|s| s.seq > 0)
+        {
+            continue;
+        }
+        let seq = ctx.emit(enc(
+            "change payload encode",
+            &ChangePayload::Event {
+                room_id: cmd.room_id.clone(),
+                event_id: ev.event_id.clone(),
+            },
+        )?);
+        let stored = StoredEvent {
+            raw: ev.raw.clone(),
+            seq,
+            state_group_after: group_id,
+            depth: ev.depth,
+            rejected: None,
+            history_idx: None,
+        };
+        ctx.put(
+            T_EVENT,
+            ev.event_id.as_bytes(),
+            enc("event encode", &stored)?,
+        );
+        ctx.put(
+            T_SEQ,
+            &seq.to_be_bytes(),
+            enc(
+                "seq entry encode",
+                &SeqEntry::Event {
+                    room_id: cmd.room_id.clone(),
+                    event_id: ev.event_id.clone(),
+                },
+            )?,
+        );
+        ctx.put(
+            T_ROOM_SEQ,
+            &room_u64_key(&cmd.room_id, seq),
+            ev.event_id.as_bytes().to_vec(),
+        );
+        first_seq.get_or_insert(seq);
+        last_id = Some(ev.event_id.clone());
+        appended += 1;
+    }
+
+    if let Some(first) = first_seq {
+        // The timeline is not contiguous below this point.
+        meta.gap_markers.push(first);
+    }
+    if let Some(last) = last_id {
+        // The chain's newest event is a genuine forward extremity until
+        // the PDU that triggered the gap-fill consumes it.
+        if !meta.extremities.contains(&last) {
+            meta.extremities.push(last);
+        }
+    }
+    for id in &cmd.frontier_add {
+        let visible = get_typed::<StoredEvent>(ctx, "event decode", T_EVENT, id.as_bytes())?
+            .is_some_and(|s| s.seq > 0 || s.history_idx.is_some());
+        if !visible && !meta.history_frontier.contains(id) {
+            meta.history_frontier.push(id.clone());
+        }
+    }
+    ctx.put(
+        T_ROOM,
+        cmd.room_id.as_bytes(),
+        enc("room meta encode", &meta)?,
+    );
+
+    Ok(RoomResponse::Segment { appended })
+}
+
+fn apply_import_history(ctx: &mut ApplyCtx<'_>, cmd: &ImportHistory) -> StoreResult<RoomResponse> {
+    let Some(b) = ctx.get(T_ROOM, cmd.room_id.as_bytes())? else {
+        return Err(StoreError::Engine(format!(
+            "history import to unknown room {}",
+            cmd.room_id
+        )));
+    };
+    let mut meta: RoomMeta = dec("room meta decode", &b)?;
+
+    // Ids made visible in this batch: `ctx.get` may not see this apply's
+    // own staged puts, so track them explicitly.
+    let mut batch_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut new_prevs: Vec<String> = Vec::new();
+    let mut idx = meta.next_history_idx;
+    let mut indexed = 0u64;
+    for ev in &cmd.events {
+        let existing: Option<StoredEvent> =
+            get_typed(ctx, "event decode", T_EVENT, ev.event_id.as_bytes())?;
+        let stored = match existing {
+            // Already on the timeline or already in history: nothing to do
+            // (also the idempotence path for a re-applied batch).
+            Some(s) if s.seq > 0 || s.history_idx.is_some() => {
+                batch_ids.insert(ev.event_id.clone());
+                continue;
+            }
+            // Held off-timeline (import support event): joins the history
+            // order, keeps its stored body.
+            Some(mut s) => {
+                s.history_idx = Some(idx);
+                s
+            }
+            None => StoredEvent {
+                raw: ev.raw.clone(),
+                seq: 0,
+                state_group_after: 0,
+                depth: ev.depth,
+                rejected: None,
+                history_idx: Some(idx),
+            },
+        };
+        let raw: CanonicalJsonObject =
+            serde_json::from_slice(&stored.raw).map_err(|e| codec_err("history event parse", e))?;
+        ctx.put(
+            T_EVENT,
+            ev.event_id.as_bytes(),
+            enc("event encode", &stored)?,
+        );
+        ctx.put(
+            T_HISTORY,
+            &room_u64_key(&cmd.room_id, idx),
+            ev.event_id.as_bytes().to_vec(),
+        );
+        batch_ids.insert(ev.event_id.clone());
+        new_prevs.extend(crate::prev_event_ids(&raw));
+        idx += 1;
+        indexed += 1;
+    }
+
+    // Recompute the frontier: everything referenced at the historical edge
+    // that is still not visible (neither timeline-stored, history-indexed,
+    // nor part of this batch).
+    let mut frontier: std::collections::BTreeSet<String> =
+        meta.history_frontier.iter().cloned().collect();
+    frontier.extend(new_prevs);
+    let mut still_missing = Vec::new();
+    for id in frontier {
+        if batch_ids.contains(&id) {
+            continue;
+        }
+        let visible = get_typed::<StoredEvent>(ctx, "event decode", T_EVENT, id.as_bytes())?
+            .is_some_and(|s| s.seq > 0 || s.history_idx.is_some());
+        if !visible {
+            still_missing.push(id);
+        }
+    }
+    meta.history_frontier = still_missing;
+    meta.next_history_idx = idx;
+    let complete = meta.history_frontier.is_empty();
+    ctx.put(
+        T_ROOM,
+        cmd.room_id.as_bytes(),
+        enc("room meta encode", &meta)?,
+    );
+
+    Ok(RoomResponse::History { indexed, complete })
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +717,44 @@ impl RoomStore {
             let event_id = String::from_utf8(v)
                 .map_err(|_| StoreError::Engine("room seq value not UTF-8".into()))?;
             out.push((seq, event_id));
+        }
+        Ok(out)
+    }
+
+    /// One room's backfilled history with index in `(after, until]`
+    /// (`until` = no bound when `None`): at most `limit` entries. History
+    /// indexes grow *older* (idx 1 is the newest pre-timeline event), so
+    /// `oldest_first: false` reads ascending idx (newer→older — the
+    /// natural order for backwards `/messages` pagination continuing past
+    /// the timeline floor) and `oldest_first: true` reads descending idx
+    /// from the top of the window (older→newer, forwards pagination).
+    pub fn room_history(
+        &self,
+        room_id: &str,
+        after: u64,
+        until: Option<u64>,
+        limit: usize,
+        oldest_first: bool,
+    ) -> StoreResult<Vec<(u64, String)>> {
+        let start = room_u64_key(room_id, after.saturating_add(1));
+        let end = match until {
+            Some(u) if u == u64::MAX => room_u64_end(room_id),
+            Some(u) => room_u64_key(room_id, u + 1),
+            None => room_u64_end(room_id),
+        };
+        let mut out = Vec::new();
+        for (k, v) in self
+            .read
+            .scan(T_HISTORY, &start, &end, limit, oldest_first)?
+        {
+            let idx = u64::from_be_bytes(
+                k[k.len() - 8..]
+                    .try_into()
+                    .map_err(|_| StoreError::Engine("history key width".into()))?,
+            );
+            let event_id = String::from_utf8(v)
+                .map_err(|_| StoreError::Engine("history value not UTF-8".into()))?;
+            out.push((idx, event_id));
         }
         Ok(out)
     }
