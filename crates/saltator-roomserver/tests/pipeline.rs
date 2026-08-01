@@ -598,13 +598,13 @@ async fn receipts_redactions_room_timeline() {
     // Receipts: recorded, deduplicated, visible in T_SEQ catch-up scans.
     let seq = env
         .server
-        .write_receipt(&room_id, &alice, "m.read", &m1_id, 1000)
+        .write_receipt(&room_id, &alice, "m.read", &m1_id, None, 1000)
         .await
         .unwrap();
     assert!(seq > m2_seq);
     let dup = env
         .server
-        .write_receipt(&room_id, &alice, "m.read", &m1_id, 2000)
+        .write_receipt(&room_id, &alice, "m.read", &m1_id, None, 2000)
         .await
         .unwrap();
     assert_eq!(dup, 0);

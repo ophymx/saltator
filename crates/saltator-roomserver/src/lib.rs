@@ -921,6 +921,7 @@ impl RoomServer {
         user_id: &UserId,
         receipt_type: &str,
         event_id: &EventId,
+        thread_id: Option<String>,
         ts: u64,
     ) -> Result<u64> {
         let resp = self
@@ -929,6 +930,7 @@ impl RoomServer {
                 user_id: user_id.to_string(),
                 receipt_type: receipt_type.to_owned(),
                 event_id: event_id.to_string(),
+                thread_id,
                 ts,
             }))
             .await?;

@@ -58,14 +58,20 @@ pub(crate) fn room_u64_end(room_id: &str) -> Vec<u8> {
     k
 }
 
-/// Key of a receipt: `room_id ++ 0x00 ++ user_id ++ 0x00 ++ receipt_type`.
-fn receipt_key(room_id: &str, user_id: &str, receipt_type: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(room_id.len() + user_id.len() + receipt_type.len() + 2);
+/// Key of a receipt: `room_id ++ 0x00 ++ user_id ++ 0x00 ++ receipt_type
+/// ++ 0x00 ++ thread` — one receipt position per thread (`thread` is
+/// empty for the unthreaded receipt, `"main"` or a thread-root event id
+/// for threaded ones).
+fn receipt_key(room_id: &str, user_id: &str, receipt_type: &str, thread: &str) -> Vec<u8> {
+    let mut k =
+        Vec::with_capacity(room_id.len() + user_id.len() + receipt_type.len() + thread.len() + 3);
     k.extend_from_slice(room_id.as_bytes());
     k.push(0);
     k.extend_from_slice(user_id.as_bytes());
     k.push(0);
     k.extend_from_slice(receipt_type.as_bytes());
+    k.push(0);
+    k.extend_from_slice(thread.as_bytes());
     k
 }
 
@@ -85,7 +91,12 @@ impl ShardApp for RoomApp {
 }
 
 fn apply_receipt(ctx: &mut ApplyCtx<'_>, cmd: &ReceiptCmd) -> StoreResult<RoomResponse> {
-    let key = receipt_key(&cmd.room_id, &cmd.user_id, &cmd.receipt_type);
+    let key = receipt_key(
+        &cmd.room_id,
+        &cmd.user_id,
+        &cmd.receipt_type,
+        cmd.thread_id.as_deref().unwrap_or(""),
+    );
     // Idempotence: re-acking the same event is a no-op (no seq burn).
     if let Some(b) = ctx.get(T_RECEIPT, &key)? {
         let existing: ReceiptRecord = dec("receipt decode", &b)?;
@@ -120,6 +131,7 @@ fn apply_receipt(ctx: &mut ApplyCtx<'_>, cmd: &ReceiptCmd) -> StoreResult<RoomRe
             "receipt encode",
             &ReceiptRecord {
                 event_id: cmd.event_id.clone(),
+                thread_id: cmd.thread_id.clone(),
                 ts: cmd.ts,
                 seq,
             },
@@ -773,7 +785,14 @@ impl RoomStore {
                 .ok_or_else(|| StoreError::Engine("receipt key shape".into()))?;
             let user_id = String::from_utf8(rest[..sep].to_vec())
                 .map_err(|_| StoreError::Engine("receipt user not UTF-8".into()))?;
-            let receipt_type = String::from_utf8(rest[sep + 1..].to_vec())
+            // The type runs to the next separator; the trailing thread
+            // component is carried in the record itself.
+            let type_and_thread = &rest[sep + 1..];
+            let type_end = type_and_thread
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(type_and_thread.len());
+            let receipt_type = String::from_utf8(type_and_thread[..type_end].to_vec())
                 .map_err(|_| StoreError::Engine("receipt type not UTF-8".into()))?;
             out.push((user_id, receipt_type, dec("receipt decode", &v)?));
         }

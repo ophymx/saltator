@@ -232,13 +232,19 @@ pub struct ReceiptCmd {
     /// `m.read` or `m.read.private`.
     pub receipt_type: String,
     pub event_id: String,
+    /// Threaded receipts (MSC3771): `None` = unthreaded, `Some("main")` =
+    /// the main timeline, `Some(<event id>)` = that thread. Each thread
+    /// keeps its own receipt position.
+    pub thread_id: Option<String>,
     pub ts: u64,
 }
 
-/// Stored receipt state for one `(room, user, type)`.
+/// Stored receipt state for one `(room, user, type, thread)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptRecord {
     pub event_id: String,
+    /// See [`ReceiptCmd::thread_id`].
+    pub thread_id: Option<String>,
     pub ts: u64,
     /// Shard seq at which this receipt was recorded (sync windowing).
     pub seq: u64,

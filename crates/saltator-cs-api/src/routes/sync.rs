@@ -150,7 +150,7 @@ pub async fn sync_events(
             typing: state.typing.generation(),
             presence: state.presence.generation(),
         };
-        let resp = build_sync(&state, &auth, since, now_pos, &filter, req.full_state)?;
+        let resp = build_sync(&state, &auth, since, now_pos, &filter, req.full_state).await?;
         let empty = resp.rooms.is_empty()
             && resp.account_data.is_empty()
             && resp.presence.is_empty()
@@ -201,6 +201,9 @@ struct SyncFilter {
     limit: usize,
     lazy: bool,
     include_leave: bool,
+    /// MSC3773: split unread counts per thread instead of one unthreaded
+    /// total.
+    unread_threads: bool,
     timeline_types: Option<Vec<String>>,
     timeline_not_types: Vec<String>,
     state_types: Option<Vec<String>>,
@@ -213,6 +216,7 @@ impl Default for SyncFilter {
             limit: 10,
             lazy: false,
             include_leave: false,
+            unread_threads: false,
             timeline_types: None,
             timeline_not_types: Vec::new(),
             state_types: None,
@@ -281,6 +285,7 @@ fn load_filter(state: &CsState, auth: &Auth, filter: Option<&v3::Filter>) -> Res
             .min(100),
         lazy: !matches!(def.room.state.lazy_load_options, LazyLoadOptions::Disabled),
         include_leave: def.room.include_leave,
+        unread_threads: def.room.timeline.unread_thread_notifications,
         timeline_types: def.room.timeline.types.clone(),
         timeline_not_types: def.room.timeline.not_types.clone(),
         state_types: def.room.state.types.clone(),
@@ -288,7 +293,7 @@ fn load_filter(state: &CsState, auth: &Auth, filter: Option<&v3::Filter>) -> Res
     })
 }
 
-fn build_sync(
+async fn build_sync(
     state: &CsState,
     auth: &Auth,
     since: Option<SyncPos>,
@@ -345,7 +350,8 @@ fn build_sync(
                     filter,
                     full_state,
                     room_initial,
-                )?;
+                )
+                .await?;
                 // Suppress unchanged rooms on incremental syncs.
                 let unchanged = !room_initial
                     && joined.timeline.events.is_empty()
@@ -520,7 +526,7 @@ fn build_sync(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_joined_room(
+async fn build_joined_room(
     state: &CsState,
     auth: &Auth,
     room_id: &ruma::RoomId,
@@ -648,7 +654,19 @@ fn build_joined_room(
         let entry = receipt_content
             .entry(record.event_id.clone())
             .or_insert_with(|| serde_json::json!({}));
-        entry[&receipt_type][&user] = serde_json::json!({ "ts": record.ts });
+        // Unthreaded and threaded receipts can land on the same event;
+        // the unthreaded one wins there (MSC4102).
+        let existing_unthreaded = entry[&receipt_type][&user]
+            .as_object()
+            .is_some_and(|o| !o.contains_key("thread_id"));
+        if existing_unthreaded {
+            continue;
+        }
+        let mut value = serde_json::json!({ "ts": record.ts });
+        if let Some(thread) = &record.thread_id {
+            value["thread_id"] = serde_json::json!(thread);
+        }
+        entry[&receipt_type][&user] = value;
     }
     if !receipt_content.is_empty() {
         let content: serde_json::Map<String, serde_json::Value> =
@@ -703,10 +721,30 @@ fn build_joined_room(
     out.summary.joined_member_count = Some(joined_count.into());
     out.summary.invited_member_count = Some(invited_count.into());
 
-    // Unread counts: messages after the user's read receipt.
-    out.unread_notifications.notification_count =
-        Some(unread_count(state, room_id.as_str(), auth.user_id.as_str(), now.room)?.into());
-    out.unread_notifications.highlight_count = Some(0u32.into());
+    // Unread counts: push rules evaluated over events past the user's
+    // read positions. With the MSC3773 filter flag, the unthreaded total
+    // narrows to the main timeline and threads report separately.
+    let unread =
+        crate::push_eval::room_unread(state, &auth.user_id, room_id.as_str(), now.room).await?;
+    let main = if filter.unread_threads {
+        unread.main
+    } else {
+        unread.all
+    };
+    let uint = |n: u64| ruma::UInt::try_from(n).unwrap_or(ruma::UInt::MAX);
+    out.unread_notifications.notification_count = Some(uint(main.notify));
+    out.unread_notifications.highlight_count = Some(uint(main.highlight));
+    if filter.unread_threads {
+        for (root, counts) in unread.threads {
+            let Ok(root) = ruma::OwnedEventId::try_from(root) else {
+                continue;
+            };
+            let mut c = ruma::api::client::sync::sync_events::UnreadNotificationsCount::new();
+            c.notification_count = Some(uint(counts.notify));
+            c.highlight_count = Some(uint(counts.highlight));
+            out.unread_thread_notifications.insert(root, c);
+        }
+    }
 
     let _ = membership;
     Ok(out)
@@ -856,46 +894,6 @@ fn build_left_room(
     Ok(out)
 }
 
-/// `m.room.message` events after the user's `m.read` receipt, not sent by
-/// the user (bounded scan; push-rule-driven counts land in M5).
-fn unread_count(state: &CsState, room_id: &str, user_id: &str, upto: u64) -> Result<u32> {
-    const SCAN_CAP: usize = 256;
-    let store = state.rooms.store();
-    let read_seq = store
-        .receipts(room_id)
-        .map_err(internal)?
-        .into_iter()
-        .filter(|(u, t, _)| u == user_id && (t == "m.read" || t == "m.read.private"))
-        .filter_map(|(_, _, r)| {
-            store
-                .event(&r.event_id)
-                .ok()
-                .flatten()
-                .map(|stored| stored.seq)
-        })
-        .max()
-        .unwrap_or(0);
-    let mut count = 0u32;
-    for (_, event_id) in store
-        .room_timeline(room_id, read_seq, Some(upto), SCAN_CAP, false)
-        .map_err(internal)?
-    {
-        let Some(raw) = raw_event(&state.rooms, &event_id)? else {
-            continue;
-        };
-        let is_message = raw
-            .get("type")
-            .map(|t| matches!(t, ruma::CanonicalJsonValue::String(s) if s == "m.room.message"));
-        let own = raw
-            .get("sender")
-            .map(|s| matches!(s, ruma::CanonicalJsonValue::String(u) if u == user_id));
-        if is_message == Some(true) && own != Some(true) {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 fn account_data_event(data_type: &str, content: &[u8]) -> Result<serde_json::Value> {
     let content: serde_json::Value = serde_json::from_slice(content).map_err(internal)?;
     Ok(serde_json::json!({ "type": data_type, "content": content }))
@@ -909,6 +907,7 @@ async fn write_receipt(
     user_id: &UserId,
     receipt_type: &str,
     event_id: &ruma::EventId,
+    thread_id: Option<String>,
 ) -> Result<()> {
     // The receipt target must be a known event of this room.
     let Some(raw) = raw_event(&state.rooms, event_id.as_str())? else {
@@ -921,7 +920,14 @@ async fn write_receipt(
     }
     state
         .rooms
-        .write_receipt(room_id, user_id, receipt_type, event_id, now_ms())
+        .write_receipt(
+            room_id,
+            user_id,
+            receipt_type,
+            event_id,
+            thread_id,
+            now_ms(),
+        )
         .await?;
     Ok(())
 }
@@ -932,10 +938,25 @@ pub async fn send_receipt(
     Ar(req): Ar<create_receipt::v3::Request>,
 ) -> Result<Ra<create_receipt::v3::Response>> {
     use create_receipt::v3::ReceiptType;
+    use ruma::events::receipt::ReceiptThread;
     crate::room_util::require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    let thread_id = match &req.thread {
+        ReceiptThread::Unthreaded => None,
+        ReceiptThread::Main => Some("main".to_owned()),
+        ReceiptThread::Thread(root) => Some(root.to_string()),
+        other => Some(other.as_str().unwrap_or("main").to_owned()),
+    };
     match &req.receipt_type {
         ReceiptType::Read => {
-            write_receipt(&state, &req.room_id, &auth.user_id, "m.read", &req.event_id).await?;
+            write_receipt(
+                &state,
+                &req.room_id,
+                &auth.user_id,
+                "m.read",
+                &req.event_id,
+                thread_id,
+            )
+            .await?;
         }
         ReceiptType::ReadPrivate => {
             write_receipt(
@@ -944,6 +965,7 @@ pub async fn send_receipt(
                 &auth.user_id,
                 "m.read.private",
                 &req.event_id,
+                thread_id,
             )
             .await?;
         }
@@ -975,7 +997,15 @@ pub async fn set_read_markers(
             .await?;
     }
     if let Some(event_id) = &req.read_receipt {
-        write_receipt(&state, &req.room_id, &auth.user_id, "m.read", event_id).await?;
+        write_receipt(
+            &state,
+            &req.room_id,
+            &auth.user_id,
+            "m.read",
+            event_id,
+            None,
+        )
+        .await?;
     }
     if let Some(event_id) = &req.private_read_receipt {
         write_receipt(
@@ -984,6 +1014,7 @@ pub async fn set_read_markers(
             &auth.user_id,
             "m.read.private",
             event_id,
+            None,
         )
         .await?;
     }

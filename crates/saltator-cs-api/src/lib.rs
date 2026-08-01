@@ -6,6 +6,7 @@
 mod error;
 mod extract;
 mod presence;
+mod push_eval;
 mod room_util;
 mod routes;
 mod txn;

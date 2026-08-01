@@ -2437,6 +2437,224 @@ async fn members_at_prev_batch_snapshots_mint_position() {
     env.shutdown().await;
 }
 
+/// Push-rule evaluation with threaded receipts (Complement
+/// TestThreadedReceipts's count matrix): a timeline with a thread, two
+/// highlights, and a reaction; threaded/unthreaded receipts move the
+/// unthreaded and per-thread counts exactly as the spec demands.
+#[tokio::test]
+async fn threaded_receipts_move_unread_counts() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+    let bob_id = format!("@bob:{SERVER}");
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/join"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let send = |txn: &'static str, ty: &'static str, content: Value| {
+        let env = &env;
+        let alice = alice.clone();
+        let room_id = room_id.clone();
+        async move {
+            let (status, body) = env
+                .req(
+                    "PUT",
+                    &format!("/_matrix/client/v3/rooms/{room_id}/send/{ty}/{txn}"),
+                    Some(&alice),
+                    Some(content),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["event_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let thread_rel = |root: &str| json!({"event_id": root, "rel_type": "m.thread"});
+
+    // A<--B<--C<--E [thread A], D + F(reference) + G(annotation) on main.
+    let ev_a = send(
+        "ta",
+        "m.room.message",
+        json!({"msgtype": "m.text", "body": "Hello world!"}),
+    )
+    .await;
+    let ev_b = send(
+        "tb",
+        "m.room.message",
+        json!({"msgtype": "m.text", "body": "Start thread!", "m.relates_to": thread_rel(&ev_a)}),
+    )
+    .await;
+    let _ev_c = send(
+        "tc",
+        "m.room.message",
+        json!({"msgtype": "m.text", "body": format!("Thread response {bob_id}!"),
+               "m.relates_to": thread_rel(&ev_a)}),
+    )
+    .await;
+    let ev_d = send(
+        "td",
+        "m.room.message",
+        json!({"msgtype": "m.text", "body": format!("Hello {bob_id}!")}),
+    )
+    .await;
+    let _ev_e = send(
+        "te",
+        "m.room.message",
+        json!({"msgtype": "m.text", "body": "End thread", "m.relates_to": thread_rel(&ev_a)}),
+    )
+    .await;
+    let ev_f = send(
+        "tf",
+        "m.room.message",
+        json!({"msgtype": "m.text", "body": "Reference!",
+               "m.relates_to": {"event_id": ev_a, "rel_type": "m.reference"}}),
+    )
+    .await;
+    let ev_g = send(
+        "tg",
+        "m.room.reaction",
+        json!({"m.relates_to": {"event_id": ev_f, "rel_type": "m.annotation", "key": "x"}}),
+    )
+    .await;
+
+    const THREAD_FILTER: &str =
+        "%7B%22room%22%3A%7B%22timeline%22%3A%7B%22unread_thread_notifications%22%3Atrue%7D%7D%7D";
+    let counts = |body: &Value| -> (u64, u64) {
+        let u = &body["rooms"]["join"][&room_id]["unread_notifications"];
+        (
+            u["notification_count"].as_u64().unwrap(),
+            u["highlight_count"].as_u64().unwrap(),
+        )
+    };
+    let thread_counts = |body: &Value, root: &str| -> Option<(u64, u64)> {
+        let t = &body["rooms"]["join"][&room_id]["unread_thread_notifications"][root];
+        Some((
+            t["notification_count"].as_u64()?,
+            t["highlight_count"].as_u64()?,
+        ))
+    };
+    let sync_plain = |expect: (u64, u64)| {
+        let env = &env;
+        let bob = bob.clone();
+        let counts = &counts;
+        async move {
+            let (status, body) = env
+                .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(counts(&body), expect, "unthreaded counts: {body}");
+            body
+        }
+    };
+    let sync_threaded = |expect_main: (u64, u64), expect_thread: Option<(u64, u64)>| {
+        let env = &env;
+        let bob = bob.clone();
+        let ev_a = ev_a.clone();
+        let counts = &counts;
+        let thread_counts = &thread_counts;
+        async move {
+            let (status, body) = env
+                .req(
+                    "GET",
+                    &format!("/_matrix/client/v3/sync?filter={THREAD_FILTER}"),
+                    Some(&bob),
+                    None,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(counts(&body), expect_main, "main counts: {body}");
+            assert_eq!(
+                thread_counts(&body, &ev_a),
+                expect_thread,
+                "thread counts: {body}"
+            );
+        }
+    };
+    let receipt = |event: String, thread: Option<&'static str>| {
+        let env = &env;
+        let bob = bob.clone();
+        let room_id = room_id.clone();
+        let ev_a = ev_a.clone();
+        async move {
+            let body = match thread {
+                Some("root") => json!({"thread_id": ev_a}),
+                Some(t) => json!({"thread_id": t}),
+                None => json!({}),
+            };
+            let (status, resp) = env
+                .req(
+                    "POST",
+                    &format!("/_matrix/client/v3/rooms/{room_id}/receipt/m.read/{event}"),
+                    Some(&bob),
+                    Some(body),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{resp}");
+        }
+    };
+
+    // Everything unread: 6 notifying events (the reaction is silent),
+    // 2 highlights; threaded split 3/1 main + 3/1 in thread A.
+    sync_plain((6, 2)).await;
+    sync_threaded((3, 1), Some((3, 1))).await;
+
+    // Threaded main-receipt at A: only A leaves the counts.
+    receipt(ev_a.clone(), Some("main")).await;
+    let body = sync_plain((5, 2)).await;
+    let bob_receipt = &body["rooms"]["join"][&room_id]["ephemeral"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "m.receipt")
+        .expect("receipt EDU")["content"][&ev_a]["m.read"][&bob_id];
+    assert_eq!(bob_receipt["thread_id"], "main", "{body}");
+    sync_threaded((2, 1), Some((3, 1))).await;
+
+    // Thread receipt at B: thread A's tally drops by one.
+    receipt(ev_b.clone(), Some("root")).await;
+    sync_plain((4, 2)).await;
+    sync_threaded((2, 1), Some((2, 1))).await;
+
+    // Unthreaded receipt at D clears both timelines up to D.
+    receipt(ev_d.clone(), None).await;
+    let body = sync_plain((2, 0)).await;
+    let d_receipt = &body["rooms"]["join"][&room_id]["ephemeral"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "m.receipt")
+        .expect("receipt EDU")["content"][&ev_d]["m.read"][&bob_id];
+    assert!(
+        d_receipt.get("thread_id").is_none(),
+        "unthreaded receipt grew a thread_id: {body}"
+    );
+    sync_threaded((1, 0), Some((1, 0))).await;
+
+    // Thread receipt at G (past the thread's end): thread A fully read,
+    // the main timeline unaffected.
+    receipt(ev_g.clone(), Some("root")).await;
+    sync_plain((1, 0)).await;
+    sync_threaded((1, 0), None).await;
+
+    env.shutdown().await;
+}
+
 /// Key-upload validation, query shape rules, and MSC4225 claim ordering.
 #[tokio::test]
 async fn key_upload_validation_and_claim_ordering() {
