@@ -266,6 +266,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             registration_enabled: cfg.client.registration_enabled,
             max_upload_size: cfg.client.max_upload_size,
             well_known_client: cfg.client.well_known_client.clone(),
+            rate_limits: if cfg.client.rate_limits_enabled {
+                saltator_cs_api::RateLimitConfig::default()
+            } else {
+                saltator_cs_api::RateLimitConfig::disabled()
+            },
         },
     )
     .with_federation(fed_client.clone(), signer.clone());

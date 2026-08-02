@@ -43,6 +43,8 @@ data_dir = "/data"
 # per spec v1.19.
 [client]
 default_room_version = "11"
+# The suite hammers every endpoint far past real-client rates.
+rate_limits_enabled = false
 
 [node]
 id = 1

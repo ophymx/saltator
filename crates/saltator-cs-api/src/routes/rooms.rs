@@ -1123,6 +1123,8 @@ pub async fn send_message_event(
     ) {
         return Ok(Ra(send_message_event::v3::Response::new(event_id)));
     }
+    // After the txn-cache check: idempotent retries must not be limited.
+    state.rate_limit(crate::ratelimit::Kind::Message, auth.user_id.as_str())?;
     let content: serde_json::Value = serde_json::from_str(req.body.json().get())
         .map_err(|e| ApiError::bad_json(e.to_string()))?;
     let outcome = state

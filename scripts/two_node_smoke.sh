@@ -28,6 +28,8 @@ write_config() {
   cat > "$dir.toml" <<EOF
 server_name = "cluster.test"
 data_dir = "$dir"
+[client]
+rate_limits_enabled = false
 [node]
 id = $id
 advertise = "$internal"

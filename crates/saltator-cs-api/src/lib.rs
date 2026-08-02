@@ -8,6 +8,7 @@ mod extract;
 mod presence;
 mod push_eval;
 mod push_gateway;
+mod ratelimit;
 mod room_util;
 mod routes;
 mod txn;
@@ -27,6 +28,7 @@ use saltator_userserver::UserServer;
 pub use error::ApiError;
 pub use presence::PresenceMap;
 pub use push_gateway::spawn_push_delivery;
+pub use ratelimit::RateLimitConfig;
 pub use typing::TypingMap;
 
 /// Client-facing configuration of the CS surface.
@@ -43,6 +45,9 @@ pub struct CsConfig {
     /// (e.g. `https://matrix.example.org`); the well-known route is only
     /// served when set.
     pub well_known_client: Option<String>,
+    /// Rate limiting of the abusable endpoints (login, registration,
+    /// message sends). Disable for test harnesses that hammer the API.
+    pub rate_limits: ratelimit::RateLimitConfig,
 }
 
 /// Shared state of every CS route.
@@ -66,6 +71,7 @@ pub struct CsState {
     /// would otherwise lose one write.
     pub(crate) push_rule_locks:
         tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) rate_limiter: ratelimit::RateLimiter,
 }
 
 /// The bits of the federation surface the CS API drives directly: a signed
@@ -119,7 +125,15 @@ impl CsState {
             federation: None,
             txns: txn::TxnCache::new(),
             push_rule_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            rate_limiter: ratelimit::RateLimiter::new(),
         })
+    }
+
+    /// Take one rate-limit token for `(kind, key)`; 429 when drained.
+    pub(crate) fn rate_limit(&self, kind: ratelimit::Kind, key: &str) -> Result<(), ApiError> {
+        self.rate_limiter
+            .check(&self.config.rate_limits, kind, key)
+            .map_err(ApiError::limit_exceeded)
     }
 
     /// The shared typing map (to pass to the federation surface).

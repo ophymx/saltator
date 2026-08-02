@@ -38,6 +38,17 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "M_BAD_JSON", message)
     }
 
+    pub fn limit_exceeded(retry_after_ms: u64) -> Self {
+        let mut err = Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "M_LIMIT_EXCEEDED",
+            "Too many requests",
+        );
+        err.extra
+            .insert("retry_after_ms".into(), retry_after_ms.into());
+        err
+    }
+
     pub fn invalid_param(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", message)
     }
@@ -107,12 +118,24 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut body = self.extra;
+        // Spec v1.10: 429s SHOULD carry Retry-After alongside the legacy
+        // retry_after_ms body field.
+        let retry_after = body
+            .get("retry_after_ms")
+            .and_then(|v| v.as_u64())
+            .map(|ms| ms.div_ceil(1000).max(1));
         // UIA challenges are the one shape where errcode/error are absent.
         if !body.contains_key("flows") {
             body.insert("errcode".into(), self.errcode.into());
             body.insert("error".into(), self.message.into());
         }
-        (self.status, axum::Json(serde_json::Value::Object(body))).into_response()
+        let mut resp = (self.status, axum::Json(serde_json::Value::Object(body))).into_response();
+        if let Some(secs) = retry_after {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut().insert("Retry-After", value);
+            }
+        }
+        resp
     }
 }
 

@@ -96,6 +96,8 @@ pub async fn register(
         Some(u) => u.clone(),
         None => random_localpart(),
     };
+    // Registration is unauthenticated, so the budget is server-global.
+    state.rate_limit(crate::ratelimit::Kind::Registration, "")?;
     let (user_id, session) = state
         .users
         .register(
@@ -163,6 +165,9 @@ pub async fn login(
         (None, Some(u)) => u.clone(),
         _ => return Err(ApiError::forbidden("Unsupported identifier type")),
     };
+    // Keyed by the targeted account: brakes credential stuffing without
+    // letting one attacked account starve others.
+    state.rate_limit(crate::ratelimit::Kind::Login, &user)?;
     let session = state
         .users
         .login_password(

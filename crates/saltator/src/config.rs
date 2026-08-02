@@ -63,6 +63,10 @@ pub struct ClientConfig {
     /// well-known route is only served when set.
     #[serde(default)]
     pub well_known_client: Option<String>,
+    /// Rate limiting of login/registration/message endpoints. Disable
+    /// only for test harnesses that hammer the API.
+    #[serde(default = "default_true")]
+    pub rate_limits_enabled: bool,
 }
 
 impl Default for ClientConfig {
@@ -72,6 +76,7 @@ impl Default for ClientConfig {
             default_room_version: default_room_version(),
             max_upload_size: default_max_upload(),
             well_known_client: None,
+            rate_limits_enabled: true,
         }
     }
 }
@@ -160,6 +165,8 @@ federation = "127.0.0.1:8448"
 registration_enabled = true
 default_room_version = "12"
 max_upload_size = 52428800
+# Login/registration/message rate limiting (429 M_LIMIT_EXCEEDED).
+rate_limits_enabled = true
 # well_known_client = "https://matrix.example.org"
 
 [federation]

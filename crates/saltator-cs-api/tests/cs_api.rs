@@ -29,6 +29,11 @@ struct Env {
 }
 
 async fn start_env() -> Env {
+    // Tests hammer the API far past real-client rates.
+    start_env_with(saltator_cs_api::RateLimitConfig::disabled()).await
+}
+
+async fn start_env_with(rate_limits: saltator_cs_api::RateLimitConfig) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
     let server_name = ruma::OwnedServerName::try_from(SERVER).unwrap();
@@ -69,6 +74,7 @@ async fn start_env() -> Env {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: Some("https://hs.test".into()),
+            rate_limits,
         },
     );
     Env {
@@ -4397,6 +4403,7 @@ async fn client_joins_a_remote_room_via_federation() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     )
     .with_federation(
@@ -4594,6 +4601,7 @@ async fn remote_join_backfills_full_history() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     )
     .with_federation(
@@ -4871,6 +4879,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     )
     .with_federation(
@@ -5183,6 +5192,7 @@ async fn inbound_federated_invite_appears_in_sync() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     );
     let cs_router = saltator_cs_api::router(cs_state);
@@ -5370,6 +5380,7 @@ async fn cs_stack(
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     );
     if let Some(base) = fed_client_base {
@@ -5502,6 +5513,7 @@ async fn outbound_federated_invite_round_trip() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     )
     .with_federation(
@@ -5642,6 +5654,7 @@ async fn to_device_over_federation_round_trip() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     )
     .with_federation(
@@ -5775,6 +5788,7 @@ async fn federated_key_query_claim_and_device_list_update() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     )
     .with_federation(
@@ -5945,6 +5959,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     );
     let cs_router = saltator_cs_api::router(cs_state.clone());
@@ -6218,6 +6233,7 @@ async fn client_downloads_remote_media_over_federation() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     )
     .with_federation(
@@ -6445,6 +6461,7 @@ async fn client_queries_remote_profile_and_directory() {
             registration_enabled: true,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
         },
     )
     .with_federation(
@@ -6496,6 +6513,121 @@ async fn client_queries_remote_profile_and_directory() {
     a_users.shutdown().await.unwrap();
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
+}
+
+/// Rate limiting (spec "Rate limiting"): drained buckets return 429
+/// M_LIMIT_EXCEEDED with retry_after_ms and a Retry-After header;
+/// budgets are per class and per key.
+#[tokio::test]
+async fn rate_limits_return_429_with_retry() {
+    let mut cfg = saltator_cs_api::RateLimitConfig::disabled();
+    cfg.enabled = true;
+    // Tiny message/login budgets that won't refill within the test; a
+    // roomy registration budget so setup doesn't trip it.
+    cfg.message_rate = 0.001;
+    cfg.message_burst = 2;
+    cfg.login_rate = 0.001;
+    cfg.login_burst = 2;
+    cfg.registration_rate = 1000.0;
+    cfg.registration_burst = 100;
+    let env = start_env_with(cfg).await;
+    let alice = env.register("alice", "alice-pw").await;
+    env.register("bob", "bob-pw").await;
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_enc = body["room_id"]
+        .as_str()
+        .unwrap()
+        .replace('!', "%21")
+        .replace(':', "%3A");
+
+    // Two sends fit the burst; the third drains the bucket.
+    for txn in ["rl1", "rl2"] {
+        let (status, body) = env
+            .req(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/{txn}"),
+                Some(&alice),
+                Some(json!({"msgtype": "m.text", "body": txn})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    // Raw request so the Retry-After header is observable.
+    let resp = env
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/rl3"
+                ))
+                .header("Authorization", format!("Bearer {alice}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"msgtype":"m.text","body":"rl3"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_header: u64 = resp.headers()["Retry-After"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_header >= 1);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED", "{body}");
+    assert!(body["retry_after_ms"].as_u64().unwrap() >= 1, "{body}");
+    // Replaying a limited txn id is NOT rate limited (idempotency wins),
+    // and other users keep their own budget untouched.
+    let (status, _) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/rl1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "rl1"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Login is keyed by the targeted account: alice's budget drains,
+    // bob's stays intact.
+    let login = |user: &'static str, pw: &'static str| {
+        env.req(
+            "POST",
+            "/_matrix/client/v3/login",
+            None,
+            Some(json!({
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": user},
+                "password": pw,
+            })),
+        )
+    };
+    for _ in 0..2 {
+        let (status, _) = login("alice", "wrong").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, body) = login("alice", "alice-pw").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["errcode"], "M_LIMIT_EXCEEDED");
+    let (status, _) = login("bob", "bob-pw").await;
+    assert_eq!(status, StatusCode::OK);
+
+    env.shutdown().await;
 }
 
 /// HTTP push delivery: a message lands, bob's pusher gateway receives a
