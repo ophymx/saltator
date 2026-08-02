@@ -2748,6 +2748,278 @@ async fn url_preview_extracts_og_tags_and_caches_image() {
     env.shutdown().await;
 }
 
+/// Fallback keys (spec 1.2): served by /keys/claim once one-time keys
+/// run dry, kept (not deleted) and marked used; sync advertises the
+/// unused algorithms; a rotated key resets the flag.
+#[tokio::test]
+async fn fallback_keys_serve_after_otk_exhaustion() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let user = format!("@alice:{SERVER}");
+
+    // A device identity, one OTK, and a fallback key.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            Some(&alice),
+            Some(json!({
+                "device_keys": {
+                    "user_id": user, "device_id": device_of(&env, &alice).await,
+                    "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                    "keys": {}, "signatures": {},
+                },
+                "one_time_keys": {"signed_curve25519:OTK1": {"key": "otk"}},
+                "fallback_keys": {"signed_curve25519:FALL1": {"key": "fall1"}},
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let device = device_of(&env, &alice).await;
+
+    // Sync advertises the unused fallback algorithm.
+    let (_, sync0) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    assert_eq!(
+        sync0["device_unused_fallback_key_types"],
+        json!(["signed_curve25519"]),
+        "{sync0}"
+    );
+
+    async fn claim(env: &Env, token: String, user: String, device: String) -> String {
+        let (status, got) = env
+            .req(
+                "POST",
+                "/_matrix/client/v3/keys/claim",
+                Some(&token),
+                Some(json!({"one_time_keys": {&user: {&device: "signed_curve25519"}}})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        got["one_time_keys"][&user][&device]
+            .as_object()
+            .and_then(|m| m.keys().next().cloned())
+            .unwrap_or_default()
+    }
+
+    // First claim eats the OTK; the next two serve the SAME fallback.
+    let k1 = claim(&env, alice.clone(), user.clone(), device.clone()).await;
+    assert_eq!(k1, "signed_curve25519:OTK1");
+    let k2 = claim(&env, alice.clone(), user.clone(), device.clone()).await;
+    assert_eq!(k2, "signed_curve25519:FALL1");
+    let k3 = claim(&env, alice.clone(), user.clone(), device.clone()).await;
+    assert_eq!(
+        k3, "signed_curve25519:FALL1",
+        "fallback must not be deleted"
+    );
+
+    // Used now — gone from the unused list until a new key rotates in.
+    let (_, sync1) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    assert_eq!(
+        sync1["device_unused_fallback_key_types"],
+        json!([]),
+        "{sync1}"
+    );
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            Some(&alice),
+            Some(json!({"fallback_keys": {"signed_curve25519:FALL2": {"key": "fall2"}}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, sync2) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    assert_eq!(
+        sync2["device_unused_fallback_key_types"],
+        json!(["signed_curve25519"]),
+        "{sync2}"
+    );
+    let k4 = claim(&env, alice, user, device).await;
+    assert_eq!(k4, "signed_curve25519:FALL2");
+
+    env.shutdown().await;
+}
+
+/// Cross-signing: first upload needs no UIA, replacement does; /keys/query
+/// surfaces master+self-signing to everyone and user-signing only to the
+/// owner; /keys/signatures/upload merges into stored keys.
+#[tokio::test]
+async fn cross_signing_upload_query_and_signatures() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+    let bob = env.register("bob", "bob-pw-123").await;
+    let user = format!("@alice:{SERVER}");
+    let device = device_of(&env, &alice).await;
+
+    // Device identity keys, so signatures have something to land on.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/upload",
+            Some(&alice),
+            Some(json!({
+                "device_keys": {
+                    "user_id": user, "device_id": device,
+                    "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+                    "keys": {format!("ed25519:{device}"): "devicepub"},
+                    "signatures": {},
+                },
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let master = json!({
+        "user_id": user, "usage": ["master"],
+        "keys": {"ed25519:masterpub": "masterpub"},
+    });
+    let self_signing = json!({
+        "user_id": user, "usage": ["self_signing"],
+        "keys": {"ed25519:selfpub": "selfpub"},
+        "signatures": {&user: {"ed25519:masterpub": "sig-by-master"}},
+    });
+    let user_signing = json!({
+        "user_id": user, "usage": ["user_signing"],
+        "keys": {"ed25519:userpub": "userpub"},
+    });
+
+    // First upload: no UIA required.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/device_signing/upload",
+            Some(&alice),
+            Some(json!({
+                "master_key": master,
+                "self_signing_key": self_signing,
+                "user_signing_key": user_signing,
+            })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "first upload should skip UIA: {body}"
+    );
+
+    // Owner sees all three; another user sees no user-signing key.
+    let (status, got) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/query",
+            Some(&alice),
+            Some(json!({"device_keys": {&user: []}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(
+        got["master_keys"][&user]["usage"],
+        json!(["master"]),
+        "{got}"
+    );
+    assert!(got["self_signing_keys"][&user].is_object(), "{got}");
+    assert!(got["user_signing_keys"][&user].is_object(), "{got}");
+    let (_, bob_got) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/query",
+            Some(&bob),
+            Some(json!({"device_keys": {&user: []}})),
+        )
+        .await;
+    assert!(bob_got["master_keys"][&user].is_object(), "{bob_got}");
+    assert!(
+        bob_got["user_signing_keys"].get(&user).is_none(),
+        "user-signing key leaked: {bob_got}"
+    );
+
+    // Replacing the master key re-authenticates: bare replacement 401s
+    // with UIA flows, the password-authed one succeeds.
+    let (status, challenge) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/device_signing/upload",
+            Some(&alice),
+            Some(json!({"master_key": master})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{challenge}");
+    let session = challenge["session"].as_str().unwrap();
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/device_signing/upload",
+            Some(&alice),
+            Some(json!({
+                "master_key": master,
+                "auth": {
+                    "type": "m.login.password",
+                    "identifier": {"type": "m.id.user", "user": "alice"},
+                    "password": "alice-pw-123",
+                    "session": session,
+                },
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "authed replacement failed: {body}");
+
+    // Signatures: self-signing key signs the device; a device signs the
+    // master key. Both merge into what /keys/query returns.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/signatures/upload",
+            Some(&alice),
+            Some(json!({
+                &user: {
+                    &device: {
+                        "user_id": user, "device_id": device,
+                        "signatures": {&user: {"ed25519:selfpub": "sig-by-self"}},
+                    },
+                    "ed25519:masterpub": {
+                        "user_id": user, "usage": ["master"],
+                        "signatures": {&user: {format!("ed25519:{device}"): "sig-by-device"}},
+                    },
+                },
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, got) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/keys/query",
+            Some(&alice),
+            Some(json!({"device_keys": {&user: []}})),
+        )
+        .await;
+    assert_eq!(
+        got["device_keys"][&user][&device]["signatures"][&user]["ed25519:selfpub"], "sig-by-self",
+        "{got}"
+    );
+    assert_eq!(
+        got["master_keys"][&user]["signatures"][&user][format!("ed25519:{device}")],
+        "sig-by-device",
+        "{got}"
+    );
+
+    env.shutdown().await;
+}
+
+/// The session's device id, from /account/whoami.
+async fn device_of(env: &Env, token: &str) -> String {
+    let (_, who) = env
+        .req("GET", "/_matrix/client/v3/account/whoami", Some(token), None)
+        .await;
+    who["device_id"].as_str().unwrap().to_owned()
+}
+
 /// Key-upload validation, query shape rules, and MSC4225 claim ordering.
 #[tokio::test]
 async fn key_upload_validation_and_claim_ordering() {

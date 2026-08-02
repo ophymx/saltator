@@ -228,6 +228,11 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             .route(&p("/keys/query"), post(keys::query_keys))
             .route(&p("/keys/claim"), post(keys::claim_keys))
             .route(&p("/keys/changes"), get(keys::key_changes))
+            .route(
+                &p("/keys/device_signing/upload"),
+                post(keys::device_signing_upload),
+            )
+            .route(&p("/keys/signatures/upload"), post(keys::signatures_upload))
             // -- e2ee key backup
             .route(
                 &p("/room_keys/version"),

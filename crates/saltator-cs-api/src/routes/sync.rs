@@ -476,6 +476,16 @@ async fn build_sync(
             )
         })
         .collect();
+    // Always present (never null): its absence would tell clients the
+    // server ignores fallback keys.
+    resp.device_unused_fallback_key_types = Some(
+        store
+            .unused_fallback_algorithms(user_id, &auth.device_id)
+            .map_err(internal)?
+            .into_iter()
+            .map(|a| a.as_str().into())
+            .collect(),
+    );
 
     // Presence: users the caller shares a room with (and the caller) whose
     // presence changed inside the window — plus newly-visible users

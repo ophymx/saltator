@@ -401,7 +401,7 @@ pub async fn update_device(
 /// The single-password UIA stage shared by destructive account
 /// endpoints: challenge when auth is absent, 401 `M_FORBIDDEN` (with the
 /// flows) on a wrong password.
-async fn require_password_uia(
+pub(crate) async fn require_password_uia(
     state: &CsState,
     auth: &Auth,
     req_auth: &Option<AuthData>,

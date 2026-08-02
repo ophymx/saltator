@@ -70,6 +70,14 @@ pub const T_BACKUP_VERSION: u8 = APP_TABLE_MIN + 17;
 /// `user_id ++ 0x00 ++ version (u64 BE) ++ 0x00 ++ room_id ++ 0x00 ++
 /// session_id → KeyBackupData JSON` — the backed-up room keys.
 pub const T_BACKUP_KEY: u8 = APP_TABLE_MIN + 18;
+/// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ algorithm → FallbackEntry` —
+/// one fallback key per device+algorithm, served by `/keys/claim` when
+/// the one-time keys run dry (spec 1.2 / MSC2732). Never deleted by a
+/// claim, only replaced by upload.
+pub const T_FALLBACK_KEY: u8 = APP_TABLE_MIN + 19;
+/// `user_id ++ 0x00 ++ kind → raw key JSON` — cross-signing keys, kind ∈
+/// `master` | `self_signing` | `user_signing`.
+pub const T_CROSS_SIGNING: u8 = APP_TABLE_MIN + 20;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -345,11 +353,30 @@ pub enum UserCommand {
         /// `(key_id, raw JSON)` one-time keys to add, e.g.
         /// `("signed_curve25519:AAAAAQ", {...})`.
         one_time_keys: Vec<(String, Vec<u8>)>,
+        /// `(key_id, raw JSON)` fallback keys — one kept per algorithm; a
+        /// changed key replaces the old one and resets its used flag.
+        fallback_keys: Vec<(String, Vec<u8>)>,
     },
     /// Claim one one-time key per requested `(user, device, algorithm)`,
     /// removing it so it is never claimed twice (`/keys/claim`).
     ClaimKeys {
         claims: Vec<ClaimRequest>,
+    },
+    /// Store the user's cross-signing identity
+    /// (`/keys/device_signing/upload`): each present key replaces the
+    /// stored one. Logs a key change — peers must re-query.
+    SetCrossSigningKeys {
+        user_id: String,
+        master: Option<Vec<u8>>,
+        self_signing: Option<Vec<u8>>,
+        user_signing: Option<Vec<u8>>,
+    },
+    /// Merge uploaded signatures (`/keys/signatures/upload`) into the
+    /// user's own stored device keys or cross-signing keys. Each target is
+    /// `(device id or cross-signing public key id, signatures object)`.
+    AddSignatures {
+        user_id: String,
+        targets: Vec<(String, Vec<u8>)>,
     },
     /// Queue to-device events into recipients' inboxes (`/sendToDevice`,
     /// later the `m.direct_to_device` federation EDU). Wakes each
@@ -444,6 +471,19 @@ pub struct OtkEntry {
     pub order: u64,
     /// Raw one-time-key JSON.
     pub json: Vec<u8>,
+}
+
+/// A stored fallback key ([`T_FALLBACK_KEY`]): the device's key of last
+/// resort for one algorithm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FallbackEntry {
+    /// Full key id (`algorithm:id`).
+    pub key_id: String,
+    /// Raw key JSON.
+    pub json: Vec<u8>,
+    /// Set once a claim has served it; cleared when a new key replaces
+    /// this one (feeds sync's `device_unused_fallback_key_types`).
+    pub used: bool,
 }
 
 /// One key-backup version's metadata ([`T_BACKUP_VERSION`]).

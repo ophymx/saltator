@@ -325,6 +325,7 @@ impl UserServer {
         device_id: &str,
         device_keys: Option<Vec<u8>>,
         one_time_keys: Vec<(String, Vec<u8>)>,
+        fallback_keys: Vec<(String, Vec<u8>)>,
     ) -> Result<std::collections::BTreeMap<String, u64>> {
         match self
             .propose(&UserCommand::UploadKeys {
@@ -332,12 +333,44 @@ impl UserServer {
                 device_id: device_id.to_owned(),
                 device_keys,
                 one_time_keys,
+                fallback_keys,
             })
             .await?
         {
             UserResponse::OneTimeKeyCounts(counts) => Ok(counts),
             other => Err(unexpected(other)),
         }
+    }
+
+    /// Store the user's cross-signing keys (`/keys/device_signing/upload`).
+    pub async fn set_cross_signing_keys(
+        &self,
+        user_id: &UserId,
+        master: Option<Vec<u8>>,
+        self_signing: Option<Vec<u8>>,
+        user_signing: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.expect_ok(&UserCommand::SetCrossSigningKeys {
+            user_id: user_id.to_string(),
+            master,
+            self_signing,
+            user_signing,
+        })
+        .await
+    }
+
+    /// Merge uploaded signatures into the user's stored device or
+    /// cross-signing keys (`/keys/signatures/upload`).
+    pub async fn add_signatures(
+        &self,
+        user_id: &UserId,
+        targets: Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
+        self.expect_ok(&UserCommand::AddSignatures {
+            user_id: user_id.to_string(),
+            targets,
+        })
+        .await
     }
 
     /// Claim one one-time key per request (`/keys/claim`) — a linearizable

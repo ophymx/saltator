@@ -53,7 +53,28 @@ pub async fn keys_query(State(state): State<Arc<FedState>>, auth: Authenticated)
         }
     }
 
-    Ok(axum::Json(json!({ "device_keys": out })))
+    // Cross-signing identity: master + self-signing are public;
+    // user-signing keys never leave the user's own server.
+    let mut master_keys = Map::new();
+    let mut self_signing_keys = Map::new();
+    for user_id in requested.keys() {
+        for (kind, map) in [
+            ("master", &mut master_keys),
+            ("self_signing", &mut self_signing_keys),
+        ] {
+            if let Ok(Some(raw)) = store.cross_signing_key(user_id, kind) {
+                if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
+                    map.insert(user_id.clone(), value);
+                }
+            }
+        }
+    }
+
+    Ok(axum::Json(json!({
+        "device_keys": out,
+        "master_keys": master_keys,
+        "self_signing_keys": self_signing_keys,
+    })))
 }
 
 /// `POST /_matrix/federation/v1/user/keys/claim`: claim one one-time key

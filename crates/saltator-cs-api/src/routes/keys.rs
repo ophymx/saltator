@@ -52,11 +52,29 @@ pub async fn upload_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body)
             .collect(),
         _ => Vec::new(),
     };
+    // Stable name (spec 1.2) or the MSC2732 unstable prefix older clients
+    // still send.
+    let fallback_keys = match body
+        .get("fallback_keys")
+        .or_else(|| body.get("org.matrix.msc2732.fallback_keys"))
+    {
+        Some(Value::Object(m)) => m
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string().into_bytes()))
+            .collect(),
+        _ => Vec::new(),
+    };
 
     let announces = device_keys.is_some();
     let counts = state
         .users
-        .upload_keys(&auth.user_id, &auth.device_id, device_keys, one_time_keys)
+        .upload_keys(
+            &auth.user_id,
+            &auth.device_id,
+            device_keys,
+            one_time_keys,
+            fallback_keys,
+        )
         .await?;
     // New identity keys are a device-list change remote peers care about.
     if announces {
@@ -86,8 +104,10 @@ fn is_local(state: &CsState, user_id: &str) -> bool {
 }
 
 /// Fan a per-destination request out over federation, merging each
-/// response's `merge_key` object into `out`; failed servers land in
+/// response's `merge_key` object into `out` (and any `extra_merges`
+/// side-sections, e.g. cross-signing keys); failed servers land in
 /// `failures`.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_key_requests(
     state: &CsState,
     path: &str,
@@ -96,6 +116,7 @@ async fn proxy_key_requests(
     remote: std::collections::BTreeMap<String, Map<String, Value>>,
     out: &mut Map<String, Value>,
     failures: &mut Map<String, Value>,
+    mut extra_merges: Vec<(&str, &mut Map<String, Value>)>,
 ) {
     if remote.is_empty() {
         return;
@@ -121,6 +142,13 @@ async fn proxy_key_requests(
                         out.insert(user.clone(), value.clone());
                     }
                 }
+                for (key, map) in extra_merges.iter_mut() {
+                    if let Some(merged) = resp.get(*key).and_then(|d| d.as_object()) {
+                        for (user, value) in merged {
+                            map.insert(user.clone(), value.clone());
+                        }
+                    }
+                }
             }
             Err(e) => {
                 failures.insert(
@@ -136,7 +164,7 @@ async fn proxy_key_requests(
 /// the requested users' devices; remote users' keys are fetched live from
 /// their servers (never cached, so device-list gaps can't serve stale
 /// keys).
-pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body): Jb) -> JsonResp {
+pub async fn query_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body): Jb) -> JsonResp {
     let requested = match body.get("device_keys") {
         Some(Value::Object(m)) => m,
         _ => {
@@ -146,6 +174,9 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
 
     let store = state.users.store();
     let mut out = Map::new();
+    let mut master_keys = Map::new();
+    let mut self_signing_keys = Map::new();
+    let mut user_signing_keys = Map::new();
     let mut failures = Map::new();
     let mut remote: std::collections::BTreeMap<String, Map<String, Value>> = Default::default();
     for (user_id, devices) in requested {
@@ -182,6 +213,25 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
         }
         // Requested users always appear, empty when they have no keys.
         out.insert(user_id.clone(), Value::Object(per_user));
+
+        // Cross-signing identity: master + self-signing are public; the
+        // user-signing key is only shown to its owner.
+        let mut kinds = vec![
+            ("master", &mut master_keys),
+            ("self_signing", &mut self_signing_keys),
+        ];
+        if user_id == auth.user_id.as_str() {
+            kinds.push(("user_signing", &mut user_signing_keys));
+        }
+        for (kind, map) in kinds {
+            if let Some(raw) = store
+                .cross_signing_key(user_id, kind)
+                .map_err(ApiError::internal)?
+            {
+                let value: Value = serde_json::from_slice(&raw).map_err(ApiError::internal)?;
+                map.insert(user_id.clone(), value);
+            }
+        }
     }
     proxy_key_requests(
         &state,
@@ -191,16 +241,113 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
         remote,
         &mut out,
         &mut failures,
+        vec![
+            ("master_keys", &mut master_keys),
+            ("self_signing_keys", &mut self_signing_keys),
+        ],
     )
     .await;
 
     Ok(axum::Json(json!({
         "device_keys": out,
-        "master_keys": {},
-        "self_signing_keys": {},
-        "user_signing_keys": {},
+        "master_keys": master_keys,
+        "self_signing_keys": self_signing_keys,
+        "user_signing_keys": user_signing_keys,
         "failures": failures,
     })))
+}
+
+/// `POST /keys/device_signing/upload`: store the cross-signing identity.
+/// Replacing an existing master key re-authenticates (UIA); the first
+/// upload does not (MSC3967 / spec 1.11).
+pub async fn device_signing_upload(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Jb(body): Jb,
+) -> JsonResp {
+    let has_master = state
+        .users
+        .store()
+        .cross_signing_key(auth.user_id.as_str(), "master")
+        .map_err(ApiError::internal)?
+        .is_some();
+    if has_master {
+        let req_auth = match body.get("auth") {
+            Some(a) => Some(
+                serde_json::from_value(a.clone())
+                    .map_err(|e| ApiError::bad_json(format!("auth: {e}")))?,
+            ),
+            None => None,
+        };
+        crate::routes::account::require_password_uia(&state, &auth, &req_auth).await?;
+    }
+    let key_of = |field: &str| -> Result<Option<Vec<u8>>> {
+        match body.get(field) {
+            None => Ok(None),
+            Some(v) => {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| ApiError::bad_json(format!("{field} is not an object")))?;
+                if obj.get("user_id").and_then(|u| u.as_str()) != Some(auth.user_id.as_str()) {
+                    return Err(ApiError::bad_json(format!(
+                        "{field} does not belong to this user"
+                    )));
+                }
+                Ok(Some(v.to_string().into_bytes()))
+            }
+        }
+    };
+    let master = key_of("master_key")?;
+    let self_signing = key_of("self_signing_key")?;
+    let user_signing = key_of("user_signing_key")?;
+    if master.is_some() || self_signing.is_some() || user_signing.is_some() {
+        state
+            .users
+            .set_cross_signing_keys(&auth.user_id, master, self_signing, user_signing)
+            .await?;
+        crate::routes::edu::broadcast_device_list_update(
+            &state,
+            auth.user_id.as_str(),
+            &auth.device_id,
+            false,
+        );
+    }
+    Ok(axum::Json(json!({})))
+}
+
+/// `POST /keys/signatures/upload`: merge new signatures into the caller's
+/// own stored device/cross-signing keys. Signatures on OTHER users' keys
+/// (user-signing attestations) are accepted but not yet persisted —
+/// cross-user verification badges degrade, encryption does not.
+pub async fn signatures_upload(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Jb(body): Jb,
+) -> JsonResp {
+    let mut targets = Vec::new();
+    for (user_id, keys) in &body {
+        if user_id != auth.user_id.as_str() {
+            continue;
+        }
+        let Some(keys) = keys.as_object() else {
+            continue;
+        };
+        for (target, signed) in keys {
+            if let Some(signatures) = signed.get("signatures") {
+                targets.push((target.clone(), signatures.to_string().into_bytes()));
+            }
+        }
+    }
+    if !targets.is_empty() {
+        state.users.add_signatures(&auth.user_id, targets).await?;
+        crate::routes::edu::broadcast_device_list_update(
+            &state,
+            auth.user_id.as_str(),
+            &auth.device_id,
+            false,
+        );
+    }
+    Ok(axum::Json(json!({ "failures": {} })))
 }
 
 /// The `device_lists` deltas for `user_id` over the user-shard window
@@ -369,6 +516,7 @@ pub async fn claim_keys(State(state): State<Arc<CsState>>, _auth: Auth, Jb(body)
         remote,
         &mut out,
         &mut failures,
+        Vec::new(),
     )
     .await;
 

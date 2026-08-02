@@ -6,11 +6,12 @@ use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
     account_data_key, device_scoped_key, prefix_end, to_device_key, user_key, Account,
-    AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimedKey, Device, KeyChangeEntry, MediaMeta,
-    MembershipEntry, OtkEntry, Profile, SessionCmd, TokenEntry, TokenKind, UserChangePayload,
-    UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION,
-    T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE,
-    T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE,
+    AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimedKey, Device, FallbackEntry,
+    KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, SessionCmd, TokenEntry,
+    TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS,
+    T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS,
+    T_DIRECTORY, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP,
+    T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -120,7 +121,7 @@ fn delete_device(ctx: &mut ApplyCtx<'_>, user_id: &str, device_id: &str) -> Stor
     // pushers this session registered.
     ctx.delete(T_DEVICE_KEYS, &dkey);
     let prefix = device_scoped_key(user_id, device_id, "");
-    for table in [T_ONE_TIME_KEY, T_TO_DEVICE, T_PUSHER] {
+    for table in [T_ONE_TIME_KEY, T_TO_DEVICE, T_PUSHER, T_FALLBACK_KEY] {
         for (k, _) in ctx.range(table, &prefix, &prefix_end(&prefix))? {
             ctx.delete(table, &k);
         }
@@ -559,6 +560,7 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             device_id,
             device_keys,
             one_time_keys,
+            fallback_keys,
         } => {
             if let Some(dk) = device_keys {
                 ctx.put(T_DEVICE_KEYS, &user_key(user_id, device_id), dk.clone());
@@ -604,6 +606,29 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                     next_order += 1;
                 }
             }
+            // Fallback keys: one per algorithm; re-uploading the same key
+            // keeps its used flag, a new key resets it.
+            for (key_id, json) in fallback_keys {
+                let algo = key_id.split(':').next().unwrap_or_default();
+                let fkey = device_scoped_key(user_id, device_id, algo);
+                let existing: Option<FallbackEntry> =
+                    get_typed(ctx, "fallback decode", T_FALLBACK_KEY, &fkey)?;
+                let used = existing
+                    .as_ref()
+                    .is_some_and(|e| e.key_id == *key_id && e.used);
+                ctx.put(
+                    T_FALLBACK_KEY,
+                    &fkey,
+                    enc(
+                        "fallback encode",
+                        &FallbackEntry {
+                            key_id: key_id.clone(),
+                            json: json.clone(),
+                            used,
+                        },
+                    )?,
+                );
+            }
             let mut counts = std::collections::BTreeMap::new();
             for id in ids {
                 let algo = id.split(':').next().unwrap_or_default().to_owned();
@@ -640,9 +665,108 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                         key_id,
                         key_json: json,
                     });
+                    continue;
+                }
+                // One-time keys exhausted: fall back to the device's key
+                // of last resort (kept, marked used — many sessions may
+                // start from it until the device rotates it).
+                let fkey = device_scoped_key(&req.user_id, &req.device_id, &req.algorithm);
+                if let Some(mut entry) =
+                    get_typed::<FallbackEntry>(ctx, "fallback decode", T_FALLBACK_KEY, &fkey)?
+                {
+                    if !entry.used {
+                        entry.used = true;
+                        ctx.put(T_FALLBACK_KEY, &fkey, enc("fallback encode", &entry)?);
+                    }
+                    claimed.push(ClaimedKey {
+                        user_id: req.user_id.clone(),
+                        device_id: req.device_id.clone(),
+                        key_id: entry.key_id,
+                        key_json: entry.json,
+                    });
                 }
             }
             Ok(UserResponse::ClaimedKeys(claimed))
+        }
+        UserCommand::SetCrossSigningKeys {
+            user_id,
+            master,
+            self_signing,
+            user_signing,
+        } => {
+            for (kind, key) in [
+                ("master", master),
+                ("self_signing", self_signing),
+                ("user_signing", user_signing),
+            ] {
+                if let Some(json) = key {
+                    ctx.put(T_CROSS_SIGNING, &user_key(user_id, kind), json.clone());
+                }
+            }
+            log_key_change(ctx, user_id)?;
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::AddSignatures { user_id, targets } => {
+            // Merge each signatures patch into the matching stored object:
+            // a device's identity keys, or one of the cross-signing keys
+            // (matched by the public key id in its `keys` map).
+            let merge = |stored: &[u8], patch: &[u8]| -> Option<Vec<u8>> {
+                let mut obj: serde_json::Value = serde_json::from_slice(stored).ok()?;
+                let patch: serde_json::Value = serde_json::from_slice(patch).ok()?;
+                let sigs = obj
+                    .as_object_mut()?
+                    .entry("signatures")
+                    .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                for (signer, keys) in patch.as_object()? {
+                    let per_signer = sigs
+                        .as_object_mut()?
+                        .entry(signer.clone())
+                        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                    for (key_id, sig) in keys.as_object()? {
+                        per_signer
+                            .as_object_mut()?
+                            .insert(key_id.clone(), sig.clone());
+                    }
+                }
+                serde_json::to_vec(&obj).ok()
+            };
+            let mut changed = false;
+            for (target, patch) in targets {
+                let dkey = user_key(user_id, target);
+                if let Some(stored) = ctx.get(T_DEVICE_KEYS, &dkey)? {
+                    if let Some(updated) = merge(&stored, patch) {
+                        ctx.put(T_DEVICE_KEYS, &dkey, updated);
+                        changed = true;
+                    }
+                    continue;
+                }
+                for kind in ["master", "self_signing", "user_signing"] {
+                    let ckey = user_key(user_id, kind);
+                    let Some(stored) = ctx.get(T_CROSS_SIGNING, &ckey)? else {
+                        continue;
+                    };
+                    let holds_key = serde_json::from_slice::<serde_json::Value>(&stored)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("keys")?.as_object().map(|k| {
+                                k.keys()
+                                    .any(|id| id == target || id.ends_with(target.as_str()))
+                            })
+                        })
+                        .unwrap_or(false);
+                    if holds_key {
+                        if let Some(updated) = merge(&stored, patch) {
+                            ctx.put(T_CROSS_SIGNING, &ckey, updated);
+                            changed = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if changed {
+                log_key_change(ctx, user_id)?;
+            }
+            Ok(UserResponse::Ok)
         }
         UserCommand::SendToDevice { messages } => {
             for m in messages {
@@ -1030,6 +1154,33 @@ impl UserStore {
             *counts.entry(algo).or_insert(0u64) += 1;
         }
         Ok(counts)
+    }
+
+    /// One cross-signing key's raw JSON (kind ∈ `master` | `self_signing`
+    /// | `user_signing`).
+    pub fn cross_signing_key(&self, user_id: &str, kind: &str) -> StoreResult<Option<Vec<u8>>> {
+        self.read.get(T_CROSS_SIGNING, &user_key(user_id, kind))
+    }
+
+    /// Algorithms whose fallback key has not yet been served by a claim
+    /// (`/sync`'s `device_unused_fallback_key_types`).
+    pub fn unused_fallback_algorithms(
+        &self,
+        user_id: &str,
+        device_id: &str,
+    ) -> StoreResult<Vec<String>> {
+        let prefix = device_scoped_key(user_id, device_id, "");
+        let mut out = Vec::new();
+        for (k, v) in self
+            .read
+            .range(T_FALLBACK_KEY, &prefix, &prefix_end(&prefix))?
+        {
+            let entry: FallbackEntry = dec("fallback decode", &v)?;
+            if !entry.used {
+                out.push(String::from_utf8_lossy(&k[prefix.len()..]).into_owned());
+            }
+        }
+        Ok(out)
     }
 
     /// The latest live key-backup version, if any: `(version, meta)`.

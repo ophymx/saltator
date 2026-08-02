@@ -172,7 +172,7 @@ async fn e2ee_key_upload_query_claim() {
         ),
     ];
     let counts = u
-        .upload_keys(&uid, &dev, Some(device_keys), otks)
+        .upload_keys(&uid, &dev, Some(device_keys), otks, vec![])
         .await
         .unwrap();
     assert_eq!(counts.get("signed_curve25519"), Some(&2));
@@ -205,7 +205,10 @@ async fn e2ee_key_upload_query_claim() {
         .await
         .unwrap();
     assert!(third.is_empty());
-    let counts = u.upload_keys(&uid, &dev, None, vec![]).await.unwrap();
+    let counts = u
+        .upload_keys(&uid, &dev, None, vec![], vec![])
+        .await
+        .unwrap();
     assert_eq!(counts.get("signed_curve25519").copied().unwrap_or(0), 0);
 
     env.rooms.shutdown().await.unwrap();
@@ -285,6 +288,7 @@ async fn to_device_inbox_send_and_ack() {
             "signed_curve25519:AAAAAQ".to_owned(),
             serde_json::to_vec(&json!({"key": "aaa"})).unwrap(),
         )],
+        vec![],
     )
     .await
     .unwrap();
@@ -320,6 +324,7 @@ async fn device_list_log_and_device_cleanup() {
         &dev,
         Some(b"{}".to_vec()),
         vec![("signed_curve25519:AAAAAQ".to_owned(), b"{}".to_vec())],
+        vec![],
     )
     .await
     .unwrap();
@@ -335,6 +340,7 @@ async fn device_list_log_and_device_cleanup() {
         &dev,
         None,
         vec![("signed_curve25519:AAAAAg".to_owned(), b"{}".to_vec())],
+        vec![],
     )
     .await
     .unwrap();
