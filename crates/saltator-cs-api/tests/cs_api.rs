@@ -501,10 +501,71 @@ async fn two_users_chat_end_to_end() {
     let resp = env.router.clone().oneshot(download).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers().get("content-type").unwrap(), "text/plain");
+    // Media responses are hardened against being rendered as an active
+    // document on the homeserver origin.
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert!(resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("sandbox"));
+    // text/plain is inline-safe.
+    assert!(resp
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("inline"));
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     assert_eq!(&bytes[..], b"hello media");
+
+    // An uploaded HTML document must come back as an attachment (never
+    // inline) so it can't run script on the media origin.
+    let up_html = Request::builder()
+        .method("POST")
+        .uri("/_matrix/media/v3/upload?filename=x.html")
+        .header("Authorization", format!("Bearer {alice}"))
+        .header("Content-Type", "text/html")
+        .body(Body::from("<script>alert(1)</script>"))
+        .unwrap();
+    let resp = env.router.clone().oneshot(up_html).await.unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let html_id = body["content_uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let dl_html = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/_matrix/client/v1/media/download/{SERVER}/{html_id}"
+        ))
+        .header("Authorization", format!("Bearer {bob}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = env.router.clone().oneshot(dl_html).await.unwrap();
+    assert!(resp
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("attachment"));
     // Unauthenticated media is refused.
     let download = Request::builder()
         .method("GET")

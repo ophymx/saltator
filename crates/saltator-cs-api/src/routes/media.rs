@@ -437,14 +437,10 @@ pub async fn download(
     State(state): State<Arc<CsState>>,
     _auth: Auth,
     Ar(req): Ar<get_content::v1::Request>,
-) -> Result<Ra<get_content::v1::Response>> {
+) -> Result<axum::response::Response> {
     if is_remote(&state, &req.server_name) {
         let (bytes, ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
-        return Ok(Ra(get_content::v1::Response::new(
-            bytes,
-            ct.unwrap_or_else(|| "application/octet-stream".to_owned()),
-            ContentDisposition::new(ContentDispositionType::Inline),
-        )));
+        return Ok(blob_response(bytes, ct, None));
     }
     let meta = lookup_meta(&state, &req.server_name, &req.media_id)?;
     let bytes = state
@@ -452,28 +448,17 @@ pub async fn download(
         .read(&req.media_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Media content missing"))?;
-    let resp = get_content::v1::Response::new(
-        bytes,
-        meta.content_type
-            .unwrap_or_else(|| "application/octet-stream".to_owned()),
-        ContentDisposition::new(ContentDispositionType::Inline).with_filename(meta.filename),
-    );
-    Ok(Ra(resp))
+    Ok(blob_response(bytes, meta.content_type, meta.filename))
 }
 
 pub async fn download_named(
     State(state): State<Arc<CsState>>,
     _auth: Auth,
     Ar(req): Ar<get_content_as_filename::v1::Request>,
-) -> Result<Ra<get_content_as_filename::v1::Response>> {
+) -> Result<axum::response::Response> {
     if is_remote(&state, &req.server_name) {
         let (bytes, ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
-        return Ok(Ra(get_content_as_filename::v1::Response::new(
-            bytes,
-            ct.unwrap_or_else(|| "application/octet-stream".to_owned()),
-            ContentDisposition::new(ContentDispositionType::Inline)
-                .with_filename(Some(req.filename.clone())),
-        )));
+        return Ok(blob_response(bytes, ct, Some(req.filename.clone())));
     }
     let meta = lookup_meta(&state, &req.server_name, &req.media_id)?;
     let bytes = state
@@ -481,21 +466,18 @@ pub async fn download_named(
         .read(&req.media_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Media content missing"))?;
-    let resp = get_content_as_filename::v1::Response::new(
+    Ok(blob_response(
         bytes,
-        meta.content_type
-            .unwrap_or_else(|| "application/octet-stream".to_owned()),
-        ContentDisposition::new(ContentDispositionType::Inline)
-            .with_filename(Some(req.filename.clone())),
-    );
-    Ok(Ra(resp))
+        meta.content_type,
+        Some(req.filename.clone()),
+    ))
 }
 
 pub async fn thumbnail(
     State(state): State<Arc<CsState>>,
     _auth: Auth,
     Ar(req): Ar<get_content_thumbnail::v1::Request>,
-) -> Result<Ra<get_content_thumbnail::v1::Response>> {
+) -> Result<axum::response::Response> {
     let method = match req.method {
         Some(ruma::media::Method::Crop) => ThumbMethod::Crop,
         _ => ThumbMethod::Scale,
@@ -518,12 +500,7 @@ pub async fn thumbnail(
             .await?
             .ok_or_else(|| ApiError::not_found("Media content missing"))?
     };
-    let resp = get_content_thumbnail::v1::Response::new(
-        bytes,
-        "image/png".to_owned(),
-        ContentDisposition::new(ContentDispositionType::Inline),
-    );
-    Ok(Ra(resp))
+    Ok(blob_response(bytes, Some("image/png".to_owned()), None))
 }
 
 pub async fn config(
@@ -557,21 +534,49 @@ fn legacy_meta(state: &CsState, server_name: &str, media_id: &str) -> Result<Med
     Ok(meta)
 }
 
+/// Content-types safe to render inline in a browser. Everything else
+/// (notably `text/html` and `image/svg+xml`) is served as an attachment so
+/// attacker-uploaded markup can't execute script on the media origin.
+fn inline_safe(content_type: &str) -> bool {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    ct == "text/plain"
+        || ct == "application/pdf"
+        || ct.starts_with("audio/")
+        || ct.starts_with("video/")
+        || (ct.starts_with("image/") && ct != "image/svg+xml")
+}
+
+/// Build a media byte response with the standard media-repo hardening:
+/// `nosniff`, a locked-down CSP (so even an inline HTML/SVG can't run
+/// script), and `Content-Disposition: attachment` for anything not on the
+/// inline-safe allowlist.
 fn blob_response(
     bytes: Vec<u8>,
     content_type: Option<String>,
     filename: Option<String>,
 ) -> axum::response::Response {
-    let disposition =
-        ContentDisposition::new(ContentDispositionType::Inline).with_filename(filename);
+    let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_owned());
+    let dtype = if inline_safe(&content_type) {
+        ContentDispositionType::Inline
+    } else {
+        ContentDispositionType::Attachment
+    };
+    let disposition = ContentDisposition::new(dtype).with_filename(filename);
     axum::response::Response::builder()
-        .header(
-            axum::http::header::CONTENT_TYPE,
-            content_type.unwrap_or_else(|| "application/octet-stream".to_owned()),
-        )
+        .header(axum::http::header::CONTENT_TYPE, content_type)
         .header(
             axum::http::header::CONTENT_DISPOSITION,
             disposition.to_string(),
+        )
+        .header("X-Content-Type-Options", "nosniff")
+        .header(
+            "Content-Security-Policy",
+            "sandbox; default-src 'none'; script-src 'none'; object-src 'none';",
         )
         .body(axum::body::Body::from(bytes))
         .expect("static response parts")
