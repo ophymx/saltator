@@ -510,6 +510,16 @@ fn apply_import_segment(ctx: &mut ApplyCtx<'_>, cmd: &ImportSegment) -> StoreRes
     if let Some(first) = first_seq {
         // The timeline is not contiguous below this point.
         meta.gap_markers.push(first);
+        // Only markers above a client's `since` matter for sync-window
+        // truncation, and `since` is always recent — so cap the retained
+        // set to the newest few. Unbounded, a room that is repeatedly
+        // gap-filled would grow RoomMeta without limit and, since the whole
+        // record is rewritten per event, make every later append cost O(n).
+        const MAX_GAP_MARKERS: usize = 1024;
+        if meta.gap_markers.len() > MAX_GAP_MARKERS {
+            let drop = meta.gap_markers.len() - MAX_GAP_MARKERS;
+            meta.gap_markers.drain(..drop);
+        }
     }
     if let Some(last) = last_id {
         // The chain's newest event is a genuine forward extremity until
