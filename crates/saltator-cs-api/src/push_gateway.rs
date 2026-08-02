@@ -35,7 +35,10 @@ pub fn spawn_push_delivery(state: Arc<CsState>) -> tokio::task::JoinHandle<()> {
 }
 
 async fn run(state: Arc<CsState>) -> Result<(), String> {
-    let client = reqwest::Client::builder()
+    // Gateway URLs come from clients; the guarded client blocks a pusher
+    // pointed at an internal address (defence in depth on top of the
+    // set-time check in routes/push.rs) including via DNS rebinding.
+    let client = saltator_federation::ssrf::guarded_client(state.config.allow_internal_fetch)
         .timeout(GATEWAY_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;

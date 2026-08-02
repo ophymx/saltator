@@ -25,6 +25,12 @@ pub struct PresenceSnapshot {
     pub entry: PresenceEntry,
 }
 
+/// Hard cap on tracked users. Inbound federation `m.presence` EDUs carry
+/// remote-controlled user ids, so without a bound a malicious server could
+/// grow this map without limit (and every `/sync` scans it). At the cap we
+/// evict the least-recently-active users.
+const MAX_PRESENCE_USERS: usize = 50_000;
+
 /// Per-user presence with a global change generation and a wake channel
 /// for `/sync` long-polls — the same shape as [`crate::TypingMap`].
 pub struct PresenceMap {
@@ -68,24 +74,41 @@ impl PresenceMap {
     fn update(&self, user_id: &str, presence: &str, status_msg: Option<Option<String>>) {
         let mut inner = self.inner.lock().expect("presence lock poisoned");
         let now = Instant::now();
-        let entry = inner
-            .entry(user_id.to_owned())
-            .or_insert_with(|| PresenceEntry {
-                presence: String::new(),
-                status_msg: None,
-                last_active: now,
-                changed_at: 0,
-            });
-        let mut changed = entry.presence != presence;
-        entry.presence = presence.to_owned();
-        entry.last_active = now;
-        if let Some(msg) = status_msg {
-            changed |= entry.status_msg != msg;
-            entry.status_msg = msg;
+        let changed;
+        {
+            let entry = inner
+                .entry(user_id.to_owned())
+                .or_insert_with(|| PresenceEntry {
+                    presence: String::new(),
+                    status_msg: None,
+                    last_active: now,
+                    changed_at: 0,
+                });
+            let mut c = entry.presence != presence;
+            entry.presence = presence.to_owned();
+            entry.last_active = now;
+            if let Some(msg) = status_msg {
+                c |= entry.status_msg != msg;
+                entry.status_msg = msg;
+            }
+            if c {
+                entry.changed_at = self.gen.fetch_add(1, Ordering::AcqRel) + 1;
+            }
+            changed = c;
         }
+        // Bound the table: evict least-recently-active users once over the
+        // cap. Runs only at the cap (amortized O(1)); the just-touched user
+        // has the newest timestamp and is never the one evicted.
+        if inner.len() > MAX_PRESENCE_USERS {
+            let target = MAX_PRESENCE_USERS * 9 / 10;
+            let evict = inner.len() - target;
+            let mut times: Vec<Instant> = inner.values().map(|e| e.last_active).collect();
+            times.select_nth_unstable(evict);
+            let cutoff = times[evict];
+            inner.retain(|_, e| e.last_active >= cutoff);
+        }
+        drop(inner);
         if changed {
-            entry.changed_at = self.gen.fetch_add(1, Ordering::AcqRel) + 1;
-            drop(inner);
             let _ = self.wake.send(());
         }
     }

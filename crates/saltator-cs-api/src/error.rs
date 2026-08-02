@@ -148,6 +148,9 @@ impl From<UserError> for ApiError {
             UserError::InvalidUsername(_) => {
                 Self::new(StatusCode::BAD_REQUEST, "M_INVALID_USERNAME", e.to_string())
             }
+            UserError::InvalidPassword(_) => {
+                Self::new(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", e.to_string())
+            }
             UserError::Forbidden => Self::forbidden(e.to_string()),
             UserError::InvalidGrant => Self::unknown_token(),
             UserError::NotFound => Self::not_found(e.to_string()),

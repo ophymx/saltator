@@ -16,6 +16,12 @@ struct RoomTyping {
     changed_at: u64,
 }
 
+/// Hard cap on tracked rooms. Inbound federation `m.typing` EDUs carry
+/// remote-controlled room ids, so without a bound a malicious server could
+/// grow this map without limit. At the cap we evict the rooms whose typing
+/// set changed least recently.
+const MAX_TYPING_ROOMS: usize = 50_000;
+
 /// Per-room typing users with expiry, a global change generation (so sync
 /// tokens can window typing updates), and a wake channel for `/sync`
 /// long-polls.
@@ -47,6 +53,17 @@ impl TypingMap {
 
     pub fn set(&self, room_id: &str, user_id: &str, typing: bool, timeout: Duration) {
         let mut inner = self.inner.lock().expect("typing lock poisoned");
+        // Bound the number of rooms before adding a new one (evict the
+        // least-recently-changed; the room we're about to touch is absent
+        // so it's never among the evicted).
+        if !inner.contains_key(room_id) && inner.len() >= MAX_TYPING_ROOMS {
+            let target = MAX_TYPING_ROOMS * 9 / 10;
+            let evict = inner.len() - target;
+            let mut gens: Vec<u64> = inner.values().map(|r| r.changed_at).collect();
+            gens.select_nth_unstable(evict);
+            let cutoff = gens[evict];
+            inner.retain(|_, r| r.changed_at > cutoff);
+        }
         let room = inner.entry(room_id.to_owned()).or_default();
         let changed = if typing {
             room.users
@@ -77,6 +94,9 @@ impl TypingMap {
         }
         let mut users: Vec<String> = room.users.keys().cloned().collect();
         users.sort();
+        // NB: an emptied room is left in place (not removed here). Removing
+        // it as a side effect of this read regressed TestTyping, and the
+        // per-room count is already bounded by the cap in `set`.
         (users, room.changed_at)
     }
 }

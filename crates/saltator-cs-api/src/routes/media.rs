@@ -67,9 +67,9 @@ const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `GET /preview_url?url=`: fetch the page, extract its OpenGraph tags,
 /// and cache any `og:image` into the media store as an `mxc://` URI
-/// (spec "URL previews"). NOTE production hardening (private-IP/SSRF
-/// blocklists, per-user caching) is future work — spec.md keeps this
-/// endpoint disabled-by-default territory until then.
+/// (spec "URL previews"). Outbound fetches go through the SSRF guard
+/// (private-IP denylist + redirect/rebind vetting) and stream with a size
+/// cap. Per-user preview caching is still future work.
 pub async fn preview_url(
     State(state): State<Arc<CsState>>,
     auth: Auth,
@@ -83,12 +83,16 @@ pub async fn preview_url(
     if !matches!(page_url.scheme(), "http" | "https") {
         return Err(ApiError::invalid_param("url: unsupported scheme"));
     }
+    // SSRF guard: reject IP-literal targets in internal ranges up front; the
+    // guarded client below vets hostname resolutions and every redirect hop.
+    let allow_internal = state.config.allow_internal_fetch;
+    saltator_federation::ssrf::check_url(&page_url, allow_internal).map_err(ApiError::forbidden)?;
 
-    let client = reqwest::Client::builder()
+    let client = saltator_federation::ssrf::guarded_client(allow_internal)
         .timeout(PREVIEW_TIMEOUT)
         .build()
         .map_err(internal)?;
-    let (content_type, body) = preview_fetch(&client, page_url.clone()).await?;
+    let (content_type, body) = preview_fetch(&client, page_url.clone(), false).await?;
 
     let mut out = serde_json::Map::new();
     let mut image_url = None;
@@ -120,7 +124,14 @@ pub async fn preview_url(
     // Cache the image locally; clients must never fetch the remote URL.
     if let Some(image) = image_url {
         if let Ok(image_abs) = page_url.join(&image) {
-            if let Ok((image_type, bytes)) = preview_fetch(&client, image_abs).await {
+            // The og:image path fetches an attacker-named URL, so re-check it
+            // (a page can point og:image at an internal literal) and require
+            // an image content-type so it can't be used to read arbitrary
+            // internal responses back as media.
+            if saltator_federation::ssrf::check_url(&image_abs, allow_internal).is_err() {
+                return Ok(axum::Json(serde_json::Value::Object(out)));
+            }
+            if let Ok((image_type, bytes)) = preview_fetch(&client, image_abs, true).await {
                 if let Some((w, h)) = png_dimensions(&bytes) {
                     out.insert("og:image:width".to_owned(), w.into());
                     out.insert("og:image:height".to_owned(), h.into());
@@ -154,10 +165,15 @@ pub async fn preview_url(
     Ok(axum::Json(serde_json::Value::Object(out)))
 }
 
-/// Fetch a preview target, capped at [`PREVIEW_MAX_BYTES`].
+/// Fetch a preview target, streaming with a hard [`PREVIEW_MAX_BYTES`] cap
+/// (so a malicious server can't OOM us by streaming gigabytes). When
+/// `require_image` is set the response must carry an `image/*`
+/// content-type — the og:image path uses this so it can't be turned into a
+/// reader for arbitrary internal responses.
 async fn preview_fetch(
     client: &reqwest::Client,
     url: reqwest::Url,
+    require_image: bool,
 ) -> Result<(Option<String>, Vec<u8>)> {
     let gateway = |e: reqwest::Error| {
         ApiError::new(
@@ -166,7 +182,14 @@ async fn preview_fetch(
             format!("preview fetch failed: {e}"),
         )
     };
-    let resp = client.get(url).send().await.map_err(gateway)?;
+    let too_large = || {
+        ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "M_TOO_LARGE",
+            "preview target too large",
+        )
+    };
+    let mut resp = client.get(url).send().await.map_err(gateway)?;
     if !resp.status().is_success() {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_GATEWAY,
@@ -179,15 +202,33 @@ async fn preview_fetch(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|c| c.split(';').next().unwrap_or(c).trim().to_owned());
-    let bytes = resp.bytes().await.map_err(gateway)?;
-    if bytes.len() > PREVIEW_MAX_BYTES {
+    if require_image
+        && !content_type
+            .as_deref()
+            .is_some_and(|c| c.starts_with("image/"))
+    {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_GATEWAY,
-            "M_TOO_LARGE",
-            "preview target too large",
+            "M_UNKNOWN",
+            "og:image target is not an image",
         ));
     }
-    Ok((content_type, bytes.to_vec()))
+    // Reject early on an oversized declared length, then enforce the cap
+    // while streaming (Content-Length can lie or be absent).
+    if resp
+        .content_length()
+        .is_some_and(|n| n > PREVIEW_MAX_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(gateway)? {
+        if bytes.len() + chunk.len() > PREVIEW_MAX_BYTES {
+            return Err(too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((content_type, bytes))
 }
 
 /// OpenGraph `<meta property="og:..." content="...">` pairs, in document
@@ -195,7 +236,7 @@ async fn preview_fetch(
 /// and a wrong parse only degrades the preview.
 fn og_tags(html: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let mut at = 0;
     while let Some(pos) = lower[at..].find("<meta") {
         let start = at + pos;
@@ -217,7 +258,7 @@ fn og_tags(html: &str) -> Vec<(String, String)> {
 
 /// One quoted attribute value out of a tag snippet.
 fn meta_attr(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
+    let lower = tag.to_ascii_lowercase();
     let at = lower.find(&format!("{attr}="))? + attr.len() + 1;
     let rest = &tag[at..];
     let quote = rest.chars().next()?;
@@ -229,7 +270,7 @@ fn meta_attr(tag: &str, attr: &str) -> Option<String> {
 }
 
 fn html_title(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let start = lower.find("<title>")? + "<title>".len();
     let end = lower[start..].find("</title>")? + start;
     Some(html[start..end].trim().to_owned())
@@ -396,14 +437,10 @@ pub async fn download(
     State(state): State<Arc<CsState>>,
     _auth: Auth,
     Ar(req): Ar<get_content::v1::Request>,
-) -> Result<Ra<get_content::v1::Response>> {
+) -> Result<axum::response::Response> {
     if is_remote(&state, &req.server_name) {
         let (bytes, ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
-        return Ok(Ra(get_content::v1::Response::new(
-            bytes,
-            ct.unwrap_or_else(|| "application/octet-stream".to_owned()),
-            ContentDisposition::new(ContentDispositionType::Inline),
-        )));
+        return Ok(blob_response(bytes, ct, None));
     }
     let meta = lookup_meta(&state, &req.server_name, &req.media_id)?;
     let bytes = state
@@ -411,28 +448,17 @@ pub async fn download(
         .read(&req.media_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Media content missing"))?;
-    let resp = get_content::v1::Response::new(
-        bytes,
-        meta.content_type
-            .unwrap_or_else(|| "application/octet-stream".to_owned()),
-        ContentDisposition::new(ContentDispositionType::Inline).with_filename(meta.filename),
-    );
-    Ok(Ra(resp))
+    Ok(blob_response(bytes, meta.content_type, meta.filename))
 }
 
 pub async fn download_named(
     State(state): State<Arc<CsState>>,
     _auth: Auth,
     Ar(req): Ar<get_content_as_filename::v1::Request>,
-) -> Result<Ra<get_content_as_filename::v1::Response>> {
+) -> Result<axum::response::Response> {
     if is_remote(&state, &req.server_name) {
         let (bytes, ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
-        return Ok(Ra(get_content_as_filename::v1::Response::new(
-            bytes,
-            ct.unwrap_or_else(|| "application/octet-stream".to_owned()),
-            ContentDisposition::new(ContentDispositionType::Inline)
-                .with_filename(Some(req.filename.clone())),
-        )));
+        return Ok(blob_response(bytes, ct, Some(req.filename.clone())));
     }
     let meta = lookup_meta(&state, &req.server_name, &req.media_id)?;
     let bytes = state
@@ -440,21 +466,18 @@ pub async fn download_named(
         .read(&req.media_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Media content missing"))?;
-    let resp = get_content_as_filename::v1::Response::new(
+    Ok(blob_response(
         bytes,
-        meta.content_type
-            .unwrap_or_else(|| "application/octet-stream".to_owned()),
-        ContentDisposition::new(ContentDispositionType::Inline)
-            .with_filename(Some(req.filename.clone())),
-    );
-    Ok(Ra(resp))
+        meta.content_type,
+        Some(req.filename.clone()),
+    ))
 }
 
 pub async fn thumbnail(
     State(state): State<Arc<CsState>>,
     _auth: Auth,
     Ar(req): Ar<get_content_thumbnail::v1::Request>,
-) -> Result<Ra<get_content_thumbnail::v1::Response>> {
+) -> Result<axum::response::Response> {
     let method = match req.method {
         Some(ruma::media::Method::Crop) => ThumbMethod::Crop,
         _ => ThumbMethod::Scale,
@@ -477,12 +500,7 @@ pub async fn thumbnail(
             .await?
             .ok_or_else(|| ApiError::not_found("Media content missing"))?
     };
-    let resp = get_content_thumbnail::v1::Response::new(
-        bytes,
-        "image/png".to_owned(),
-        ContentDisposition::new(ContentDispositionType::Inline),
-    );
-    Ok(Ra(resp))
+    Ok(blob_response(bytes, Some("image/png".to_owned()), None))
 }
 
 pub async fn config(
@@ -516,21 +534,49 @@ fn legacy_meta(state: &CsState, server_name: &str, media_id: &str) -> Result<Med
     Ok(meta)
 }
 
+/// Content-types safe to render inline in a browser. Everything else
+/// (notably `text/html` and `image/svg+xml`) is served as an attachment so
+/// attacker-uploaded markup can't execute script on the media origin.
+fn inline_safe(content_type: &str) -> bool {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    ct == "text/plain"
+        || ct == "application/pdf"
+        || ct.starts_with("audio/")
+        || ct.starts_with("video/")
+        || (ct.starts_with("image/") && ct != "image/svg+xml")
+}
+
+/// Build a media byte response with the standard media-repo hardening:
+/// `nosniff`, a locked-down CSP (so even an inline HTML/SVG can't run
+/// script), and `Content-Disposition: attachment` for anything not on the
+/// inline-safe allowlist.
 fn blob_response(
     bytes: Vec<u8>,
     content_type: Option<String>,
     filename: Option<String>,
 ) -> axum::response::Response {
-    let disposition =
-        ContentDisposition::new(ContentDispositionType::Inline).with_filename(filename);
+    let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_owned());
+    let dtype = if inline_safe(&content_type) {
+        ContentDispositionType::Inline
+    } else {
+        ContentDispositionType::Attachment
+    };
+    let disposition = ContentDisposition::new(dtype).with_filename(filename);
     axum::response::Response::builder()
-        .header(
-            axum::http::header::CONTENT_TYPE,
-            content_type.unwrap_or_else(|| "application/octet-stream".to_owned()),
-        )
+        .header(axum::http::header::CONTENT_TYPE, content_type)
         .header(
             axum::http::header::CONTENT_DISPOSITION,
             disposition.to_string(),
+        )
+        .header("X-Content-Type-Options", "nosniff")
+        .header(
+            "Content-Security-Policy",
+            "sandbox; default-src 'none'; script-src 'none'; object-src 'none';",
         )
         .body(axum::body::Body::from(bytes))
         .expect("static response parts")

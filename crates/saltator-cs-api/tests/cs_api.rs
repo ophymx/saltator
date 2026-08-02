@@ -30,10 +30,17 @@ struct Env {
 
 async fn start_env() -> Env {
     // Tests hammer the API far past real-client rates.
-    start_env_with(saltator_cs_api::RateLimitConfig::disabled()).await
+    start_env_cfg(saltator_cs_api::RateLimitConfig::disabled(), true).await
 }
 
 async fn start_env_with(rate_limits: saltator_cs_api::RateLimitConfig) -> Env {
+    start_env_cfg(rate_limits, true).await
+}
+
+async fn start_env_cfg(
+    rate_limits: saltator_cs_api::RateLimitConfig,
+    allow_internal_fetch: bool,
+) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
     let server_name = ruma::OwnedServerName::try_from(SERVER).unwrap();
@@ -75,6 +82,7 @@ async fn start_env_with(rate_limits: saltator_cs_api::RateLimitConfig) -> Env {
             max_upload_size: 1024 * 1024,
             well_known_client: Some("https://hs.test".into()),
             rate_limits,
+            allow_internal_fetch,
         },
     );
     Env {
@@ -493,10 +501,71 @@ async fn two_users_chat_end_to_end() {
     let resp = env.router.clone().oneshot(download).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers().get("content-type").unwrap(), "text/plain");
+    // Media responses are hardened against being rendered as an active
+    // document on the homeserver origin.
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert!(resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("sandbox"));
+    // text/plain is inline-safe.
+    assert!(resp
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("inline"));
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     assert_eq!(&bytes[..], b"hello media");
+
+    // An uploaded HTML document must come back as an attachment (never
+    // inline) so it can't run script on the media origin.
+    let up_html = Request::builder()
+        .method("POST")
+        .uri("/_matrix/media/v3/upload?filename=x.html")
+        .header("Authorization", format!("Bearer {alice}"))
+        .header("Content-Type", "text/html")
+        .body(Body::from("<script>alert(1)</script>"))
+        .unwrap();
+    let resp = env.router.clone().oneshot(up_html).await.unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let html_id = body["content_uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let dl_html = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/_matrix/client/v1/media/download/{SERVER}/{html_id}"
+        ))
+        .header("Authorization", format!("Bearer {bob}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = env.router.clone().oneshot(dl_html).await.unwrap();
+    assert!(resp
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("attachment"));
     // Unauthenticated media is refused.
     let download = Request::builder()
         .method("GET")
@@ -4404,6 +4473,7 @@ async fn client_joins_a_remote_room_via_federation() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     )
     .with_federation(
@@ -4602,6 +4672,7 @@ async fn remote_join_backfills_full_history() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     )
     .with_federation(
@@ -4880,6 +4951,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     )
     .with_federation(
@@ -5193,6 +5265,7 @@ async fn inbound_federated_invite_appears_in_sync() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     );
     let cs_router = saltator_cs_api::router(cs_state);
@@ -5381,6 +5454,7 @@ async fn cs_stack(
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     );
     if let Some(base) = fed_client_base {
@@ -5514,6 +5588,7 @@ async fn outbound_federated_invite_round_trip() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     )
     .with_federation(
@@ -5655,6 +5730,7 @@ async fn to_device_over_federation_round_trip() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     )
     .with_federation(
@@ -5789,6 +5865,7 @@ async fn federated_key_query_claim_and_device_list_update() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     )
     .with_federation(
@@ -5960,6 +6037,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     );
     let cs_router = saltator_cs_api::router(cs_state.clone());
@@ -6234,6 +6312,7 @@ async fn client_downloads_remote_media_over_federation() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     )
     .with_federation(
@@ -6462,6 +6541,7 @@ async fn client_queries_remote_profile_and_directory() {
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
         },
     )
     .with_federation(
@@ -6513,6 +6593,58 @@ async fn client_queries_remote_profile_and_directory() {
     a_users.shutdown().await.unwrap();
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
+}
+
+/// SSRF guard: with internal fetches disabled (production default), both
+/// preview_url and pusher registration refuse targets that point at
+/// internal/loopback addresses or non-http schemes.
+#[tokio::test]
+async fn ssrf_guard_blocks_internal_targets() {
+    let env = start_env_cfg(saltator_cs_api::RateLimitConfig::disabled(), false).await;
+    let tok = env.register("alice", "pw").await;
+
+    // preview_url against internal literals / bad schemes is forbidden.
+    for url in [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1/admin",
+        "http://[::1]:8080/x",
+        "file:///etc/passwd",
+    ] {
+        let enc = url
+            .replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('[', "%5B")
+            .replace(']', "%5D");
+        let (status, body) = env
+            .req(
+                "GET",
+                &format!("/_matrix/client/v1/media/preview_url?url={enc}"),
+                Some(&tok),
+                None,
+            )
+            .await;
+        assert!(
+            status == StatusCode::FORBIDDEN || status == StatusCode::BAD_REQUEST,
+            "preview_url {url} should be refused, got {status}: {body}"
+        );
+    }
+
+    // A pusher aimed at an internal gateway is refused at registration.
+    let (status, _) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/pushers/set",
+            Some(&tok),
+            Some(json!({
+                "app_id": "t", "pushkey": "k", "kind": "http",
+                "app_display_name": "t", "device_display_name": "t", "lang": "en",
+                "data": { "url": "http://169.254.169.254/_matrix/push/v1/notify" },
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    env.shutdown().await;
 }
 
 /// Rate limiting (spec "Rate limiting"): drained buckets return 429

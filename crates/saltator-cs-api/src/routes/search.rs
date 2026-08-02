@@ -138,8 +138,11 @@ pub async fn search(
     if matches.len().saturating_sub(offset) >= limit {
         room_events.next_batch = Some((offset + limit).to_string());
     }
-    let before_limit = u64::from(criteria.event_context.before_limit) as usize;
-    let after_limit = u64::from(criteria.event_context.after_limit) as usize;
+    // Clamp the per-hit context windows like the main limit: unbounded,
+    // they let one request run up to two full-timeline scans per hit.
+    const MAX_CONTEXT: usize = 100;
+    let before_limit = (u64::from(criteria.event_context.before_limit) as usize).min(MAX_CONTEXT);
+    let after_limit = (u64::from(criteria.event_context.after_limit) as usize).min(MAX_CONTEXT);
     for (seq, room_id, ev) in matches.iter().skip(offset).take(limit) {
         let mut result = search_events::v3::SearchResult::new();
         result.rank = Some(1.0);

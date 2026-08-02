@@ -135,28 +135,15 @@ jobs:
         # goes only to the file — a test stuck in a retry loop once flooded
         # the step log until the runner killed the job.
         run: go test -json -timeout 30m ./tests/csapi > /tmp/complement.json || true
-      - name: Pass-rate summary
-        run: |
-          pass=$(jq -r 'select(.Action=="pass" and .Test != null) | .Test' /tmp/complement.json | wc -l)
-          fail=$(jq -r 'select(.Action=="fail" and .Test != null) | .Test' /tmp/complement.json | wc -l)
-          skip=$(jq -r 'select(.Action=="skip" and .Test != null) | .Test' /tmp/complement.json | wc -l)
-          total=$((pass + fail))
-          # Also to stdout: the step summary is not reachable through the
-          # API, and the JSON stream no longer hits the step log.
-          echo "Complement csapi: ${pass}/${total} passed (${skip} skipped)"
-          jq -r 'select(.Action=="fail" and .Test != null) | "FAILED: " + .Test' /tmp/complement.json
-          echo "## Complement csapi: ${pass}/${total} passed (${skip} skipped)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "<details><summary>Failed tests</summary>" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          jq -r 'select(.Action=="fail" and .Test != null) | "- `" + .Test + "`"' /tmp/complement.json >> "$GITHUB_STEP_SUMMARY"
-          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
-          # Zero passes means the image or deployer is broken, not a
-          # protocol gap — fail loudly.
-          if [ "$pass" -eq 0 ]; then
-            echo "no Complement tests passed; deployment is broken" >&2
-            exit 1
-          fi
+      # Summarize + gate: fails on any leaf failure not in the allowlist.
+      # (Logic in scripts/complement-csapi-gate.sh — the args are the
+      # results JSON, the allowlist, and the step-summary file.)
+      - name: Pass-rate summary + regression gate
+        run: >-
+          bash scripts/complement-csapi-gate.sh
+          /tmp/complement.json
+          docker/complement/csapi-allowed-failures.txt
+          "$GITHUB_STEP_SUMMARY"
       # The raw go-test JSON (with per-test failure output) is only here —
       # it no longer hits the step log.
       - name: Upload results JSON
@@ -203,26 +190,20 @@ jobs:
           # unfiltered.
           SKIP_DEFERRED: ${{ github.event_name != 'schedule' && '-skip=Knock|RestrictedRooms|TestDeviceListsUpdateOverFederation' || '' }}
         # The federation suite is the root `tests` package (not
-        # `tests/csapi`). Tracked, not gated: federation coverage is early,
-        # so this reports the pass rate and never fails the build — it exists
-        # to surface which endpoints the real handshake demands next.
+        # `tests/csapi`). `|| true` here so the raw `go test` exit never
+        # decides the job — the must-pass gate below does. Coverage is
+        # early, so the gate is a positive list (regression protection on
+        # the tests we've gotten green), not an allowed-to-fail list.
         run: go test -json -timeout 30m $SKIP_DEFERRED ./tests | tee /tmp/complement-fed.json || true
-      - name: Pass-rate summary
-        run: |
-          pass=$(jq -r 'select(.Action=="pass" and .Test != null) | .Test' /tmp/complement-fed.json | wc -l)
-          fail=$(jq -r 'select(.Action=="fail" and .Test != null) | .Test' /tmp/complement-fed.json | wc -l)
-          skip=$(jq -r 'select(.Action=="skip" and .Test != null) | .Test' /tmp/complement-fed.json | wc -l)
-          total=$((pass + fail))
-          echo "## Complement federation: ${pass}/${total} passed (${skip} skipped)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "<details><summary>Passed tests</summary>" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          jq -r 'select(.Action=="pass" and .Test != null) | "- `" + .Test + "`"' /tmp/complement-fed.json >> "$GITHUB_STEP_SUMMARY"
-          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
-          echo "<details><summary>Failed tests</summary>" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          jq -r 'select(.Action=="fail" and .Test != null) | "- `" + .Test + "`"' /tmp/complement-fed.json >> "$GITHUB_STEP_SUMMARY"
-          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+      # Summarize + gate: fails if any must-pass federation test regressed.
+      # (Logic in scripts/complement-fed-gate.sh — args are the results
+      # JSON, the must-pass list, and the step-summary file.)
+      - name: Pass-rate summary + regression gate
+        run: >-
+          bash scripts/complement-fed-gate.sh
+          /tmp/complement-fed.json
+          docker/complement/federation-must-pass.txt
+          "$GITHUB_STEP_SUMMARY"
 
   synapse-interop:
     name: interop (synapse)

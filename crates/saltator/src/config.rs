@@ -67,6 +67,12 @@ pub struct ClientConfig {
     /// only for test harnesses that hammer the API.
     #[serde(default = "default_true")]
     pub rate_limits_enabled: bool,
+    /// Allow server-initiated fetches (URL previews, push gateways) to
+    /// reach private/loopback addresses. Keep false in production; enable
+    /// only in network-isolated test harnesses (Complement) whose mock
+    /// servers live on private IPs.
+    #[serde(default)]
+    pub allow_internal_fetch: bool,
 }
 
 impl Default for ClientConfig {
@@ -77,6 +83,7 @@ impl Default for ClientConfig {
             max_upload_size: default_max_upload(),
             well_known_client: None,
             rate_limits_enabled: true,
+            allow_internal_fetch: false,
         }
     }
 }
@@ -167,6 +174,9 @@ default_room_version = "12"
 max_upload_size = 52428800
 # Login/registration/message rate limiting (429 M_LIMIT_EXCEEDED).
 rate_limits_enabled = true
+# Allow URL-preview / push-gateway fetches to reach private/loopback IPs.
+# Keep false in production (SSRF protection); true only in isolated tests.
+allow_internal_fetch = false
 # well_known_client = "https://matrix.example.org"
 
 [federation]

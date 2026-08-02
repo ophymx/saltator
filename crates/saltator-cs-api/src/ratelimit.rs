@@ -60,9 +60,14 @@ struct Bucket {
     last: Instant,
 }
 
-/// Keep the table bounded: past this size, refilled-to-full (idle)
-/// buckets are dropped before inserting new ones.
+/// Soft mark: past this size we first drop idle (refilled-to-full)
+/// buckets, which clears normal churn cheaply.
 const PRUNE_ABOVE: usize = 10_000;
+/// Hard cap: the table never exceeds this. When idle-pruning isn't enough
+/// (e.g. a flood of distinct unauthenticated login keys that are all still
+/// draining), evict the least-recently-used entries down to the soft mark.
+/// Bounds memory regardless of attacker-controlled key cardinality.
+const MAX_BUCKETS: usize = 100_000;
 
 #[derive(Default)]
 pub(crate) struct RateLimiter {
@@ -89,7 +94,13 @@ impl RateLimiter {
 
         let mut buckets = self.buckets.lock().expect("rate limiter poisoned");
         let now = Instant::now();
-        if buckets.len() > PRUNE_ABOVE {
+        // Compaction runs only when the table hits the hard cap — never on
+        // the common path. Since each run frees (MAX_BUCKETS - PRUNE_ABOVE)
+        // slots, its O(n) cost amortizes to O(1) per call, so a flood of
+        // distinct keys can't turn every request into an O(n) scan under
+        // the lock (that amplification was itself the DoS).
+        if buckets.len() >= MAX_BUCKETS {
+            // Drop idle (would-be-full) buckets first — clears ordinary churn.
             buckets.retain(|(k, _), b| {
                 let (rate, burst) = match k {
                     Kind::Login => (cfg.login_rate, f64::from(cfg.login_burst)),
@@ -100,6 +111,15 @@ impl RateLimiter {
                 };
                 b.tokens + now.duration_since(b.last).as_secs_f64() * rate < burst
             });
+            // If a flood of still-draining keys is holding it full, evict the
+            // least-recently-used down to the soft mark.
+            if buckets.len() > PRUNE_ABOVE {
+                let mut times: Vec<Instant> = buckets.values().map(|b| b.last).collect();
+                let evict = buckets.len() - PRUNE_ABOVE;
+                times.select_nth_unstable(evict);
+                let cutoff = times[evict];
+                buckets.retain(|_, b| b.last >= cutoff);
+            }
         }
         let bucket = buckets.entry((kind, key.to_owned())).or_insert(Bucket {
             tokens: burst,
@@ -140,6 +160,24 @@ mod tests {
         // At 1000/s the bucket refills within a few ms.
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(limiter.check(&cfg, Kind::Message, "@a:x").is_ok());
+    }
+
+    #[test]
+    fn table_stays_bounded_under_key_flood() {
+        let limiter = RateLimiter::new();
+        // Slow refill so buckets stay "draining" and can't be idle-pruned;
+        // this is the flood the LRU hard cap must contain.
+        let cfg = RateLimitConfig {
+            enabled: true,
+            login_rate: 0.001,
+            login_burst: 5,
+            ..RateLimitConfig::default()
+        };
+        for i in 0..(MAX_BUCKETS + 5_000) {
+            let _ = limiter.check(&cfg, Kind::Login, &format!("user-{i}"));
+        }
+        let len = limiter.buckets.lock().unwrap().len();
+        assert!(len <= MAX_BUCKETS, "table grew to {len}, over the hard cap");
     }
 
     #[test]

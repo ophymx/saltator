@@ -45,6 +45,9 @@ data_dir = "/data"
 default_room_version = "11"
 # The suite hammers every endpoint far past real-client rates.
 rate_limits_enabled = false
+# Complement's URL-preview/pusher targets live on the isolated test network
+# (private IPs); allow the server to fetch them.
+allow_internal_fetch = true
 
 [node]
 id = 1

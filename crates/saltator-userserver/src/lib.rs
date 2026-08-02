@@ -48,6 +48,8 @@ pub enum UserError {
     UserExists,
     #[error("invalid username: {0}")]
     InvalidUsername(String),
+    #[error("invalid password: {0}")]
+    InvalidPassword(String),
     #[error("bad credentials")]
     Forbidden,
     #[error("unknown or superseded refresh token")]
@@ -196,9 +198,11 @@ impl UserServer {
             .store()
             .account(user_id.as_str())
             .map_err(storage_err)?
-            .filter(|a| !a.deactivated)
-            .ok_or(UserError::Forbidden)?;
-        let Some(hash) = account.password_hash else {
+            .filter(|a| !a.deactivated);
+        let Some(hash) = account.and_then(|a| a.password_hash) else {
+            // No such account (or no password): still spend an Argon2 verify
+            // so latency doesn't disclose account existence.
+            dummy_verify().await;
             return Err(UserError::Forbidden);
         };
         if !verify_password(password.to_owned(), hash).await? {
@@ -214,15 +218,13 @@ impl UserServer {
 
     /// Check a user's password (UIA stages, device deletion).
     pub async fn verify_user_password(&self, user_id: &UserId, password: &str) -> Result<bool> {
-        let Some(account) = self
+        let account = self
             .store()
             .account(user_id.as_str())
             .map_err(storage_err)?
-            .filter(|a| !a.deactivated)
-        else {
-            return Ok(false);
-        };
-        let Some(hash) = account.password_hash else {
+            .filter(|a| !a.deactivated);
+        let Some(hash) = account.and_then(|a| a.password_hash) else {
+            dummy_verify().await;
             return Ok(false);
         };
         verify_password(password.to_owned(), hash).await
@@ -270,6 +272,18 @@ impl UserServer {
         }
         let user_id = OwnedUserId::try_from(entry.user_id)
             .map_err(|e| UserError::Internal(format!("stored user id: {e}")))?;
+        // Defence in depth: deactivation already deletes a user's tokens,
+        // but never honour a token for a deactivated account even if one
+        // survived (a missed deletion path, projection lag, a future
+        // session command that skips the check).
+        if self
+            .store()
+            .account(user_id.as_str())
+            .map_err(storage_err)?
+            .is_none_or(|a| a.deactivated)
+        {
+            return Ok(None);
+        }
         Ok(Some((user_id, entry.device_id)))
     }
 
@@ -937,7 +951,34 @@ pub fn generate_device_id() -> String {
         .collect()
 }
 
+/// Upper bound on password length before Argon2. Argon2 pre-hashes the
+/// whole input with Blake2b, so an unbounded password is a CPU/memory
+/// amplifier on the blocking pool; no legitimate password approaches this.
+const MAX_PASSWORD_LEN: usize = 1024;
+
+/// A real Argon2 verify against a throwaway hash, used on account-miss
+/// paths so login/UIA latency doesn't reveal whether an account exists.
+async fn dummy_verify() {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let phc = match DUMMY.get() {
+        Some(p) => p.clone(),
+        None => {
+            let p = hash_password("saltator-timing-equalizer")
+                .await
+                .unwrap_or_default();
+            let _ = DUMMY.set(p.clone());
+            p
+        }
+    };
+    if !phc.is_empty() {
+        let _ = verify_password("saltator-timing-equalizer-miss".to_owned(), phc).await;
+    }
+}
+
 async fn hash_password(password: &str) -> Result<String> {
+    if password.len() > MAX_PASSWORD_LEN {
+        return Err(UserError::InvalidPassword("password too long".into()));
+    }
     let password = password.to_owned();
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut rand::thread_rng());
@@ -951,6 +992,11 @@ async fn hash_password(password: &str) -> Result<String> {
 }
 
 async fn verify_password(password: String, phc: String) -> Result<bool> {
+    // An over-length input can't match any stored hash (we cap at hash
+    // time), so reject it without spending Argon2 on attacker-sized input.
+    if password.len() > MAX_PASSWORD_LEN {
+        return Ok(false);
+    }
     tokio::task::spawn_blocking(move || {
         let parsed =
             PasswordHash::new(&phc).map_err(|e| UserError::Internal(format!("argon2: {e}")))?;

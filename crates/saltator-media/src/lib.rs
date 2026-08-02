@@ -133,7 +133,7 @@ impl MediaStore {
         let width = width.clamp(1, 1024);
         let height = height.clamp(1, 1024);
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            let img = image::load_from_memory(&bytes).map_err(|_| MediaError::NotAnImage)?;
+            let img = decode_limited(&bytes)?;
             let thumb = match method {
                 ThumbMethod::Scale => img.thumbnail(width, height),
                 ThumbMethod::Crop => {
@@ -175,6 +175,25 @@ impl MediaStore {
             .join(leaf.parent().unwrap_or(Path::new("")))
             .join(name))
     }
+}
+
+/// Decode an image with hard resource limits so a small, highly-compressed
+/// input can't declare enormous dimensions and OOM us at decode time (a
+/// "decompression bomb"). Caps both pixel dimensions and total allocation
+/// before the full buffer is materialized.
+fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage> {
+    const MAX_DIM: u32 = 8192;
+    const MAX_ALLOC: u64 = 128 * 1024 * 1024; // 128 MiB decode budget
+
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| MediaError::NotAnImage)?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DIM);
+    limits.max_image_height = Some(MAX_DIM);
+    limits.max_alloc = Some(MAX_ALLOC);
+    reader.limits(limits);
+    reader.decode().map_err(|_| MediaError::NotAnImage)
 }
 
 /// `<first 2 chars>/<media_id>`, refusing anything that could escape the
