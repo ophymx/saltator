@@ -1976,6 +1976,9 @@ pub async fn create_alias(
         return Err(ApiError::forbidden("Alias must be on this server"));
     }
     room_meta(&state.rooms, req.room_id.as_str())?;
+    // The caller must be a member of the target room — otherwise anyone
+    // could squat local aliases pointing at rooms they can't even see.
+    require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
     state
         .users
         .create_alias(req.room_alias.as_str(), req.room_id.as_str(), &auth.user_id)
@@ -2275,7 +2278,23 @@ pub async fn set_visibility(
     auth: Auth,
     Ar(req): Ar<set_room_visibility::v3::Request>,
 ) -> Result<Ra<set_room_visibility::v3::Response>> {
-    require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    // Publishing to the public directory exposes room metadata to everyone
+    // (and over federation), so gate it on alias-admin power rather than
+    // mere membership — otherwise any member could list a private room.
+    let state_map = require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    let meta = room_meta(&state.rooms, req.room_id.as_str())?;
+    let version = room_version(&meta)?;
+    if !can_send_state(
+        &state.rooms,
+        &state_map,
+        version,
+        auth.user_id.as_str(),
+        "m.room.canonical_alias",
+    )? {
+        return Err(ApiError::forbidden(
+            "Not allowed to change this room's directory visibility",
+        ));
+    }
     state
         .users
         .set_room_visibility(req.room_id.as_str(), req.visibility == Visibility::Public)
