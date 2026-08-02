@@ -273,6 +273,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // EDUs update them).
     let cs_typing = cs_state.typing_map();
     let cs_presence = cs_state.presence_map();
+    // HTTP push: notify gateways about new events for users with pushers.
+    let push_delivery = saltator_cs_api::spawn_push_delivery(cs_state.clone());
     let cs_router = saltator_cs_api::router(cs_state);
     let cs_listener = tokio::net::TcpListener::bind(cfg.listeners.client).await?;
     tracing::info!(listen = %cfg.listeners.client, "client-server API listening");
@@ -374,6 +376,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     cs_task.await??;
     fed_task.await??;
     fed_sender.abort();
+    push_delivery.abort();
     reconciler.abort();
     projection.abort();
     rooms.shutdown().await?;

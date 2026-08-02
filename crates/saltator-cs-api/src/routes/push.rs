@@ -251,6 +251,19 @@ pub async fn set_pushers(State(state): State<Arc<CsState>>, auth: Auth, Jb(body)
         .ok_or_else(|| ApiError::invalid_param("Missing pushkey"))?
         .to_owned();
     let delete = body.get("kind").is_none_or(|k| k.is_null());
+    // http pushers must name a gateway, and the spec fixes its path.
+    if !delete && body.get("kind").and_then(|k| k.as_str()) == Some("http") {
+        let url = body
+            .get("data")
+            .and_then(|d| d.get("url"))
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| ApiError::invalid_param("http pushers require data.url"))?;
+        if !url.ends_with("/_matrix/push/v1/notify") {
+            return Err(ApiError::invalid_param(
+                "data.url must end with /_matrix/push/v1/notify",
+            ));
+        }
+    }
     let json = if delete {
         None
     } else {

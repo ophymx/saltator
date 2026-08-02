@@ -39,6 +39,38 @@ pub struct RoomUnread {
 /// unbounded history for a user who never sent a receipt.
 const SCAN_CAP: usize = 512;
 
+/// The evaluation inputs for one `(user, room)`: the user's ruleset (with
+/// the legacy mention rules injected) and the room push context.
+pub(crate) fn rule_inputs(
+    state: &CsState,
+    user_id: &UserId,
+    room_id: &str,
+) -> Result<(ruma::push::Ruleset, PushConditionRoomCtx)> {
+    let mut ruleset = crate::routes::push::load_ruleset(state, user_id)?;
+    add_legacy_mention_rules(&mut ruleset, user_id);
+    let member_count = room_util::joined_member_ids(&state.rooms, room_id)?.len();
+    let display_name = state
+        .users
+        .store()
+        .profile(user_id.as_str())
+        .ok()
+        .flatten()
+        .and_then(|p| p.displayname)
+        .unwrap_or_else(|| user_id.localpart().to_owned());
+    let current = room_util::current_state(&state.rooms, room_id)?;
+    let power_levels = room_util::state_content_in(&state.rooms, &current, "m.room.power_levels")?
+        .as_ref()
+        .and_then(power_levels_ctx);
+    let mut ctx = PushConditionRoomCtx::new(
+        ruma::OwnedRoomId::try_from(room_id).map_err(|e| ApiError::internal(e.to_string()))?,
+        u32::try_from(member_count).unwrap_or(u32::MAX).into(),
+        user_id.to_owned(),
+        display_name,
+    );
+    ctx.power_levels = power_levels;
+    Ok((ruleset, ctx))
+}
+
 pub async fn room_unread(
     state: &CsState,
     user_id: &UserId,
@@ -68,30 +100,7 @@ pub async fn room_unread(
         }
     }
 
-    // The rule context: room size, our display name, power levels.
-    let mut ruleset = crate::routes::push::load_ruleset(state, user_id)?;
-    add_legacy_mention_rules(&mut ruleset, user_id);
-    let member_count = room_util::joined_member_ids(&state.rooms, room_id)?.len();
-    let display_name = state
-        .users
-        .store()
-        .profile(user_id.as_str())
-        .ok()
-        .flatten()
-        .and_then(|p| p.displayname)
-        .unwrap_or_else(|| user_id.localpart().to_owned());
-    let current = room_util::current_state(&state.rooms, room_id)?;
-    let power_levels = room_util::state_content_in(&state.rooms, &current, "m.room.power_levels")?
-        .as_ref()
-        .and_then(power_levels_ctx);
-    let mut ctx = PushConditionRoomCtx::new(
-        ruma::OwnedRoomId::try_from(room_id).map_err(|e| ApiError::internal(e.to_string()))?,
-        u32::try_from(member_count).unwrap_or(u32::MAX).into(),
-        user_id.to_owned(),
-        display_name,
-    );
-    ctx.power_levels = power_levels;
-
+    let (ruleset, ctx) = rule_inputs(state, user_id, room_id)?;
     let meta = room_util::room_meta(&state.rooms, room_id)?;
     let version = room_util::room_version(&meta)?;
 

@@ -7,6 +7,7 @@ mod error;
 mod extract;
 mod presence;
 mod push_eval;
+mod push_gateway;
 mod room_util;
 mod routes;
 mod txn;
@@ -25,6 +26,7 @@ use saltator_userserver::UserServer;
 
 pub use error::ApiError;
 pub use presence::PresenceMap;
+pub use push_gateway::spawn_push_delivery;
 pub use typing::TypingMap;
 
 /// Client-facing configuration of the CS surface.

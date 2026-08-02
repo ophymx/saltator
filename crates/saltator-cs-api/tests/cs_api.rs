@@ -24,6 +24,7 @@ struct Env {
     router: axum::Router,
     rooms: Arc<RoomServer>,
     users: Arc<UserServer>,
+    state: Arc<CsState>,
     projection: tokio::task::JoinHandle<()>,
 }
 
@@ -72,9 +73,10 @@ async fn start_env() -> Env {
     );
     Env {
         _dir: dir,
-        router: saltator_cs_api::router(state),
+        router: saltator_cs_api::router(state.clone()),
         rooms,
         users,
+        state,
         projection,
     }
 }
@@ -6494,6 +6496,149 @@ async fn client_queries_remote_profile_and_directory() {
     a_users.shutdown().await.unwrap();
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
+}
+
+/// HTTP push delivery: a message lands, bob's pusher gateway receives a
+/// notification with the event, tweaks, and counts; a gateway rejection
+/// then drops the pusher (spec "Push Gateway API").
+#[tokio::test]
+async fn http_pusher_delivers_and_drops_rejected() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+
+    // Mock push gateway: captures notifications, rejects on demand.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let reject: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let gateway = axum::Router::new().route(
+        "/_matrix/push/v1/notify",
+        axum::routing::post({
+            let reject = reject.clone();
+            move |axum::Json(body): axum::Json<Value>| {
+                let rejected = reject.lock().unwrap().clone();
+                tx.send(body).unwrap();
+                async move { axum::Json(json!({ "rejected": rejected })) }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_url = format!(
+        "http://{}/_matrix/push/v1/notify",
+        listener.local_addr().unwrap()
+    );
+    let gateway_task = tokio::spawn(async move { axum::serve(listener, gateway).await });
+
+    // http pushers must carry a spec-shaped gateway URL.
+    let (status, _) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/pushers/set",
+            Some(&bob),
+            Some(json!({
+                "app_id": "test.app", "pushkey": "pk1", "kind": "http",
+                "app_display_name": "t", "device_display_name": "t", "lang": "en",
+                "data": { "url": "https://bad.example/notify" },
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/pushers/set",
+            Some(&bob),
+            Some(json!({
+                "app_id": "test.app", "pushkey": "pk1", "kind": "http",
+                "app_display_name": "t", "device_display_name": "t", "lang": "en",
+                "data": { "url": gateway_url },
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let delivery = saltator_cs_api::spawn_push_delivery(env.state.clone());
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat", "name": "push room"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().unwrap().to_owned();
+    let room_enc = room_id.replace('!', "%21").replace(':', "%3A");
+    let (status, _) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/join"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/push1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "hello bob"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The gateway hears about alice's message (join/member events don't
+    // notify under default rules).
+    let deadline = tokio::time::Duration::from_secs(10);
+    let pushed = tokio::time::timeout(deadline, rx.recv())
+        .await
+        .expect("no push arrived")
+        .unwrap();
+    let n = &pushed["notification"];
+    assert_eq!(n["room_id"], room_id.as_str(), "{pushed}");
+    assert_eq!(n["type"], "m.room.message");
+    assert_eq!(n["sender"], "@alice:hs.test");
+    assert_eq!(n["content"]["body"], "hello bob");
+    assert_eq!(n["room_name"], "push room");
+    assert_eq!(n["devices"][0]["app_id"], "test.app");
+    assert_eq!(n["devices"][0]["pushkey"], "pk1");
+    assert!(n["counts"]["unread"].as_u64().unwrap() >= 1, "{pushed}");
+    assert!(n["event_id"].as_str().unwrap().starts_with('$'));
+
+    // Gateway starts rejecting pk1: the pusher must be dropped.
+    reject.lock().unwrap().push("pk1".to_owned());
+    let (status, _) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/push2"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "hello again"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    tokio::time::timeout(deadline, rx.recv())
+        .await
+        .expect("no second push")
+        .unwrap();
+    for _ in 0..100 {
+        let (_, body) = env
+            .req("GET", "/_matrix/client/v3/pushers", Some(&bob), None)
+            .await;
+        if body["pushers"].as_array().is_some_and(|p| p.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (_, body) = env
+        .req("GET", "/_matrix/client/v3/pushers", Some(&bob), None)
+        .await;
+    assert_eq!(body["pushers"], json!([]), "rejected pusher not dropped");
+
+    delivery.abort();
+    gateway_task.abort();
+    env.shutdown().await;
 }
 
 /// A federated join served over /sync: `import_room` keeps the
