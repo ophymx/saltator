@@ -85,6 +85,9 @@ pub struct CsState {
 pub struct Federation {
     pub client: Arc<FederationClient>,
     pub signer: Arc<ServerSigner>,
+    /// Fetches remote servers' signing keys so imported events (send_join
+    /// state, backfill) can be signature-verified before we trust them.
+    pub key_cache: Arc<saltator_federation::KeyCache>,
 }
 
 /// Applies inbound EDUs (typing/presence) to the shared ephemeral maps —
@@ -156,11 +159,16 @@ impl CsState {
         mut self: Arc<Self>,
         client: Arc<FederationClient>,
         signer: Arc<ServerSigner>,
+        key_cache: Arc<saltator_federation::KeyCache>,
     ) -> Arc<Self> {
         // `self` is freshly built here (single owner), so this is safe.
         Arc::get_mut(&mut self)
             .expect("with_federation called on a shared CsState")
-            .federation = Some(Federation { client, signer });
+            .federation = Some(Federation {
+            client,
+            signer,
+            key_cache,
+        });
         self
     }
 }

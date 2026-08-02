@@ -256,6 +256,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         Some(ca) => saltator_federation::FederationClient::with_ca(signer.clone(), ca),
         None => saltator_federation::FederationClient::new(signer.clone()),
     });
+    // The CS import paths (remote join, backfill) verify fetched events, so
+    // they need their own key cache to look up authoring servers' keys.
+    let cs_key_cache = Arc::new(match &outbound_ca {
+        Some(ca) => saltator_federation::KeyCache::with_ca(ca),
+        None => saltator_federation::KeyCache::new(),
+    });
     let cs_state = saltator_cs_api::CsState::new(
         users.clone(),
         rooms.clone(),
@@ -274,7 +280,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             allow_internal_fetch: cfg.client.allow_internal_fetch,
         },
     )
-    .with_federation(fed_client.clone(), signer.clone());
+    .with_federation(fed_client.clone(), signer.clone(), cs_key_cache);
     // Typing/presence maps are shared with the federation surface (inbound
     // EDUs update them).
     let cs_typing = cs_state.typing_map();

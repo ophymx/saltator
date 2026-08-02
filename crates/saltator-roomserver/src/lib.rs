@@ -350,6 +350,9 @@ impl RoomServer {
     /// only when fully verified. Used to vet off-timeline state snapshots
     /// (gap-fill `/state`) before trusting them — the caller must first
     /// trust the keys of every server that authored one of the events.
+    /// Looks the room version up from stored meta; use
+    /// [`Self::verify_pdu_at`] when the room does not exist locally yet
+    /// (a fresh send_join).
     pub fn verify_pdu(&self, room_id: &str, raw: &CanonicalJsonObject) -> bool {
         let Ok(Some(meta)) = self.store().meta(room_id) else {
             return false;
@@ -357,6 +360,13 @@ impl RoomServer {
         let Ok(version) = RoomVersion::parse(&meta.version) else {
             return false;
         };
+        self.verify_pdu_at(version, raw)
+    }
+
+    /// Like [`Self::verify_pdu`] but with an explicit room version, so it
+    /// works before the room is stored locally (send_join import). The
+    /// caller must have trusted the authoring servers' keys first.
+    pub fn verify_pdu_at(&self, version: RoomVersion, raw: &CanonicalJsonObject) -> bool {
         if validation::validate_pdu(raw, version).is_err() {
             return false;
         }

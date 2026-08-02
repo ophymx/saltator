@@ -6,11 +6,41 @@
 //! cache it. The cache is in-memory for now; §5.4 wants it in the metadata
 //! group, which lands with the out-queue work.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use ruma::signatures::PublicKeyMap;
 use ruma::{CanonicalJsonObject, CanonicalJsonValue};
+
+use saltator_roomserver::RoomServer;
+
+/// Fetch and trust the signing keys of every server that authored one of
+/// `events`, so a following [`RoomServer::verify_pdu`] /
+/// [`RoomServer::verify_pdu_at`] can check each event's signature.
+/// Best-effort per server: a failed key fetch simply leaves that server
+/// untrusted, so its events won't verify (fail closed).
+pub async fn trust_event_servers(
+    key_cache: &KeyCache,
+    rooms: &RoomServer,
+    events: &[CanonicalJsonObject],
+) {
+    let now = crate::now_ms();
+    let mut servers: BTreeSet<String> = BTreeSet::new();
+    for ev in events {
+        if let Some(CanonicalJsonValue::String(sender)) = ev.get("sender") {
+            if let Ok(uid) = ruma::UserId::parse(sender) {
+                servers.insert(uid.server_name().to_string());
+            }
+        }
+    }
+    for server in &servers {
+        if let Ok(keys) = key_cache.keys_for(server, now).await {
+            if let Some(set) = keys.get(server.as_str()) {
+                rooms.trust_keys(server, set.clone());
+            }
+        }
+    }
+}
 
 /// Verified keys for one server plus the freshness bound we honor.
 #[derive(Clone)]

@@ -4477,8 +4477,12 @@ async fn client_joins_a_remote_room_via_federation() {
         },
     )
     .with_federation(
-        Arc::new(FederationClient::with_base_url(b_signer.clone(), a_base)),
+        Arc::new(FederationClient::with_base_url(
+            b_signer.clone(),
+            a_base.clone(),
+        )),
         b_signer.clone(),
+        Arc::new(KeyCache::with_base_url(a_base)),
     );
     let router = saltator_cs_api::router(state);
 
@@ -4676,8 +4680,12 @@ async fn remote_join_backfills_full_history() {
         },
     )
     .with_federation(
-        Arc::new(FederationClient::with_base_url(b_signer.clone(), a_base)),
+        Arc::new(FederationClient::with_base_url(
+            b_signer.clone(),
+            a_base.clone(),
+        )),
         b_signer.clone(),
+        Arc::new(KeyCache::with_base_url(a_base)),
     );
     let router = saltator_cs_api::router(state);
 
@@ -4960,6 +4968,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
             a_base.clone(),
         )),
         b_signer.clone(),
+        Arc::new(KeyCache::with_base_url(a_base.clone())),
     );
     let router = saltator_cs_api::router(state);
 
@@ -5459,8 +5468,12 @@ async fn cs_stack(
     );
     if let Some(base) = fed_client_base {
         cs = cs.with_federation(
-            Arc::new(FederationClient::with_base_url(signer.clone(), base)),
+            Arc::new(FederationClient::with_base_url(
+                signer.clone(),
+                base.clone(),
+            )),
             signer.clone(),
+            Arc::new(KeyCache::with_base_url(base)),
         );
     }
     let router = saltator_cs_api::router(cs);
@@ -5594,9 +5607,10 @@ async fn outbound_federated_invite_round_trip() {
     .with_federation(
         Arc::new(FederationClient::with_base_url(
             a_signer.clone(),
-            b_fed_base,
+            b_fed_base.clone(),
         )),
         a_signer.clone(),
+        Arc::new(KeyCache::with_base_url(b_fed_base)),
     );
     let a_router = saltator_cs_api::router(a_cs);
 
@@ -5736,9 +5750,10 @@ async fn to_device_over_federation_round_trip() {
     .with_federation(
         Arc::new(FederationClient::with_base_url(
             a_signer.clone(),
-            b_fed_base,
+            b_fed_base.clone(),
         )),
         a_signer.clone(),
+        Arc::new(KeyCache::with_base_url(b_fed_base)),
     );
     let a_router = saltator_cs_api::router(a_cs);
 
@@ -5874,6 +5889,7 @@ async fn federated_key_query_claim_and_device_list_update() {
             b_fed_base.clone(),
         )),
         a_signer.clone(),
+        Arc::new(KeyCache::with_base_url(b_fed_base.clone())),
     );
     let a_router = saltator_cs_api::router(a_cs);
 
@@ -6316,8 +6332,12 @@ async fn client_downloads_remote_media_over_federation() {
         },
     )
     .with_federation(
-        Arc::new(FederationClient::with_base_url(b_signer.clone(), a_base)),
+        Arc::new(FederationClient::with_base_url(
+            b_signer.clone(),
+            a_base.clone(),
+        )),
         b_signer.clone(),
+        Arc::new(KeyCache::with_base_url(a_base)),
     );
     let router = saltator_cs_api::router(cs_state);
 
@@ -6545,8 +6565,12 @@ async fn client_queries_remote_profile_and_directory() {
         },
     )
     .with_federation(
-        Arc::new(FederationClient::with_base_url(b_signer.clone(), a_base)),
+        Arc::new(FederationClient::with_base_url(
+            b_signer.clone(),
+            a_base.clone(),
+        )),
         b_signer.clone(),
+        Arc::new(KeyCache::with_base_url(a_base)),
     );
     let router = saltator_cs_api::router(cs_state);
 

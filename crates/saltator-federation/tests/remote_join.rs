@@ -54,6 +54,77 @@ fn obj(v: serde_json::Value) -> CanonicalJsonObject {
     }
 }
 
+/// The verification primitive behind H1 import checks: `verify_pdu_at`
+/// accepts a genuinely-signed event only when the authoring server's keys
+/// are trusted, and rejects it when untrusted or tampered.
+#[tokio::test]
+async fn verify_pdu_at_accepts_only_trusted_untampered_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let a_name: OwnedServerName = "a.test".try_into().unwrap();
+    let b_name: OwnedServerName = "b.test".try_into().unwrap();
+    let (a_signer, _) = ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let (b_signer, _) = ServerSigner::generate(b_name, "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+
+    // A signs a real event (the room create event).
+    let rooms_a = start_rooms("a", a_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let (_room_id, oc) = rooms_a
+        .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+        .await
+        .unwrap();
+    let create_id = match oc {
+        Outcome::Accepted { event_id, .. } => event_id,
+        other => panic!("{other:?}"),
+    };
+    let raw: CanonicalJsonObject = serde_json::from_slice(
+        &rooms_a
+            .store()
+            .event(create_id.as_str())
+            .unwrap()
+            .unwrap()
+            .raw,
+    )
+    .unwrap();
+
+    // A separate server B does the verifying; it knows only its own keys.
+    let rooms_b = start_rooms("b", Arc::new(b_signer), dir.path()).await;
+
+    // Untrusted author -> rejected (fail closed).
+    assert!(
+        !rooms_b.verify_pdu_at(RoomVersion::V11, &raw),
+        "must reject an event whose author's keys are untrusted"
+    );
+
+    // Trust A's keys -> the genuine event verifies.
+    let a_keys = a_signer
+        .public_key_map()
+        .get("a.test")
+        .cloned()
+        .expect("a.test keys");
+    rooms_b.trust_keys("a.test", a_keys);
+    assert!(
+        rooms_b.verify_pdu_at(RoomVersion::V11, &raw),
+        "must accept a genuinely-signed event from a trusted server"
+    );
+
+    // Tampered content -> rejected even with the author trusted (the
+    // content hash no longer matches the signed event).
+    let mut forged = raw.clone();
+    forged.insert(
+        "content".to_owned(),
+        CanonicalJsonValue::try_from(json!({"creator": "@attacker:a.test", "injected": true}))
+            .unwrap(),
+    );
+    assert!(
+        !rooms_b.verify_pdu_at(RoomVersion::V11, &forged),
+        "must reject a tampered event"
+    );
+
+    rooms_a.shutdown().await.unwrap();
+    rooms_b.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn remote_join_handshake_returns_room_state() {
     let dir = tempfile::tempdir().unwrap();
