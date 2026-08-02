@@ -94,13 +94,10 @@ impl TypingMap {
         }
         let mut users: Vec<String> = room.users.keys().cloned().collect();
         users.sort();
-        let changed_at = room.changed_at;
-        // Drop the room once nobody is typing, so idle rooms don't
-        // accumulate empty entries forever.
-        if room.users.is_empty() {
-            inner.remove(room_id);
-        }
-        (users, changed_at)
+        // NB: an emptied room is left in place (not removed here). Removing
+        // it as a side effect of this read regressed TestTyping, and the
+        // per-room count is already bounded by the cap in `set`.
+        (users, room.changed_at)
     }
 }
 
