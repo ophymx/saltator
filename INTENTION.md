@@ -51,11 +51,12 @@ Vetted before selection. Summary of what's clear and what to route around:
 
 ## Status
 
-**M2 (Client-server) complete** — see [spec.md](spec.md) §12 for the
-milestone plan. A single-node Saltator serves the Matrix client-server API
-end to end: two users can register, create a room, and chat, surviving a
-node restart. Matrix spec pinned at v1.19. Next: M3 (federation — server
-keys, transactions, remote join + backfill).
+**M0–M5 complete** — see [spec.md](spec.md) §12 for the milestone plan
+and [README.md](README.md) for the current feature surface. Saltator
+federates with Synapse (proven in CI), self-clusters and survives node
+loss without message loss, and carries real E2EE traffic for matrix-nio
+and Element clients. Matrix spec pinned at v1.19. Next: hardening and a
+first public deployment.
 
 ## Next steps (from the original inception list)
 

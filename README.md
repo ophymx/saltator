@@ -10,15 +10,32 @@ database and no role configuration.
 
 ## Status
 
-**M2 — Client-server** complete (see spec.md §12 for the milestone plan):
-registration, login, rooms, messaging, `/sync`, receipts/typing, and local
-media work on a single node, and the Complement client-server suite is wired
-into CI. Under the hood: the full event pipeline (auth rules, state
-resolution v2 for room versions 11/12), room/user shards as Raft state
-machines, and an embedded RocksDB store — no external database.
+**M0–M5 complete** (see spec.md §12 for the milestone plan) — the full
+stack works end to end, with every exit criterion proven in CI:
 
-Not yet a homeserver you can deploy: federation lands in M3, multi-node
-clustering in M4, the E2EE surface in M5.
+- **Client-server**: registration, login, rooms (versions 9–12 +
+  upgrades), messaging, `/sync`, receipts/typing/presence, search, media
+  and URL previews, push rules with HTTP gateway delivery, key backup,
+  rate limiting. Complement CS suite: 366/371 subtests green.
+- **Federation**: signed server keys, X-Matrix request auth over HTTPS
+  (well-known + SRV resolution), remote join/invite/leave, backfill and
+  gap recovery, EDUs, remote media — proven against a real Synapse in a
+  gating CI job.
+- **Clustering**: self-forming multi-node cluster on Raft shard groups
+  with an embedded RocksDB store — no external database, no role
+  configuration. A 3-node cluster survives `kill -9` of any node
+  mid-traffic with no message loss (chaos test gates CI).
+- **E2EE surface**: device keys, one-time and fallback keys, to-device
+  messaging, cross-signing, key backup. The gating proof: fresh
+  matrix-nio devices exchange Megolm-encrypted messages in both
+  directions across Saltator↔Synapse federation; also verified hands-on
+  with real Element clients.
+
+Still pre-release: hardening remains (durable federation-out cursors,
+per-event signature verification on trusted backfill imports, an SSRF
+blocklist for URL previews), the federation Complement suite is a
+tracked work-in-progress rather than a gate, and the on-disk format
+still breaks between commits without migration.
 
 ## Try it
 

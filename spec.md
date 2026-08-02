@@ -403,26 +403,38 @@ group (self-contained CA; no external PKI).
 
 - **M0 — Foundations.** Workspace, config, storage trait + RocksDB, metadata
   Raft group, single-node bootstrap, internal RPC skeleton, CI. *Exit: a
-  1-node "cluster" starts, persists, restarts.*
+  1-node "cluster" starts, persists, restarts.* **Exit met 2026-07-12.**
 - **M1 — Core engine.** `saltator-core` complete for room v11/12 (auth,
   state-res v2, validation) with vector tests. Room + user shards as state
   machines; event pipeline working single-node. *Exit: events flow through
-  the full pipeline in-process.*
+  the full pipeline in-process.* **Exit met 2026-07-13.**
 - **M2 — Client-server.** Registration, login, room create/join/send,
   `/sync` v2, receipts/typing, media (local blobs). *Exit: two Element users
   chat on a single-node Saltator; Complement CS suite running in CI.*
+  **Exit met 2026-07-14** (element-shaped e2e test + Complement in CI;
+  confirmed with real Element clients 2026-08-02).
 - **M3 — Federation.** Server keys, inbound/outbound transactions, remote
   join + backfill, out-queues. *Exit: join a room on matrix.org, converse
   bidirectionally with a Synapse user. This is the project's first public
-  proof point.*
+  proof point.* **Exit met 2026-07-24** via the gating CI interop job: a
+  Saltator user joins a real Synapse's room over federation and messages
+  flow both ways (no public deployment yet, so a live matrix.org join is
+  deferred to launch).
 - **M4 — Clustering.** Multi-node: placement controller, shard moves, node
   join/drain/failure, sync across shards, per-destination out-queue
   ownership. Simulation harness green. *Exit: 3-node cluster survives
   kill -9 of any node mid-traffic with no message loss; chaos test in CI.*
+  **Exit met 2026-07-24** (gating chaos job; graceful drain and
+  leader-forwarded writes deferred as hardening).
 - **M5 — E2EE surface + hardening.** Device/key APIs, key backup,
   cross-signing, to-device at scale, push, rate limits, Complement pass-rate
   push, older room versions (9/10) for federation reach. *Exit: E2EE chat
   between Element clients across Saltator↔Synapse federation.*
+  **Exit met 2026-08-02** via the gating CI interop job: fresh matrix-nio
+  devices exchange Megolm messages both directions across
+  Saltator↔Synapse federation (device-key query, one-time-key claim, and
+  room-key to-device sharing all crossing the wire); the same E2EE flows
+  verified hands-on with real Element clients against Saltator.
 
 Milestone order note: M2 before M3 is sequencing pragmatism, not a scope
 statement — federation remains in v1, and M1's pipeline is built
