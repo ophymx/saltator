@@ -76,6 +76,11 @@ pub async fn send_transaction(
                         apply_device_list_edu(users, &auth.origin, edu).await;
                     }
                 }
+                Some("m.receipt") => {
+                    if let Some(rooms) = &state.rooms {
+                        apply_receipt_edu(rooms, &auth.origin, edu).await;
+                    }
+                }
                 _ => {
                     if let Some(sink) = &state.edu_sink {
                         apply_edu(sink.as_ref(), &auth.origin, edu);
@@ -168,6 +173,61 @@ async fn apply_to_device_edu(
     }
     if let Err(e) = users.send_to_device(batch).await {
         tracing::warn!(error = %e, origin, "to-device EDU apply failed");
+    }
+}
+
+/// Apply an inbound `m.receipt` EDU: store each remote user's read
+/// receipt so it surfaces in local members' `/sync` (spec "Receipts").
+/// Only `m.read` federates; the claimed user must live on the sending
+/// server. `thread_id` (MSC4102) is preserved so the unthreaded-wins rule
+/// still applies at render time.
+async fn apply_receipt_edu(
+    rooms: &saltator_roomserver::RoomServer,
+    origin: &str,
+    edu: &serde_json::Value,
+) {
+    let Some(content) = edu.get("content").and_then(|c| c.as_object()) else {
+        return;
+    };
+    for (room_id, per_room) in content {
+        let Ok(rid) = ruma::RoomId::parse(room_id) else {
+            continue;
+        };
+        let Some(reads) = per_room.get("m.read").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (user_id, receipt) in reads {
+            // Only the origin server may post receipts for its own users.
+            let Ok(uid) = ruma::UserId::parse(user_id.as_str()) else {
+                continue;
+            };
+            if uid.server_name().as_str() != origin {
+                continue;
+            }
+            let data = receipt.get("data");
+            let ts = data
+                .and_then(|d| d.get("ts"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let thread_id = data
+                .and_then(|d| d.get("thread_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let Some(event_ids) = receipt.get("event_ids").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for ev in event_ids {
+                let Some(Ok(eid)) = ev.as_str().map(ruma::EventId::parse) else {
+                    continue;
+                };
+                if let Err(e) = rooms
+                    .write_receipt(&rid, &uid, "m.read", &eid, thread_id.clone(), ts)
+                    .await
+                {
+                    tracing::debug!(error = %e, origin, "inbound receipt EDU apply failed");
+                }
+            }
+        }
     }
 }
 

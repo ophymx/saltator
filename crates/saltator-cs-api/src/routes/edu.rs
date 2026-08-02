@@ -77,6 +77,42 @@ pub(crate) fn broadcast_device_list_update(
     );
 }
 
+/// Federate a local user's read receipt to the remote servers in the room
+/// (`m.receipt` EDU, spec "Receipts"). Only public `m.read` receipts
+/// federate — private receipts and fully-read markers stay local. The
+/// `thread_id` (MSC4102) rides in `data` so the receiver can honor the
+/// unthreaded-wins rule.
+pub(crate) fn broadcast_receipt(
+    state: &Arc<CsState>,
+    room_id: &str,
+    user_id: &str,
+    event_id: &str,
+    thread_id: Option<&str>,
+) {
+    let dests = room_destinations(state, room_id);
+    if dests.is_empty() {
+        return;
+    }
+    let mut data = serde_json::json!({ "ts": now_ms() });
+    if let Some(thread) = thread_id {
+        data["thread_id"] = thread.into();
+    }
+    send_edu(
+        state,
+        dests,
+        serde_json::json!({
+            "edu_type": "m.receipt",
+            "content": {
+                room_id: {
+                    "m.read": {
+                        user_id: { "data": data, "event_ids": [event_id] }
+                    }
+                }
+            },
+        }),
+    );
+}
+
 /// Remote servers sharing any joined room with `user_id` — the audience
 /// for a presence update.
 pub(crate) fn presence_destinations(state: &CsState, user_id: &str) -> Vec<String> {

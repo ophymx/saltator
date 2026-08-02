@@ -1754,11 +1754,13 @@ pub async fn get_messages(
         .unwrap_or_else(|| "t0".to_owned());
     // `end` is omitted once no further events are available (spec v1.12+):
     // clients paginate until it disappears, so serving it forever traps
-    // them in an infinite loop. A limit-full batch may have more; a short
-    // one is the boundary — except when the backfill frontier is known to
-    // be open (fetch failed or budget ran out), where the token survives
-    // so the client can resume.
-    resp.end = if rows.len() == limit || more_history {
+    // them in an infinite loop. Keep the token when there may be more:
+    // a limit-full raw scan, an open backfill frontier, or — crucially
+    // with a `contains_url`/lazy filter — a non-empty returned chunk (the
+    // filter can shrink the chunk below the raw scan, so a short chunk is
+    // NOT proof we hit the timeline start). Omit it only when nothing was
+    // returned and the scan reached the start.
+    resp.end = if rows.len() == limit || more_history || !chunk.is_empty() {
         rows.last().map(|(p, _)| match p {
             RowPos::Timeline(s) => format!("t{s}"),
             RowPos::History(i) => format!("h{i}"),

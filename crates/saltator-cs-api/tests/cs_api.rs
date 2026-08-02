@@ -1775,6 +1775,65 @@ async fn txn_ids_scope_to_device_and_path() {
     env.shutdown().await;
 }
 
+/// /messages must keep the `end` token when a `contains_url` filter shrinks
+/// the chunk below the raw scan: a short *filtered* chunk is not proof the
+/// timeline start was reached, so dropping `end` would strand the client
+/// before earlier matching events (regression for TestRoomImageRoundtrip).
+#[tokio::test]
+async fn messages_end_survives_url_filter() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // A plain text message, then one carrying a `url` (the only filter match).
+    for (txn, content) in [
+        ("m1", json!({"msgtype": "m.text", "body": "hello"})),
+        (
+            "m2",
+            json!({"msgtype": "m.file", "body": "f.png", "url": "mxc://hs.test/abc"}),
+        ),
+    ] {
+        let (status, body) = env
+            .req(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn}"),
+                Some(&alice),
+                Some(content),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    // {"contains_url": true}, percent-encoded.
+    let filter = "%7B%22contains_url%22%3Atrue%7D";
+    let (status, got) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_id}/messages?dir=b&filter={filter}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let chunk = got["chunk"].as_array().unwrap();
+    assert_eq!(chunk.len(), 1, "only the url event matches: {got}");
+    assert_eq!(chunk[0]["content"]["url"], "mxc://hs.test/abc");
+    // The token must be present even though the filtered chunk is short.
+    assert!(
+        got["end"].is_string(),
+        "end must survive a filtered short chunk: {got}"
+    );
+}
+
 /// /messages with a lazy_load_members filter returns the member events of
 /// the chunk's senders in `state` — exactly one per distinct sender.
 #[tokio::test]
@@ -5668,6 +5727,113 @@ async fn outbound_federated_invite_round_trip() {
     b_proj.abort();
     a_rooms.shutdown().await.unwrap();
     a_users.shutdown().await.unwrap();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}
+
+/// An inbound `m.receipt` EDU from a remote server surfaces that user's
+/// read receipt in a local member's `/sync` (federated read receipts).
+#[tokio::test]
+async fn receipt_edu_over_federation_surfaces_in_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let (b_rooms, b_users, b_signer, b_router, b_proj) = cs_stack("b.test", dir.path(), None).await;
+
+    // Remote server A + its key server so B can authenticate A's /send.
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let (a_signer, _) = saltator_roomserver::ServerSigner::generate(a_name, "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let a_key_base = spawn_fed("a.test", a_signer.clone(), None, None).await;
+
+    // B's federation surface (rooms + users), trusting A's keys.
+    let b_fed = Arc::new(FedState {
+        server_name: ruma::OwnedServerName::try_from("b.test").unwrap(),
+        signer: b_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(a_key_base),
+        rooms: Some(b_rooms.clone()),
+        users: Some(b_users.clone()),
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let b_fed_base = {
+        let app = saltator_federation::router(b_fed);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(l, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+
+    // Bob (on B) hosts a room and sends a message.
+    let bob = reg(&b_router, "bob").await;
+    let (_s, room) = oneshot(
+        &b_router,
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        Some(&bob),
+        Some(json!({"preset": "public_chat"})),
+    )
+    .await;
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let (_s, sent) = oneshot(
+        &b_router,
+        "PUT",
+        &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/rm1"),
+        Some(&bob),
+        Some(json!({"msgtype": "m.text", "body": "hi"})),
+    )
+    .await;
+    let event_id = sent["event_id"].as_str().unwrap().to_owned();
+
+    // A signs an m.receipt EDU: @alice:a.test read bob's message.
+    let a_client = FederationClient::with_base_url(a_signer.clone(), b_fed_base);
+    let txn = json!({
+        "origin": "a.test",
+        "origin_server_ts": 1000,
+        "edus": [{
+            "edu_type": "m.receipt",
+            "content": { room_id.clone(): { "m.read": { "@alice:a.test": {
+                "data": {"ts": 1234},
+                "event_ids": [event_id.clone()],
+            }}}},
+        }],
+    });
+    a_client
+        .put("b.test", "/_matrix/federation/v1/send/rcpt1", &txn)
+        .await
+        .unwrap();
+
+    // Bob's sync shows alice's read receipt on his event.
+    let mut seen = false;
+    for _ in 0..100 {
+        let (_s, sync) = oneshot(
+            &b_router,
+            "GET",
+            "/_matrix/client/v3/sync",
+            Some(&bob),
+            None,
+        )
+        .await;
+        let ephemeral = &sync["rooms"]["join"][&room_id]["ephemeral"]["events"];
+        if ephemeral.as_array().is_some_and(|evs| {
+            evs.iter().any(|e| {
+                e["type"] == "m.receipt"
+                    && !e["content"][&event_id]["m.read"]["@alice:a.test"].is_null()
+            })
+        }) {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        seen,
+        "alice's federated read receipt never appeared in bob's sync"
+    );
+
+    b_proj.abort();
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
 }
