@@ -563,3 +563,59 @@ async fn membership_projection_tracks_room_shard() {
     env.rooms.shutdown().await.unwrap();
     env.users.shutdown().await.unwrap();
 }
+
+/// A federated invite followed by a federated join: the invite row is
+/// written by `record_remote_invite` (no room-shard seq exists yet), and
+/// the join later arrives through the projection with a genuine — small —
+/// room-shard seq. The join must win: the invite row carries no
+/// projection ordering, so it must never make the join look stale.
+#[tokio::test]
+async fn remote_invite_then_projected_join_becomes_join() {
+    let env = start_env().await;
+    let u = &env.users;
+    let (uid, _) = u
+        .register("bob", Some("pw"), None, None, false, false)
+        .await
+        .unwrap();
+
+    // Inflate the user-shard seq well past any room-shard seq — this is
+    // what a real client does via key uploads, account data, to-device.
+    for i in 0..20 {
+        u.put_account_data(&uid, "", &format!("m.test.{i}"), b"{}".to_vec())
+            .await
+            .unwrap();
+    }
+
+    let room = "!remote:elsewhere.test";
+    u.record_remote_invite(uid.as_str(), room, "@eve:elsewhere.test", "$inv", vec![])
+        .await
+        .unwrap();
+    let m = u.store().membership(uid.as_str(), room).unwrap().unwrap();
+    assert_eq!(m.membership, "invite");
+
+    // The federated join lands via the projection path with room_seq=1 —
+    // far below the user-shard seq the invite was recorded at.
+    u.apply_room_changes(
+        &format!("import/{room}"),
+        1,
+        vec![saltator_userserver::MembershipChange {
+            user_id: uid.to_string(),
+            room_id: room.to_owned(),
+            membership: "join".to_owned(),
+            event_id: "$join".to_owned(),
+            sender: uid.to_string(),
+            room_seq: 1,
+        }],
+    )
+    .await
+    .unwrap();
+
+    let m = u.store().membership(uid.as_str(), room).unwrap().unwrap();
+    assert_eq!(
+        m.membership, "join",
+        "projected join must overwrite the remote invite"
+    );
+
+    env.rooms.shutdown().await.unwrap();
+    u.shutdown().await.unwrap();
+}

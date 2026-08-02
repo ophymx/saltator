@@ -501,9 +501,12 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                         membership: "invite".to_owned(),
                         event_id: event_id.clone(),
                         sender: sender.clone(),
-                        // No room-shard seq for a room we don't host; the
-                        // user-shard seq drives the sync window.
-                        room_seq: seq,
+                        // Not from the room-shard projection, so it must
+                        // never win the projection's staleness ordering: a
+                        // later projected join/leave (any room_seq > 0)
+                        // must overwrite this row. The user-shard seq
+                        // alone drives the sync window.
+                        room_seq: 0,
                         seq,
                         forgotten: false,
                     },
@@ -534,7 +537,10 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                         membership: "leave".to_owned(),
                         event_id: String::new(),
                         sender: user_id.clone(),
-                        room_seq: seq,
+                        // room_seq: 0 for the same reason as remote
+                        // invites — a later projected membership must not
+                        // be judged stale against this row.
+                        room_seq: 0,
                         seq,
                         forgotten: false,
                     },
