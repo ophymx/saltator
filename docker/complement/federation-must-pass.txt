@@ -1,0 +1,38 @@
+# Complement federation tests that MUST pass — the regression gate.
+#
+# Federation coverage is still growing, so unlike csapi this is a positive
+# ("must pass") list rather than an allowed-to-fail list: it locks in the
+# top-level tests we've gotten green so a regression fails CI, while the
+# long tail of not-yet-implemented features is free to keep failing. The
+# job fails if any test below is missing from the run's passes or shows a
+# `--- FAIL:` marker.
+#
+# When a federation feature lands and flips a test green, add it here. Do
+# NOT add a test that only passes intermittently — fix the flake first.
+# (Reviewed 2026-08-02 across 4 runs: these 19 pass every run;
+# TestMediaWithoutFileNameCSMediaV1 was deliberately left out — it passed
+# only 1 of 4, the known media flakiness.)
+#
+# Works for both the per-push (-skip deferred buckets) and the weekly
+# unfiltered run: none of these live in a skipped bucket, and none is in
+# the deferred set, so the gate behaves identically for both.
+
+TestBannedUserCannotSendJoin
+TestContentMediaV1
+TestFederationThumbnail
+TestGetMissingEventsGapFilling
+TestInboundFederationKeys
+TestInboundFederationProfile
+TestIsDirectFlagFederation
+TestJoinFederatedRoomFailOver
+TestLocalPngThumbnail
+TestMSC4291RoomIDAsHashOfCreateEvent
+TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent
+TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
+TestMSC4297StateResolutionV2_1_starts_from_empty_set
+TestOutboundFederationProfile
+TestRemoteAliasRequestsUnderstandUnicode
+TestRemotePresence
+TestRemoteTyping
+TestUserAppearsInChangedDeviceListOnJoinOverFederation
+TestWriteMDirectAccountData
