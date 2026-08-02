@@ -1834,6 +1834,111 @@ async fn messages_end_survives_url_filter() {
     );
 }
 
+/// v12 create-event semantics (MSC4289/4291): trusted_private_chat
+/// invitees join `additional_creators`, client-supplied creators merge in,
+/// a client can't send `m.room.create`, and an upgrade preserves
+/// `additional_creators` while omitting `predecessor.event_id`.
+#[tokio::test]
+async fn v12_create_event_semantics() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let bob = format!("@bob:{SERVER}");
+    let charlie = format!("@charlie:{SERVER}");
+    env.register("bob", "pw").await;
+    env.register("charlie", "pw").await;
+
+    // trusted_private_chat (v12) + invite bob + creation_content charlie:
+    // the create event's additional_creators holds BOTH.
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({
+                "room_version": "12",
+                "preset": "trusted_private_chat",
+                "is_direct": true,
+                "invite": [bob],
+                "creation_content": {"additional_creators": [charlie]},
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+
+    let (status, create) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{enc}/state/m.room.create/"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{create}");
+    let creators: Vec<&str> = create["additional_creators"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        creators.contains(&bob.as_str()),
+        "invitee missing: {create}"
+    );
+    assert!(
+        creators.contains(&charlie.as_str()),
+        "client creator missing: {create}"
+    );
+
+    // A client cannot send m.room.create — 400, not the pipeline's 403.
+    let (status, _) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc}/state/m.room.create/"),
+            Some(&alice),
+            Some(json!({"room_version": "12", "entropy": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Upgrade: additional_creators preserved, predecessor has no event_id.
+    let (status, up) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/upgrade"),
+            Some(&alice),
+            Some(json!({"new_version": "12"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{up}");
+    let new_enc = up["replacement_room"]
+        .as_str()
+        .unwrap()
+        .replace('!', "%21")
+        .replace(':', "%3A");
+    let (status, new_create) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{new_enc}/state/m.room.create/"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{new_create}");
+    assert!(
+        new_create["additional_creators"].is_array(),
+        "additional_creators lost on upgrade: {new_create}"
+    );
+    assert!(
+        new_create["predecessor"]["event_id"].is_null(),
+        "v12 predecessor must omit event_id: {new_create}"
+    );
+    assert_eq!(new_create["predecessor"]["room_id"], room_id.as_str());
+
+    env.shutdown().await;
+}
+
 /// /messages with a lazy_load_members filter returns the member events of
 /// the chunk's senders in `state` — exactly one per distinct sender.
 #[tokio::test]

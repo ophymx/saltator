@@ -68,12 +68,40 @@ pub async fn create_room(
         None => None,
     };
 
+    let preset = req.preset.clone().unwrap_or(match req.visibility {
+        ruma::api::client::room::Visibility::Public => RoomPreset::PublicChat,
+        _ => RoomPreset::PrivateChat,
+    });
+
     // 1. m.room.create
-    let creation_content: serde_json::Map<String, serde_json::Value> = match &req.creation_content {
-        Some(raw) => serde_json::from_str(raw.json().get())
-            .map_err(|e| ApiError::bad_json(format!("creation_content: {e}")))?,
-        None => serde_json::Map::new(),
-    };
+    let mut creation_content: serde_json::Map<String, serde_json::Value> =
+        match &req.creation_content {
+            Some(raw) => serde_json::from_str(raw.json().get())
+                .map_err(|e| ApiError::bad_json(format!("creation_content: {e}")))?,
+            None => serde_json::Map::new(),
+        };
+    // MSC4289: in a privileged-creator room (v12+) created as a
+    // trusted_private_chat, the invited users join the creator set — merge
+    // them into `additional_creators` (keeping any the client supplied).
+    if version.privileged_creators() && preset == RoomPreset::TrustedPrivateChat {
+        let mut list = creation_content
+            .get("additional_creators")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let have: std::collections::BTreeSet<String> = list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        for invitee in &req.invite {
+            if !have.contains(invitee.as_str()) {
+                list.push(invitee.to_string().into());
+            }
+        }
+        if !list.is_empty() {
+            creation_content.insert("additional_creators".into(), list.into());
+        }
+    }
     let additional_creators: Vec<String> = creation_content
         .get("additional_creators")
         .and_then(|v| v.as_array())
@@ -111,10 +139,6 @@ pub async fn create_room(
 
     // 3. power levels: spec defaults + trusted-invitee elevation + client
     //    override.
-    let preset = req.preset.clone().unwrap_or(match req.visibility {
-        ruma::api::client::room::Visibility::Public => RoomPreset::PublicChat,
-        _ => RoomPreset::PrivateChat,
-    });
     let mut users = serde_json::Map::new();
     if !version.privileged_creators() {
         users.insert(auth.user_id.to_string(), 100.into());
@@ -634,12 +658,9 @@ pub async fn upgrade_room(
         crate::room_util::state_content_in(&state.rooms, &current, "m.room.create")?
             .and_then(|c| c.as_object().cloned())
             .unwrap_or_default();
-    for server_managed in [
-        "room_version",
-        "creator",
-        "predecessor",
-        "additional_creators",
-    ] {
+    // `additional_creators` is deliberately preserved across the upgrade
+    // (MSC4289): the new room keeps the same creator set.
+    for server_managed in ["room_version", "creator", "predecessor"] {
         creation_content.remove(server_managed);
     }
     let last_event = state
@@ -652,8 +673,13 @@ pub async fn upgrade_room(
         .map(|(_, event_id)| event_id);
     let mut predecessor = serde_json::Map::new();
     predecessor.insert("room_id".into(), room_id.clone().into());
+    // In privileged-creator versions (v12+) the room id IS the create
+    // event's reference hash, so the predecessor carries no separate
+    // event_id (MSC4291); older versions still include it.
     if let Some(event_id) = last_event {
-        predecessor.insert("event_id".into(), event_id.into());
+        if !version.privileged_creators() {
+            predecessor.insert("event_id".into(), event_id.into());
+        }
     }
     creation_content.insert("predecessor".into(), predecessor.into());
 
@@ -1222,6 +1248,11 @@ pub async fn send_state_event(
 ) -> Result<Ra<send_state_event::v3::Response>> {
     let content: serde_json::Value = serde_json::from_str(req.body.json().get())
         .map_err(|e| ApiError::bad_json(e.to_string()))?;
+    // m.room.create is only ever the room's first event; a client can never
+    // send another. Reject with 400 (not the pipeline's auth 403).
+    if req.event_type == ruma::events::StateEventType::RoomCreate {
+        return Err(ApiError::bad_json("Cannot send a m.room.create event"));
+    }
     if req.event_type == ruma::events::StateEventType::RoomCanonicalAlias {
         validate_canonical_alias(&state, req.room_id.as_str(), &content)?;
     }
