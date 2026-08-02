@@ -16,9 +16,7 @@
 # unsupported (spec.md room-versions). The rest of TestRoomCreate passes.
 TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
 
-# --- Known failures, NOT by design (track down and fix, then delete) ---
-# Threaded read receipts in the MSC4102 sync shape.
-TestThreadReceiptsInSyncMSC4102
-# Media upload -> download -> thumbnail roundtrip. Long assumed a flake,
-# but it fails on every run — a genuine bug, not noise.
-TestRoomImageRoundtrip
+# (TestThreadReceiptsInSyncMSC4102 and TestRoomImageRoundtrip were fixed
+# 2026-08-02 — federated read-receipt EDUs and the /messages `end` token
+# with filters — and removed from this list, so the gate now enforces
+# them.)

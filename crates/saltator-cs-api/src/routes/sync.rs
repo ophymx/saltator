@@ -981,9 +981,17 @@ pub async fn send_receipt(
                 &auth.user_id,
                 "m.read",
                 &req.event_id,
-                thread_id,
+                thread_id.clone(),
             )
             .await?;
+            // Public read receipts federate to the other servers in the room.
+            crate::routes::edu::broadcast_receipt(
+                &state,
+                req.room_id.as_str(),
+                auth.user_id.as_str(),
+                req.event_id.as_str(),
+                thread_id.as_deref(),
+            );
         }
         ReceiptType::ReadPrivate => {
             write_receipt(
