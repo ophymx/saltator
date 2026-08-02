@@ -77,6 +77,16 @@ impl ApiError {
         )
     }
 
+    /// A known path called with an unsupported method: 405 with the
+    /// `M_UNRECOGNIZED` body the spec expects (not a bare 405).
+    pub fn method_not_allowed() -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "M_UNRECOGNIZED",
+            "Unrecognized request",
+        )
+    }
+
     pub fn internal(message: impl std::fmt::Display) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

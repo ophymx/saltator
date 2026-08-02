@@ -397,6 +397,10 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_matrix/client/v1/rooms/{room_id}/threads",
             get(relations::get_threads),
+        )
+        .route(
+            "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
+            get(rooms::timestamp_to_event),
         );
 
     // -- media (authenticated endpoints only, Matrix 1.11+)
@@ -442,6 +446,7 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route("/_matrix/media/v3/config", get(media::config_legacy));
 
     app.fallback(unrecognized)
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
@@ -453,6 +458,10 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
 
 async fn unrecognized() -> ApiError {
     ApiError::unrecognized()
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::method_not_allowed()
 }
 
 pub(crate) fn now_ms() -> u64 {

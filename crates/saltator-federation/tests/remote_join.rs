@@ -651,3 +651,57 @@ async fn leave_client_rejects_over_federation() {
         "b.test should be gone after leave"
     );
 }
+
+/// RoomServer::event_auth_chain returns an event's transitive auth events
+/// (the /event_auth endpoint's body); unknown events give None.
+#[tokio::test]
+async fn event_auth_chain_includes_the_create_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let a_name: OwnedServerName = "a.test".try_into().unwrap();
+    let (a_signer, _) = ServerSigner::generate(a_name, "1".to_owned());
+    let rooms = start_rooms("a", Arc::new(a_signer), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let (room_id, _) = rooms
+        .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+        .await
+        .unwrap();
+    rooms
+        .send_state(
+            &room_id,
+            &alice,
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership":"join"}),
+        )
+        .await
+        .unwrap();
+    let pl = rooms
+        .send_state(
+            &room_id,
+            &alice,
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        )
+        .await
+        .unwrap();
+    let pl_id = match pl {
+        Outcome::Accepted { event_id, .. } => event_id.to_string(),
+        other => panic!("{other:?}"),
+    };
+
+    let chain = rooms
+        .event_auth_chain(&pl_id)
+        .unwrap()
+        .expect("known event has an auth chain");
+    assert!(
+        chain.iter().any(|o| matches!(
+            o.get("type"),
+            Some(CanonicalJsonValue::String(t)) if t == "m.room.create"
+        )),
+        "auth chain must include the create event"
+    );
+    assert!(rooms.event_auth_chain("$missing").unwrap().is_none());
+
+    rooms.shutdown().await.unwrap();
+}

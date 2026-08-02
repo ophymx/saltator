@@ -1939,6 +1939,112 @@ async fn v12_create_event_semantics() {
     env.shutdown().await;
 }
 
+/// Unknown endpoints 404 and wrong methods 405, both with an
+/// M_UNRECOGNIZED body (spec "API standards"; TestUnknownEndpoints).
+#[tokio::test]
+async fn unknown_endpoint_and_method_are_m_unrecognized() {
+    let env = start_env().await;
+    // Unknown path -> 404 M_UNRECOGNIZED.
+    let (status, body) = env
+        .req("GET", "/_matrix/client/v3/nonexistent_endpoint", None, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{body}");
+    // Known path, wrong method -> 405 M_UNRECOGNIZED.
+    let (status, body) = env.req("PUT", "/_matrix/client/v3/login", None, None).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{body}");
+    // Media upload with a bogus method (the case Complement hits).
+    let (status, body) = env
+        .req("PATCH", "/_matrix/media/v3/upload", None, None)
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{body}");
+
+    env.shutdown().await;
+}
+
+/// GET /timestamp_to_event returns the closest event by origin_server_ts
+/// in the requested direction, and 404s past the ends (MSC3030).
+#[tokio::test]
+async fn timestamp_to_event_endpoint() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+
+    let (_s, sent) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc}/send/m.room.message/ts1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "hi"})),
+        )
+        .await;
+    let msg_id = sent["event_id"].as_str().unwrap().to_owned();
+    // Read the message's own timestamp.
+    let (_s, ev) = env
+        .req(
+            "GET",
+            &format!(
+                "/_matrix/client/v3/rooms/{enc}/event/{}",
+                msg_id.replace('$', "%24")
+            ),
+            Some(&alice),
+            None,
+        )
+        .await;
+    let t1 = ev["origin_server_ts"].as_u64().unwrap();
+
+    let tte = |ts: u64, dir: &str| {
+        format!("/_matrix/client/v1/rooms/{enc}/timestamp_to_event?ts={ts}&dir={dir}")
+    };
+
+    // At exactly t1: forwards and backwards both resolve to the message
+    // (it's the newest event, so the latest <= t1 and the earliest >= t1).
+    let (status, r) = env.req("GET", &tte(t1, "f"), Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["event_id"], msg_id.as_str());
+    let (status, r) = env.req("GET", &tte(t1, "b"), Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["event_id"], msg_id.as_str());
+
+    // Nothing after a far-future ts, nothing before ts=0.
+    let (status, _) = env
+        .req("GET", &tte(t1 + 10_000_000, "f"), Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = env.req("GET", &tte(0, "b"), Some(&alice), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // ts=0 forwards finds the earliest event (the create event).
+    let (status, r) = env.req("GET", &tte(0, "f"), Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert!(r["event_id"].as_str().unwrap().starts_with('$'));
+
+    // Non-members can't query.
+    let bob = env.register("bob", "pw").await;
+    let (status, _) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v1/rooms/{enc}/timestamp_to_event?ts={t1}&dir=f"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    env.shutdown().await;
+}
+
 /// GET /context/{eventId} returns the event with its before/after
 /// neighbours and room state; the v12 create event served through it
 /// carries room_id (MSC4291 RoomIDIsOnCreateEvent).

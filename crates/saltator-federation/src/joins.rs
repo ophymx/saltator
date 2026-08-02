@@ -25,6 +25,45 @@ fn err(
 
 type FedResult = Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)>;
 
+/// A `send_join`/`send_leave` body must be an `m.room.member` event with
+/// the expected membership and `state_key == sender`; anything else is
+/// rejected with 400 (spec: these endpoints only accept the corresponding
+/// membership transition, so a non-join can't be smuggled through
+/// `send_join`).
+fn require_membership_event(
+    raw: &CanonicalJsonObject,
+    expected: &str,
+) -> Result<(), (StatusCode, axum::Json<serde_json::Value>)> {
+    let str_of = |k: &str| match raw.get(k) {
+        Some(CanonicalJsonValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    let is_member = str_of("type") == Some("m.room.member");
+    let membership = match raw.get("content") {
+        Some(CanonicalJsonValue::Object(c)) => match c.get("membership") {
+            Some(CanonicalJsonValue::String(m)) => Some(m.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let state_key = str_of("state_key");
+    if is_member
+        && membership == Some(expected)
+        && state_key.is_some()
+        && state_key == str_of("sender")
+    {
+        Ok(())
+    } else {
+        Err(err(
+            StatusCode::BAD_REQUEST,
+            "M_BAD_JSON",
+            &format!(
+                "event must be an m.room.member with membership={expected} and state_key==sender"
+            ),
+        ))
+    }
+}
+
 /// `GET /_matrix/federation/v1/make_join/{roomId}/{userId}`.
 pub async fn make_join(
     State(state): State<Arc<FedState>>,
@@ -92,6 +131,7 @@ pub async fn send_join(
             ))
         }
     };
+    require_membership_event(&raw, "join")?;
 
     match rooms.send_join(raw).await {
         Ok(result) => Ok(axum::Json(serde_json::json!({
@@ -114,6 +154,29 @@ fn to_array(events: Vec<CanonicalJsonObject>) -> serde_json::Value {
             .map(|e| serde_json::Value::from(CanonicalJsonValue::Object(e)))
             .collect(),
     )
+}
+
+/// `GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}`: the auth
+/// chain of an event (spec "Retrieving events").
+pub async fn event_auth(
+    State(state): State<Arc<FedState>>,
+    Path((_room_id, event_id)): Path<(String, String)>,
+    _auth: Authenticated,
+) -> FedResult {
+    let Some(rooms) = state.rooms.clone() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
+    };
+    match rooms.event_auth_chain(&event_id) {
+        Ok(Some(chain)) => Ok(axum::Json(serde_json::json!({
+            "auth_chain": to_array(chain),
+        }))),
+        Ok(None) => Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown event")),
+        Err(e) => Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        )),
+    }
 }
 
 /// `GET /_matrix/federation/v1/make_leave/{roomId}/{userId}`: template for
@@ -179,6 +242,7 @@ pub async fn send_leave(
             ))
         }
     };
+    require_membership_event(&raw, "leave")?;
     match rooms.send_leave(raw).await {
         Ok(saltator_roomserver::Outcome::Rejected { reason, .. }) => {
             Err(err(StatusCode::FORBIDDEN, "M_FORBIDDEN", &reason))
@@ -348,4 +412,47 @@ pub async fn invite(
     Ok(axum::Json(serde_json::json!({
         "event": CanonicalJsonValue::Object(signed),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_membership_event;
+    use ruma::{CanonicalJsonObject, CanonicalJsonValue};
+
+    fn obj(v: serde_json::Value) -> CanonicalJsonObject {
+        match CanonicalJsonValue::try_from(v).unwrap() {
+            CanonicalJsonValue::Object(o) => o,
+            _ => panic!("not an object"),
+        }
+    }
+
+    #[test]
+    fn membership_event_validation() {
+        let join = obj(serde_json::json!({
+            "type": "m.room.member",
+            "sender": "@bob:b.test",
+            "state_key": "@bob:b.test",
+            "content": {"membership": "join"},
+        }));
+        assert!(require_membership_event(&join, "join").is_ok());
+        // send_leave must reject a join event, and vice versa.
+        assert!(require_membership_event(&join, "leave").is_err());
+
+        // A non-membership event can't be smuggled through send_join.
+        let message = obj(serde_json::json!({
+            "type": "m.room.message",
+            "sender": "@bob:b.test",
+            "content": {"body": "hi"},
+        }));
+        assert!(require_membership_event(&message, "join").is_err());
+
+        // state_key must equal sender.
+        let mismatched = obj(serde_json::json!({
+            "type": "m.room.member",
+            "sender": "@bob:b.test",
+            "state_key": "@carol:b.test",
+            "content": {"membership": "join"},
+        }));
+        assert!(require_membership_event(&mismatched, "join").is_err());
+    }
 }
