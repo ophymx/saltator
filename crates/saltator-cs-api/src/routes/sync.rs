@@ -618,7 +618,24 @@ async fn build_joined_room(
 
     // State delta up to the start of the timeline.
     let timeline_start_state = match window.first() {
-        Some((first_seq, _)) => state_at(state, room_id.as_str(), first_seq.saturating_sub(1))?,
+        Some((first_seq, first_event_id)) => {
+            let mut at_start = state_at(state, room_id.as_str(), first_seq.saturating_sub(1))?;
+            if at_start.is_empty() {
+                // No timeline precedes the window's first event. For a
+                // send_join import that event is the co-signed join and
+                // the room's real state lives only in its state group
+                // (the resident's dump is stored off-timeline) — serve
+                // that, minus the event itself, or a freshly joined
+                // federated room syncs with no state at all.
+                if let Some(stored) = store.event(first_event_id).map_err(internal)? {
+                    at_start = store
+                        .resolve_group(room_id.as_str(), stored.state_group_after)
+                        .map_err(internal)?;
+                    at_start.retain(|_, id| id != first_event_id);
+                }
+            }
+            at_start
+        }
         None => state_at(state, room_id.as_str(), now.room)?,
     };
     let base_state: StateMap = if initial || full_state {

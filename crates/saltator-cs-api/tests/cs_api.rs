@@ -6495,3 +6495,100 @@ async fn client_queries_remote_profile_and_directory() {
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
 }
+
+/// A federated join served over /sync: `import_room` keeps the
+/// resident's state dump off-timeline — only our co-signed join rides
+/// the timeline — so the state section must be recovered from the join's
+/// state group. The E2EE interop smoke caught this missing: a client
+/// joining an encrypted remote room never saw `m.room.encryption` and
+/// treated the room as plaintext.
+#[tokio::test]
+async fn imported_room_sync_includes_send_join_state() {
+    let env = start_env().await;
+    let bob_token = env.register("bob", "pw").await;
+
+    let room_id = "!remote:elsewhere.test";
+    let ev = |ty: &str, sk: &str, sender: &str, content: Value, depth: u64| {
+        serde_json::from_value::<ruma::CanonicalJsonObject>(json!({
+            "type": ty,
+            "state_key": sk,
+            "sender": sender,
+            "room_id": room_id,
+            "content": content,
+            "origin_server_ts": 1_700_000_000_000u64,
+            "depth": depth,
+            "prev_events": [],
+            "auth_events": [],
+        }))
+        .unwrap()
+    };
+    let create = ev(
+        "m.room.create",
+        "",
+        "@eve:elsewhere.test",
+        json!({"room_version": "11", "creator": "@eve:elsewhere.test"}),
+        1,
+    );
+    let eve_join = ev(
+        "m.room.member",
+        "@eve:elsewhere.test",
+        "@eve:elsewhere.test",
+        json!({"membership": "join"}),
+        2,
+    );
+    let encryption = ev(
+        "m.room.encryption",
+        "",
+        "@eve:elsewhere.test",
+        json!({"algorithm": "m.megolm.v1.aes-sha2"}),
+        3,
+    );
+    let bob_join = ev(
+        "m.room.member",
+        "@bob:hs.test",
+        "@bob:hs.test",
+        json!({"membership": "join"}),
+        4,
+    );
+
+    let outcome = env
+        .rooms
+        .import_room(
+            saltator_core::RoomVersion::V11,
+            bob_join,
+            vec![create.clone(), eve_join, encryption],
+            vec![create],
+        )
+        .await
+        .unwrap();
+    let seq = match outcome {
+        saltator_roomserver::Outcome::Accepted { seq, .. } => seq,
+        other => panic!("import not accepted: {other:?}"),
+    };
+    // The membership projection lifts bob's join off the room timeline.
+    saltator_userserver::wait_for_projection(&env.users, seq, Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    let body = env
+        .sync_until(&bob_token, |b| !b["rooms"]["join"][room_id].is_null())
+        .await;
+    let room = &body["rooms"]["join"][room_id];
+    let state = room["state"]["events"].as_array().unwrap();
+    assert!(
+        state.iter().any(|e| e["type"] == "m.room.encryption"),
+        "sync state must carry the imported m.room.encryption: {room}"
+    );
+    assert!(
+        state.iter().any(|e| e["type"] == "m.room.create"),
+        "sync state must carry the imported m.room.create: {room}"
+    );
+    // Bob's own join is timeline, not state.
+    assert!(room["timeline"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["type"] == "m.room.member" && e["state_key"] == "@bob:hs.test"));
+
+    env.shutdown().await;
+}
