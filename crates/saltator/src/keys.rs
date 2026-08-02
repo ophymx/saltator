@@ -137,18 +137,42 @@ pub async fn load_signing_key(
 
     // Migrate the M0/M1 file-based key, if present.
     let legacy = data_dir.join("signing.key");
-    let (der, version) = if legacy.exists() {
+    let migrated = legacy.exists();
+    let (der, version) = if migrated {
         tracing::info!(path = %legacy.display(), "migrating file-based signing key into the metadata group");
-        let der = std::fs::read(&legacy)?;
-        std::fs::rename(&legacy, data_dir.join("signing.key.imported"))?;
-        (der, "0".to_owned())
+        (std::fs::read(&legacy)?, "0".to_owned())
     } else {
         let (_, der) = ServerSigner::generate(server_name.clone(), "0".to_owned());
         tracing::info!("generated new ed25519 signing key (version 0)");
         (der, "0".to_owned())
     };
     store_signing_key(meta, kek, &version, &der).await?;
+    // Only once the encrypted copy is durably stored do we destroy the
+    // plaintext original — leaving it (even renamed) would defeat the
+    // KEK-at-rest scheme for anyone backing up or snapshotting data_dir.
+    if migrated {
+        if let Err(e) = shred_file(&legacy) {
+            tracing::warn!(path = %legacy.display(), error = %e,
+                "could not remove the migrated plaintext signing key; delete it manually");
+        }
+    }
     Ok(ServerSigner::from_der(server_name, &der, version)?)
+}
+
+/// Best-effort destruction of a secret file: overwrite the bytes with
+/// zeros, flush, then unlink. (On CoW/journaling filesystems the overwrite
+/// may not reach the original blocks, but it beats leaving the plaintext
+/// key readable, and the unlink always removes the path.)
+fn shred_file(path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Ok(len) = std::fs::metadata(path).map(|m| m.len()) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = f.write_all(&vec![0u8; len as usize]);
+            let _ = f.flush();
+            let _ = f.sync_all();
+        }
+    }
+    std::fs::remove_file(path)
 }
 
 async fn store_signing_key(
