@@ -553,6 +553,29 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId) -> Result<(
         ));
     };
 
+    // The resident's state dump is not trusted for authenticity: verify
+    // every state + auth_chain event's signature (against the authoring
+    // servers' keys, fetched via the key cache) and refuse the join if any
+    // fails, so a lying resident can't seed the room with forged state
+    // (fake power levels, memberships) that we'd serve as authentic.
+    let to_verify: Vec<ruma::CanonicalJsonObject> = resp
+        .state
+        .iter()
+        .chain(resp.auth_chain.iter())
+        .cloned()
+        .collect();
+    saltator_federation::trust_event_servers(&fed.key_cache, &state.rooms, &to_verify).await;
+    if !to_verify
+        .iter()
+        .all(|ev| state.rooms.verify_pdu_at(resp.room_version, ev))
+    {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            "remote join returned state that failed signature verification",
+        ));
+    }
+
     let outcome = state
         .rooms
         .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
@@ -1811,9 +1834,21 @@ async fn fetch_history(state: &CsState, room_id: &str, frontier: &[String]) -> R
     for dest in candidates {
         match saltator_federation::fetch_backfill(&fed.client, &dest, room_id, &v, 100).await {
             Ok(pdus) if !pdus.is_empty() => {
+                // Don't trust the backfill source for authenticity: verify
+                // each PDU's signature (against its sender-server's keys)
+                // and drop any that fail, so a malicious member server
+                // can't inject forged-sender history we'd serve as real.
+                saltator_federation::trust_event_servers(&fed.key_cache, &state.rooms, &pdus).await;
+                let verified: Vec<ruma::CanonicalJsonObject> = pdus
+                    .into_iter()
+                    .filter(|ev| state.rooms.verify_pdu(room_id, ev))
+                    .collect();
+                if verified.is_empty() {
+                    continue;
+                }
                 let (indexed, _) = state
                     .rooms
-                    .import_history(room_id, pdus)
+                    .import_history(room_id, verified)
                     .await
                     .map_err(internal)?;
                 return Ok(indexed);

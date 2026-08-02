@@ -24,7 +24,7 @@ pub use inbound::{AuthRejection, Authenticated};
 pub use join_client::{
     join_remote_room, leave_remote_room, resident_of_room, JoinError, JoinResponse,
 };
-pub use keys::{KeyCache, KeyError};
+pub use keys::{trust_event_servers, KeyCache, KeyError};
 pub use media::parse_multipart_file;
 pub use outbound::{FederationClient, OutboundError};
 pub use resolver::{ResolvedServer, ServerResolver};
@@ -220,7 +220,7 @@ async fn serve_version() -> axum::Json<serde_json::Value> {
     }))
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before epoch")
