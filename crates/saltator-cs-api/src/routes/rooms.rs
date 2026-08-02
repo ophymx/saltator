@@ -68,12 +68,40 @@ pub async fn create_room(
         None => None,
     };
 
+    let preset = req.preset.clone().unwrap_or(match req.visibility {
+        ruma::api::client::room::Visibility::Public => RoomPreset::PublicChat,
+        _ => RoomPreset::PrivateChat,
+    });
+
     // 1. m.room.create
-    let creation_content: serde_json::Map<String, serde_json::Value> = match &req.creation_content {
-        Some(raw) => serde_json::from_str(raw.json().get())
-            .map_err(|e| ApiError::bad_json(format!("creation_content: {e}")))?,
-        None => serde_json::Map::new(),
-    };
+    let mut creation_content: serde_json::Map<String, serde_json::Value> =
+        match &req.creation_content {
+            Some(raw) => serde_json::from_str(raw.json().get())
+                .map_err(|e| ApiError::bad_json(format!("creation_content: {e}")))?,
+            None => serde_json::Map::new(),
+        };
+    // MSC4289: in a privileged-creator room (v12+) created as a
+    // trusted_private_chat, the invited users join the creator set — merge
+    // them into `additional_creators` (keeping any the client supplied).
+    if version.privileged_creators() && preset == RoomPreset::TrustedPrivateChat {
+        let mut list = creation_content
+            .get("additional_creators")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let have: std::collections::BTreeSet<String> = list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        for invitee in &req.invite {
+            if !have.contains(invitee.as_str()) {
+                list.push(invitee.to_string().into());
+            }
+        }
+        if !list.is_empty() {
+            creation_content.insert("additional_creators".into(), list.into());
+        }
+    }
     let additional_creators: Vec<String> = creation_content
         .get("additional_creators")
         .and_then(|v| v.as_array())
@@ -111,10 +139,6 @@ pub async fn create_room(
 
     // 3. power levels: spec defaults + trusted-invitee elevation + client
     //    override.
-    let preset = req.preset.clone().unwrap_or(match req.visibility {
-        ruma::api::client::room::Visibility::Public => RoomPreset::PublicChat,
-        _ => RoomPreset::PrivateChat,
-    });
     let mut users = serde_json::Map::new();
     if !version.privileged_creators() {
         users.insert(auth.user_id.to_string(), 100.into());
@@ -634,12 +658,9 @@ pub async fn upgrade_room(
         crate::room_util::state_content_in(&state.rooms, &current, "m.room.create")?
             .and_then(|c| c.as_object().cloned())
             .unwrap_or_default();
-    for server_managed in [
-        "room_version",
-        "creator",
-        "predecessor",
-        "additional_creators",
-    ] {
+    // `additional_creators` is deliberately preserved across the upgrade
+    // (MSC4289): the new room keeps the same creator set.
+    for server_managed in ["room_version", "creator", "predecessor"] {
         creation_content.remove(server_managed);
     }
     let last_event = state
@@ -652,8 +673,13 @@ pub async fn upgrade_room(
         .map(|(_, event_id)| event_id);
     let mut predecessor = serde_json::Map::new();
     predecessor.insert("room_id".into(), room_id.clone().into());
+    // In privileged-creator versions (v12+) the room id IS the create
+    // event's reference hash, so the predecessor carries no separate
+    // event_id (MSC4291); older versions still include it.
     if let Some(event_id) = last_event {
-        predecessor.insert("event_id".into(), event_id.into());
+        if !version.privileged_creators() {
+            predecessor.insert("event_id".into(), event_id.into());
+        }
     }
     creation_content.insert("predecessor".into(), predecessor.into());
 
@@ -1222,6 +1248,11 @@ pub async fn send_state_event(
 ) -> Result<Ra<send_state_event::v3::Response>> {
     let content: serde_json::Value = serde_json::from_str(req.body.json().get())
         .map_err(|e| ApiError::bad_json(e.to_string()))?;
+    // m.room.create is only ever the room's first event; a client can never
+    // send another. Reject with 400 (not the pipeline's auth 403).
+    if req.event_type == ruma::events::StateEventType::RoomCreate {
+        return Err(ApiError::bad_json("Cannot send a m.room.create event"));
+    }
     if req.event_type == ruma::events::StateEventType::RoomCanonicalAlias {
         validate_canonical_alias(&state, req.room_id.as_str(), &content)?;
     }
@@ -1381,6 +1412,92 @@ pub async fn get_state_event_empty_key(
     req: Ar<get_state_event_for_key::v3::Request>,
 ) -> Result<Ra<get_state_event_for_key::v3::Response>> {
     get_state_event(state, auth, req).await
+}
+
+/// `GET /rooms/{roomId}/context/{eventId}`: the target event plus the
+/// events immediately before and after it, and the room state at the last
+/// event returned (spec "Room event context").
+pub async fn get_context(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<ruma::api::client::context::get_context::v3::Request>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let room_id = req.room_id.as_str();
+    let user = auth.user_id.as_str();
+    // The caller must be able to view the room; a departed member sees up
+    // to their leave (the ceiling bounds events_after).
+    let (_view, ceiling) = crate::room_util::member_view(&state.rooms, room_id, user)?;
+    let meta = room_meta(&state.rooms, room_id)?;
+    let version = room_version(&meta)?;
+
+    // The target must exist, belong to this room, and be visible.
+    if !crate::room_util::user_can_see_event(&state.rooms, room_id, req.event_id.as_str(), user)? {
+        return Err(ApiError::not_found("Event not found"));
+    }
+    let Some(target) = state
+        .rooms
+        .store()
+        .event(req.event_id.as_str())
+        .map_err(internal)?
+    else {
+        return Err(ApiError::not_found("Event not found"));
+    };
+    let event = client_event(&state.rooms, version, room_id, req.event_id.as_str(), user)?
+        .filter(|ev| ev.get("room_id").and_then(|r| r.as_str()) == Some(room_id))
+        .ok_or_else(|| ApiError::not_found("Event not found"))?;
+    let target_seq = target.seq;
+
+    let total = (u64::from(req.limit) as usize).min(100);
+    let before_limit = total / 2 + total % 2;
+    let after_limit = total - before_limit;
+    let store = state.rooms.store();
+
+    let mut events_before = Vec::new();
+    let mut oldest = target_seq;
+    for (seq, id) in store
+        .room_timeline(
+            room_id,
+            0,
+            Some(target_seq.saturating_sub(1)),
+            before_limit,
+            true,
+        )
+        .map_err(internal)?
+    {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+            oldest = seq;
+            events_before.push(ev);
+        }
+    }
+    let mut events_after = Vec::new();
+    let mut newest = target_seq;
+    for (seq, id) in store
+        .room_timeline(room_id, target_seq, ceiling, after_limit, false)
+        .map_err(internal)?
+    {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+            newest = seq;
+            events_after.push(ev);
+        }
+    }
+
+    // State at the newest event returned (spec).
+    let state_map = crate::room_util::state_at_seq(&state.rooms, room_id, newest)?;
+    let mut state_events = Vec::new();
+    for id in state_map.values() {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, id, user)? {
+            state_events.push(ev);
+        }
+    }
+
+    Ok(axum::Json(serde_json::json!({
+        "start": format!("t{}", oldest.saturating_sub(1)),
+        "end": format!("t{newest}"),
+        "events_before": events_before,
+        "event": event,
+        "events_after": events_after,
+        "state": state_events,
+    })))
 }
 
 pub async fn get_room_event(

@@ -247,10 +247,34 @@ fn to_client_format(raw: &CanonicalJsonObject, room_id: &str, event_id: &str) ->
 /// The stripped state format of invites: `content`, `sender`,
 /// `state_key`, `type`.
 pub fn stripped_event(raw: &CanonicalJsonObject) -> serde_json::Value {
+    // MSC4311: the m.room.create event is served in full on stripped state
+    // (invite_state) — invitees need its `origin_server_ts` and, in v12,
+    // its full content to verify the room. Every other event keeps the
+    // minimal stripped form (content/sender/state_key/type).
+    let is_create = matches!(
+        raw.get("type"),
+        Some(CanonicalJsonValue::String(t)) if t == "m.room.create"
+    );
     let mut out = serde_json::Map::new();
-    for key in ["content", "sender", "state_key", "type"] {
-        if let Some(v) = raw.get(key) {
-            out.insert(key.to_owned(), serde_json::Value::from(v.clone()));
+    let keys: &[&str] = if is_create {
+        &[
+            "content",
+            "sender",
+            "state_key",
+            "type",
+            "origin_server_ts",
+            "auth_events",
+            "depth",
+            "hashes",
+            "prev_events",
+            "signatures",
+        ]
+    } else {
+        &["content", "sender", "state_key", "type"]
+    };
+    for key in keys {
+        if let Some(v) = raw.get(*key) {
+            out.insert((*key).to_owned(), serde_json::Value::from(v.clone()));
         }
     }
     serde_json::Value::Object(out)
