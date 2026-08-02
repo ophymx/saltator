@@ -236,7 +236,7 @@ async fn preview_fetch(
 /// and a wrong parse only degrades the preview.
 fn og_tags(html: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let mut at = 0;
     while let Some(pos) = lower[at..].find("<meta") {
         let start = at + pos;
@@ -258,7 +258,7 @@ fn og_tags(html: &str) -> Vec<(String, String)> {
 
 /// One quoted attribute value out of a tag snippet.
 fn meta_attr(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
+    let lower = tag.to_ascii_lowercase();
     let at = lower.find(&format!("{attr}="))? + attr.len() + 1;
     let rest = &tag[at..];
     let quote = rest.chars().next()?;
@@ -270,7 +270,7 @@ fn meta_attr(tag: &str, attr: &str) -> Option<String> {
 }
 
 fn html_title(html: &str) -> Option<String> {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     let start = lower.find("<title>")? + "<title>".len();
     let end = lower[start..].find("</title>")? + start;
     Some(html[start..end].trim().to_owned())
