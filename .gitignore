@@ -11,3 +11,4 @@
 /docker/interop/ca/
 /docker/interop/certs/
 /docker/interop/synapse-data/
+__pycache__/

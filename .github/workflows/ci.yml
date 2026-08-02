@@ -226,10 +226,12 @@ jobs:
 
   synapse-interop:
     name: interop (synapse)
-    # The M3 exit criterion against a real Synapse: a saltator user joins a
-    # Synapse-hosted room and messages flow both ways. Unlike the Complement
-    # jobs (tracked pass-rate), this is a binary proof and GATES — a green
-    # run means the federation loop actually works end to end.
+    # The M3 + M5 exit criteria against a real Synapse: a saltator user
+    # joins a Synapse-hosted room, messages flow both ways in the clear,
+    # then fresh matrix-nio devices exchange Megolm-encrypted messages
+    # (device-key query, one-time-key claim, and to-device room-key
+    # sharing all crossing federation). Unlike the Complement jobs
+    # (tracked pass-rate), this is a binary proof and GATES.
     runs-on: ubuntu-24.04
     needs: build
     steps:
@@ -243,13 +245,20 @@ jobs:
         run: |
           cp target/release/saltator docker/complement/saltator
           docker build -t interop-saltator:latest docker/complement
+      - name: Install E2EE test client (matrix-nio)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q libolm-dev
+          python3 -m venv /tmp/nio-venv
+          /tmp/nio-venv/bin/pip install --quiet "matrix-nio[e2e]"
       - name: Synapse interop round-trip
+        env:
+          E2EE_PYTHON: /tmp/nio-venv/bin/python
         run: ./docker/interop/run.sh
       - name: Result summary
         if: always()
         run: |
           if [ "${{ job.status }}" = "success" ]; then
-            echo "## Synapse interop: ✅ PASS — federated join + bidirectional messaging" >> "$GITHUB_STEP_SUMMARY"
+            echo "## Synapse interop: ✅ PASS — federated join, bidirectional messaging, E2EE round trip" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "## Synapse interop: ❌ FAIL (see the interop step logs)" >> "$GITHUB_STEP_SUMMARY"
           fi

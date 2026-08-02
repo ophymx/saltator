@@ -165,9 +165,22 @@ pub async fn user_devices(
         devices.push(entry);
     }
     let stream_id = users.shard_handle().seq().unwrap_or(0);
-    Ok(axum::Json(json!({
+    let mut out = json!({
         "user_id": user_id,
         "stream_id": stream_id,
         "devices": devices,
-    })))
+    });
+    // Cross-signing identity rides the device resync too (master +
+    // self-signing only; user-signing stays home).
+    for (kind, field) in [
+        ("master", "master_key"),
+        ("self_signing", "self_signing_key"),
+    ] {
+        if let Ok(Some(raw)) = store.cross_signing_key(&user_id, kind) {
+            if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
+                out[field] = value;
+            }
+        }
+    }
+    Ok(axum::Json(out))
 }

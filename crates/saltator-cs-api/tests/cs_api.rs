@@ -3015,7 +3015,12 @@ async fn cross_signing_upload_query_and_signatures() {
 /// The session's device id, from /account/whoami.
 async fn device_of(env: &Env, token: &str) -> String {
     let (_, who) = env
-        .req("GET", "/_matrix/client/v3/account/whoami", Some(token), None)
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(token),
+            None,
+        )
         .await;
     who["device_id"].as_str().unwrap().to_owned()
 }

@@ -153,3 +153,14 @@ log "asserting saltator (bob) received alice's message"
 sees "$SAL" "$bob_token" "$ALICE_MSG" || { echo "saltator never saw alice's message" >&2; exit 1; }
 
 log "SUCCESS: saltator <-> Synapse federation round-trip verified"
+
+# --- E2EE round trip (the M5 exit criterion) ------------------------------
+# Fresh matrix-nio devices on both accounts exchange Megolm-encrypted
+# messages: device-key query + one-time-key claim + to-device room-key
+# sharing all cross the federation boundary in both directions.
+# E2EE_PYTHON points at a python with matrix-nio[e2e] installed (CI sets
+# up a venv; the default works if nio is on the system python).
+log "E2EE round trip via matrix-nio"
+"${E2EE_PYTHON:-python3}" e2ee_smoke.py "$SYN" "$SAL"
+
+log "SUCCESS: saltator <-> Synapse E2EE round-trip verified"
