@@ -13,6 +13,7 @@ mod outbound;
 mod query;
 mod resolver;
 mod sender;
+pub mod ssrf;
 mod transactions;
 mod user_keys;
 mod xmatrix;

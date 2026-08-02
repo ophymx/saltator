@@ -48,6 +48,11 @@ pub struct CsConfig {
     /// Rate limiting of the abusable endpoints (login, registration,
     /// message sends). Disable for test harnesses that hammer the API.
     pub rate_limits: ratelimit::RateLimitConfig,
+    /// Allow server-initiated fetches (URL previews, push gateways) to
+    /// reach private/loopback addresses. MUST stay false in production —
+    /// enable only in trusted, network-isolated test harnesses whose
+    /// mock servers live on loopback/private IPs.
+    pub allow_internal_fetch: bool,
 }
 
 /// Shared state of every CS route.

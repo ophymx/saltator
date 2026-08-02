@@ -271,6 +271,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             } else {
                 saltator_cs_api::RateLimitConfig::disabled()
             },
+            allow_internal_fetch: cfg.client.allow_internal_fetch,
         },
     )
     .with_federation(fed_client.clone(), signer.clone());

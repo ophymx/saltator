@@ -263,6 +263,15 @@ pub async fn set_pushers(State(state): State<Arc<CsState>>, auth: Auth, Jb(body)
                 "data.url must end with /_matrix/push/v1/notify",
             ));
         }
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|_| ApiError::invalid_param("data.url is not a valid URL"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(ApiError::invalid_param("data.url must be http(s)"));
+        }
+        // Reject a gateway pointed at an internal literal up front; hostname
+        // targets are re-vetted at delivery by the guarded client.
+        saltator_federation::ssrf::check_url(&parsed, state.config.allow_internal_fetch)
+            .map_err(ApiError::forbidden)?;
     }
     let json = if delete {
         None
