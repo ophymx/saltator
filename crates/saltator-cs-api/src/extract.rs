@@ -13,9 +13,15 @@ use ruma::OwnedUserId;
 use crate::error::ApiError;
 use crate::CsState;
 
-/// Request body cap for the JSON API surface; media uploads are checked
-/// against the configured limit separately.
-const MAX_BODY: usize = 64 * 1024 * 1024;
+/// Body cap for the JSON API surface. Every JSON endpoint buffers the
+/// whole body in memory before parsing, so this bounds per-request memory
+/// (× concurrency). Generous enough for bulk endpoints (key backup, bulk
+/// to-device, large initial_state) while far below the media ceiling.
+const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
+/// Body cap for binary uploads. The media upload handler additionally
+/// enforces the operator's `max_upload_size`; this is just the hard
+/// ceiling for the raw read.
+const MAX_MEDIA_BODY: usize = 64 * 1024 * 1024;
 
 /// A parsed ruma request ("axum request"). Authentication is a separate
 /// extractor ([`Auth`] / [`MaybeAuth`]) — handlers state their own
@@ -35,21 +41,27 @@ where
             .await
             .map_err(|e| ApiError::internal(format!("path params: {e}")))?;
         let path_args: Vec<String> = params.iter().map(|(_, v)| v.to_owned()).collect();
-        let bytes = axum::body::to_bytes(body, MAX_BODY).await.map_err(|e| {
+        // JSON bodies must be valid UTF-8; binary bodies (media uploads)
+        // pass through untouched. Absent Content-Type defaults to JSON per
+        // the Matrix convention. The content-type also picks the size cap
+        // so JSON endpoints aren't allowed a media-sized body.
+        let is_json_body = parts
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_none_or(|ct| ct.starts_with("application/json"));
+        let cap = if is_json_body {
+            MAX_JSON_BODY
+        } else {
+            MAX_MEDIA_BODY
+        };
+        let bytes = axum::body::to_bytes(body, cap).await.map_err(|e| {
             ApiError::new(
                 axum::http::StatusCode::PAYLOAD_TOO_LARGE,
                 "M_TOO_LARGE",
                 e.to_string(),
             )
         })?;
-        // JSON bodies must be valid UTF-8; binary bodies (media uploads)
-        // pass through untouched. Absent Content-Type defaults to JSON per
-        // the Matrix convention.
-        let is_json_body = parts
-            .headers
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_none_or(|ct| ct.starts_with("application/json"));
         if is_json_body && std::str::from_utf8(&bytes).is_err() {
             return Err(ApiError::new(
                 axum::http::StatusCode::BAD_REQUEST,
@@ -84,7 +96,7 @@ where
     type Rejection = ApiError;
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let bytes = axum::body::to_bytes(req.into_body(), MAX_BODY)
+        let bytes = axum::body::to_bytes(req.into_body(), MAX_JSON_BODY)
             .await
             .map_err(|e| {
                 ApiError::new(
