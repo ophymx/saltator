@@ -7,8 +7,11 @@ first** (cs_api integration tests for CS endpoints, roomserver/federation
 unit tests for server-to-server logic) and only pushed once a substantial
 batch is green locally.
 
-Baseline at time of writing: ~19 top-level federation tests pass. PR #4
-(v12 create-event semantics) targets ~9 more and is separate.
+Baseline: run 30770852233 (2026-08-02) has **29** top-level federation
+tests green; **28** are gated in `federation-must-pass.txt` (the media
+flake `TestMediaWithoutFileNameCSMediaV1` is excluded). This reflects the
+merged create-event batch (PR #4) plus the `/event_auth` + send-V2 +
+partial jump-to-date/unknown-endpoint batch (PR #5).
 
 Legend — **Difficulty**: S(mall)/M(edium)/L(arge). **Peer**: "synthetic"
 means the test drives our server from Complement's in-process Go homeserver
@@ -37,37 +40,46 @@ join-rule filtering, and `allowed_room_ids` on a restricted child.
 
 ## Group 2 — Jump to date (`/timestamp_to_event`)  ·  S  ·  CS-local
 Tests: `TestJumpToDateEndpoint`.
-Cause: `GET /_matrix/client/v1/rooms/{roomId}/timestamp_to_event?ts&dir` → 404.
-Spec: MSC3030 / client-server "Room previews"; federation
-`GET /_matrix/federation/v1/timestamp_to_event/{roomId}`.
-Build: return the event closest to `ts` in direction `dir` (f/b). Scan the
-room timeline for the first event with `origin_server_ts >= ts` (f) or
-`<= ts` (b); fall to backfill/federation only when the local timeline
-doesn't cover it.
-Local test: send events with known ts spacing, query both directions,
-assert the returned `event_id`/`origin_server_ts`.
+Status (2026-08-02): PARTIAL. The CS endpoint is live and passes the
+direction + permission leaves (find after/before, nothing past the
+ends, non-member 403 on private/public). Two leaves remain:
+  1. `parallel/federation` — needs the **federation**
+     `GET /_matrix/federation/v1/timestamp_to_event/{roomId}` fallback: when
+     the local timeline has no event on the requested side of `ts`, query
+     the resident/other server and backfill, then answer.
+  2. `should_find_next_event_topologically_{after,before}...when all message
+     timestamps are the same` — the tie-break must be **topological** (DAG
+     depth / stream order), not `(origin_server_ts, seq)`. When many events
+     share a ts, return the one closest in topological order.
+Build: add the fed endpoint + client fallback; change the equal-ts tie-break
+to topological order.
+Local test: extend `timestamp_to_event_endpoint` with an all-equal-ts batch
+and assert topological selection; fed leaf needs the peer harness.
 
 ## Group 3 — Unknown endpoint / method handling  ·  S  ·  CS-local
 Tests: `TestUnknownEndpoints`.
-Cause: e.g. `PATCH /_matrix/media/v3/upload` → 405; the suite wants a
-consistent `404 M_UNRECOGNIZED` for unknown endpoint+method combinations.
-Spec: client-server "API standards" (unrecognised request → 404
-`M_UNRECOGNIZED`).
-Build: a fallback that returns `M_UNRECOGNIZED` for method-mismatches on
-known paths rather than axum's bare 405.
-Local test: hit known paths with wrong methods, assert 404 `M_UNRECOGNIZED`.
+Status (2026-08-02): PARTIAL. `Media_endpoints` and `Unknown_prefix` pass
+(CS + media + fed routers got the M_UNRECOGNIZED fallback). Remaining leaf:
+`Key_endpoints` — the key / `.well-known` / server-keys router
+(`/_matrix/key/v2/...`) still returns a bare 404/405 instead of the
+`M_UNRECOGNIZED` JSON. Add the same `.fallback` + `.method_not_allowed_
+fallback` to that router.
+Local test: hit `/_matrix/key/v2/<unknown>` and a known key path with the
+wrong method, assert 404/405 with `M_UNRECOGNIZED`.
 
 ## Group 4 — send_join / send_leave membership validation  ·  M  ·  unit-local
 Tests: `TestCannotSendNonJoinViaSendJoinV1/V2`,
 `TestCannotSendNonLeaveViaSendLeaveV1/V2`.
-Cause: our resident-side `send_join`/`send_leave` accept an event whose
-membership isn't `join`/`leave` (they should 400).
-Spec: federation `PUT /send_join|/send_leave` — the submitted event must be
-an `m.room.member` with the matching membership, else `M_BAD_JSON`.
-Build: validate the membership (and state_key == sender) in the send_join /
-send_leave handlers before ingest.
-Local test: roomserver/federation unit test — submit a non-join event to
-`send_join`, assert rejection.
+Status (2026-08-02): PARTIAL — **V2 green**, V1 still failing. The V2
+handlers now run `require_membership_event` and 400 on a mismatched
+membership / state_key. The **v1** endpoints
+(`PUT /_matrix/federation/v1/send_join|send_leave/{roomId}/{eventId}`) are
+simply not registered, so the v1 tests hit the router fallback instead of
+the validated handler. Follow-up: register the v1 routes pointing at the
+same handlers (v1 response shape differs — legacy `[200, {...}]` envelope
+for send_join), so validation applies identically.
+Local test: existing `membership_event_validation` unit test covers the
+validator; add a route-level test once v1 is wired.
 
 ## Group 5 — Server ACLs (`m.room.server_acl`)  ·  M  ·  unit-local + peer
 Tests: `TestACLs`, `TestACLsForEDUs`.
@@ -80,11 +92,11 @@ integration needs a peer for the full path.
 
 ## Group 6 — `/event_auth` endpoint  ·  S–M  ·  unit-local
 Tests: `TestEventAuth`.
-Cause: `GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}` likely
-unimplemented.
-Spec: federation "Retrieving events" — return the auth chain of an event.
-Build: serve `collect_auth_chain` for the event (already exists for
-send_join). Local test: unit test over a built room.
+Status (2026-08-02): DONE — green in run 30770852233, gated. Serves
+`RoomServer::event_auth_chain` (seeded from the event's `auth_event_ids`,
+walked via `collect_auth_chain`) at
+`GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}`. Unit test:
+`event_auth_chain_includes_the_create_event`.
 
 ## Group 6b — Auth-chain / rejected-event semantics  ·  L  ·  synthetic
 Tests: `TestCorruptedAuthChain`, `TestInboundFederationRejectsEventsWithRejectedAuthEvents`,

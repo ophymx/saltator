@@ -9,16 +9,28 @@
 #
 # When a federation feature lands and flips a test green, add it here. Do
 # NOT add a test that only passes intermittently — fix the flake first.
-# (Reviewed 2026-08-02 across 4 runs: these 19 pass every run;
+# (Reviewed 2026-08-02 across 4 runs: the original 19 pass every run;
 # TestMediaWithoutFileNameCSMediaV1 was deliberately left out — it passed
 # only 1 of 4, the known media flakiness.)
+#
+# 2026-08-02, run 30770852233: +9 deterministic feature wins from the
+# create-event (MSC4289/4291/4311), /event_auth, and send_join/leave-V2
+# validation batches. These are pure-logic tests (no media/timing/network
+# race), so a single green run is sufficient to gate them. Still-partial
+# and NOT gated yet: TestJumpToDateEndpoint (needs federation fallback +
+# topological tie-break), TestUnknownEndpoints (key-server router lacks the
+# M_UNRECOGNIZED fallback), and the V1 send_join/send_leave variants (v1
+# routes unregistered) — see docs/federation-conformance.md.
 #
 # Works for both the per-push (-skip deferred buckets) and the weekly
 # unfiltered run: none of these live in a skipped bucket, and none is in
 # the deferred set, so the gate behaves identically for both.
 
 TestBannedUserCannotSendJoin
+TestCannotSendNonJoinViaSendJoinV2
+TestCannotSendNonLeaveViaSendLeaveV2
 TestContentMediaV1
+TestEventAuth
 TestFederationThumbnail
 TestGetMissingEventsGapFilling
 TestInboundFederationKeys
@@ -26,10 +38,16 @@ TestInboundFederationProfile
 TestIsDirectFlagFederation
 TestJoinFederatedRoomFailOver
 TestLocalPngThumbnail
+TestMSC4289PrivilegedRoomCreators_AdditionalCreatorsAndInvited
+TestMSC4289PrivilegedRoomCreators_InvitedAreCreators
 TestMSC4291RoomIDAsHashOfCreateEvent
 TestMSC4291RoomIDAsHashOfCreateEvent_AuthEventsOmitsCreateEvent
+TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent
+TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent
+TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms
 TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
 TestMSC4297StateResolutionV2_1_starts_from_empty_set
+TestMSC4311FullCreateEventOnStrippedState
 TestOutboundFederationProfile
 TestRemoteAliasRequestsUnderstandUnicode
 TestRemotePresence
