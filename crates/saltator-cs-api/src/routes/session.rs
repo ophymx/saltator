@@ -165,9 +165,17 @@ pub async fn login(
         (None, Some(u)) => u.clone(),
         _ => return Err(ApiError::forbidden("Unsupported identifier type")),
     };
-    // Keyed by the targeted account: brakes credential stuffing without
-    // letting one attacked account starve others.
-    state.rate_limit(crate::ratelimit::Kind::Login, &user)?;
+    // Keyed by the CANONICAL account id: login normalizes case and accepts
+    // both localpart and full `@user:server` forms, so the raw string would
+    // let an attacker multiply the per-account budget with cosmetic
+    // variants (Alice/alice/@alice:server/...). Fall back to the raw input
+    // only when it doesn't canonicalize (the login then fails anyway).
+    let limit_key = state
+        .users
+        .canonical_user_id(&user)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| user.to_lowercase());
+    state.rate_limit(crate::ratelimit::Kind::Login, &limit_key)?;
     let session = state
         .users
         .login_password(
