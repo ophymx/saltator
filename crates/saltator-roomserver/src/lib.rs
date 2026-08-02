@@ -345,6 +345,32 @@ impl RoomServer {
         self.process(raw, version, &room_id, is_create).await
     }
 
+    /// Verify a single PDU's structure, signature, and content hash against
+    /// the currently trusted keys, WITHOUT ingesting it. Returns `true`
+    /// only when fully verified. Used to vet off-timeline state snapshots
+    /// (gap-fill `/state`) before trusting them — the caller must first
+    /// trust the keys of every server that authored one of the events.
+    pub fn verify_pdu(&self, room_id: &str, raw: &CanonicalJsonObject) -> bool {
+        let Ok(Some(meta)) = self.store().meta(room_id) else {
+            return false;
+        };
+        let Ok(version) = RoomVersion::parse(&meta.version) else {
+            return false;
+        };
+        if validation::validate_pdu(raw, version).is_err() {
+            return false;
+        }
+        let keys = self
+            .verify_keys
+            .read()
+            .expect("verify_keys lock poisoned")
+            .clone();
+        matches!(
+            validation::verify_event(raw, version, &keys),
+            Ok(VerifyOutcome::Verified)
+        )
+    }
+
     /// The event ID a PDU will have, without ingesting it. Lets the
     /// `/send` handler key per-PDU results even when ingest fails before an
     /// [`Outcome`] exists. `None` if the PDU is too malformed to classify.

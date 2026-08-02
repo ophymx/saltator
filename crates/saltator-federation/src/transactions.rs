@@ -373,13 +373,55 @@ async fn fill_gap(state: &FedState, origin: &str, pdu: &CanonicalJsonObject) -> 
             })
             .unwrap_or_default()
     };
-    let state = pdu_objects("pdus");
+    let state_events = pdu_objects("pdus");
     let auth_chain = pdu_objects("auth_chain");
-    if state.is_empty() {
+    if state_events.is_empty() {
+        return ingested > 0;
+    }
+    // The /state snapshot is imported wholesale, so a lying peer could
+    // otherwise inject forged room state (fake power levels/memberships)
+    // that we'd serve as authentic. Verify every event's signature first,
+    // trusting the keys of each authoring server; if anything fails to
+    // verify, abandon the gap-fill (the gap simply stays, flagged limited
+    // in sync) rather than trust unverified state.
+    let now = crate::now_ms();
+    let mut servers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for ev in state_events.iter().chain(auth_chain.iter()) {
+        if let Some(server) = ev
+            .get("sender")
+            .and_then(|s| {
+                if let CanonicalJsonValue::String(s) = s {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .and_then(|s| ruma::UserId::parse(s).ok())
+            .map(|u| u.server_name().to_string())
+        {
+            servers.insert(server);
+        }
+    }
+    for server in &servers {
+        if let Ok(keys) = state.key_cache.keys_for(server, now).await {
+            if let Some(set) = keys.get(server.as_str()) {
+                rooms.trust_keys(server, set.clone());
+            }
+        }
+    }
+    if !state_events
+        .iter()
+        .chain(auth_chain.iter())
+        .all(|ev| rooms.verify_pdu(room_id, ev))
+    {
+        tracing::warn!(
+            room_id,
+            "gap anchor: /state snapshot failed signature verification; not importing"
+        );
         return ingested > 0;
     }
     match rooms
-        .import_segment(room_id, state, auth_chain, chain)
+        .import_segment(room_id, state_events, auth_chain, chain)
         .await
     {
         Ok(appended) => {
