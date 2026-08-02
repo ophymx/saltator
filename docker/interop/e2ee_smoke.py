@@ -54,9 +54,14 @@ async def main() -> None:
     r = await bob.login("bobpass")
     assert isinstance(r, LoginResponse), f"bob login failed: {r}"
 
-    # First syncs make nio publish device keys + one-time keys.
+    # Plain sync() does not publish keys (that's sync_forever's job) —
+    # upload device + one-time keys explicitly.
     await alice.sync(timeout=0)
     await bob.sync(timeout=0)
+    for c in (alice, bob):
+        assert c.should_upload_keys, f"{c.user_id} has no keys to upload?"
+        r = await c.keys_upload()
+        print(f"{c.user_id} keys_upload: {r}", flush=True)
 
     # Alice creates an encrypted room and invites bob across federation.
     r = await alice.room_create(
@@ -89,6 +94,15 @@ async def main() -> None:
         RoomMessageText,
     )
 
+    # Manual-sync protocol: fetch the other side's device keys before
+    # encrypting (sync_forever would do this between syncs).
+    if alice.should_query_keys:
+        r = await alice.keys_query()
+        print(f"alice keys_query: {r}", flush=True)
+    if bob.should_query_keys:
+        r = await bob.keys_query()
+        print(f"bob keys_query: {r}", flush=True)
+
     # Synapse -> saltator: alice encrypts to bob's device (device keys
     # queried and one-time key claimed through Synapse over federation;
     # the Megolm session rides a federated to-device message).
@@ -102,6 +116,9 @@ async def main() -> None:
     await sync_until(bob, lambda: ALICE_MSG in got_bob, "bob decrypting alice's message")
 
     # saltator -> Synapse: the same loop driven from our side.
+    if bob.should_query_keys:
+        r = await bob.keys_query()
+        print(f"bob keys_query (pre-send): {r}", flush=True)
     r = await bob.room_send(
         room_id,
         "m.room.message",
