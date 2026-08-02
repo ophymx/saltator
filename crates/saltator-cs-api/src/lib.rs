@@ -334,6 +334,10 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
                 &p("/rooms/{room_id}/event/{event_id}"),
                 get(rooms::get_room_event),
             )
+            .route(
+                &p("/rooms/{room_id}/context/{event_id}"),
+                get(rooms::get_context),
+            )
             .route(&p("/rooms/{room_id}/members"), get(rooms::get_members))
             .route(
                 &p("/rooms/{room_id}/joined_members"),

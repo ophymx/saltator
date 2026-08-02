@@ -1939,6 +1939,116 @@ async fn v12_create_event_semantics() {
     env.shutdown().await;
 }
 
+/// GET /context/{eventId} returns the event with its before/after
+/// neighbours and room state; the v12 create event served through it
+/// carries room_id (MSC4291 RoomIDIsOnCreateEvent).
+#[tokio::test]
+async fn room_context_endpoint() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"room_version": "12", "preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+
+    let (status, sent) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc}/send/m.room.message/c1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "hi"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let event_id = sent["event_id"].as_str().unwrap().to_owned();
+    let ev_enc = event_id.replace('$', "%24");
+
+    // Context around the message.
+    let (status, ctx) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{enc}/context/{ev_enc}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ctx}");
+    assert_eq!(ctx["event"]["event_id"], event_id.as_str());
+    assert_eq!(ctx["event"]["room_id"], room_id.as_str());
+    assert!(
+        ctx["events_before"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "create/member should precede the message: {ctx}"
+    );
+    assert!(ctx["state"].as_array().is_some_and(|a| !a.is_empty()));
+
+    // The v12 create event, fetched via context, carries room_id (its id is
+    // the room id with a '$' sigil — MSC4291).
+    let create_id = format!("${}", &room_id[1..]);
+    let (status, cctx) = env
+        .req(
+            "GET",
+            &format!(
+                "/_matrix/client/v3/rooms/{enc}/context/{}",
+                create_id.replace('$', "%24")
+            ),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{cctx}");
+    assert_eq!(cctx["event"]["type"], "m.room.create");
+    assert_eq!(cctx["event"]["room_id"], room_id.as_str());
+
+    env.shutdown().await;
+}
+
+/// An invitee's stripped invite_state carries the full m.room.create event
+/// including origin_server_ts (MSC4311).
+#[tokio::test]
+async fn invite_stripped_state_has_full_create() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let bob = env.register("bob", "pw").await;
+    let bob_id = format!("@bob:{SERVER}");
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"room_version": "12", "preset": "private_chat", "invite": [bob_id]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (status, sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = sync["rooms"]["invite"][&room_id]["invite_state"]["events"]
+        .as_array()
+        .expect("invite_state events");
+    let create = events
+        .iter()
+        .find(|e| e["type"] == "m.room.create")
+        .expect("create event in invite_state");
+    assert!(
+        !create["origin_server_ts"].is_null(),
+        "stripped create must include origin_server_ts: {create}"
+    );
+
+    env.shutdown().await;
+}
+
 /// /messages with a lazy_load_members filter returns the member events of
 /// the chunk's senders in `state` — exactly one per distinct sender.
 #[tokio::test]

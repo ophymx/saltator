@@ -1414,6 +1414,92 @@ pub async fn get_state_event_empty_key(
     get_state_event(state, auth, req).await
 }
 
+/// `GET /rooms/{roomId}/context/{eventId}`: the target event plus the
+/// events immediately before and after it, and the room state at the last
+/// event returned (spec "Room event context").
+pub async fn get_context(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Ar(req): Ar<ruma::api::client::context::get_context::v3::Request>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let room_id = req.room_id.as_str();
+    let user = auth.user_id.as_str();
+    // The caller must be able to view the room; a departed member sees up
+    // to their leave (the ceiling bounds events_after).
+    let (_view, ceiling) = crate::room_util::member_view(&state.rooms, room_id, user)?;
+    let meta = room_meta(&state.rooms, room_id)?;
+    let version = room_version(&meta)?;
+
+    // The target must exist, belong to this room, and be visible.
+    if !crate::room_util::user_can_see_event(&state.rooms, room_id, req.event_id.as_str(), user)? {
+        return Err(ApiError::not_found("Event not found"));
+    }
+    let Some(target) = state
+        .rooms
+        .store()
+        .event(req.event_id.as_str())
+        .map_err(internal)?
+    else {
+        return Err(ApiError::not_found("Event not found"));
+    };
+    let event = client_event(&state.rooms, version, room_id, req.event_id.as_str(), user)?
+        .filter(|ev| ev.get("room_id").and_then(|r| r.as_str()) == Some(room_id))
+        .ok_or_else(|| ApiError::not_found("Event not found"))?;
+    let target_seq = target.seq;
+
+    let total = (u64::from(req.limit) as usize).min(100);
+    let before_limit = total / 2 + total % 2;
+    let after_limit = total - before_limit;
+    let store = state.rooms.store();
+
+    let mut events_before = Vec::new();
+    let mut oldest = target_seq;
+    for (seq, id) in store
+        .room_timeline(
+            room_id,
+            0,
+            Some(target_seq.saturating_sub(1)),
+            before_limit,
+            true,
+        )
+        .map_err(internal)?
+    {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+            oldest = seq;
+            events_before.push(ev);
+        }
+    }
+    let mut events_after = Vec::new();
+    let mut newest = target_seq;
+    for (seq, id) in store
+        .room_timeline(room_id, target_seq, ceiling, after_limit, false)
+        .map_err(internal)?
+    {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+            newest = seq;
+            events_after.push(ev);
+        }
+    }
+
+    // State at the newest event returned (spec).
+    let state_map = crate::room_util::state_at_seq(&state.rooms, room_id, newest)?;
+    let mut state_events = Vec::new();
+    for id in state_map.values() {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, id, user)? {
+            state_events.push(ev);
+        }
+    }
+
+    Ok(axum::Json(serde_json::json!({
+        "start": format!("t{}", oldest.saturating_sub(1)),
+        "end": format!("t{newest}"),
+        "events_before": events_before,
+        "event": event,
+        "events_after": events_after,
+        "state": state_events,
+    })))
+}
+
 pub async fn get_room_event(
     State(state): State<Arc<CsState>>,
     auth: Auth,
