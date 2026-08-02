@@ -1,0 +1,24 @@
+# Complement csapi tests permitted to fail without failing CI.
+#
+# The csapi job fails if any test fails that is NOT listed here — that is a
+# regression. Only LEAF failures are checked: a parent test that fails
+# solely because an allowed leaf under it failed is ignored.
+#
+# List exact test names (as Complement reports them). Keep it minimal and
+# annotated. Reviewed 2026-08-02 against 15 CI runs: none of the entries
+# below is flaky — each fails on every run. A test that fails only
+# intermittently should be fixed or quarantined at the source, not hidden
+# here; adding a flaky test to this list would let a real regression on it
+# pass unnoticed.
+
+# --- By design ---
+# Room version "2" predates reference hashes and is deliberately
+# unsupported (spec.md room-versions). The rest of TestRoomCreate passes.
+TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version
+
+# --- Known failures, NOT by design (track down and fix, then delete) ---
+# Threaded read receipts in the MSC4102 sync shape.
+TestThreadReceiptsInSyncMSC4102
+# Media upload -> download -> thumbnail roundtrip. Long assumed a flake,
+# but it fails on every run — a genuine bug, not noise.
+TestRoomImageRoundtrip
