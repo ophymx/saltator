@@ -188,15 +188,50 @@ where
     if let Some(chain) = cache.get(id) {
         return Ok(chain.clone());
     }
-    let event = fetch(id).ok_or_else(|| StateResError::MissingEvent(id.to_owned()))?;
-    let mut chain = BTreeSet::new();
-    for a in event.auth_events() {
-        if chain.insert(a.clone()) {
-            chain.extend(auth_chain(a, fetch, cache)?);
+    // Iterative post-order over the auth DAG, kept on the heap so a long
+    // chain can't overflow the (2 MiB) worker stack — a remote peer could
+    // otherwise craft a deep chain of events and crash the node when a fork
+    // forces resolution. Auth graphs are acyclic (event ids are content
+    // hashes, so an event cannot reference a descendant), which guarantees
+    // termination. Semantics (and the per-node memo) match the former
+    // recursion exactly.
+    let mut order: Vec<OwnedEventId> = Vec::new();
+    let mut finished: BTreeSet<OwnedEventId> = BTreeSet::new();
+    let mut stack: Vec<(OwnedEventId, bool)> = vec![(id.to_owned(), false)];
+    while let Some((node, post)) = stack.pop() {
+        if post {
+            // Finalize once; the first post-marker to pop has, by
+            // construction, had all children finalized before it.
+            if finished.insert(node.clone()) {
+                order.push(node);
+            }
+            continue;
+        }
+        if finished.contains(&node) || cache.contains_key(&node) {
+            continue;
+        }
+        let event = fetch(&node).ok_or_else(|| StateResError::MissingEvent(node.clone()))?;
+        stack.push((node.clone(), true));
+        for a in event.auth_events() {
+            if !finished.contains(a) && !cache.contains_key(a) {
+                stack.push((a.to_owned(), false));
+            }
         }
     }
-    cache.insert(id.to_owned(), chain.clone());
-    Ok(chain)
+    // Dependencies first: each node's auth events are cached by the time we
+    // reach it, so its transitive closure assembles in one pass.
+    for node in &order {
+        let event = fetch(node).ok_or_else(|| StateResError::MissingEvent(node.clone()))?;
+        let mut chain = BTreeSet::new();
+        for a in event.auth_events() {
+            chain.insert(a.to_owned());
+            if let Some(sub) = cache.get(a) {
+                chain.extend(sub.iter().cloned());
+            }
+        }
+        cache.insert(node.clone(), chain);
+    }
+    Ok(cache.get(id).cloned().unwrap_or_default())
 }
 
 /// v2.1: the conflicted state subgraph — every event lying on an
