@@ -143,13 +143,13 @@ impl FederationClient {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let bytes = resp.bytes().await.map_err(OutboundError::Http)?.to_vec();
         if !status.is_success() {
             return Err(OutboundError::Status(
                 status.as_u16(),
                 serde_json::Value::Null,
             ));
         }
+        let bytes = read_capped(resp, MAX_MEDIA_RESPONSE).await?;
         Ok((bytes, content_type))
     }
 
@@ -185,7 +185,9 @@ impl FederationClient {
         }
         let resp = req.send().await.map_err(OutboundError::Http)?;
         let status = resp.status();
-        let value: serde_json::Value = resp.json().await.map_err(OutboundError::Http)?;
+        let body = read_capped(resp, MAX_JSON_RESPONSE).await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
             return Err(OutboundError::Status(status.as_u16(), value));
         }
@@ -205,4 +207,29 @@ pub enum OutboundError {
     Encode(String),
     #[error("invalid HTTP method")]
     BadMethod,
+    #[error("remote response exceeded the size cap")]
+    TooLarge,
+}
+
+/// Largest JSON federation response we buffer (state dumps, backfill, key
+/// queries). Bounds memory against a malicious peer streaming gigabytes.
+const MAX_JSON_RESPONSE: usize = 64 * 1024 * 1024;
+/// Largest remote media/file response we buffer.
+const MAX_MEDIA_RESPONSE: usize = 100 * 1024 * 1024;
+
+/// Read a response body, aborting once `max` bytes have arrived (streaming,
+/// so an oversized body never fully materializes). Also rejects early on an
+/// oversized declared `Content-Length`.
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>, OutboundError> {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        return Err(OutboundError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(OutboundError::Http)? {
+        if bytes.len() + chunk.len() > max {
+            return Err(OutboundError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
