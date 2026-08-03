@@ -9,6 +9,7 @@
 //! most. Wire types (identifiers, canonical JSON, hashing/signing rules)
 //! come from ruma (spec.md §5.1).
 
+pub mod acl;
 pub mod auth;
 pub mod event;
 pub mod power_levels;

@@ -505,6 +505,38 @@ impl RoomServer {
             .unwrap_or_default())
     }
 
+    /// The room's current `m.room.server_acl`, if any is set.
+    pub fn server_acl(&self, room_id: &str) -> Result<Option<saltator_core::acl::ServerAcl>> {
+        let store = self.store();
+        let Some(meta) = store.meta(room_id).map_err(storage_err)? else {
+            return Ok(None);
+        };
+        let current = store
+            .resolve_group(room_id, meta.current_group)
+            .map_err(storage_err)?;
+        let Some(event_id) = current.get(&("m.room.server_acl".to_owned(), String::new())) else {
+            return Ok(None);
+        };
+        let Some(stored) = store.event(event_id).map_err(storage_err)? else {
+            return Ok(None);
+        };
+        let raw: CanonicalJsonObject =
+            serde_json::from_slice(&stored.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
+        match raw.get("content") {
+            Some(CanonicalJsonValue::Object(content)) => {
+                Ok(Some(saltator_core::acl::ServerAcl::from_content(content)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether the room's server ACL denies `server` from participating.
+    /// False when the room is unknown or has no ACL (fail open — an ACL must
+    /// be present to deny).
+    pub fn server_acl_denies(&self, room_id: &str, server: &str) -> bool {
+        matches!(self.server_acl(room_id), Ok(Some(acl)) if !acl.is_allowed(server))
+    }
+
     /// Walk the room DAG backward from `start` event IDs along
     /// `prev_events`, returning up to `limit` events (the `/backfill`
     /// response). The `start` events are included; highest-depth (most

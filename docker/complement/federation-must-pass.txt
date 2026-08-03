@@ -39,10 +39,18 @@
 # through a named member server even when the room-id's server can't service
 # the join. (Enabled optimistically with the fix — CI is the end-to-end check.)
 #
+# 2026-08-03: +TestACLs, +TestACLsForEDUs — inbound /send now enforces
+# m.room.server_acl per PDU (denied origin's events dropped) and for
+# room-scoped EDUs (typing, receipts). Matcher: saltator_core::acl (globs,
+# allow_ip_literals, port-stripped). Enabled with the fix; CI is the 3-node
+# end-to-end check.
+#
 # Works for both the per-push (-skip deferred buckets) and the weekly
 # unfiltered run: none of these live in a skipped bucket, and none is in
 # the deferred set, so the gate behaves identically for both.
 
+TestACLs
+TestACLsForEDUs
 TestBannedUserCannotSendJoin
 TestCannotSendNonJoinViaSendJoinV1
 TestCannotSendNonJoinViaSendJoinV2

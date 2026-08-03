@@ -81,6 +81,22 @@ pub async fn send_transaction(
                         apply_receipt_edu(rooms, &auth.origin, edu).await;
                     }
                 }
+                Some("m.typing") => {
+                    // Typing is room-scoped, so it's subject to the room's
+                    // server ACL (spec "Server ACLs").
+                    let denied = edu
+                        .get("content")
+                        .and_then(|c| c.get("room_id"))
+                        .and_then(|v| v.as_str())
+                        .zip(state.rooms.as_ref())
+                        .map(|(room_id, rooms)| rooms.server_acl_denies(room_id, &auth.origin))
+                        .unwrap_or(false);
+                    if !denied {
+                        if let Some(sink) = &state.edu_sink {
+                            apply_edu(sink.as_ref(), &auth.origin, edu);
+                        }
+                    }
+                }
                 _ => {
                     if let Some(sink) = &state.edu_sink {
                         apply_edu(sink.as_ref(), &auth.origin, edu);
@@ -193,6 +209,11 @@ async fn apply_receipt_edu(
         let Ok(rid) = ruma::RoomId::parse(room_id) else {
             continue;
         };
+        // Receipts for a room a denied server can't participate in are
+        // ignored (spec "Server ACLs" — per-room EDU protection).
+        if rooms.server_acl_denies(room_id, origin) {
+            continue;
+        }
         let Some(reads) = per_room.get("m.read").and_then(|v| v.as_object()) else {
             continue;
         };
@@ -308,6 +329,15 @@ async fn process_pdu(
     // Best-effort event ID up front, so failures before an Outcome still
     // key into the response.
     let precomputed = rooms.pdu_event_id(&raw).map(|id| id.to_string());
+
+    // Server ACL: a PDU whose origin is denied by the room's
+    // m.room.server_acl is ignored, with an error keyed by its event ID
+    // (spec "Server ACLs" — applied per PDU on /send, before ingest).
+    if let Some(CanonicalJsonValue::String(room_id)) = raw.get("room_id") {
+        if rooms.server_acl_denies(room_id, origin) {
+            return (precomputed, error_result("denied by server ACL"));
+        }
+    }
 
     match rooms.ingest_pdu(raw.clone()).await {
         Ok(outcome) => outcome_result(outcome),
