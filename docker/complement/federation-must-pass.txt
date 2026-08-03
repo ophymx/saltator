@@ -34,6 +34,11 @@
 # ported-name resolution, optional send_join `event`, origin_server_ts on the
 # membership, and not re-federating imported (send_join/backfill) events.
 #
+# 2026-08-03: +TestJoinViaRoomIDAndServerName — the join path now honours the
+# client's ?server_name= / ?via= routing hints, so a room can be joined
+# through a named member server even when the room-id's server can't service
+# the join. (Enabled optimistically with the fix — CI is the end-to-end check.)
+#
 # Works for both the per-push (-skip deferred buckets) and the weekly
 # unfiltered run: none of these live in a skipped bucket, and none is in
 # the deferred set, so the gate behaves identically for both.
@@ -53,6 +58,7 @@ TestIsDirectFlagFederation
 TestIsDirectFlagLocal
 TestJoinFederatedRoomFailOver
 TestJoinFederatedRoomWithUnverifiableEvents
+TestJoinViaRoomIDAndServerName
 TestLocalPngThumbnail
 TestMSC4289PrivilegedRoomCreators_AdditionalCreatorsAndInvited
 TestMSC4289PrivilegedRoomCreators_InvitedAreCreators
