@@ -19,6 +19,20 @@ crafting edge-case events (hard to reproduce locally; needs a fake-peer
 harness); "CS-local" means reproducible with a single node via the cs_api
 harness.
 
+## Fake-peer harness (2026-08-03) — the "synthetic" blocker is lifted
+`crates/saltator-federation/tests/support/mod.rs` is a light mock Matrix peer
+(the Rust analogue of Complement's `federation.NewServer`): its own ed25519
+identity + `/_matrix/key/v2/server`, a signed-DAG room builder (`PeerRoom`:
+`make_room`, `state_event`, `message`, `event_with_prev` for forks/merges),
+`make_join`/`send_join` handlers, active `send_transaction` push, and capture
+of our server's outbound `/send`. Events reuse the real
+`auth_types_for_event` + `event::event_id`, so they are byte-identical to
+what our pipeline expects; `strip_signatures` (and friends) craft malformed
+PDUs. Proven in `tests/fake_peer.rs`: our server joins a peer-hosted room,
+ingests a peer-pushed message, and rejects an unsigned one. The
+"synthetic"-tagged groups below are now reproducible locally — build each
+failing case as a `PeerRoom` scenario before touching server code.
+
 ---
 
 ## Group 1 — Spaces / room hierarchy  ·  L  ·  mostly CS-local
