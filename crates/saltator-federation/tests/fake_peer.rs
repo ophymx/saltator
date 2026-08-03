@@ -481,3 +481,129 @@ async fn peer_malformed_pdu_is_rejected() {
 
     our_rooms.shutdown().await.unwrap();
 }
+
+/// A PDU whose origin is denied by the room's m.room.server_acl is dropped
+/// on inbound /send, while the same origin is unaffected in a room that
+/// allows it (Complement TestACLs).
+#[tokio::test]
+async fn inbound_pdu_from_acl_denied_server_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+    // A ported name, as Complement/deployments use — the ACL entry and the
+    // sending origin must match on the full `host:port`.
+    let peer = MockPeer::start("peer.test:9001").await;
+
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
+
+    // A room whose ACL denies the peer (by its full host:port), and one that allows it.
+    let mk_room = |acl_deny: &'static str| {
+        let rooms = our_rooms.clone();
+        let alice = alice.clone();
+        async move {
+            let (room, _) = rooms
+                .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+                .await
+                .unwrap();
+            for (ty, sk, content) in [
+                (
+                    "m.room.member",
+                    alice.as_str(),
+                    json!({"membership": "join"}),
+                ),
+                (
+                    "m.room.power_levels",
+                    "",
+                    json!({"users": {alice.as_str(): 100}}),
+                ),
+                (
+                    "m.room.server_acl",
+                    "",
+                    json!({"allow": ["*"], "deny": [acl_deny]}),
+                ),
+            ] {
+                rooms
+                    .send_state(&room, &alice, ty, sk, content)
+                    .await
+                    .unwrap();
+            }
+            room.to_string()
+        }
+    };
+    let denied_room = mk_room("peer.test:9001").await;
+    let open_room = mk_room("other.test").await;
+
+    let our_fed = Arc::new(FedState {
+        server_name: hs.clone(),
+        signer: hs_signer.clone(),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: KeyCache::with_base_url(peer.base_url.clone()),
+        rooms: Some(our_rooms.clone()),
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let our_base = spawn(router(our_fed)).await;
+
+    // A signed message PDU for `room` from a user on the peer.
+    let make_pdu = |room: &str| {
+        let mut raw = match ruma::CanonicalJsonValue::try_from(json!({
+            "room_id": room,
+            "sender": "@mallory:peer.test:9001",
+            "type": "m.room.message",
+            "content": {"msgtype": "m.text", "body": "hi"},
+            "auth_events": [],
+            "prev_events": [],
+            "depth": 5,
+            "origin_server_ts": 1_700_000_000_000u64,
+        }))
+        .unwrap()
+        {
+            ruma::CanonicalJsonValue::Object(o) => o,
+            _ => unreachable!(),
+        };
+        peer.signer
+            .hash_and_sign_event(&mut raw, RoomVersion::V11)
+            .unwrap();
+        raw
+    };
+
+    // Denied room: the PDU is ACL-rejected and not persisted.
+    let denied_pdu = make_pdu(&denied_room);
+    let denied_id = saltator_core::event::event_id(&denied_pdu, RoomVersion::V11)
+        .unwrap()
+        .to_string();
+    let out = peer
+        .send_transaction(&our_base, "hs.test", vec![denied_pdu])
+        .await;
+    assert!(
+        out["pdus"][&denied_id]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("server ACL"),
+        "denied PDU should be ACL-rejected: {out}"
+    );
+    assert!(our_rooms.store().event(&denied_id).unwrap().is_none());
+
+    // Allowed room: the same origin is NOT ACL-rejected (it fails ingest for
+    // a different reason — missing events — proving the ACL let it through).
+    let open_pdu = make_pdu(&open_room);
+    let open_id = saltator_core::event::event_id(&open_pdu, RoomVersion::V11)
+        .unwrap()
+        .to_string();
+    let out = peer
+        .send_transaction(&our_base, "hs.test", vec![open_pdu])
+        .await;
+    assert!(
+        !out["pdus"][&open_id]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("server ACL"),
+        "allowed server must not be ACL-rejected: {out}"
+    );
+
+    our_rooms.shutdown().await.unwrap();
+}

@@ -39,6 +39,13 @@
 # through a named member server even when the room-id's server can't service
 # the join. (Enabled optimistically with the fix — CI is the end-to-end check.)
 #
+# 2026-08-03: m.room.server_acl enforcement landed (saltator_core::acl +
+# inbound /send drops for PDUs and room-scoped EDUs), but TestACLs /
+# TestACLsForEDUs are NOT gated yet: they need send_join membership fanout
+# (a 3rd server that joins via the room host must be announced to the other
+# member servers — today the host only relays its own users' events), a
+# separate feature. Re-gate once that lands.
+#
 # Works for both the per-push (-skip deferred buckets) and the weekly
 # unfiltered run: none of these live in a skipped bucket, and none is in
 # the deferred set, so the gate behaves identically for both.
