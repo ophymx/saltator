@@ -392,11 +392,14 @@ impl PeerRoom {
         let content = canon(json!({"membership": "join"}));
         let auth_events = self.auth_events_for(user_id, "m.room.member", Some(user_id), &content);
         let depth = self.max_prev_depth(&self.extremities) + 1;
+        // Deliberately omit origin_server_ts (and let the joiner set it), as
+        // Synapse's make_join does — a joining server that forgets to stamp
+        // it produces an invalid PDU. Keeping the harness faithful here is
+        // what makes the ported/real-server send tests meaningful.
         canon(json!({
             "room_id": self.room_id,
             "sender": user_id,
             "state_key": user_id,
-            "origin_server_ts": now_ms(),
             "type": "m.room.member",
             "content": CanonicalJsonValue::Object(content),
             "auth_events": auth_events,

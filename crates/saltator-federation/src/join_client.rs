@@ -92,6 +92,11 @@ pub async fn join_remote_room(
     if join.get("room_id").and_then(|v| v.as_str()) != Some(room_id) {
         return Err(JoinError::Malformed("template room_id mismatch"));
     }
+    // The joining server stamps origin_server_ts — the resident's make_join
+    // template omits it (Synapse), and an event without it is not a valid
+    // PDU, which surfaces later when the event is read back (e.g. as a
+    // prev_event the next time we send into the room).
+    stamp_origin_ts(&mut join);
     signer
         .hash_and_sign_event(&mut join, version)
         .map_err(|e| JoinError::Sign(e.to_string()))?;
@@ -165,6 +170,7 @@ pub async fn leave_remote_room(
     expect_str(&leave, "type", "m.room.member")?;
     expect_str(&leave, "sender", user_id)?;
     expect_str(&leave, "state_key", user_id)?;
+    stamp_origin_ts(&mut leave);
     signer
         .hash_and_sign_event(&mut leave, version)
         .map_err(|e| JoinError::Sign(e.to_string()))?;
@@ -182,6 +188,17 @@ pub async fn leave_remote_room(
         .await
         .map_err(JoinError::Transport)?;
     Ok(())
+}
+
+/// Stamp `origin_server_ts` with our current time — the joining/leaving
+/// server owns this field, and make_join/make_leave templates omit it.
+fn stamp_origin_ts(obj: &mut CanonicalJsonObject) {
+    obj.insert(
+        "origin_server_ts".to_owned(),
+        CanonicalJsonValue::Integer(
+            ruma::Int::try_from(crate::now_ms() as i64).unwrap_or(ruma::Int::MAX),
+        ),
+    );
 }
 
 fn expect_str(obj: &CanonicalJsonObject, key: &str, want: &str) -> Result<(), JoinError> {

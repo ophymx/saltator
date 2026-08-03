@@ -355,6 +355,56 @@ async fn outbound_send_reaches_remote_members() {
     our_rooms.shutdown().await.unwrap();
 }
 
+/// After importing a room hosted on a server whose name carries a *port*
+/// (`peer.test:1099`), our local user can still send into it — a regression
+/// guard for the ported-server-name send bug (Complement's servers are all
+/// `host.docker.internal:PORT`).
+#[tokio::test]
+async fn local_send_in_imported_ported_room() {
+    use saltator_federation::{join_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    let peer = MockPeer::start("peer.test:1099").await;
+    let room_id = peer.make_room(RoomVersion::V11, "charlie");
+
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let client = FederationClient::with_base_url(hs_signer.clone(), peer.base_url.clone());
+    let resp = join_remote_room(
+        &client,
+        &hs_signer,
+        "peer.test:1099",
+        &room_id,
+        "@alice:hs.test",
+    )
+    .await
+    .expect("join");
+    our_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import");
+
+    let alice = ruma::UserId::parse("@alice:hs.test").unwrap();
+    let room = ruma::RoomId::parse(&room_id).unwrap();
+    let sent = our_rooms
+        .send_message(
+            &room,
+            &alice,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "hi"}),
+        )
+        .await;
+    assert!(
+        matches!(sent, Ok(Outcome::Accepted { .. })),
+        "send into a ported-server imported room should be accepted: {sent:?}"
+    );
+
+    our_rooms.shutdown().await.unwrap();
+}
+
 /// The peer crafts a PDU with its signature stripped; our server must reject
 /// it on `/send` and not persist it (the Group 6b/8 capability).
 #[tokio::test]
