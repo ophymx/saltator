@@ -148,8 +148,22 @@ Tests: `TestOutboundFederationSend`, `TestOutboundFederationEventSizeGetMissingE
 `TestComplementCanCreateValidV12Rooms`.
 Cause: our server joins/sends against Complement's synthetic homeserver,
 which crafts edge cases (oversized events, bad JSON per room version,
-unverifiable auth events, partitions). Needs a local fake-peer harness to
-reproduce; defer as a block once that harness exists.
+unverifiable auth events, partitions).
+Status (2026-08-03): **`TestOutboundFederationSend` DONE** (pending CI). It
+had two halves, both now landed with local tests:
+  1. *join by remote alias* — `join_by_id_or_alias` now resolves a remote
+     alias through the aliasing server's `/query/directory`
+     (`resolve_remote_alias`) before joining, instead of only consulting our
+     local table. Local test (two real nodes): `client_joins_a_remote_room_
+     by_remote_alias` in cs_api.
+  2. *outbound delivery* — the sender forwards a locally-authored message to
+     the remote members of a joined room. Local test (fake-peer):
+     `outbound_send_reaches_remote_members`.
+The rest (oversized/bad-JSON/unverifiable/partition edge cases) are the
+malformed-DAG cases the fake-peer harness now makes reproducible — build
+each as a `PeerRoom` scenario. `TestJoinViaRoomIDAndServerName` needs the
+`?server_name=` join hint threaded through to `join_remote` (so a v12 room
+whose ID names no server still routes) — small follow-up.
 
 ## Group 9 — Federated key query / to-device edge cases  ·  M  ·  peer
 Tests: `TestFederationKeyUploadQuery`, `TestToDeviceMessagesOverFederation`.
