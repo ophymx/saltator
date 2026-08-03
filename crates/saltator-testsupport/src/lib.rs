@@ -1,10 +1,12 @@
-//! A light-weight mock Matrix federation peer for local tests — the Rust
-//! analogue of Complement's in-process `federation.NewServer`.
+//! Shared test support: a light-weight mock Matrix federation peer — the
+//! Rust analogue of Complement's in-process `federation.NewServer`. A
+//! dev-dependency of the crates whose tests drive federation
+//! (`saltator-federation`, `saltator-cs-api`).
 //!
-//! Unlike the other federation tests (which spin up a *real* `RoomServer`
-//! as the peer), this peer crafts and signs events directly, so it can
-//! build arbitrary — including deliberately malformed or DAG-forked —
-//! rooms that a real server would refuse to produce. It:
+//! Unlike tests that spin up a *real* `RoomServer` as the peer, this peer
+//! crafts and signs events directly, so it can build arbitrary — including
+//! deliberately malformed or DAG-forked — rooms that a real server would
+//! refuse to produce. It:
 //!
 //!   1. has its own ed25519 identity and serves `/_matrix/key/v2/server`,
 //!   2. hosts rooms as a signed event DAG ([`PeerRoom`]),
@@ -16,7 +18,6 @@
 //! `make_membership_template` exactly, and reuses the real
 //! `auth_types_for_event` selection + `event::event_id` hashing, so events
 //! this peer produces are byte-for-byte the shape our pipeline expects.
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,6 +220,22 @@ impl PeerRoom {
         self.append(sender, "m.room.message", None, content, None)
     }
 
+    /// Append a state event, then strip its signature so it lands in the
+    /// room's current state as an *unverifiable* event (for testing that a
+    /// receiver drops non-critical unverifiable state rather than refusing
+    /// the whole send_join). The reference hash — and thus the event ID —
+    /// is unchanged by stripping signatures, so the event is well-formed but
+    /// unsigned.
+    pub fn unverifiable_state_event(
+        &mut self,
+        sender: &str,
+        ty: &str,
+        state_key: &str,
+        content: serde_json::Value,
+    ) -> String {
+        self.append_inner(sender, ty, Some(state_key), content, None, true)
+    }
+
     /// Append an event with explicit `prev_events` — the primitive for
     /// forking (prev = an earlier event) or merging (prev = several leaves).
     pub fn event_with_prev(
@@ -239,6 +256,18 @@ impl PeerRoom {
         state_key: Option<&str>,
         content: serde_json::Value,
         prev_override: Option<Vec<String>>,
+    ) -> String {
+        self.append_inner(sender, ty, state_key, content, prev_override, false)
+    }
+
+    fn append_inner(
+        &mut self,
+        sender: &str,
+        ty: &str,
+        state_key: Option<&str>,
+        content: serde_json::Value,
+        prev_override: Option<Vec<String>>,
+        strip_sig: bool,
     ) -> String {
         let content_obj = canon(content);
         let auth_events = self.auth_events_for(sender, ty, state_key, &content_obj);
@@ -263,6 +292,9 @@ impl PeerRoom {
             .hash_and_sign_event(&mut raw, self.version)
             .unwrap();
         let id = event::event_id(&raw, self.version).unwrap().to_string();
+        if strip_sig {
+            raw = strip_signatures(raw);
+        }
         self.record(
             id.clone(),
             raw,
@@ -300,17 +332,74 @@ impl PeerRoom {
         self.events.get(id).expect("unknown event id").clone()
     }
 
+    /// The room's current forward extremities (use as `prev_events` for a
+    /// crafted event that should sit at the tip).
+    pub fn tip(&self) -> Vec<String> {
+        self.extremities.clone()
+    }
+
+    /// The event ID of a current state entry (`m.room.create`, power levels,
+    /// a member) — for hand-building `auth_events`.
+    pub fn state_event_id(&self, ty: &str, state_key: &str) -> Option<String> {
+        self.state
+            .get(&(ty.to_owned(), state_key.to_owned()))
+            .cloned()
+    }
+
+    /// Craft (build + sign) a standalone event with **explicit** `prev_events`
+    /// and `auth_events`, without folding it into the room's tracked state or
+    /// forward extremities. This is the primitive for hand-shaping DAG
+    /// fragments — rejected events, outliers, events that cite a specific
+    /// (possibly rejected) auth event — that the automatic builders won't
+    /// produce. The raw event is retained so later `raw()`/auth lookups
+    /// resolve it. Returns its `(event_id, raw)`.
+    pub fn craft(
+        &mut self,
+        sender: &str,
+        ty: &str,
+        state_key: Option<&str>,
+        content: serde_json::Value,
+        prev: Vec<String>,
+        auth_events: Vec<String>,
+    ) -> (String, CanonicalJsonObject) {
+        let depth = self.max_prev_depth(&prev) + 1;
+        let ts = self.next_ts();
+        let mut v = json!({
+            "room_id": self.room_id,
+            "sender": sender,
+            "origin_server_ts": ts,
+            "type": ty,
+            "content": CanonicalJsonValue::Object(canon(content)),
+            "auth_events": auth_events,
+            "prev_events": prev,
+            "depth": depth,
+        });
+        if let Some(sk) = state_key {
+            v["state_key"] = sk.into();
+        }
+        let mut raw = canon(v);
+        self.signer
+            .hash_and_sign_event(&mut raw, self.version)
+            .unwrap();
+        let id = event::event_id(&raw, self.version).unwrap().to_string();
+        self.events.insert(id.clone(), raw.clone());
+        (id, raw)
+    }
+
     /// An unsigned `m.room.member` join template for `user_id` (the shape
     /// `make_join` returns; the joiner fills nothing and signs it as-is).
     fn join_template(&self, user_id: &str) -> CanonicalJsonObject {
         let content = canon(json!({"membership": "join"}));
         let auth_events = self.auth_events_for(user_id, "m.room.member", Some(user_id), &content);
         let depth = self.max_prev_depth(&self.extremities) + 1;
+        // Deliberately omit origin_server_ts (and let the joiner set it), as
+        // Synapse's make_join does — a joining server that forgets to stamp
+        // it produces an invalid PDU. Keeping the harness faithful here is
+        // what makes the ported/real-server send tests meaningful.
         canon(json!({
             "room_id": self.room_id,
             "sender": user_id,
             "state_key": user_id,
-            "origin_server_ts": now_ms(),
             "type": "m.room.member",
             "content": CanonicalJsonValue::Object(content),
             "auth_events": auth_events,

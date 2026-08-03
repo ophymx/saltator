@@ -1,0 +1,17 @@
+[package]
+name = "saltator-testsupport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+saltator-core.workspace = true
+saltator-roomserver.workspace = true
+saltator-federation.workspace = true
+
+axum.workspace = true
+ruma.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true

@@ -5238,6 +5238,331 @@ async fn client_joins_a_remote_room_by_remote_alias() {
     a_users.shutdown().await.unwrap();
 }
 
+/// A send_join response carrying an unverifiable *non-critical* state event
+/// (an unsigned room name) must not block the join: the bad event is dropped
+/// and the join succeeds. Only the join's own auth chain must verify
+/// (Complement TestJoinFederatedRoomWithUnverifiableEvents).
+#[tokio::test]
+async fn remote_join_drops_unverifiable_noncritical_state() {
+    use saltator_testsupport::MockPeer;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // A mock resident hosting a room whose current state includes an
+    // unsigned m.room.name (not part of a joiner's auth chain).
+    let peer = MockPeer::start("peer.test").await;
+    let room_id = peer.make_room(saltator_core::RoomVersion::V11, "charlie");
+    peer.with_room(&room_id, |room| {
+        room.unverifiable_state_event(
+            "@charlie:peer.test",
+            "m.room.name",
+            "",
+            json!({"name": "This event has no signature"}),
+        )
+    });
+
+    // Node B: full CS stack + federation aimed at the peer.
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    let b_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+
+    let media = MediaStore::open(b_dir.join("media")).unwrap();
+    let state = CsState::new(
+        b_users.clone(),
+        b_rooms.clone(),
+        media,
+        CsConfig {
+            server_name: b_name,
+            default_room_version: saltator_core::RoomVersion::V12,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(
+            b_signer.clone(),
+            peer.base_url.clone(),
+        )),
+        b_signer.clone(),
+        Arc::new(KeyCache::with_base_url(peer.base_url.clone())),
+    );
+    let router = saltator_cs_api::router(state);
+
+    let http_req =
+        |method: &'static str, path: String, token: Option<String>, body: Option<Value>| {
+            let router = router.clone();
+            async move {
+                let mut b = Request::builder().method(method).uri(path);
+                if let Some(t) = token {
+                    b = b.header("Authorization", format!("Bearer {t}"));
+                }
+                let body = match body {
+                    Some(v) => {
+                        b = b.header("Content-Type", "application/json");
+                        Body::from(serde_json::to_vec(&v).unwrap())
+                    }
+                    None => Body::empty(),
+                };
+                let resp = router.oneshot(b.body(body).unwrap()).await.unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let val: Value = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+                };
+                (status, val)
+            }
+        };
+
+    // Register bob on B.
+    let (_s, ch) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({"username": "bob", "password": "bob-pw-1234"})),
+    )
+    .await;
+    let session = ch["session"].as_str().unwrap().to_owned();
+    let (_s, reg) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({
+            "username": "bob", "password": "bob-pw-1234",
+            "auth": {"type": "m.login.dummy", "session": session},
+        })),
+    )
+    .await;
+    let bob = reg["access_token"].as_str().unwrap().to_owned();
+
+    // Join by room ID: the unsigned room name in the resident's state must
+    // be dropped, not block the join.
+    let room_enc: String = room_id
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let (status, body) = http_req(
+        "POST",
+        format!("/_matrix/client/v3/rooms/{room_enc}/join"),
+        Some(bob.clone()),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "join with an unverifiable non-critical event should succeed: {body}"
+    );
+    assert_eq!(body["room_id"], room_id);
+
+    // Bob's /sync shows the room joined.
+    let (status, sync) = http_req("GET", "/_matrix/client/v3/sync".into(), Some(bob), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        sync["rooms"]["join"].get(&room_id).is_some(),
+        "joined room missing from sync: {sync}"
+    );
+
+    projection.abort();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}
+
+/// After joining a room hosted on a *ported* server name
+/// (`host.docker.internal:PORT`), a client can send a message into it through
+/// the CS API — regression for the ported-room-id send bug behind
+/// Complement's TestOutboundFederationSend.
+#[tokio::test]
+async fn send_message_in_remote_ported_room() {
+    use saltator_testsupport::MockPeer;
+
+    let dir = tempfile::tempdir().unwrap();
+    let peer = MockPeer::start("peer.test:1099").await;
+    let room_id = peer.make_room(saltator_core::RoomVersion::V11, "charlie");
+
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    let b_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+
+    let media = MediaStore::open(b_dir.join("media")).unwrap();
+    let state = CsState::new(
+        b_users.clone(),
+        b_rooms.clone(),
+        media,
+        CsConfig {
+            server_name: b_name,
+            default_room_version: saltator_core::RoomVersion::V12,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(
+            b_signer.clone(),
+            peer.base_url.clone(),
+        )),
+        b_signer.clone(),
+        Arc::new(KeyCache::with_base_url(peer.base_url.clone())),
+    );
+    let router = saltator_cs_api::router(state);
+
+    let http_req =
+        |method: &'static str, path: String, token: Option<String>, body: Option<Value>| {
+            let router = router.clone();
+            async move {
+                let mut rb = Request::builder().method(method).uri(path);
+                if let Some(t) = token {
+                    rb = rb.header("Authorization", format!("Bearer {t}"));
+                }
+                let body = match body {
+                    Some(v) => {
+                        rb = rb.header("Content-Type", "application/json");
+                        Body::from(serde_json::to_vec(&v).unwrap())
+                    }
+                    None => Body::empty(),
+                };
+                let resp = router.oneshot(rb.body(body).unwrap()).await.unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let val: Value = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+                };
+                (status, val)
+            }
+        };
+
+    let (_s, ch) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({"username": "bob", "password": "bob-pw-1234"})),
+    )
+    .await;
+    let session = ch["session"].as_str().unwrap().to_owned();
+    let (_s, reg) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({
+            "username": "bob", "password": "bob-pw-1234",
+            "auth": {"type": "m.login.dummy", "session": session},
+        })),
+    )
+    .await;
+    let bob = reg["access_token"].as_str().unwrap().to_owned();
+
+    let enc = |s: &str| -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    };
+    let room_enc = enc(&room_id);
+    let (status, body) = http_req(
+        "POST",
+        format!("/_matrix/client/v3/rooms/{room_enc}/join"),
+        Some(bob.clone()),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "join failed: {body}");
+
+    // The regression: sending into the ported-server room via the CS API.
+    let (status, body) = http_req(
+        "PUT",
+        format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/txn1"),
+        Some(bob),
+        Some(json!({"msgtype": "m.text", "body": "hello"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "send into ported-server room should succeed: {body}"
+    );
+    assert!(body["event_id"].is_string(), "no event_id: {body}");
+
+    projection.abort();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}
+
 /// Remote join, then paginate the room's WHOLE history backwards: the
 /// messages sent before our join live on the resident and arrive via
 /// federated `GET /backfill`, continuing seamlessly past the local

@@ -24,6 +24,11 @@
 # parallel/federation leaf + topological equal-ts tie-break need the fake-
 # peer harness) — see docs/federation-conformance.md.
 #
+# 2026-08-03: +TestJoinFederatedRoomWithUnverifiableEvents — remote join now
+# drops unverifiable non-critical state (join_auth_closure), joins by remote
+# alias resolve through /query/directory, resident_of_room parses ported
+# server names, and the joiner stamps origin_server_ts on the membership.
+#
 # Works for both the per-push (-skip deferred buckets) and the weekly
 # unfiltered run: none of these live in a skipped bucket, and none is in
 # the deferred set, so the gate behaves identically for both.
@@ -42,6 +47,7 @@ TestInboundFederationProfile
 TestIsDirectFlagFederation
 TestIsDirectFlagLocal
 TestJoinFederatedRoomFailOver
+TestJoinFederatedRoomWithUnverifiableEvents
 TestLocalPngThumbnail
 TestMSC4289PrivilegedRoomCreators_AdditionalCreatorsAndInvited
 TestMSC4289PrivilegedRoomCreators_InvitedAreCreators

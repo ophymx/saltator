@@ -25,6 +25,7 @@ hickory-resolver = "0.25"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 saltator-shard.workspace = true
 saltator-store.workspace = true
+saltator-testsupport.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 axum-server.workspace = true
