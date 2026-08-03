@@ -3021,6 +3021,7 @@ dependencies = [
  "saltator-roomserver",
  "saltator-shard",
  "saltator-store",
+ "saltator-testsupport",
  "saltator-userserver",
  "serde",
  "serde_json",
@@ -3048,6 +3049,7 @@ dependencies = [
  "saltator-roomserver",
  "saltator-shard",
  "saltator-store",
+ "saltator-testsupport",
  "saltator-userserver",
  "serde",
  "serde_json",
@@ -3111,6 +3113,20 @@ dependencies = [
  "rocksdb",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "saltator-testsupport"
+version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "reqwest",
+ "ruma",
+ "saltator-core",
+ "saltator-federation",
+ "saltator-roomserver",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

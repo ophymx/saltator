@@ -18,6 +18,7 @@ saltator-userserver = { path = "crates/saltator-userserver" }
 saltator-cs-api = { path = "crates/saltator-cs-api" }
 saltator-federation = { path = "crates/saltator-federation" }
 saltator-media = { path = "crates/saltator-media" }
+saltator-testsupport = { path = "crates/saltator-testsupport" }
 
 anyhow = "1"
 thiserror = "2"

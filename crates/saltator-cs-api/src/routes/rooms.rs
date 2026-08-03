@@ -537,6 +537,49 @@ async fn local_pipeline_join(
 
 /// Join a room hosted on another server: run the make_join/send_join
 /// handshake against a resident and import the returned state.
+/// Event IDs referenced under an event's `auth_events` (v3+ list-of-strings).
+fn auth_event_ids(ev: &ruma::CanonicalJsonObject) -> Vec<String> {
+    match ev.get("auth_events") {
+        Some(ruma::CanonicalJsonValue::Array(a)) => a
+            .iter()
+            .filter_map(|v| match v {
+                ruma::CanonicalJsonValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The transitive `auth_events` closure of `join` over `events` — the set
+/// that must verify for the join to be trustworthy. Events reachable only
+/// from *other* returned events (not from the join) are not included, so an
+/// unverifiable event dragged into the resident's auth chain by an unrelated
+/// membership doesn't block the join.
+fn join_auth_closure(
+    join: &ruma::CanonicalJsonObject,
+    events: &[ruma::CanonicalJsonObject],
+    version: saltator_core::RoomVersion,
+) -> std::collections::BTreeSet<String> {
+    let mut auth_of: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for ev in events {
+        if let Ok(id) = saltator_core::event::event_id(ev, version) {
+            auth_of.insert(id.to_string(), auth_event_ids(ev));
+        }
+    }
+    let mut closure = std::collections::BTreeSet::new();
+    let mut stack = auth_event_ids(join);
+    while let Some(id) = stack.pop() {
+        if closure.insert(id.clone()) {
+            if let Some(parents) = auth_of.get(&id) {
+                stack.extend(parents.iter().cloned());
+            }
+        }
+    }
+    closure
+}
+
 async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId) -> Result<()> {
     let Some(fed) = &state.federation else {
         return Err(ApiError::not_found("Unknown room"));
@@ -593,32 +636,52 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId) -> Result<(
         ));
     };
 
-    // The resident's state dump is not trusted for authenticity: verify
-    // every state + auth_chain event's signature (against the authoring
-    // servers' keys, fetched via the key cache) and refuse the join if any
-    // fails, so a lying resident can't seed the room with forged state
-    // (fake power levels, memberships) that we'd serve as authentic.
-    let to_verify: Vec<ruma::CanonicalJsonObject> = resp
+    // The resident's state dump is not trusted for authenticity. The events
+    // that authorise *our* join — its transitive auth chain (create, power
+    // levels, join rules, the sender's prior membership) — MUST verify, or a
+    // lying resident could seed forged critical state (fake power levels,
+    // memberships) that we'd serve as authentic. Other returned events (a
+    // room name, an unrelated membership, an event pulled into the auth
+    // chain only by something else) may legitimately be unverifiable —
+    // signed by a key we can't fetch, say — and per the spec are dropped,
+    // not grounds to refuse the join (Complement
+    // TestJoinFederatedRoomWithUnverifiableEvents).
+    let all_events: Vec<ruma::CanonicalJsonObject> = resp
         .state
         .iter()
         .chain(resp.auth_chain.iter())
         .cloned()
         .collect();
-    saltator_federation::trust_event_servers(&fed.key_cache, &state.rooms, &to_verify).await;
-    if !to_verify
-        .iter()
-        .all(|ev| state.rooms.verify_pdu_at(resp.room_version, ev))
-    {
-        return Err(ApiError::new(
-            axum::http::StatusCode::BAD_GATEWAY,
-            "M_UNKNOWN",
-            "remote join returned state that failed signature verification",
-        ));
+    saltator_federation::trust_event_servers(&fed.key_cache, &state.rooms, &all_events).await;
+
+    let critical = join_auth_closure(&resp.event, &all_events, resp.room_version);
+    for ev in &all_events {
+        let id = saltator_core::event::event_id(ev, resp.room_version)
+            .map(|i| i.to_string())
+            .unwrap_or_default();
+        if critical.contains(&id) && !state.rooms.verify_pdu_at(resp.room_version, ev) {
+            return Err(ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "M_UNKNOWN",
+                "remote join returned auth-chain state that failed signature verification",
+            ));
+        }
     }
+    // Keep the verifiable events; drop unverifiable non-critical ones.
+    let kept_state: Vec<_> = resp
+        .state
+        .into_iter()
+        .filter(|e| state.rooms.verify_pdu_at(resp.room_version, e))
+        .collect();
+    let kept_auth: Vec<_> = resp
+        .auth_chain
+        .into_iter()
+        .filter(|e| state.rooms.verify_pdu_at(resp.room_version, e))
+        .collect();
 
     let outcome = state
         .rooms
-        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .import_room(resp.room_version, resp.event, kept_state, kept_auth)
         .await
         .map_err(internal)?;
     accepted_event_id(outcome)?;

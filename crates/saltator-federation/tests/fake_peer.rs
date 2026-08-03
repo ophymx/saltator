@@ -3,8 +3,6 @@
 //! a PDU the peer deliberately malforms. This is the local capability that
 //! stands in for Complement's synthetic-peer tests (Groups 6b/8/…).
 
-mod support;
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +15,7 @@ use saltator_roomserver::{Outcome, RoomServer, ServerSigner};
 use saltator_shard::NoopNetworkFactory;
 use saltator_store::RocksEngine;
 
-use support::{strip_signatures, MockPeer};
+use saltator_testsupport::{strip_signatures, MockPeer};
 
 async fn spawn(app: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

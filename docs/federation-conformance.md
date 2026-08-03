@@ -20,16 +20,19 @@ harness); "CS-local" means reproducible with a single node via the cs_api
 harness.
 
 ## Fake-peer harness (2026-08-03) — the "synthetic" blocker is lifted
-`crates/saltator-federation/tests/support/mod.rs` is a light mock Matrix peer
-(the Rust analogue of Complement's `federation.NewServer`): its own ed25519
-identity + `/_matrix/key/v2/server`, a signed-DAG room builder (`PeerRoom`:
-`make_room`, `state_event`, `message`, `event_with_prev` for forks/merges),
+`crates/saltator-testsupport` (`MockPeer`) is a light mock Matrix peer (the
+Rust analogue of Complement's `federation.NewServer`), a shared
+dev-dependency of `saltator-federation` and `saltator-cs-api` so both their
+test suites can drive it. It brings its own ed25519 identity +
+`/_matrix/key/v2/server`, a signed-DAG room builder (`PeerRoom`: `make_room`,
+`state_event`, `message`, `event_with_prev` for forks/merges,
+`unverifiable_state_event` for signature-stripped state),
 `make_join`/`send_join` handlers, active `send_transaction` push, and capture
 of our server's outbound `/send`. Events reuse the real
 `auth_types_for_event` + `event::event_id`, so they are byte-identical to
-what our pipeline expects; `strip_signatures` (and friends) craft malformed
-PDUs. Proven in `tests/fake_peer.rs`: our server joins a peer-hosted room,
-ingests a peer-pushed message, and rejects an unsigned one. The
+what our pipeline expects; `strip_signatures` crafts malformed PDUs. Proven
+in `saltator-federation/tests/fake_peer.rs` (join/ingest/reject/outbound) and
+`saltator-cs-api` (remote join dropping unverifiable state). The
 "synthetic"-tagged groups below are now reproducible locally — build each
 failing case as a `PeerRoom` scenario before touching server code.
 
@@ -159,9 +162,18 @@ had two halves, both now landed with local tests:
   2. *outbound delivery* — the sender forwards a locally-authored message to
      the remote members of a joined room. Local test (fake-peer):
      `outbound_send_reaches_remote_members`.
-The rest (oversized/bad-JSON/unverifiable/partition edge cases) are the
-malformed-DAG cases the fake-peer harness now makes reproducible — build
-each as a `PeerRoom` scenario. `TestJoinViaRoomIDAndServerName` needs the
+**`TestJoinFederatedRoomWithUnverifiableEvents` DONE** (pending CI): the CS
+join path (`join_remote`) verified *every* returned state/auth-chain event
+and refused the join on any failure. It now verifies only the join's own
+transitive auth chain (`join_auth_closure`) and *drops* unverifiable
+non-critical events instead of rejecting — so an unsigned room name, a
+bad-signed unrelated membership, or an event dragged into the auth chain by
+something else no longer blocks the join, while forged auth-critical state is
+still refused. Local test (fake-peer with `unverifiable_state_event`):
+`remote_join_drops_unverifiable_noncritical_state` in cs_api.
+The rest (oversized / bad-JSON-per-version / partition ordering) are the
+remaining malformed-DAG cases the harness makes reproducible — build each as
+a `PeerRoom` scenario. `TestJoinViaRoomIDAndServerName` needs the
 `?server_name=` join hint threaded through to `join_remote` (so a v12 room
 whose ID names no server still routes) — small follow-up.
 

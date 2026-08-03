@@ -31,6 +31,7 @@ futures-util.workspace = true
 [dev-dependencies]
 saltator-shard.workspace = true
 saltator-store.workspace = true
+saltator-testsupport.workspace = true
 tempfile.workspace = true
 anyhow.workspace = true
 tower = { version = "0.5", features = ["util"] }

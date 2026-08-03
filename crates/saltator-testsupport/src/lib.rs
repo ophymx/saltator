@@ -1,10 +1,12 @@
-//! A light-weight mock Matrix federation peer for local tests — the Rust
-//! analogue of Complement's in-process `federation.NewServer`.
+//! Shared test support: a light-weight mock Matrix federation peer — the
+//! Rust analogue of Complement's in-process `federation.NewServer`. A
+//! dev-dependency of the crates whose tests drive federation
+//! (`saltator-federation`, `saltator-cs-api`).
 //!
-//! Unlike the other federation tests (which spin up a *real* `RoomServer`
-//! as the peer), this peer crafts and signs events directly, so it can
-//! build arbitrary — including deliberately malformed or DAG-forked —
-//! rooms that a real server would refuse to produce. It:
+//! Unlike tests that spin up a *real* `RoomServer` as the peer, this peer
+//! crafts and signs events directly, so it can build arbitrary — including
+//! deliberately malformed or DAG-forked — rooms that a real server would
+//! refuse to produce. It:
 //!
 //!   1. has its own ed25519 identity and serves `/_matrix/key/v2/server`,
 //!   2. hosts rooms as a signed event DAG ([`PeerRoom`]),
@@ -16,7 +18,6 @@
 //! `make_membership_template` exactly, and reuses the real
 //! `auth_types_for_event` selection + `event::event_id` hashing, so events
 //! this peer produces are byte-for-byte the shape our pipeline expects.
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,6 +220,22 @@ impl PeerRoom {
         self.append(sender, "m.room.message", None, content, None)
     }
 
+    /// Append a state event, then strip its signature so it lands in the
+    /// room's current state as an *unverifiable* event (for testing that a
+    /// receiver drops non-critical unverifiable state rather than refusing
+    /// the whole send_join). The reference hash — and thus the event ID —
+    /// is unchanged by stripping signatures, so the event is well-formed but
+    /// unsigned.
+    pub fn unverifiable_state_event(
+        &mut self,
+        sender: &str,
+        ty: &str,
+        state_key: &str,
+        content: serde_json::Value,
+    ) -> String {
+        self.append_inner(sender, ty, Some(state_key), content, None, true)
+    }
+
     /// Append an event with explicit `prev_events` — the primitive for
     /// forking (prev = an earlier event) or merging (prev = several leaves).
     pub fn event_with_prev(
@@ -239,6 +256,18 @@ impl PeerRoom {
         state_key: Option<&str>,
         content: serde_json::Value,
         prev_override: Option<Vec<String>>,
+    ) -> String {
+        self.append_inner(sender, ty, state_key, content, prev_override, false)
+    }
+
+    fn append_inner(
+        &mut self,
+        sender: &str,
+        ty: &str,
+        state_key: Option<&str>,
+        content: serde_json::Value,
+        prev_override: Option<Vec<String>>,
+        strip_sig: bool,
     ) -> String {
         let content_obj = canon(content);
         let auth_events = self.auth_events_for(sender, ty, state_key, &content_obj);
@@ -263,6 +292,9 @@ impl PeerRoom {
             .hash_and_sign_event(&mut raw, self.version)
             .unwrap();
         let id = event::event_id(&raw, self.version).unwrap().to_string();
+        if strip_sig {
+            raw = strip_signatures(raw);
+        }
         self.record(
             id.clone(),
             raw,
