@@ -33,8 +33,12 @@ pub struct JoinResponse {
 /// ID carries no server (v12+) and the caller must supply a candidate
 /// (e.g. an invite's origin).
 pub fn resident_of_room(room_id: &str) -> Option<String> {
+    // A room ID is `!<localpart>:<server_name>`, and the server name may
+    // itself carry a port (`host:1045`). The localpart (an opaque hash)
+    // never contains a colon, so split on the *first* colon — splitting on
+    // the last would return just the port for a ported server name.
     room_id
-        .rsplit_once(':')
+        .split_once(':')
         .map(|(_, server)| server.to_owned())
         .filter(|s| !s.is_empty())
 }
@@ -220,4 +224,26 @@ pub enum JoinError {
     UnsupportedVersion(String),
     #[error("could not sign join event: {0}")]
     Sign(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resident_of_room;
+
+    #[test]
+    fn resident_of_room_handles_ported_server_names() {
+        // Bare server name.
+        assert_eq!(
+            resident_of_room("!abc:example.org").as_deref(),
+            Some("example.org")
+        );
+        // Server name with an explicit port (the Complement / dev shape):
+        // the port must stay attached to the host, not be returned alone.
+        assert_eq!(
+            resident_of_room("!abc:host.docker.internal:1045").as_deref(),
+            Some("host.docker.internal:1045")
+        );
+        // v12-style room ID (no server part) has no resident.
+        assert_eq!(resident_of_room("!hashonly"), None);
+    }
 }
