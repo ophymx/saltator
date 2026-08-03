@@ -29,6 +29,11 @@
 # alias resolve through /query/directory, resident_of_room parses ported
 # server names, and the joiner stamps origin_server_ts on the membership.
 #
+# 2026-08-03: +TestOutboundFederationSend — closes the join-by-alias →
+# import → local send → outbound-deliver path end to end: remote-alias join,
+# ported-name resolution, optional send_join `event`, origin_server_ts on the
+# membership, and not re-federating imported (send_join/backfill) events.
+#
 # Works for both the per-push (-skip deferred buckets) and the weekly
 # unfiltered run: none of these live in a skipped bucket, and none is in
 # the deferred set, so the gate behaves identically for both.
@@ -60,6 +65,7 @@ TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph
 TestMSC4297StateResolutionV2_1_starts_from_empty_set
 TestMSC4311FullCreateEventOnStrippedState
 TestOutboundFederationProfile
+TestOutboundFederationSend
 TestRemoteAliasRequestsUnderstandUnicode
 TestRemotePresence
 TestRemoteTyping
