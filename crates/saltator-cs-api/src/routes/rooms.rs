@@ -853,6 +853,12 @@ pub async fn join_by_id_or_alias(
         .map_err(|e| ApiError::invalid_param(format!("room_id_or_alias: {e}")))?;
     let room_id: OwnedRoomId = match id_or_alias.try_into() {
         Ok(room_id) => room_id,
+        // A remote alias is resolved through the aliasing server's
+        // directory (the resulting room ID names the resident to join
+        // through); a local alias resolves from our own table.
+        Err(alias) if alias.server_name() != state.config.server_name => {
+            resolve_remote_alias(&state, alias.as_str()).await?.0
+        }
         Err(alias) => resolve_alias(&state, alias.as_str())?,
     };
     join_with_body(&state, &auth, &room_id, body).await?;

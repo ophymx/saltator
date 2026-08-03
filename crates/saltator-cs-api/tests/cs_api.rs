@@ -5011,6 +5011,233 @@ async fn client_joins_a_remote_room_via_federation() {
     a_rooms.shutdown().await.unwrap();
 }
 
+/// Joining by a *remote* alias: B resolves `#flibble:a.test` through A's
+/// federation `/query/directory`, then joins the room it names — the
+/// join-by-alias half of Complement's TestOutboundFederationSend.
+#[tokio::test]
+async fn client_joins_a_remote_room_by_remote_alias() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Node A: rooms + a user server (so it can serve the directory), hosting
+    // a public v11 room reachable via the alias #flibble:a.test.
+    let (a_rooms, a_signer) = start_fed_rooms("a.test", dir.path()).await;
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let a_users_engine = Arc::new(RocksEngine::open(&dir.path().join("a_users")).unwrap());
+    let a_users = UserServer::start(
+        1,
+        a_users_engine,
+        a_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    a_users
+        .shard_handle()
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let (room_id, _) = a_rooms
+        .create_room(
+            &alice,
+            saltator_core::RoomVersion::V11,
+            serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        a_rooms
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+    }
+    let room_alias = "#flibble:a.test";
+    a_users
+        .create_alias(room_alias, room_id.as_str(), &alice)
+        .await
+        .unwrap();
+
+    // Node B: full CS stack + its own room/user servers + federation.
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    let b_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+
+    // B's key server, so A can verify B's signed requests and join event.
+    let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
+    // A's federation surface: rooms + users (for /query/directory),
+    // authenticating B against B's key server.
+    let a_state = FedState {
+        server_name: a_name.clone(),
+        signer: a_signer.clone(),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: KeyCache::with_base_url(b_key_base),
+        rooms: Some(a_rooms.clone()),
+        users: Some(a_users.clone()),
+        client: None,
+        edu_sink: None,
+        media: None,
+    };
+    let a_app = saltator_federation::router(Arc::new(a_state));
+    let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = a_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(a_listener, a_app).await.unwrap();
+    });
+    let a_base = format!("http://{a_addr}");
+
+    // B's CS state, with an outbound client + key cache aimed at A.
+    let media = MediaStore::open(b_dir.join("media")).unwrap();
+    let state = CsState::new(
+        b_users.clone(),
+        b_rooms.clone(),
+        media,
+        CsConfig {
+            server_name: b_name,
+            default_room_version: saltator_core::RoomVersion::V12,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(
+            b_signer.clone(),
+            a_base.clone(),
+        )),
+        b_signer.clone(),
+        Arc::new(KeyCache::with_base_url(a_base)),
+    );
+    let router = saltator_cs_api::router(state);
+
+    let http_req =
+        |method: &'static str, path: String, token: Option<String>, body: Option<Value>| {
+            let router = router.clone();
+            async move {
+                let mut b = Request::builder().method(method).uri(path);
+                if let Some(t) = token {
+                    b = b.header("Authorization", format!("Bearer {t}"));
+                }
+                let body = match body {
+                    Some(v) => {
+                        b = b.header("Content-Type", "application/json");
+                        Body::from(serde_json::to_vec(&v).unwrap())
+                    }
+                    None => Body::empty(),
+                };
+                let resp = router.oneshot(b.body(body).unwrap()).await.unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let val: Value = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+                };
+                (status, val)
+            }
+        };
+
+    // Register bob on B.
+    let (_s, ch) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({"username": "bob", "password": "bob-pw-1234"})),
+    )
+    .await;
+    let session = ch["session"].as_str().unwrap().to_owned();
+    let (_s, reg) = http_req(
+        "POST",
+        "/_matrix/client/v3/register".into(),
+        None,
+        Some(json!({
+            "username": "bob", "password": "bob-pw-1234",
+            "auth": {"type": "m.login.dummy", "session": session},
+        })),
+    )
+    .await;
+    let bob = reg["access_token"].as_str().unwrap().to_owned();
+
+    // POST /join/{roomIdOrAlias} with the REMOTE alias.
+    let alias_enc: String = room_alias
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let (status, body) = http_req(
+        "POST",
+        format!("/_matrix/client/v3/join/{alias_enc}"),
+        Some(bob.clone()),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remote-alias join failed: {body}");
+    assert_eq!(body["room_id"], room_id.as_str());
+
+    // Bob's /sync now shows the room joined.
+    let (status, sync) = http_req("GET", "/_matrix/client/v3/sync".into(), Some(bob), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        sync["rooms"]["join"].get(room_id.as_str()).is_some(),
+        "joined room missing from sync: {sync}"
+    );
+
+    projection.abort();
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+    a_rooms.shutdown().await.unwrap();
+    a_users.shutdown().await.unwrap();
+}
+
 /// Remote join, then paginate the room's WHOLE history backwards: the
 /// messages sent before our join live on the resident and arrive via
 /// federated `GET /backfill`, continuing seamlessly past the local

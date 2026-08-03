@@ -164,6 +164,87 @@ async fn peer_pushed_message_is_ingested() {
     our_rooms.shutdown().await.unwrap();
 }
 
+/// After joining the peer's room, a message our local user sends is
+/// delivered outbound to the peer (which shares the room) — the outbound
+/// half of Complement's TestOutboundFederationSend.
+#[tokio::test]
+async fn outbound_send_reaches_remote_members() {
+    use saltator_federation::{join_remote_room, spawn_sender, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    let peer = MockPeer::start("peer.test").await;
+    let room_id = peer.make_room(RoomVersion::V11, "charlie");
+
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let client = FederationClient::with_base_url(hs_signer.clone(), peer.base_url.clone());
+    let resp = join_remote_room(&client, &hs_signer, "peer.test", &room_id, "@alice:hs.test")
+        .await
+        .expect("join");
+    our_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import");
+
+    // Start the outbound sender aimed at the peer *before* sending, so the
+    // message lands after the sender's start cursor.
+    let sender = spawn_sender(
+        our_rooms.clone(),
+        Arc::new(FederationClient::with_base_url(
+            hs_signer.clone(),
+            peer.base_url.clone(),
+        )),
+        hs.clone(),
+    );
+
+    // Our local user (joined via the handshake) sends a message.
+    let alice = ruma::UserId::parse("@alice:hs.test").unwrap();
+    let room = ruma::RoomId::parse(&room_id).unwrap();
+    let sent = our_rooms
+        .send_message(
+            &room,
+            &alice,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "Hello world!"}),
+        )
+        .await
+        .expect("send");
+    let msg_id = match sent {
+        Outcome::Accepted { event_id, .. } => event_id.to_string(),
+        other => panic!("message not accepted: {other:?}"),
+    };
+
+    // The peer should receive it in a transaction (delivery is async).
+    let mut delivered = false;
+    for _ in 0..50 {
+        if peer.received().iter().any(|txn| {
+            txn.origin == "hs.test"
+                && txn.pdus.iter().any(|p| {
+                    p.get("type").and_then(|t| t.as_str()) == Some("m.room.message")
+                        && p.get("content")
+                            .and_then(|c| c.get("body"))
+                            .and_then(|b| b.as_str())
+                            == Some("Hello world!")
+                })
+        }) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        delivered,
+        "peer never received the outbound message {msg_id}; got {:?}",
+        peer.received()
+    );
+
+    sender.abort();
+    our_rooms.shutdown().await.unwrap();
+}
+
 /// The peer crafts a PDU with its signature stripped; our server must reject
 /// it on `/send` and not persist it (the Group 6b/8 capability).
 #[tokio::test]
