@@ -1041,6 +1041,16 @@ pub async fn set_read_markers(
             None,
         )
         .await?;
+        // A public read receipt set via read_markers federates just like one
+        // set via the /receipt endpoint (spec "Receipts"); without this the
+        // other servers in the room never see it.
+        crate::routes::edu::broadcast_receipt(
+            &state,
+            req.room_id.as_str(),
+            auth.user_id.as_str(),
+            event_id.as_str(),
+            None,
+        );
     }
     if let Some(event_id) = &req.private_read_receipt {
         write_receipt(
