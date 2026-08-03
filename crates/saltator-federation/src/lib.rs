@@ -195,8 +195,16 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
             put(joins::send_leave),
         )
         .route(
+            "/_matrix/federation/v1/send_leave/{room_id}/{event_id}",
+            put(joins::send_leave_v1),
+        )
+        .route(
             "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
             put(joins::send_join),
+        )
+        .route(
+            "/_matrix/federation/v1/send_join/{room_id}/{event_id}",
+            put(joins::send_join_v1),
         )
         .route(
             "/_matrix/federation/v1/user/keys/query",

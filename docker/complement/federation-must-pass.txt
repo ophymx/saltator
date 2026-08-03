@@ -16,18 +16,22 @@
 # 2026-08-02, run 30770852233: +9 deterministic feature wins from the
 # create-event (MSC4289/4291/4311), /event_auth, and send_join/leave-V2
 # validation batches. These are pure-logic tests (no media/timing/network
-# race), so a single green run is sufficient to gate them. Still-partial
-# and NOT gated yet: TestJumpToDateEndpoint (needs federation fallback +
-# topological tie-break), TestUnknownEndpoints (key-server router lacks the
-# M_UNRECOGNIZED fallback), and the V1 send_join/send_leave variants (v1
-# routes unregistered) — see docs/federation-conformance.md.
+# race), so a single green run is sufficient to gate them.
+#
+# 2026-08-03, run 30774112449: +4 more deterministic wins (v1 send_join/leave
+# validation, is_direct local invite flag, unknown-endpoint parity). 32 top-
+# level pass; all 32 gated. Still NOT gated: TestJumpToDateEndpoint (its
+# parallel/federation leaf + topological equal-ts tie-break need the fake-
+# peer harness) — see docs/federation-conformance.md.
 #
 # Works for both the per-push (-skip deferred buckets) and the weekly
 # unfiltered run: none of these live in a skipped bucket, and none is in
 # the deferred set, so the gate behaves identically for both.
 
 TestBannedUserCannotSendJoin
+TestCannotSendNonJoinViaSendJoinV1
 TestCannotSendNonJoinViaSendJoinV2
+TestCannotSendNonLeaveViaSendLeaveV1
 TestCannotSendNonLeaveViaSendLeaveV2
 TestContentMediaV1
 TestEventAuth
@@ -36,6 +40,7 @@ TestGetMissingEventsGapFilling
 TestInboundFederationKeys
 TestInboundFederationProfile
 TestIsDirectFlagFederation
+TestIsDirectFlagLocal
 TestJoinFederatedRoomFailOver
 TestLocalPngThumbnail
 TestMSC4289PrivilegedRoomCreators_AdditionalCreatorsAndInvited
@@ -52,5 +57,6 @@ TestOutboundFederationProfile
 TestRemoteAliasRequestsUnderstandUnicode
 TestRemotePresence
 TestRemoteTyping
+TestUnknownEndpoints
 TestUserAppearsInChangedDeviceListOnJoinOverFederation
 TestWriteMDirectAccountData

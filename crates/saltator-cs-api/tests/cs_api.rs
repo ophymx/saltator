@@ -1960,6 +1960,22 @@ async fn unknown_endpoint_and_method_are_m_unrecognized() {
         .await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{body}");
+    // Server-server + key endpoints are reachable on the client origin too,
+    // so a wrong method on a known one is 405, not 404 (Complement drives
+    // these through the same base URL: TestUnknownEndpoints Server-server /
+    // Key subtests).
+    let (status, body) = env
+        .req("PUT", "/_matrix/federation/v1/version", None, None)
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{body}");
+    let (status, body) = env.req("PUT", "/_matrix/key/v2/query", None, None).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{body}");
+    // ...while an unknown path under those prefixes is still 404.
+    let (status, body) = env.req("GET", "/_matrix/key/v2/unknown", None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{body}");
 
     env.shutdown().await;
 }
@@ -2150,6 +2166,49 @@ async fn invite_stripped_state_has_full_create() {
     assert!(
         !create["origin_server_ts"].is_null(),
         "stripped create must include origin_server_ts: {create}"
+    );
+
+    env.shutdown().await;
+}
+
+/// createRoom with is_direct carries content.is_direct=true onto the
+/// invitee's stripped m.room.member invite (TestIsDirectFlagLocal).
+#[tokio::test]
+async fn is_direct_invite_carries_flag() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let bob = env.register("bob", "pw").await;
+    let bob_id = format!("@bob:{SERVER}");
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"invite": [bob_id], "is_direct": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    let (status, sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = sync["rooms"]["invite"][&room_id]["invite_state"]["events"]
+        .as_array()
+        .expect("invite_state events");
+    let invite = events
+        .iter()
+        .find(|e| {
+            e["type"] == "m.room.member"
+                && e["state_key"] == bob_id
+                && e["content"]["membership"] == "invite"
+        })
+        .expect("bob's invite member event in invite_state");
+    assert_eq!(
+        invite["content"]["is_direct"],
+        json!(true),
+        "invite must carry is_direct: {invite}"
     );
 
     env.shutdown().await;
