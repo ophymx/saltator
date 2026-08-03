@@ -77,6 +77,13 @@ pub struct StoredEvent {
     /// event was indexed there. Doubles as the idempotence marker for
     /// re-applied [`RoomCommand::ImportHistory`] batches.
     pub history_idx: Option<u64>,
+    /// True for events adopted from a resident's `send_join` state dump
+    /// (our own remote-join membership and its supporting state). The
+    /// resident distributes those to the room, so our outbound sender must
+    /// not re-federate them. `#[serde(default)]` keeps older records
+    /// (written before this field) readable as `false`.
+    #[serde(default)]
+    pub imported: bool,
 }
 
 /// A state snapshot or delta. Resolving a group walks the parent chain to

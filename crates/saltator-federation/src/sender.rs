@@ -106,6 +106,13 @@ async fn deliver(
             return;
         }
     };
+    // Events adopted from a resident's send_join state dump (our own remote
+    // join and its supporting state) or from backfill are distributed by the
+    // resident/origin, not us — re-federating our join would reach the
+    // resident as an unsolicited membership PDU.
+    if stored.imported {
+        return;
+    }
     // Only forward events our own users/server produced.
     let is_local = raw
         .get("sender")

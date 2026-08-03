@@ -435,15 +435,16 @@ impl PeerRoom {
         out
     }
 
-    /// Accept a joiner's signed membership: co-sign it, fold it into the
-    /// DAG, and return the `send_join` response body (matching the shape our
-    /// `send_join` handler produces: `{event, state, auth_chain, origin}`).
-    fn accept_join(&mut self, mut join: CanonicalJsonObject) -> serde_json::Value {
-        // Co-sign as the resident (real servers do; the ID is unchanged
-        // since reference hashes exclude signatures).
-        self.signer
-            .hash_and_sign_event(&mut join, self.version)
-            .unwrap();
+    /// Accept a joiner's signed membership: fold it into the DAG and return
+    /// the `send_join` response body `{state, auth_chain, origin}`.
+    ///
+    /// Deliberately **omits** the optional `event` (the resident's co-signed
+    /// copy of the membership), as Synapse does — so the joining server must
+    /// fall back to the event it submitted, and its stored join carries only
+    /// its own signature. Keeping the harness faithful here is what makes the
+    /// outbound test exercise the real "don't re-federate an imported join"
+    /// path rather than a co-signature shortcut.
+    fn accept_join(&mut self, join: CanonicalJsonObject) -> serde_json::Value {
         let id = event::event_id(&join, self.version).unwrap().to_string();
         let sender = match join.get("state_key") {
             Some(CanonicalJsonValue::String(s)) => s.clone(),
@@ -451,12 +452,7 @@ impl PeerRoom {
         };
         let prev = id_list(&join, "prev_events");
         let seeds = id_list(&join, "auth_events");
-        self.record(
-            id.clone(),
-            join.clone(),
-            Some(("m.room.member".to_owned(), sender)),
-            &prev,
-        );
+        self.record(id, join, Some(("m.room.member".to_owned(), sender)), &prev);
         let to_array = |v: Vec<CanonicalJsonObject>| {
             serde_json::Value::Array(
                 v.into_iter()
@@ -465,7 +461,6 @@ impl PeerRoom {
             )
         };
         json!({
-            "event": CanonicalJsonValue::Object(join),
             "state": to_array(self.state_events()),
             "auth_chain": to_array(self.auth_chain(&seeds)),
             "origin": self.server_name,
