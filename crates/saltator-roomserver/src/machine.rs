@@ -162,6 +162,7 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
             depth: cmd.depth,
             rejected: Some(rejected.clone()),
             history_idx: None,
+            imported: false,
         };
         ctx.put(
             T_EVENT,
@@ -207,6 +208,7 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
         depth: cmd.depth,
         rejected: None,
         history_idx: None,
+        imported: false,
     };
     ctx.put(
         T_EVENT,
@@ -311,6 +313,7 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
             depth: ev.depth,
             rejected: None,
             history_idx: None,
+            imported: true,
         };
         ctx.put(
             T_EVENT,
@@ -349,6 +352,7 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
         depth: cmd.join_depth,
         rejected: None,
         history_idx: None,
+        imported: true,
     };
     ctx.put(
         T_EVENT,
@@ -434,6 +438,7 @@ fn apply_import_segment(ctx: &mut ApplyCtx<'_>, cmd: &ImportSegment) -> StoreRes
             depth: ev.depth,
             rejected: None,
             history_idx: None,
+            imported: true,
         };
         ctx.put(
             T_EVENT,
@@ -480,6 +485,7 @@ fn apply_import_segment(ctx: &mut ApplyCtx<'_>, cmd: &ImportSegment) -> StoreRes
             depth: ev.depth,
             rejected: None,
             history_idx: None,
+            imported: false,
         };
         ctx.put(
             T_EVENT,
@@ -582,6 +588,7 @@ fn apply_import_history(ctx: &mut ApplyCtx<'_>, cmd: &ImportHistory) -> StoreRes
                 depth: ev.depth,
                 rejected: None,
                 history_idx: Some(idx),
+                imported: true,
             },
         };
         let raw: CanonicalJsonObject =

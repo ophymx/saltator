@@ -72,9 +72,9 @@ async fn our_server_joins_peer_hosted_room() {
         .expect("join handshake against the mock peer");
 
     assert_eq!(resp.room_version, RoomVersion::V11);
-    // Co-signed by the peer (resident) and us (joiner).
+    // The resident omits `event` (like Synapse), so we fall back to the join
+    // we submitted — signed by us.
     let sigs = resp.event.get("signatures").unwrap().as_object().unwrap();
-    assert!(sigs.contains_key("peer.test"), "peer co-signature missing");
     assert!(sigs.contains_key("hs.test"), "our signature missing");
     assert!(
         resp.state
@@ -290,17 +290,10 @@ async fn outbound_send_reaches_remote_members() {
     let room_id = peer.make_room(RoomVersion::V11, "charlie");
 
     let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
-    let client = FederationClient::with_base_url(hs_signer.clone(), peer.base_url.clone());
-    let resp = join_remote_room(&client, &hs_signer, "peer.test", &room_id, "@alice:hs.test")
-        .await
-        .expect("join");
-    our_rooms
-        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
-        .await
-        .expect("import");
 
-    // Start the outbound sender aimed at the peer *before* sending, so the
-    // message lands after the sender's start cursor.
+    // Start the outbound sender *before* the join, as a real server would
+    // (it runs continuously). This puts the imported join within the
+    // sender's window, so the co-signer-skip is actually exercised.
     let sender = spawn_sender(
         our_rooms.clone(),
         Arc::new(FederationClient::with_base_url(
@@ -309,6 +302,15 @@ async fn outbound_send_reaches_remote_members() {
         )),
         hs.clone(),
     );
+
+    let client = FederationClient::with_base_url(hs_signer.clone(), peer.base_url.clone());
+    let resp = join_remote_room(&client, &hs_signer, "peer.test", &room_id, "@alice:hs.test")
+        .await
+        .expect("join");
+    our_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import");
 
     // Our local user (joined via the handshake) sends a message.
     let alice = ruma::UserId::parse("@alice:hs.test").unwrap();
@@ -348,6 +350,21 @@ async fn outbound_send_reaches_remote_members() {
     assert!(
         delivered,
         "peer never received the outbound message {msg_id}; got {:?}",
+        peer.received()
+    );
+
+    // Our co-signed join must NOT be echoed back to the resident (it already
+    // co-signed and distributed it): the peer should see no m.room.member
+    // from us in any received transaction.
+    let echoed_membership = peer.received().iter().any(|txn| {
+        txn.pdus.iter().any(|p| {
+            p.get("type").and_then(|t| t.as_str()) == Some("m.room.member")
+                && p.get("sender").and_then(|s| s.as_str()) == Some("@alice:hs.test")
+        })
+    });
+    assert!(
+        !echoed_membership,
+        "our join membership was echoed back to the resident: {:?}",
         peer.received()
     );
 
