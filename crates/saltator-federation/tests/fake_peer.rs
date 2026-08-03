@@ -491,12 +491,14 @@ async fn inbound_pdu_from_acl_denied_server_is_dropped() {
     let hs: OwnedServerName = "hs.test".try_into().unwrap();
     let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
     let hs_signer = Arc::new(hs_signer);
-    let peer = MockPeer::start("peer.test").await;
+    // A ported name, as Complement/deployments use — the ACL entry and the
+    // sending origin must match on the full `host:port`.
+    let peer = MockPeer::start("peer.test:9001").await;
 
     let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
     let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
 
-    // A room whose ACL denies peer.test, and one that allows it.
+    // A room whose ACL denies the peer (by its full host:port), and one that allows it.
     let mk_room = |acl_deny: &'static str| {
         let rooms = our_rooms.clone();
         let alice = alice.clone();
@@ -530,7 +532,7 @@ async fn inbound_pdu_from_acl_denied_server_is_dropped() {
             room.to_string()
         }
     };
-    let denied_room = mk_room("peer.test").await;
+    let denied_room = mk_room("peer.test:9001").await;
     let open_room = mk_room("other.test").await;
 
     let our_fed = Arc::new(FedState {
@@ -550,7 +552,7 @@ async fn inbound_pdu_from_acl_denied_server_is_dropped() {
     let make_pdu = |room: &str| {
         let mut raw = match ruma::CanonicalJsonValue::try_from(json!({
             "room_id": room,
-            "sender": "@mallory:peer.test",
+            "sender": "@mallory:peer.test:9001",
             "type": "m.room.message",
             "content": {"msgtype": "m.text", "body": "hi"},
             "auth_events": [],

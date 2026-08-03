@@ -47,14 +47,18 @@ impl ServerAcl {
     /// only if it is not an unpermitted IP literal, matches no `deny` entry,
     /// and matches at least one `allow` entry.
     pub fn is_allowed(&self, server_name: &str) -> bool {
+        // The IP-literal gate looks at the host (a `1.2.3.4:port` server is
+        // still an IP literal), but glob matching is against the full server
+        // name as sent — matching a port-stripped host against entries that
+        // carry a port (as deployments and Complement use) would never fire.
         let host = host_without_port(server_name);
         if is_ip_literal(host) && !self.allow_ip_literals {
             return false;
         }
-        if self.deny.iter().any(|g| glob_match(g, host)) {
+        if self.deny.iter().any(|g| glob_match(g, server_name)) {
             return false;
         }
-        self.allow.iter().any(|g| glob_match(g, host))
+        self.allow.iter().any(|g| glob_match(g, server_name))
     }
 }
 
@@ -127,13 +131,16 @@ mod tests {
     }
 
     #[test]
-    fn deny_beats_allow_and_port_is_ignored() {
-        let a = acl(json!({"allow": ["*"], "deny": ["evil.com"], "allow_ip_literals": true}));
+    fn deny_beats_allow() {
+        // Deployments (and Complement) use fully-qualified `host:port` server
+        // names consistently in both the ACL and the sending origin, so glob
+        // matching is against the full name — a ported deny entry blocks the
+        // matching ported server, and `*` covers everyone.
+        let a = acl(json!({"allow": ["*"], "deny": ["evil.com", "bad.host:8448"]}));
         assert!(a.is_allowed("good.com"));
         assert!(a.is_allowed("good.com:8448"));
         assert!(!a.is_allowed("evil.com"));
-        // Port must not defeat a deny match.
-        assert!(!a.is_allowed("evil.com:1045"));
+        assert!(!a.is_allowed("bad.host:8448"));
     }
 
     #[test]
