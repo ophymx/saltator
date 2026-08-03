@@ -100,6 +100,28 @@ pub async fn send_join(
     Path((_room_id, _event_id)): Path<(String, String)>,
     auth: Authenticated,
 ) -> FedResult {
+    Ok(axum::Json(send_join_apply(state, auth).await?))
+}
+
+/// `PUT /_matrix/federation/v1/send_join/{roomId}/{eventId}`: the legacy
+/// send_join. Identical validation and application to v2, but the body is
+/// returned in the historical `[200, body]` envelope (spec "Joining Rooms",
+/// deprecated v1 response shape).
+pub async fn send_join_v1(
+    State(state): State<Arc<FedState>>,
+    Path((_room_id, _event_id)): Path<(String, String)>,
+    auth: Authenticated,
+) -> FedResult {
+    let body = send_join_apply(state, auth).await?;
+    Ok(axum::Json(serde_json::json!([200, body])))
+}
+
+/// Shared send_join core: trust the origin's keys, validate the membership,
+/// apply the join, and return the v2 response body object.
+async fn send_join_apply(
+    state: Arc<FedState>,
+    auth: Authenticated,
+) -> Result<serde_json::Value, (StatusCode, axum::Json<serde_json::Value>)> {
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
@@ -134,12 +156,12 @@ pub async fn send_join(
     require_membership_event(&raw, "join")?;
 
     match rooms.send_join(raw).await {
-        Ok(result) => Ok(axum::Json(serde_json::json!({
+        Ok(result) => Ok(serde_json::json!({
             "event": CanonicalJsonValue::Object(result.event),
             "state": to_array(result.state),
             "auth_chain": to_array(result.auth_chain),
             "origin": state.server_name.as_str(),
-        }))),
+        })),
         Err(saltator_roomserver::RoomError::UnknownRoom(_)) => {
             Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room"))
         }
@@ -216,6 +238,27 @@ pub async fn send_leave(
     Path((_room_id, _event_id)): Path<(String, String)>,
     auth: Authenticated,
 ) -> FedResult {
+    send_leave_apply(state, auth).await?;
+    Ok(axum::Json(serde_json::json!({})))
+}
+
+/// `PUT /_matrix/federation/v1/send_leave/{roomId}/{eventId}`: the legacy
+/// send_leave, returning the historical `[200, {}]` envelope.
+pub async fn send_leave_v1(
+    State(state): State<Arc<FedState>>,
+    Path((_room_id, _event_id)): Path<(String, String)>,
+    auth: Authenticated,
+) -> FedResult {
+    send_leave_apply(state, auth).await?;
+    Ok(axum::Json(serde_json::json!([200, {}])))
+}
+
+/// Shared send_leave core: trust the origin's keys, validate the membership,
+/// and apply the leave/reject.
+async fn send_leave_apply(
+    state: Arc<FedState>,
+    auth: Authenticated,
+) -> Result<(), (StatusCode, axum::Json<serde_json::Value>)> {
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
@@ -247,7 +290,7 @@ pub async fn send_leave(
         Ok(saltator_roomserver::Outcome::Rejected { reason, .. }) => {
             Err(err(StatusCode::FORBIDDEN, "M_FORBIDDEN", &reason))
         }
-        Ok(_) => Ok(axum::Json(serde_json::json!({}))),
+        Ok(_) => Ok(()),
         Err(saltator_roomserver::RoomError::UnknownRoom(_)) => {
             Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room"))
         }

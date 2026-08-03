@@ -58,28 +58,32 @@ and assert topological selection; fed leaf needs the peer harness.
 
 ## Group 3 — Unknown endpoint / method handling  ·  S  ·  CS-local
 Tests: `TestUnknownEndpoints`.
-Status (2026-08-02): PARTIAL. `Media_endpoints` and `Unknown_prefix` pass
-(CS + media + fed routers got the M_UNRECOGNIZED fallback). Remaining leaf:
-`Key_endpoints` — the key / `.well-known` / server-keys router
-(`/_matrix/key/v2/...`) still returns a bare 404/405 instead of the
-`M_UNRECOGNIZED` JSON. Add the same `.fallback` + `.method_not_allowed_
-fallback` to that router.
-Local test: hit `/_matrix/key/v2/<unknown>` and a known key path with the
-wrong method, assert 404/405 with `M_UNRECOGNIZED`.
+Status (2026-08-03): DONE (pending CI confirm). Root cause was subtler than
+"missing fallback": Complement drives *every* `_matrix/*` path — client,
+federation, key, media — through alice's single base URL (the client
+listener). Unknown paths already 404'd via the CS fallback, but the
+`Server-server` and `Key` subtests do a *wrong-method* probe
+(`PUT /_matrix/federation/v1/version`, `PUT /_matrix/key/v2/query`) that
+expects **405**; those paths weren't registered on the client router, so
+they 404'd instead. Fix: register `GET /_matrix/federation/v1/version`,
+`POST /_matrix/key/v2/query`, and `GET /_matrix/key/v2/query/{serverName}`
+on the client router (single-origin parity). The notary handler is a
+minimal stub returning `{"server_keys": []}` — saltator is not a key notary
+— which is enough for the method-routing test; a real notary is future work
+if any test needs it. Local test: `unknown_endpoint_and_method_are_m_
+unrecognized` extended with the fed/key method + unknown-path cases.
 
 ## Group 4 — send_join / send_leave membership validation  ·  M  ·  unit-local
 Tests: `TestCannotSendNonJoinViaSendJoinV1/V2`,
 `TestCannotSendNonLeaveViaSendLeaveV1/V2`.
-Status (2026-08-02): PARTIAL — **V2 green**, V1 still failing. The V2
-handlers now run `require_membership_event` and 400 on a mismatched
-membership / state_key. The **v1** endpoints
-(`PUT /_matrix/federation/v1/send_join|send_leave/{roomId}/{eventId}`) are
-simply not registered, so the v1 tests hit the router fallback instead of
-the validated handler. Follow-up: register the v1 routes pointing at the
-same handlers (v1 response shape differs — legacy `[200, {...}]` envelope
-for send_join), so validation applies identically.
-Local test: existing `membership_event_validation` unit test covers the
-validator; add a route-level test once v1 is wired.
+Status (2026-08-03): DONE (pending CI confirm). V2 landed earlier; the v1
+endpoints (`PUT /_matrix/federation/v1/send_join|send_leave`) are now
+registered too, sharing the validated core (`send_join_apply` /
+`send_leave_apply`) and wrapping the body in the legacy `[200, body]`
+envelope. Validation (`require_membership_event`) applies identically, so
+non-join/leave events 400 on both versions.
+Local test: `membership_event_validation` unit test covers the shared
+validator that both v1 and v2 route through.
 
 ## Group 5 — Server ACLs (`m.room.server_acl`)  ·  M  ·  unit-local + peer
 Tests: `TestACLs`, `TestACLsForEDUs`.
@@ -116,6 +120,11 @@ Build: fix the is_direct invite sync shape first (CS-local); tackle the
 federated reject/unban with the peer harness.
 Local test: invite with `is_direct`, assert the invite event appears in the
 invitee's sync `invite_state`.
+Status (2026-08-03): `TestIsDirectFlagLocal` DONE (pending CI confirm) —
+`createRoom` with `is_direct` now stamps `content.is_direct=true` onto each
+invite's `m.room.member` event, so it rides through to the invitee's
+stripped `invite_state`. Local test: `is_direct_invite_carries_flag`. The
+federated reject/unban tests remain (peer harness).
 
 ## Group 8 — Outbound federation to a synthetic peer  ·  L  ·  synthetic
 Tests: `TestOutboundFederationSend`, `TestOutboundFederationEventSizeGetMissingEvents`,
@@ -133,10 +142,17 @@ Tests: `TestFederationKeyUploadQuery`, `TestToDeviceMessagesOverFederation`.
 Cause: implemented already; a specific edge case fails (e.g. device-list
 stream field, to-device delivery timing). Re-triage from a fresh log.
 
-## Group 10 — Sync state filtering over federation  ·  M  ·  CS-local-ish
+## Group 10 — Sync state filtering over federation  ·  M  ·  synthetic
 Tests: `TestSyncOmitsStateChangeOnFilteredEvents`.
-Cause: `/sync` state section doesn't honour a filter that omits certain
-state changes. CS-local to reproduce.
+Cause: a filtered-out timeline event (`please_filter_me`) must not hide the
+*state* transition (`m.room.name` S2) that a DAG fork introduced — S2 has to
+appear in the sync `state` section even though its causing timeline entry is
+filtered. Reclassified 2026-08-03 from "CS-local-ish" to **synthetic**: the
+test forks the DAG via `federation.NewServer` + `MustSendTransaction`
+(delivering S2 off-timeline on a fork of e1), which needs the fake-peer
+harness to reproduce. Defer to the peer-harness block. The underlying
+behaviour — recomputing the timeline↔state delta after a filter — is worth a
+CS-local unit test once the harness exists.
 
 ## Group 11 — Media filename / thumbnail  ·  S–M  ·  investigate
 Tests: `TestMediaFilenames`, `TestMediaWithoutFileName`,

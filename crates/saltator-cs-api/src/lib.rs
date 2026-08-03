@@ -445,6 +445,16 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         )
         .route("/_matrix/media/v3/config", get(media::config_legacy));
 
+    // A handful of server-server / key endpoints are also exposed on the
+    // client origin. In a real deployment a reverse proxy fronts one origin
+    // for every `/_matrix/*` path (and Complement drives them all through a
+    // single base URL), so these must be *known* routes here: a wrong method
+    // then yields the spec's 405 M_UNRECOGNIZED instead of a bare 404.
+    app = app
+        .route("/_matrix/federation/v1/version", get(federation_version))
+        .route("/_matrix/key/v2/query", post(notary_query))
+        .route("/_matrix/key/v2/query/{server_name}", get(notary_query));
+
     app.fallback(unrecognized)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(
@@ -458,6 +468,26 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
 
 async fn unrecognized() -> ApiError {
     ApiError::unrecognized()
+}
+
+/// `GET /_matrix/federation/v1/version` — the unauthenticated reachability
+/// probe, also answered on the client origin (see the router comment).
+async fn federation_version() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "server": {
+            "name": "saltator",
+            "version": env!("CARGO_PKG_VERSION"),
+        }
+    }))
+}
+
+/// `POST /_matrix/key/v2/query` and `GET /_matrix/key/v2/query/{serverName}`
+/// — the key notary. saltator does not act as a notary for other servers'
+/// keys, so it returns none; the route exists so wrong methods yield 405
+/// and the endpoint is recognised (spec "Querying keys through another
+/// server").
+async fn notary_query() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "server_keys": [] }))
 }
 
 async fn method_not_allowed() -> ApiError {

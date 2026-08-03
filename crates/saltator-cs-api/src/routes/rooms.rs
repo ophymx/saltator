@@ -291,10 +291,26 @@ pub async fn create_room(
         .await?;
     }
 
-    // 7. invites.
+    // 7. invites. When the room is created with is_direct, that flag rides
+    // along on each invite's `m.room.member` content so the invitee's client
+    // sees it in invite_state and can file the DM (spec: the is_direct flag
+    // on the invite member event).
     for invitee in &req.invite {
+        let mut extra = serde_json::Map::new();
+        if req.is_direct {
+            extra.insert("is_direct".to_owned(), true.into());
+        }
         // Best-effort: a bad invitee doesn't fail room creation.
-        let _ = send_membership(&state, &room_id, &auth.user_id, invitee, "invite", None).await;
+        let _ = send_membership_with(
+            &state,
+            &room_id,
+            &auth.user_id,
+            invitee,
+            "invite",
+            None,
+            extra,
+        )
+        .await;
     }
 
     // 8. directory listing.
