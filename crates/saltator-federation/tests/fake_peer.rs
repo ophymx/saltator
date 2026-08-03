@@ -162,6 +162,118 @@ async fn peer_pushed_message_is_ingested() {
     our_rooms.shutdown().await.unwrap();
 }
 
+/// An event whose `auth_events` cite a *rejected* event is itself rejected,
+/// while a normal sentinel alongside it is accepted (the core rule behind
+/// Complement's TestInboundFederationRejectsEventsWithRejectedAuthEvents).
+#[tokio::test]
+async fn event_citing_rejected_auth_event_is_rejected() {
+    use saltator_federation::{join_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    let peer = MockPeer::start("peer.test").await;
+    let room_id = peer.make_room(RoomVersion::V11, "charlie");
+
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let client = FederationClient::with_base_url(hs_signer.clone(), peer.base_url.clone());
+    let resp = join_remote_room(&client, &hs_signer, "peer.test", &room_id, "@alice:hs.test")
+        .await
+        .expect("join");
+    our_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import");
+
+    let our_fed = Arc::new(FedState {
+        server_name: hs.clone(),
+        signer: hs_signer.clone(),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: KeyCache::with_base_url(peer.base_url.clone()),
+        rooms: Some(our_rooms.clone()),
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let our_base = spawn(router(our_fed)).await;
+
+    // Gather the state event IDs to hand-build auth chains.
+    let (tip, create, pl, charlie_m) = peer.with_room(&room_id, |r| {
+        (
+            r.tip(),
+            r.state_event_id("m.room.create", "").unwrap(),
+            r.state_event_id("m.room.power_levels", "").unwrap(),
+            r.state_event_id("m.room.member", "@charlie:peer.test")
+                .unwrap(),
+        )
+    });
+
+    // R: a power-levels event from @mallory, who is NOT a member — our server
+    // rejects it on auth (the sender is not joined / lacks power).
+    let (r_id, r_raw) = peer.with_room(&room_id, |r| {
+        r.craft(
+            "@mallory:peer.test",
+            "m.room.power_levels",
+            Some(""),
+            json!({"users": {}}),
+            tip.clone(),
+            vec![create.clone(), pl.clone()],
+        )
+    });
+    // X: a well-formed message from charlie, but citing the rejected R in the
+    // (type-permitted) power-levels slot of its auth_events — must be rejected
+    // as a consequence of R being rejected.
+    let (x_id, x_raw) = peer.with_room(&room_id, |r| {
+        r.craft(
+            "@charlie:peer.test",
+            "m.room.message",
+            None,
+            json!({"body": "X cites rejected R"}),
+            tip.clone(),
+            vec![create.clone(), r_id.clone(), charlie_m.clone()],
+        )
+    });
+    // S: a genuine sentinel (cites the real power levels) that must be accepted.
+    let (s_id, s_raw) = peer.with_room(&room_id, |r| {
+        r.craft(
+            "@charlie:peer.test",
+            "m.room.message",
+            None,
+            json!({"body": "sentinel"}),
+            tip.clone(),
+            vec![create, pl, charlie_m],
+        )
+    });
+
+    let out = peer
+        .send_transaction(&our_base, "hs.test", vec![r_raw, x_raw, s_raw])
+        .await;
+
+    let rejected = |id: &str| {
+        our_rooms
+            .store()
+            .event(id)
+            .unwrap()
+            .map(|e| e.rejected.is_some())
+    };
+    assert_eq!(rejected(&r_id), Some(true), "R must be rejected: {out}");
+    assert_eq!(
+        rejected(&x_id),
+        Some(true),
+        "X cites rejected R and must be rejected: {out}"
+    );
+    assert_eq!(
+        rejected(&s_id),
+        Some(false),
+        "sentinel S must be accepted: {out}"
+    );
+
+    our_rooms.shutdown().await.unwrap();
+}
+
 /// After joining the peer's room, a message our local user sends is
 /// delivered outbound to the peer (which shares the room) — the outbound
 /// half of Complement's TestOutboundFederationSend.

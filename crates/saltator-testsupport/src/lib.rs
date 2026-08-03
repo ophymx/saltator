@@ -332,6 +332,60 @@ impl PeerRoom {
         self.events.get(id).expect("unknown event id").clone()
     }
 
+    /// The room's current forward extremities (use as `prev_events` for a
+    /// crafted event that should sit at the tip).
+    pub fn tip(&self) -> Vec<String> {
+        self.extremities.clone()
+    }
+
+    /// The event ID of a current state entry (`m.room.create`, power levels,
+    /// a member) — for hand-building `auth_events`.
+    pub fn state_event_id(&self, ty: &str, state_key: &str) -> Option<String> {
+        self.state
+            .get(&(ty.to_owned(), state_key.to_owned()))
+            .cloned()
+    }
+
+    /// Craft (build + sign) a standalone event with **explicit** `prev_events`
+    /// and `auth_events`, without folding it into the room's tracked state or
+    /// forward extremities. This is the primitive for hand-shaping DAG
+    /// fragments — rejected events, outliers, events that cite a specific
+    /// (possibly rejected) auth event — that the automatic builders won't
+    /// produce. The raw event is retained so later `raw()`/auth lookups
+    /// resolve it. Returns its `(event_id, raw)`.
+    pub fn craft(
+        &mut self,
+        sender: &str,
+        ty: &str,
+        state_key: Option<&str>,
+        content: serde_json::Value,
+        prev: Vec<String>,
+        auth_events: Vec<String>,
+    ) -> (String, CanonicalJsonObject) {
+        let depth = self.max_prev_depth(&prev) + 1;
+        let ts = self.next_ts();
+        let mut v = json!({
+            "room_id": self.room_id,
+            "sender": sender,
+            "origin_server_ts": ts,
+            "type": ty,
+            "content": CanonicalJsonValue::Object(canon(content)),
+            "auth_events": auth_events,
+            "prev_events": prev,
+            "depth": depth,
+        });
+        if let Some(sk) = state_key {
+            v["state_key"] = sk.into();
+        }
+        let mut raw = canon(v);
+        self.signer
+            .hash_and_sign_event(&mut raw, self.version)
+            .unwrap();
+        let id = event::event_id(&raw, self.version).unwrap().to_string();
+        self.events.insert(id.clone(), raw.clone());
+        (id, raw)
+    }
+
     /// An unsigned `m.room.member` join template for `user_id` (the shape
     /// `make_join` returns; the joiner fills nothing and signs it as-is).
     fn join_template(&self, user_id: &str) -> CanonicalJsonObject {

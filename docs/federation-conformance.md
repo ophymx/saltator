@@ -124,8 +124,23 @@ Tests: `TestCorruptedAuthChain`, `TestInboundFederationRejectsEventsWithRejected
 `TestUnrejectRejectedEvents`, `TestInboundCanReturnMissingEvents`.
 Cause: subtle inbound acceptance/rejection + `/get_missing_events` serving
 edge cases exercised by a synthetic peer.
-Defer until a local fake-peer harness exists; these are the hardest and
-lowest-confidence. Capture expected behaviour here before attempting.
+Status (2026-08-03): the core **rejected-auth-events** rule is confirmed
+end-to-end: an event whose `auth_events` cite a rejected event is itself
+rejected (`auth::check_auth_events` §3.3), while a sentinel beside it is
+accepted. Local test (fake-peer, hand-crafting the DAG with
+`PeerRoom::craft`): `event_citing_rejected_auth_event_is_rejected`. The
+harness now crafts arbitrary events (explicit `prev_events` / `auth_events`,
+including a rejected event in a type-permitted slot).
+Remaining for the full `TestInboundFederationRejectsEventsWithRejectedAuthEvents`:
+**outlier fetching** — when an inbound event cites an auth event we don't
+have, fetch it via `/event_auth` (Synapse) or `/event` (Dendrite), evaluate
+it (it transitively cites the rejected event → rejected), and reject the
+citing event. Today a cited-but-missing auth event yields `MissingEvents`
+(the event is dropped, not fetched) — the observable result (a 404 on the
+citing event) may already match, but the fetch path is the remaining piece.
+`TestCorruptedAuthChain` / `TestUnrejectRejectedEvents` build on the same
+machinery; `TestInboundCanReturnMissingEvents` is about *serving*
+`/get_missing_events` with history-visibility filtering (peer joins us).
 
 ## Group 7 — Invite / ban over federation  ·  M  ·  mixed
 Tests: `TestFederationRejectInvite`, `TestFederationRoomsInvite`,
