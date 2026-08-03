@@ -451,6 +451,7 @@ async fn join_with_body(
     state: &CsState,
     auth: &Auth,
     room_id: &RoomId,
+    via: &[String],
     mut body: serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
     let reason = body
@@ -490,7 +491,7 @@ async fn join_with_body(
     if hosted {
         local_pipeline_join(state, auth, room_id, reason, body).await?;
     } else {
-        match join_remote(state, auth, room_id).await {
+        match join_remote(state, auth, room_id, via).await {
             Ok(()) => {}
             // No route to a resident (e.g. a v12 room we created whose
             // id names no server): rejoin our own copy rather than fail.
@@ -580,27 +581,33 @@ fn join_auth_closure(
     closure
 }
 
-async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId) -> Result<()> {
+async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[String]) -> Result<()> {
     let Some(fed) = &state.federation else {
         return Err(ApiError::not_found("Unknown room"));
     };
-    // Candidate residents: the server in the room id (pre-v12), then any
-    // server currently in our (possibly stale) copy of the room.
+    // Candidate residents, in order: the client's explicit `?server_name=`
+    // hints (it may know a resident the room id doesn't name — e.g. a v12
+    // room, or one whose id-server refuses), then the server in the room id
+    // (pre-v12), then any server in our (possibly stale) copy of the room.
     let our_name = state.config.server_name.as_str();
     let mut candidates: Vec<String> = Vec::new();
-    if let Some(resident) = saltator_federation::resident_of_room(room_id.as_str()) {
-        if resident != our_name {
-            candidates.push(resident);
+    let push = |server: String, candidates: &mut Vec<String>| {
+        if server != our_name && !candidates.contains(&server) {
+            candidates.push(server);
         }
+    };
+    for hint in via {
+        push(hint.clone(), &mut candidates);
+    }
+    if let Some(resident) = saltator_federation::resident_of_room(room_id.as_str()) {
+        push(resident, &mut candidates);
     }
     if let Ok(servers) = state
         .rooms
         .remote_servers_in_room(room_id.as_str(), our_name)
     {
         for server in servers {
-            if !candidates.contains(&server) {
-                candidates.push(server);
-            }
+            push(server, &mut candidates);
         }
     }
     if candidates.is_empty() {
@@ -898,11 +905,13 @@ pub async fn join_room(
     State(state): State<Arc<CsState>>,
     auth: Auth,
     Path(room_id): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     Jb(body): Jb,
 ) -> Result<Ra<join_room_by_id::v3::Response>> {
     let room_id = OwnedRoomId::try_from(room_id)
         .map_err(|e| ApiError::invalid_param(format!("room_id: {e}")))?;
-    join_with_body(&state, &auth, &room_id, body).await?;
+    let via = join_via_hints(query.as_deref());
+    join_with_body(&state, &auth, &room_id, &via, body).await?;
     Ok(Ra(join_room_by_id::v3::Response::new(room_id)))
 }
 
@@ -910,10 +919,12 @@ pub async fn join_by_id_or_alias(
     State(state): State<Arc<CsState>>,
     auth: Auth,
     Path(room_id_or_alias): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     Jb(body): Jb,
 ) -> Result<Ra<join_room_by_id_or_alias::v3::Response>> {
     let id_or_alias = ruma::OwnedRoomOrAliasId::try_from(room_id_or_alias)
         .map_err(|e| ApiError::invalid_param(format!("room_id_or_alias: {e}")))?;
+    let via = join_via_hints(query.as_deref());
     let room_id: OwnedRoomId = match id_or_alias.try_into() {
         Ok(room_id) => room_id,
         // A remote alias is resolved through the aliasing server's
@@ -924,8 +935,56 @@ pub async fn join_by_id_or_alias(
         }
         Err(alias) => resolve_alias(&state, alias.as_str())?,
     };
-    join_with_body(&state, &auth, &room_id, body).await?;
+    join_with_body(&state, &auth, &room_id, &via, body).await?;
     Ok(Ra(join_room_by_id_or_alias::v3::Response::new(room_id)))
+}
+
+/// The server-routing hints on a join request: `?server_name=` (and the
+/// newer `?via=`) values, percent-decoded, in order, deduplicated.
+fn join_via_hints(query: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for pair in query.unwrap_or_default().split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k == "server_name" || k == "via" {
+            let server = percent_decode(v);
+            if !server.is_empty() && !out.contains(&server) {
+                out.push(server);
+            }
+        }
+    }
+    out
+}
+
+/// Minimal percent-decoding for a query value (`host%3A1045` -> `host:1045`).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(b) => {
+                    out.push(b);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub async fn leave_room(
@@ -2601,4 +2660,24 @@ pub async fn set_visibility(
         .set_room_visibility(req.room_id.as_str(), req.visibility == Visibility::Public)
         .await?;
     Ok(Ra(set_room_visibility::v3::Response::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_via_hints;
+
+    #[test]
+    fn join_via_hints_parses_server_name_and_via() {
+        assert_eq!(join_via_hints(Some("server_name=hs1")), vec!["hs1"]);
+        // The newer `via` alias, a percent-decoded ported name, and dedup
+        // across repeats.
+        assert_eq!(
+            join_via_hints(Some(
+                "server_name=host.docker.internal%3A1045&via=hs2&server_name=hs2"
+            )),
+            vec!["host.docker.internal:1045".to_owned(), "hs2".to_owned()]
+        );
+        assert!(join_via_hints(None).is_empty());
+        assert!(join_via_hints(Some("foo=bar")).is_empty());
+    }
 }
