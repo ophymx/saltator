@@ -39,17 +39,23 @@
 # through a named member server even when the room-id's server can't service
 # the join. (Enabled optimistically with the fix — CI is the end-to-end check.)
 #
-# 2026-08-03: m.room.server_acl enforcement landed (saltator_core::acl +
-# inbound /send drops for PDUs and room-scoped EDUs), but TestACLs /
-# TestACLsForEDUs are NOT gated yet: they need send_join membership fanout
-# (a 3rd server that joins via the room host must be announced to the other
-# member servers — today the host only relays its own users' events), a
-# separate feature. Re-gate once that lands.
+# 2026-08-03: send_join/send_leave membership fanout landed — the resident
+# now relays a joining/leaving server's membership to the room's other member
+# servers through the leader-owned outbound sender (a `relay` flag on the
+# stored event; sender excludes the joiner's own origin). This is the shared
+# blocker for the 3-server ACL tests, so TestACLs / TestACLsForEDUs are gated
+# here **in anticipation**: the fix is implemented and locally tested, and
+# these two entries make CI the merge gate — the branch merges only if both
+# go green (and nothing else regresses). If CI shows them still failing, the
+# relayed join is not being accepted end-to-end (instrument hs2's inbound
+# path); do NOT remove the gate to go green — fix the fanout.
 #
 # Works for both the per-push (-skip deferred buckets) and the weekly
 # unfiltered run: none of these live in a skipped bucket, and none is in
 # the deferred set, so the gate behaves identically for both.
 
+TestACLs
+TestACLsForEDUs
 TestBannedUserCannotSendJoin
 TestCannotSendNonJoinViaSendJoinV1
 TestCannotSendNonJoinViaSendJoinV2
