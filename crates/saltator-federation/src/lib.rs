@@ -163,6 +163,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
             get(joins::make_join),
         )
         .route(
+            "/_matrix/federation/v1/event_auth/{room_id}/{event_id}",
+            get(joins::event_auth),
+        )
+        .route(
             "/_matrix/federation/v2/invite/{room_id}/{event_id}",
             put(joins::invite),
         )
@@ -206,7 +210,26 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
             "/_matrix/federation/v1/user/devices/{user_id}",
             get(user_keys::user_devices),
         )
+        // Unknown federation/key path → 404, wrong method on a known path
+        // → 405, both with the M_UNRECOGNIZED body the spec expects.
+        .fallback(|| async { unrecognized(axum::http::StatusCode::NOT_FOUND) })
+        .method_not_allowed_fallback(|| async {
+            unrecognized(axum::http::StatusCode::METHOD_NOT_ALLOWED)
+        })
         .with_state(state)
+}
+
+/// A Matrix `M_UNRECOGNIZED` error response with the given status.
+fn unrecognized(status: axum::http::StatusCode) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "errcode": "M_UNRECOGNIZED",
+            "error": "Unrecognized request",
+        })),
+    )
+        .into_response()
 }
 
 /// `GET /_matrix/federation/v1/version` — unauthenticated reachability

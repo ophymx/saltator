@@ -924,6 +924,19 @@ impl RoomServer {
     }
 
     /// Transitive closure of `auth_events` starting from `seed` event IDs.
+    /// The auth chain of an event: the transitive closure of its
+    /// `auth_events` (not the event itself), as raw objects. Serves the
+    /// federation `/event_auth` endpoint. `Ok(None)` if we don't hold the
+    /// event.
+    pub fn event_auth_chain(&self, event_id: &str) -> Result<Option<Vec<CanonicalJsonObject>>> {
+        let store = self.store();
+        let Some(event) = self.load_raw(&store, event_id)? else {
+            return Ok(None);
+        };
+        let seed: BTreeSet<String> = auth_event_ids(&event).into_iter().collect();
+        Ok(Some(self.collect_auth_chain(&store, seed)?))
+    }
+
     fn collect_auth_chain(
         &self,
         store: &RoomStore,

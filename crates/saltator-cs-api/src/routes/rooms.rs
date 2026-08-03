@@ -1414,6 +1414,68 @@ pub async fn get_state_event_empty_key(
     get_state_event(state, auth, req).await
 }
 
+/// `GET /rooms/{roomId}/timestamp_to_event?ts=&dir=`: the event closest to
+/// `ts` in direction `dir` (MSC3030 "jump to date"). `f` returns the first
+/// event at or after `ts`, `b` the last at or before; ties break by
+/// timeline order (earliest for `f`, latest for `b`). 404 when none. This
+/// serves from the local timeline only; querying past the local history
+/// (the federated backfill fallback) is future work.
+pub async fn timestamp_to_event(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Path(room_id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::Json<serde_json::Value>> {
+    // Members only (do not leak event ids from rooms the caller isn't in).
+    crate::room_util::require_joined(&state.rooms, &room_id, auth.user_id.as_str())?;
+    let ts: u64 = q
+        .get("ts")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ApiError::invalid_param("ts: required integer (ms)"))?;
+    let backward = matches!(q.get("dir").map(String::as_str), Some("b"));
+
+    let store = state.rooms.store();
+    // Oldest-first scan; tuples compare by (ts, seq) so ties resolve to the
+    // earliest event forwards and the latest backwards.
+    let mut best: Option<(u64, u64, String)> = None;
+    for (seq, id) in store
+        .room_timeline(&room_id, 0, None, usize::MAX, false)
+        .map_err(internal)?
+    {
+        let Some(raw) = raw_event(&state.rooms, &id)? else {
+            continue;
+        };
+        let ots = match raw.get("origin_server_ts") {
+            Some(ruma::CanonicalJsonValue::Integer(i)) => match u64::try_from(i64::from(*i)) {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+        let matches_dir = if backward { ots <= ts } else { ots >= ts };
+        if !matches_dir {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((bts, bseq, _)) if backward => (ots, seq) > (*bts, *bseq),
+            Some((bts, bseq, _)) => (ots, seq) < (*bts, *bseq),
+        };
+        if better {
+            best = Some((ots, seq, id));
+        }
+    }
+    match best {
+        Some((ots, _, id)) => Ok(axum::Json(serde_json::json!({
+            "event_id": id,
+            "origin_server_ts": ots,
+        }))),
+        None => Err(ApiError::not_found(
+            "No event found for the given timestamp",
+        )),
+    }
+}
+
 /// `GET /rooms/{roomId}/context/{eventId}`: the target event plus the
 /// events immediately before and after it, and the room state at the last
 /// event returned (spec "Room event context").
