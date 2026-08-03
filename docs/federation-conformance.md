@@ -102,14 +102,51 @@ non-join/leave events 400 on both versions.
 Local test: `membership_event_validation` unit test covers the shared
 validator that both v1 and v2 route through.
 
-## Group 5 — Server ACLs (`m.room.server_acl`)  ·  M  ·  unit-local + peer
+## Group 5 — Server ACLs (`m.room.server_acl`) + membership fanout  ·  M  ·  3-node
 Tests: `TestACLs`, `TestACLsForEDUs`.
-Cause: inbound PDUs/EDUs from ACL-denied servers are not filtered.
-Spec: "Server access control lists (ACLs)".
-Build: on inbound `/send`, evaluate the room's current `m.room.server_acl`
-against the origin; drop PDUs and EDUs from denied servers.
-Local test: unit-test the ACL matcher (allow/deny/`allow_ip_literals`);
-integration needs a peer for the full path.
+Status (2026-08-03): ACL enforcement itself is **DONE** (`saltator_core::acl`
++ inbound `/send` drops for PDUs and room-scoped EDUs). What still blocks
+these two is **send_join membership fanout**, not ACLs.
+
+Both tests are **3 real HSes**: hs1 creator/resident, hs2 (ACL-denied),
+hs3 (charlie, the affected third server). The sentinel (a message/EDU from
+bob@hs2 in a *second*, un-ACL'd room) must reach charlie@hs3. bob@hs2 only
+sends to hs3 if it knows hs3 is a member — and hs3 joined via `send_join`
+serviced by **hs1**. So hs1 must relay hs3's join to hs2. That relay is the
+missing feature.
+
+**Spec grounding (v1.19) — this is normative, not a guess.** Joining Rooms:
+*"The resident server must also send the event to other servers participating
+in the room."* Leaving Rooms: *"The resident server will then send the event
+to other servers in the room."* PDU model: *"like email, it is the
+responsibility of the originating server to deliver that event... However
+PDUs are signed... so that it is possible to deliver them through third-party
+servers"* — so hs1 relaying hs3's join is valid; for room v3+ **only hs3's
+signature is required** for hs2 to verify it, hs1 need not add one.
+
+**Why the reverted attempt (`0306093`) didn't flip the test:** it fanned out
+via a fire-and-forget `tokio::spawn` from `joins.rs` — not leader-gated
+(double-delivers under replicas), no durable retry — and, more importantly,
+relaying the PDU alone is insufficient. On receipt hs2 runs the "Checks
+performed on receipt of a PDU": it must auth the join against its
+`auth_events` (create/power_levels/join_rules/sender's prior member) and the
+state before it, fetching any missing `prev_events`/`auth_events` from hs1 via
+`/get_missing_events`, `/state_ids`, `/event_auth`, `/backfill`. If hs1 can't
+serve those follow-ups, or the relayed PDU dropped hs3's signature, hs2 drops
+the join and never learns hs3 is a member. **Instrument hs2's inbound path
+first** (does it receive the relay? accept it? if not, which check fails?).
+
+Build (real fix): fold the relay into the **leader-owned outbound sender**
+(`saltator-federation/src/sender.rs`) — branch the `is_local` + `imported`
+gates so a resident-applied `m.room.member` fans out through the same
+change-stream-cursored, retrying `deliver`/`deliver_to` path. Destinations =
+`RoomServer::remote_servers_in_room(room_id, self)` (roomserver `lib.rs:208`)
+minus the origin that sent it to us. Ensure the resident serves the pull APIs
+hs2 uses to resolve the relayed event. Pairs with the outstanding durable
+per-destination cursor (sender.rs module header).
+Local test: 3-node harness (`scripts/three_node_chaos.sh` shape) — hs3 joins
+via hs1, assert hs2 receives+accepts hs3's join PDU. ACL matcher unit tests
+(allow/deny/`allow_ip_literals`) already cover enforcement.
 
 ## Group 6 — `/event_auth` endpoint  ·  S–M  ·  unit-local
 Tests: `TestEventAuth`.
@@ -147,16 +184,34 @@ Tests: `TestFederationRejectInvite`, `TestFederationRoomsInvite`,
 `TestUnbanViaInvite`, `TestIsDirectFlagLocal`.
 Cause: `TestIsDirectFlagLocal` — "missing invite event" in sync (is_direct
 invite stripped-state / sync shape, CS-local). The others involve the
-federated invite/reject/unban handshake (peer).
+federated invite/reject/unban handshake.
 Build: fix the is_direct invite sync shape first (CS-local); tackle the
-federated reject/unban with the peer harness.
+federated reject/unban.
 Local test: invite with `is_direct`, assert the invite event appears in the
 invitee's sync `invite_state`.
 Status (2026-08-03): `TestIsDirectFlagLocal` DONE (pending CI confirm) —
 `createRoom` with `is_direct` now stamps `content.is_direct=true` onto each
 invite's `m.room.member` event, so it rides through to the invitee's
-stripped `invite_state`. Local test: `is_direct_invite_carries_flag`. The
-federated reject/unban tests remain (peer harness).
+stripped `invite_state`. Local test: `is_direct_invite_carries_flag`.
+
+**Re-triaged 2026-08-03 (test-source read at pin `f002aff99e2`) — the other
+three are NOT all "peer harness":**
+- `TestFederationRoomsInvite` (2 real HSes, **bilateral, no fanout**): 9
+  subtests of hs1↔hs2 invite / reject / rescind, all asserted via CS-API
+  sync (`SyncLeftFrom` etc.). Reproducible with two real nodes in cs_api —
+  no peer, no third member server. This is auth-path / sync-shape work.
+- `TestUnbanViaInvite` (2 real HSes, **bilateral, no fanout**): bob@hs2 is
+  the creator/resident; alice@hs1 joins, is banned, unbanned, re-invited,
+  then must `send_join` again. The failing step is hs2 **accepting alice's
+  `send_join` after ban→unban→invite** (`ban_test.go:46-48`). Auth-path,
+  two real nodes — no peer.
+- `TestFederationRejectInvite` (2 real + mock peer delia, **needs send_leave
+  fanout**): delia joins hs1's room; alice invites charlie@hs2; charlie
+  rejects → `send_leave` to hs1; hs1 **must relay charlie's leave to member
+  server delia** (`invite_test.go:62-64`, observed at delia's `/send`
+  callback). Also needs the local invite membership fanned out to delia
+  (`:56-58`). This one is Group 5's fanout feature (leave variant) + the mock
+  peer. See docs/…/multi-server-fanout-blocker (memory) and Group 5.
 
 ## Group 8 — Outbound federation to a synthetic peer  ·  L  ·  synthetic
 Tests: `TestOutboundFederationSend`, `TestOutboundFederationEventSizeGetMissingEvents`,

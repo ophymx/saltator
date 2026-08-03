@@ -482,6 +482,150 @@ async fn peer_malformed_pdu_is_rejected() {
     our_rooms.shutdown().await.unwrap();
 }
 
+/// Drive a `send_join` against our server from `@<localpart>:<server>`, the
+/// way a remote homeserver would: trust the joiner's keys, fetch a join
+/// template, sign it as that server, and apply it. Returns the joiner's user
+/// id. Bypasses HTTP (we call `send_join` directly) but exercises the real
+/// resident-side apply path — including the `relay` flag the fan-out depends
+/// on.
+async fn peer_joins_our_room(
+    rooms: &RoomServer,
+    room: &ruma::RoomId,
+    server: &str,
+    localpart: &str,
+) -> String {
+    let (signer, _) = ServerSigner::generate(server.try_into().unwrap(), "1".to_owned());
+    let keys = signer
+        .public_key_map()
+        .get(server)
+        .cloned()
+        .expect("joiner keys");
+    rooms.trust_keys(server, keys);
+    let user = ruma::OwnedUserId::try_from(format!("@{localpart}:{server}")).unwrap();
+    let (version, mut template) = rooms.make_join_template(room, &user).unwrap();
+    signer.hash_and_sign_event(&mut template, version).unwrap();
+    rooms.send_join(template).await.expect("send_join applies");
+    user.to_string()
+}
+
+/// As the *resident* of a room, when a third server joins via `send_join` we
+/// must relay its membership to the room's other member servers (spec
+/// "Joining Rooms": "The resident server must also send the event to other
+/// servers participating in the room"), and must NOT echo it back to the
+/// joining server itself. This is the fan-out that unblocks Complement's
+/// TestACLs / TestACLsForEDUs.
+#[tokio::test]
+async fn resident_fans_out_send_join_membership_to_other_members() {
+    use saltator_federation::{spawn_sender, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    // Our server hosts a public room (alice is the resident creator).
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
+    let (room_id, _) = our_rooms
+        .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        our_rooms
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+    }
+    let room = ruma::RoomId::parse(&room_id).unwrap();
+
+    // Capture our outbound federation at a single mock endpoint. The sender's
+    // client ignores the destination name and posts everything here, so this
+    // stands in for every remote member server.
+    let peer = MockPeer::start("capture.test").await;
+    let sender = spawn_sender(
+        our_rooms.clone(),
+        Arc::new(FederationClient::with_base_url(
+            hs_signer.clone(),
+            peer.base_url.clone(),
+        )),
+        hs.clone(),
+    );
+
+    // b.test joins first: at that point only alice (local) is a member, so
+    // there is no other server to fan bob's join out to.
+    let bob = peer_joins_our_room(&our_rooms, &room, "b.test", "bob").await;
+    // c.test joins via us: now b.test is a member, so charlie's join must be
+    // relayed to b.test — but not back to c.test.
+    let charlie = peer_joins_our_room(&our_rooms, &room, "c.test", "charlie").await;
+
+    // charlie's join membership should reach the capture endpoint.
+    let is_join_member = |p: &serde_json::Value, who: &str| {
+        p.get("type").and_then(|t| t.as_str()) == Some("m.room.member")
+            && p.get("state_key").and_then(|s| s.as_str()) == Some(who)
+            && p.get("content")
+                .and_then(|c| c.get("membership"))
+                .and_then(|m| m.as_str())
+                == Some("join")
+    };
+    let count_join_deliveries = |who: String| {
+        move |peer: &MockPeer| {
+            peer.received()
+                .iter()
+                .filter(|txn| {
+                    txn.origin == "hs.test" && txn.pdus.iter().any(|p| is_join_member(p, &who))
+                })
+                .count()
+        }
+    };
+    let charlie_deliveries = count_join_deliveries(charlie.clone());
+    let bob_deliveries = count_join_deliveries(bob.clone());
+
+    let mut delivered = 0;
+    for _ in 0..50 {
+        delivered = charlie_deliveries(&peer);
+        if delivered > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        delivered >= 1,
+        "resident never relayed charlie's join to the other member server; got {:?}",
+        peer.received()
+    );
+    // Exactly once: relayed to b.test only, never echoed back to c.test (its
+    // own origin is excluded from the destination set).
+    assert_eq!(
+        charlie_deliveries(&peer),
+        1,
+        "charlie's join must be relayed to b.test only, not echoed to c.test: {:?}",
+        peer.received()
+    );
+    // bob's join had no other member server to reach, so it is never fanned
+    // out (and certainly not echoed back to b.test).
+    assert_eq!(
+        bob_deliveries(&peer),
+        0,
+        "bob's join should not have been fanned out: {:?}",
+        peer.received()
+    );
+
+    sender.abort();
+    our_rooms.shutdown().await.unwrap();
+}
+
 /// A PDU whose origin is denied by the room's m.room.server_acl is dropped
 /// on inbound /send, while the same origin is unaffected in a room that
 /// allows it (Complement TestACLs).
