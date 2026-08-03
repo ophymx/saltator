@@ -42,12 +42,24 @@ pub async fn send_transaction(
         .cloned()
         .unwrap_or_default();
 
-    // Trust the sending server's signing keys before ingesting any PDU: the
-    // room pipeline verifies each event's signature against them, and a
-    // steady-state transaction (no gap to backfill) would otherwise reach
-    // `ingest_pdu` with no keys for the origin and reject every event.
+    // Trust the signing keys of every server that authored a PDU in this
+    // transaction before ingesting any of them: the room pipeline verifies
+    // each event's signature against the trusted set. The sending origin is
+    // usually the author, but not always — a resident relays a third server's
+    // send_join/send_leave membership, and the spec signs PDUs by their own
+    // origin precisely so they can be delivered through third-party servers.
+    // Trusting only the transaction origin would drop those relayed events.
     if !pdus.is_empty() {
         trust_origin_keys(&state, &auth.origin).await;
+        let rooms = state.rooms.as_ref().expect("rooms checked above");
+        let pdu_objs: Vec<CanonicalJsonObject> = pdus
+            .iter()
+            .filter_map(|p| match CanonicalJsonValue::try_from(p.clone()) {
+                Ok(CanonicalJsonValue::Object(o)) => Some(o),
+                _ => None,
+            })
+            .collect();
+        crate::keys::trust_event_servers(&state.key_cache, rooms, &pdu_objs).await;
     }
 
     let mut results = serde_json::Map::new();
