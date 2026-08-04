@@ -1989,6 +1989,95 @@ async fn v12_additional_creators_request_validation() {
     env.shutdown().await;
 }
 
+/// MSC4289: `POST /rooms/{id}/upgrade` may set the replacement room's creator
+/// set via `additional_creators`. The new create event carries it, and those
+/// creators (plus the upgrader) are removed from the replacement's power-level
+/// `users` map. Complement TestMSC4289PrivilegedRoomCreators_Upgrades.
+#[tokio::test]
+async fn v12_upgrade_sets_additional_creators() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let bob = format!("@bob:{SERVER}");
+    let charlie = format!("@charlie:{SERVER}");
+
+    // A v11 room with a PL users map listing alice, bob, charlie.
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({
+                "room_version": "11",
+                "preset": "public_chat",
+                "power_level_content_override": {
+                    "users": {format!("@alice:{SERVER}"): 100, bob.clone(): 100, charlie.clone(): 50}
+                },
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+
+    // Upgrade to v12, promoting bob to a creator.
+    let (status, up) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/upgrade"),
+            Some(&alice),
+            Some(json!({"new_version": "12", "additional_creators": [bob]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "upgrade: {up}");
+    let new_room = up["replacement_room"].as_str().unwrap().to_owned();
+    let nenc = new_room.replace('!', "%21").replace(':', "%3A");
+
+    // New create event carries additional_creators = [bob].
+    let (_s, create) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{nenc}/state/m.room.create/"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    let empty = vec![];
+    let creators: Vec<&str> = create["additional_creators"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        creators,
+        vec![bob.as_str()],
+        "new create additional_creators: {create}"
+    );
+
+    // New PL: creators (alice the upgrader + bob) removed; charlie:50 kept.
+    let (_s, pl) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{nenc}/state/m.room.power_levels/"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    let users = pl["users"].as_object().unwrap();
+    assert!(
+        !users.contains_key(format!("@alice:{SERVER}").as_str()),
+        "upgrader in PL: {pl}"
+    );
+    assert!(!users.contains_key(bob.as_str()), "creator bob in PL: {pl}");
+    assert_eq!(
+        users.get(charlie.as_str()).and_then(|v| v.as_i64()),
+        Some(50),
+        "charlie PL: {pl}"
+    );
+
+    env.shutdown().await;
+}
+
 /// Unknown endpoints 404 and wrong methods 405, both with an
 /// M_UNRECOGNIZED body (spec "API standards"; TestUnknownEndpoints).
 #[tokio::test]

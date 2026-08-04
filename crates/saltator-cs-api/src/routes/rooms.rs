@@ -763,10 +763,53 @@ pub async fn upgrade_room(
         crate::room_util::state_content_in(&state.rooms, &current, "m.room.create")?
             .and_then(|c| c.as_object().cloned())
             .unwrap_or_default();
-    // `additional_creators` is deliberately preserved across the upgrade
-    // (MSC4289): the new room keeps the same creator set.
     for server_managed in ["room_version", "creator", "predecessor"] {
         creation_content.remove(server_managed);
+    }
+    // MSC4289: an upgrade may (re)set the replacement room's creator set via an
+    // `additional_creators` field on the request — validated as a request like
+    // createRoom (400 on a malformed value). When present it replaces the value
+    // carried over from the old create event; absent, the old set is preserved.
+    // It applies only to privileged-creator targets (v12+); on older targets it
+    // has no meaning and is dropped.
+    let additional_creators: Vec<String> = if let Some(v) = body.get("additional_creators") {
+        let arr = v
+            .as_array()
+            .filter(|arr| {
+                arr.iter().all(|e| {
+                    e.as_str()
+                        .is_some_and(|s| ruma::OwnedUserId::try_from(s).is_ok())
+                })
+            })
+            .ok_or_else(|| {
+                ApiError::bad_json("additional_creators must be an array of user IDs")
+            })?;
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    } else {
+        creation_content
+            .get("additional_creators")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if version.privileged_creators() && !additional_creators.is_empty() {
+        creation_content.insert(
+            "additional_creators".into(),
+            serde_json::Value::Array(
+                additional_creators
+                    .iter()
+                    .map(|s| s.clone().into())
+                    .collect(),
+            ),
+        );
+    } else {
+        creation_content.remove("additional_creators");
     }
     let last_event = state
         .rooms
@@ -838,7 +881,12 @@ pub async fn upgrade_room(
                 .or_insert_with(|| serde_json::json!({}));
             if let Some(users) = users.as_object_mut() {
                 if version.privileged_creators() {
+                    // Creators (the upgrader + additional_creators) have infinite
+                    // power and MUST NOT appear in `users` (MSC4289).
                     users.remove(auth.user_id.as_str());
+                    for creator in &additional_creators {
+                        users.remove(creator);
+                    }
                 } else {
                     let current = users
                         .get(auth.user_id.as_str())
