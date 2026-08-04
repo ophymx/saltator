@@ -106,6 +106,11 @@ TestOutboundFederationSend
 TestRemoteAliasRequestsUnderstandUnicode
 TestRemotePresence
 TestRemoteTyping
+# 2026-08-04: GET /_matrix/client/v1/room_summary/{roomIdOrAlias} (MSC3266)
+# now serves a room summary carrying allowed_room_ids for restricted rooms
+# (and room version 8, which introduced restricted join rules, is now a
+# supported version). Local-package Complement test, so it gates here.
+TestRoomSummaryAllowedRoomIDs
 # Gated in anticipation of the ban-delivery fix: a leave/ban of a *remote*
 # user now also delivers to that user's server (which the ban removes from
 # current membership), so alice@hs1 sees her ban in a room hosted on hs2.
