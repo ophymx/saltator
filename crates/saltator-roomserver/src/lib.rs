@@ -400,14 +400,18 @@ impl RoomServer {
         room_id: &ruma::RoomId,
         sender: &UserId,
         target: &UserId,
+        mut content: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
         let _guard = self.lock_room(room_id.as_str()).await;
+        // `membership: invite` is authoritative; extra content (e.g. the
+        // `is_direct` flag) rides along on the invite member event.
+        content.insert("membership".to_owned(), "invite".into());
         let (raw, version) = self.build_local(
             room_id,
             sender,
             "m.room.member",
             Some(target.as_str()),
-            serde_json::json!({ "membership": "invite" }),
+            serde_json::Value::Object(content),
         )?;
         Ok((version, raw))
     }

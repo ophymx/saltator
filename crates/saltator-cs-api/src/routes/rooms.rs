@@ -342,17 +342,24 @@ pub async fn create_room(
         if req.is_direct {
             extra.insert("is_direct".to_owned(), true.into());
         }
-        // Best-effort: a bad invitee doesn't fail room creation.
-        let _ = send_membership_with(
-            &state,
-            &room_id,
-            &auth.user_id,
-            invitee,
-            "invite",
-            None,
-            extra,
-        )
-        .await;
+        // A remote invitee's home server must co-sign the invite over
+        // federation (spec "Inviting to a room": the request "must be made");
+        // authoring it locally would never reach them. Local invitees take the
+        // direct path. Best-effort: a bad invitee doesn't fail room creation.
+        if invitee.server_name() != state.config.server_name {
+            let _ = invite_remote(&state, &auth, &room_id, invitee, extra).await;
+        } else {
+            let _ = send_membership_with(
+                &state,
+                &room_id,
+                &auth.user_id,
+                invitee,
+                "invite",
+                None,
+                extra,
+            )
+            .await;
+        }
     }
 
     // 8. directory listing.
@@ -1194,7 +1201,14 @@ pub async fn invite_user(
     // A user on another server must co-sign their own invite over
     // federation before we can put it in the room.
     if invite.user_id.server_name() != state.config.server_name {
-        invite_remote(&state, &auth, &req.room_id, &invite.user_id).await?;
+        invite_remote(
+            &state,
+            &auth,
+            &req.room_id,
+            &invite.user_id,
+            serde_json::Map::new(),
+        )
+        .await?;
     } else {
         send_membership(
             &state,
@@ -1242,13 +1256,14 @@ async fn invite_remote(
     auth: &Auth,
     room_id: &RoomId,
     invitee: &UserId,
+    content: serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
     let Some(fed) = &state.federation else {
         return Err(ApiError::forbidden("Federation is not configured"));
     };
     let (version, event) = state
         .rooms
-        .build_invite(room_id, &auth.user_id, invitee)
+        .build_invite(room_id, &auth.user_id, invitee, content)
         .await
         .map_err(internal)?;
     let event_id = saltator_core::event::event_id(&event, version).map_err(internal)?;
