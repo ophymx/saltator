@@ -414,14 +414,21 @@ async fn apply_out_of_band_leave(state: &FedState, raw: &CanonicalJsonObject) ->
     if !is_local {
         return false;
     }
-    // Only act on a standing invite; ignore otherwise (we don't host the room).
-    let has_invite = users
+    // Only act on a standing invite, and only when the leave is sent by the
+    // *inviter*: we don't host the room and can't run the auth rules, so we
+    // honour a rescission only from the user who issued the invite (a
+    // non-inviter must not be able to revoke it — Complement's
+    // "Non-invitee user cannot rescind invite over federation").
+    let Some(entry) = users
         .store()
         .membership(target, room_id)
         .ok()
         .flatten()
-        .is_some_and(|e| e.membership == "invite");
-    if !has_invite {
+        .filter(|e| e.membership == "invite")
+    else {
+        return false;
+    };
+    if str_of("sender") != Some(entry.sender.as_str()) {
         return false;
     }
     users.record_remote_leave(target, room_id).await.is_ok()
