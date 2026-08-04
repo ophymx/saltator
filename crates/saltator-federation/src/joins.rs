@@ -410,45 +410,70 @@ pub async fn invite(
         ));
     }
 
+    // If we already host this room (the invitee was a member before), the
+    // invite belongs in the room's DAG: its `prev_events` order it after any
+    // prior membership — e.g. an unban that reached us as a room event — so the
+    // invitee's /sync stays consistent with the room. Ingest it through the
+    // normal PDU path (fetching missing prev events from the origin). Only a
+    // room we don't host is recorded as an out-of-band pending invite, whose
+    // stripped state `build_invited_room` reads from the user shard.
+    let hosted = state
+        .rooms
+        .as_ref()
+        .and_then(|r| r.store().meta(_room_id.as_str()).ok().flatten())
+        .is_some();
+    let mut ingested = false;
+    if hosted {
+        let value = serde_json::Value::from(CanonicalJsonValue::Object(signed.clone()));
+        let (_, result) = crate::transactions::process_pdu(&state, &auth.origin, value).await;
+        ingested = result.get("error").is_none();
+        if !ingested {
+            tracing::warn!(room_id = %_room_id, ?result,
+                "invite: could not ingest into hosted room; recording out-of-band");
+        }
+    }
+
     // Record the pending invite (with its stripped state) so the invited
     // user sees it in /sync. The invite member event itself is included.
-    if let Some(users) = &state.users {
-        let mut stripped: Vec<Vec<u8>> = Vec::new();
-        if let Some(serde_json::Value::Array(items)) = body.get("invite_room_state") {
-            for item in items {
-                if let Ok(bytes) = serde_json::to_vec(item) {
-                    stripped.push(bytes);
+    if !ingested {
+        if let Some(users) = &state.users {
+            let mut stripped: Vec<Vec<u8>> = Vec::new();
+            if let Some(serde_json::Value::Array(items)) = body.get("invite_room_state") {
+                for item in items {
+                    if let Ok(bytes) = serde_json::to_vec(item) {
+                        stripped.push(bytes);
+                    }
                 }
             }
-        }
-        // Include the (stripped) invite membership event.
-        let member_stripped = serde_json::json!({
-            "type": "m.room.member",
-            "state_key": state_key.as_str(),
-            "sender": sender.as_str(),
-            "content": signed.get("content").map(|c| serde_json::Value::from(c.clone())),
-        });
-        if let Ok(bytes) = serde_json::to_vec(&member_stripped) {
-            stripped.push(bytes);
-        }
-        let event_id = saltator_core::event::event_id(&signed, version)
-            .map(|id| id.to_string())
-            .unwrap_or_default();
-        if let Err(e) = users
-            .record_remote_invite(
-                invitee.as_str(),
-                _room_id.as_str(),
-                &sender,
-                &event_id,
-                stripped,
-            )
-            .await
-        {
-            return Err(err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            ));
+            // Include the (stripped) invite membership event.
+            let member_stripped = serde_json::json!({
+                "type": "m.room.member",
+                "state_key": state_key.as_str(),
+                "sender": sender.as_str(),
+                "content": signed.get("content").map(|c| serde_json::Value::from(c.clone())),
+            });
+            if let Ok(bytes) = serde_json::to_vec(&member_stripped) {
+                stripped.push(bytes);
+            }
+            let event_id = saltator_core::event::event_id(&signed, version)
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+            if let Err(e) = users
+                .record_remote_invite(
+                    invitee.as_str(),
+                    _room_id.as_str(),
+                    &sender,
+                    &event_id,
+                    stripped,
+                )
+                .await
+            {
+                return Err(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "M_UNKNOWN",
+                    &e.to_string(),
+                ));
+            }
         }
     }
 

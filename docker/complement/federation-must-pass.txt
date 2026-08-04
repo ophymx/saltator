@@ -88,6 +88,10 @@ TestOutboundFederationSend
 TestRemoteAliasRequestsUnderstandUnicode
 TestRemotePresence
 TestRemoteTyping
+# Gated in anticipation of the ban-delivery fix: a leave/ban of a *remote*
+# user now also delivers to that user's server (which the ban removes from
+# current membership), so alice@hs1 sees her ban in a room hosted on hs2.
+TestUnbanViaInvite
 TestUnknownEndpoints
 TestUserAppearsInChangedDeviceListOnJoinOverFederation
 TestWriteMDirectAccountData

@@ -5011,6 +5011,232 @@ async fn client_joins_a_remote_room_via_federation() {
     a_rooms.shutdown().await.unwrap();
 }
 
+/// A federated ban of a local user must surface in that user's `/sync` in the
+/// `leave` section — and must never leak into `join`. This guards a cross-shard
+/// consistency bug behind Complement's TestUnbanViaInvite: the membership index
+/// (user shard) is a projection of the room shard and trails it, so a sync that
+/// reads a stale "join" membership while the room-shard timeline already holds
+/// the ban would classify the room as joined (ban in its timeline) and only
+/// later move it to an empty `leave`, so the transition is never observed in
+/// `leave`. hs2 hosts, alice@hs1 remote-joins, bob bans her.
+#[tokio::test]
+async fn federated_ban_of_local_user_surfaces_in_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let pct = |s: &str| -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    };
+
+    // --- hs2 hosts a public room; bob is the creator (power 100). ---
+    let (hs2_rooms, hs2_signer) = start_fed_rooms("hs2", dir.path()).await;
+    let bob = ruma::OwnedUserId::try_from("@bob:hs2").unwrap();
+    let (room_id, _) = hs2_rooms
+        .create_room(
+            &bob,
+            saltator_core::RoomVersion::V11,
+            serde_json::Map::new(),
+        )
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        ("m.room.member", bob.as_str(), json!({"membership": "join"})),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {bob.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        hs2_rooms
+            .send_state(&room_id, &bob, ty, sk, content)
+            .await
+            .unwrap();
+    }
+
+    // --- hs1: rooms + users + membership projection (alice's home server). ---
+    let hs1_dir = dir.path().join("hs1full");
+    std::fs::create_dir_all(&hs1_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&hs1_dir.join("db")).unwrap());
+    let hs1_name = ruma::OwnedServerName::try_from("hs1").unwrap();
+    let (hs1_signer, _) =
+        saltator_roomserver::ServerSigner::generate(hs1_name.clone(), "1".to_owned());
+    let hs1_signer = Arc::new(hs1_signer);
+    let hs1_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        hs1_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let hs1_users = UserServer::start(
+        1,
+        engine,
+        hs1_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [hs1_rooms.shard_handle(), hs1_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let proj = spawn_membership_projection(hs1_users.clone(), hs1_rooms.clone());
+
+    // Separate key servers break the mutual auth dependency.
+    let hs1_key_base = spawn_fed("hs1", hs1_signer.clone(), None, None).await;
+    let hs2_key_base = spawn_fed("hs2", hs2_signer.clone(), None, None).await;
+    let hs2_fed_base = spawn_fed(
+        "hs2",
+        hs2_signer.clone(),
+        Some(hs2_rooms.clone()),
+        Some(hs1_key_base),
+    )
+    .await;
+    let hs1_fed_base = spawn_fed(
+        "hs1",
+        hs1_signer.clone(),
+        Some(hs1_rooms.clone()),
+        Some(hs2_key_base),
+    )
+    .await;
+
+    // --- hs1's CS stack (alice), federating to hs2. ---
+    let media = MediaStore::open(hs1_dir.join("media")).unwrap();
+    let cs = CsState::new(
+        hs1_users.clone(),
+        hs1_rooms.clone(),
+        media,
+        CsConfig {
+            server_name: hs1_name,
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(
+            hs1_signer.clone(),
+            hs2_fed_base.clone(),
+        )),
+        hs1_signer.clone(),
+        Arc::new(KeyCache::with_base_url(hs2_fed_base.clone())),
+    );
+    let hs1_router = saltator_cs_api::router(cs);
+
+    // alice registers and joins the remote room via hs2, then syncs to obtain
+    // a baseline token from *before* the ban.
+    let alice_tok = reg(&hs1_router, "alice").await;
+    let (status, body) = oneshot(
+        &hs1_router,
+        "POST",
+        &format!(
+            "/_matrix/client/v3/rooms/{}/join?server_name=hs2",
+            pct(room_id.as_str())
+        ),
+        Some(&alice_tok),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remote join failed: {body}");
+    let (_s, sync0) = oneshot(
+        &hs1_router,
+        "GET",
+        "/_matrix/client/v3/sync",
+        Some(&alice_tok),
+        None,
+    )
+    .await;
+    assert!(
+        sync0["rooms"]["join"].get(room_id.as_str()).is_some(),
+        "alice not joined after remote join: {sync0}"
+    );
+    let since = sync0["next_batch"].as_str().unwrap().to_owned();
+
+    // hs2's real outbound sender, aimed at hs1.
+    let hs2_sender = saltator_federation::spawn_sender(
+        hs2_rooms.clone(),
+        Arc::new(FederationClient::with_base_url(
+            hs2_signer.clone(),
+            hs1_fed_base.clone(),
+        )),
+        ruma::OwnedServerName::try_from("hs2").unwrap(),
+    );
+
+    // bob bans alice; the sender delivers the ban to hs1.
+    let alice_uid = "@alice:hs1";
+    let out = hs2_rooms
+        .send_state(
+            &room_id,
+            &bob,
+            "m.room.member",
+            alice_uid,
+            json!({"membership": "ban"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(out, saltator_roomserver::Outcome::Accepted { .. }),
+        "ban not accepted on the host: {out:?}"
+    );
+
+    // Incremental syncs from the pre-ban token: the ban must appear in `leave`
+    // and must NEVER appear in `join` (the projection-lag classification bug).
+    let has_ban = |section: &Value| {
+        section["events"].as_array().is_some_and(|es| {
+            es.iter().any(|e| {
+                e["type"] == "m.room.member"
+                    && e["state_key"] == alice_uid
+                    && e["content"]["membership"] == "ban"
+            })
+        })
+    };
+    let mut seen_in_leave = false;
+    for _ in 0..100 {
+        let (_s, sync) = oneshot(
+            &hs1_router,
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={since}"),
+            Some(&alice_tok),
+            None,
+        )
+        .await;
+        let join = &sync["rooms"]["join"][room_id.as_str()];
+        assert!(
+            !has_ban(&join["timeline"]) && !has_ban(&join["state"]),
+            "ban leaked into the JOIN section (sync read a stale membership): {sync}"
+        );
+        let leave = &sync["rooms"]["leave"][room_id.as_str()];
+        if has_ban(&leave["timeline"]) || has_ban(&leave["state"]) {
+            seen_in_leave = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        seen_in_leave,
+        "alice never saw her federated ban in the /sync leave section"
+    );
+
+    hs2_sender.abort();
+    proj.abort();
+    hs1_rooms.shutdown().await.unwrap();
+    hs1_users.shutdown().await.unwrap();
+    hs2_rooms.shutdown().await.unwrap();
+}
+
 /// Joining by a *remote* alias: B resolves `#flibble:a.test` through A's
 /// federation `/query/directory`, then joins the room it names — the
 /// join-by-alias half of Complement's TestOutboundFederationSend.

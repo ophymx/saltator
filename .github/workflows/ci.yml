@@ -63,6 +63,11 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: tests
+        # ~1.75x the step's average runtime (~4 min as of 2026-08-04), so a
+        # hung test (e.g. a multi-node Raft/gRPC deadlock under a constrained
+        # runner) fails fast instead of stalling the job for hours. Bump this
+        # as the suite grows.
+        timeout-minutes: 7
         run: cargo test --workspace
 
   cluster-smoke:

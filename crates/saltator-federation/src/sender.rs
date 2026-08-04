@@ -147,6 +147,35 @@ async fn deliver(
     if let Some(origin) = sender_server.as_deref() {
         destinations.retain(|d| d.as_str() != origin);
     }
+    // A membership event that removes a *remote* user (leave/ban/kick) must
+    // also reach that user's server: as of this event that server has a user
+    // in the room and is a recipient (spec: PDUs are broadcast to servers that
+    // have joined the room), yet after it the user is gone. `remote_servers_
+    // in_room` only lists currently-joined servers, so it drops the very server
+    // being removed — leaving it to believe the user is still joined forever.
+    // Skip a self-leave/reject (target == the event's own origin): that server
+    // authored the event and already has it.
+    if raw.get("type").and_then(|t| t.as_str()) == Some("m.room.member") {
+        let membership = raw
+            .get("content")
+            .and_then(|c| c.get("membership"))
+            .and_then(|m| m.as_str());
+        if matches!(membership, Some("leave" | "ban")) {
+            if let Some(target) = raw
+                .get("state_key")
+                .and_then(|s| s.as_str())
+                .and_then(|s| ruma::UserId::parse(s).ok())
+            {
+                let target_server = target.server_name().as_str();
+                if target_server != server_name.as_str()
+                    && Some(target_server) != sender_server.as_deref()
+                    && !destinations.iter().any(|d| d == target_server)
+                {
+                    destinations.push(target_server.to_owned());
+                }
+            }
+        }
+    }
     if destinations.is_empty() {
         return;
     }

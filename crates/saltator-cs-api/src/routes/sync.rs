@@ -144,8 +144,25 @@ pub async fn sync_events(
     let mut presence_rx = state.presence.subscribe();
 
     loop {
+        let room_seq = state.rooms.shard_handle().seq().map_err(internal)?;
+        // The membership index (user shard) is a projection of the room shard
+        // and trails it. Classifying rooms into join/leave/invite from a stale
+        // membership while showing the room-shard timeline up to `room_seq`
+        // would be inconsistent: a room whose newest timeline event changes the
+        // caller's own membership — e.g. a federated ban — would still be read
+        // as "join" (with the ban sitting in its timeline) until the projection
+        // catches up, and by then the event has left the incremental window,
+        // so the room lands in `leave` empty and the transition is never seen.
+        // Wait for the projection to reach `room_seq` first (usually already
+        // there — a no-op), then read the user position after it.
+        if let Err(e) =
+            saltator_userserver::wait_for_projection(&state.users, room_seq, Duration::from_secs(5))
+                .await
+        {
+            tracing::warn!(error = %e, "sync: membership projection lagging; proceeding with stale view");
+        }
         let now_pos = SyncPos {
-            room: state.rooms.shard_handle().seq().map_err(internal)?,
+            room: room_seq,
             user: state.users.shard_handle().seq().map_err(internal)?,
             typing: state.typing.generation(),
             presence: state.presence.generation(),
