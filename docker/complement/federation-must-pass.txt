@@ -53,6 +53,16 @@
 # Works for both the per-push (-skip deferred buckets) and the weekly
 # unfiltered run: none of these live in a skipped bucket, and none is in
 # the deferred set, so the gate behaves identically for both.
+#
+# 2026-08-04: Spaces summary (MSC2946). The CS GET /rooms/{roomId}/hierarchy
+# endpoint walks m.space.child links depth-first, and its federation twin
+# GET /_matrix/federation/v1/hierarchy/{roomId} lets a tree spanning servers
+# be returned whole. Gated in anticipation of the fix: the walk, visibility,
+# ordering, pagination, and the cross-server leg are locally tested (cs_api
+# spaces_hierarchy_walks_the_tree + spaces_hierarchy_spans_federation), so
+# these make CI the merge gate. TestFederatedClientSpaces is the two-server
+# leaf; if it fails while the CS-local pair passes, the remote-fallback fetch
+# or the federation endpoint's peekable filter is the place to look.
 
 TestACLs
 TestACLsForEDUs
@@ -61,8 +71,11 @@ TestCannotSendNonJoinViaSendJoinV1
 TestCannotSendNonJoinViaSendJoinV2
 TestCannotSendNonLeaveViaSendLeaveV1
 TestCannotSendNonLeaveViaSendLeaveV2
+TestClientSpacesSummary
+TestClientSpacesSummaryJoinRules
 TestContentMediaV1
 TestEventAuth
+TestFederatedClientSpaces
 TestFederationRoomsInvite
 TestFederationThumbnail
 TestGetMissingEventsGapFilling
