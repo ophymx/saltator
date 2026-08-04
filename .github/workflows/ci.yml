@@ -46,9 +46,9 @@ jobs:
       # rate limits), so steady-state this is seconds; the consumers only
       # `docker load` the ~40 MB tarball.
       - run: cp target/release/saltator docker/complement/saltator
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build Complement image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: docker/complement
           tags: complement-saltator:latest
