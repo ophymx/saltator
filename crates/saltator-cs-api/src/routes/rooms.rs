@@ -176,13 +176,29 @@ pub async fn create_room(
     } else {
         serde_json::json!({})
     };
+    // Inviting requires moderator power (50) by default — matching Synapse's
+    // generated createRoom power levels — EXCEPT the private-chat presets,
+    // which override it to 0 so any member can invite. (The bare spec default
+    // for an absent `invite` key is 0, but the generated event spells it out,
+    // and Complement asserts both: TestRestrictedRoomsRemoteJoinLocalUser
+    // expects a member's invite to a public_chat room to be 403, while
+    // TestFederationRoomsInvite expects a member's invite to a private_chat
+    // room to succeed.)
+    let invite_level = if matches!(
+        preset,
+        RoomPreset::PrivateChat | RoomPreset::TrustedPrivateChat
+    ) {
+        0
+    } else {
+        50
+    };
     // Spell out the spec defaults: clients (and Complement) expect the
     // created power-level event to be complete, not sparse.
     let mut pl_content: serde_json::Value = serde_json::json!({
         "ban": 50,
         "events": events,
         "events_default": 0,
-        "invite": 0,
+        "invite": invite_level,
         "kick": 50,
         "notifications": { "room": 50 },
         "redact": 50,
