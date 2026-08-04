@@ -210,6 +210,14 @@ pub fn client_event(
                 .resolve_group(room_id, stored.state_group_after)
                 .map_err(ApiError::internal)?;
             let membership = membership_in(rooms, &state_at, as_user)?;
+            // For a state event, `prev_content`/`prev_sender` describe the state
+            // it replaced (spec: UnsignedData; for membership, the previous
+            // transition). Absent for the first entry of a state key.
+            let prev = if raw.contains_key("state_key") {
+                rooms.prev_state_content(event_id).ok().flatten()
+            } else {
+                None
+            };
             let unsigned = ev
                 .as_object_mut()
                 .expect("client event is an object")
@@ -217,6 +225,10 @@ pub fn client_event(
                 .or_insert_with(|| serde_json::Value::Object(Default::default()));
             if let Some(u) = unsigned.as_object_mut() {
                 u.insert("membership".to_owned(), membership.into());
+                if let Some((prev_content, prev_sender)) = prev {
+                    u.insert("prev_content".to_owned(), prev_content);
+                    u.insert("prev_sender".to_owned(), prev_sender.into());
+                }
             }
         }
     }

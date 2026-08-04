@@ -205,6 +205,57 @@ impl RoomServer {
     /// Server names (other than `exclude`) of users currently joined to
     /// `room_id` — the destinations an outbound event must reach. Empty if
     /// the room is unknown.
+    /// The `content` and `sender` of the state event that `event_id` replaced
+    /// for its own `(type, state_key)` — i.e. `unsigned.prev_content` /
+    /// `unsigned.prev_sender`. Found via the event's `auth_events`, which for a
+    /// membership event include the target's prior membership (so a join's
+    /// previous invite is available even in an imported room). `None` for a
+    /// non-state event or when there is no prior entry.
+    pub fn prev_state_content(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<(serde_json::Value, String)>> {
+        let store = self.store();
+        let Some(stored) = store.event(event_id).map_err(storage_err)? else {
+            return Ok(None);
+        };
+        let raw: serde_json::Value =
+            serde_json::from_slice(&stored.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
+        let (Some(etype), Some(skey)) = (
+            raw.get("type").and_then(|v| v.as_str()),
+            raw.get("state_key").and_then(|v| v.as_str()),
+        ) else {
+            return Ok(None);
+        };
+        let auth_ids: Vec<&str> = raw
+            .get("auth_events")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for auth_id in auth_ids {
+            let Some(ae) = store.event(auth_id).map_err(storage_err)? else {
+                continue;
+            };
+            let aev: serde_json::Value =
+                serde_json::from_slice(&ae.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
+            if aev.get("type").and_then(|v| v.as_str()) == Some(etype)
+                && aev.get("state_key").and_then(|v| v.as_str()) == Some(skey)
+            {
+                let content = aev
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let sender = aev
+                    .get("sender")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                return Ok(Some((content, sender)));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn remote_servers_in_room(&self, room_id: &str, exclude: &str) -> Result<Vec<String>> {
         let store = self.store();
         let Some(meta) = store
@@ -400,14 +451,18 @@ impl RoomServer {
         room_id: &ruma::RoomId,
         sender: &UserId,
         target: &UserId,
+        mut content: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
         let _guard = self.lock_room(room_id.as_str()).await;
+        // `membership: invite` is authoritative; extra content (e.g. the
+        // `is_direct` flag) rides along on the invite member event.
+        content.insert("membership".to_owned(), "invite".into());
         let (raw, version) = self.build_local(
             room_id,
             sender,
             "m.room.member",
             Some(target.as_str()),
-            serde_json::json!({ "membership": "invite" }),
+            serde_json::Value::Object(content),
         )?;
         Ok((version, raw))
     }

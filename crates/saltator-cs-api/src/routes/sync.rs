@@ -896,6 +896,24 @@ fn build_left_room(
     let store = rooms.store();
     let mut out = v3::LeftRoom::new();
     let Some(meta) = store.meta(room_id).map_err(internal)? else {
+        // A room we don't host that the caller left/was removed from — e.g.
+        // rejecting a remote invite, or having one rescinded. We hold no room
+        // DAG, so synthesize the caller's leave member event so their client
+        // still observes the transition (the invite is gone from invite_state).
+        if matches!(membership.membership.as_str(), "leave" | "ban") {
+            let ev = serde_json::json!({
+                "type": "m.room.member",
+                "state_key": auth.user_id.as_str(),
+                "sender": membership.sender,
+                "content": { "membership": membership.membership },
+                "event_id": membership.event_id,
+                "room_id": room_id,
+                "origin_server_ts": 0,
+            });
+            if let Ok(raw) = to_raw(&ev) {
+                out.timeline.events.push(raw);
+            }
+        }
         return Ok(out);
     };
     let version = RoomVersion::parse(&meta.version).map_err(internal)?;

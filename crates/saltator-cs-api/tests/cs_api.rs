@@ -2454,6 +2454,47 @@ async fn is_direct_invite_carries_flag() {
         "invite must carry is_direct: {invite}"
     );
 
+    // After bob joins, his join event carries the invite as prev_content
+    // (with is_direct) and the inviter as prev_sender (spec: UnsignedData).
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+    let (status, _) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/join/{enc}"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let sync = env
+        .sync_until(&bob, |b| b["rooms"]["join"].get(&room_id).is_some())
+        .await;
+    let join = sync["rooms"]["join"][&room_id]["timeline"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["type"] == "m.room.member"
+                && e["state_key"] == bob_id
+                && e["content"]["membership"] == "join"
+        })
+        .expect("bob's join event in timeline");
+    assert_eq!(
+        join["unsigned"]["prev_content"]["membership"],
+        json!("invite"),
+        "prev_content.membership: {join}"
+    );
+    assert_eq!(
+        join["unsigned"]["prev_content"]["is_direct"],
+        json!(true),
+        "prev_content.is_direct: {join}"
+    );
+    assert_eq!(
+        join["unsigned"]["prev_sender"],
+        json!(format!("@alice:{SERVER}")),
+        "prev_sender: {join}"
+    );
+
     env.shutdown().await;
 }
 
@@ -7078,39 +7119,27 @@ async fn outbound_federated_invite_round_trip() {
     // bob registers on B.
     let bob = reg(&b_router, "bob").await;
 
-    // alice registers on A, creates a room, and invites @bob:b.test.
+    // alice registers on A and creates a room that invites @bob:b.test at
+    // creation. bob is remote, so the invite must be co-signed via /invite
+    // (spec "Inviting to a room"), carrying the room's stripped state — a local
+    // member write would never reach him.
     let alice = reg(&a_router, "alice").await;
     let (status, room) = oneshot(
         &a_router,
         "POST",
         "/_matrix/client/v3/createRoom",
         Some(&alice),
-        Some(json!({"preset":"private_chat"})),
+        Some(json!({
+            "preset": "private_chat",
+            "name": "Invites room",
+            "invite": ["@bob:b.test"],
+        })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{room}");
     let room_id = room["room_id"].as_str().unwrap().to_owned();
-    let enc: String = room_id
-        .bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect();
-    let (status, body) = oneshot(
-        &a_router,
-        "POST",
-        &format!("/_matrix/client/v3/rooms/{enc}/invite"),
-        Some(&alice),
-        Some(json!({"user_id":"@bob:b.test"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "invite failed: {body}");
 
-    // bob on B sees the invite.
+    // bob on B sees the invite, with the room's metadata in invite_state.
     let (status, sync) = oneshot(
         &b_router,
         "GET",
@@ -7120,9 +7149,20 @@ async fn outbound_federated_invite_round_trip() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let inv = sync["rooms"]["invite"].get(&room_id);
+    assert!(inv.is_some(), "invite missing from bob's sync: {sync}");
+    let events = inv.unwrap()["invite_state"]["events"]
+        .as_array()
+        .expect("invite_state events");
     assert!(
-        sync["rooms"]["invite"].get(&room_id).is_some(),
-        "invite missing from bob's sync: {sync}"
+        events.iter().any(|e| e["type"] == "m.room.create"),
+        "invite_state missing m.room.create: {sync}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "m.room.name" && e["content"]["name"] == "Invites room"),
+        "invite_state missing room name: {sync}"
     );
 
     a_proj.abort();
