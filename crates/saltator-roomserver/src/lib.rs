@@ -32,12 +32,15 @@ use std::sync::Arc;
 
 use openraft::network::RaftNetworkFactory;
 use ruma::signatures::PublicKeyMap;
-use ruma::{CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedEventId, OwnedRoomId, UserId};
+use ruma::{
+    CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedEventId, OwnedRoomId, OwnedUserId,
+    UserId,
+};
 use tokio::sync::{broadcast, Mutex, OwnedMutexGuard};
 
 use saltator_core::auth::{self, AuthEntry, StateMap};
 use saltator_core::event::{self, EventFormatError, IdentifiedPdu, Pdu};
-use saltator_core::power_levels::RoomPowerLevels;
+use saltator_core::power_levels::{PowerLevel, RoomPowerLevels};
 use saltator_core::room_version::UnsupportedRoomVersion;
 use saltator_core::state_res::{self, StateIds, StateResError};
 use saltator_core::validation::{self, ValidationError, VerificationError, VerifyOutcome};
@@ -78,12 +81,30 @@ pub enum RoomError {
     Sign(#[from] SignError),
     #[error("malformed event: {0}")]
     Malformed(String),
+    /// A restricted / `knock_restricted` join could not be authorised by
+    /// this server. The federation layer maps the variant to the spec
+    /// errcode (`M_FORBIDDEN` / `M_UNABLE_TO_AUTHORISE_JOIN` /
+    /// `M_UNABLE_TO_GRANT_JOIN`).
+    #[error("restricted join not authorised: {0:?}")]
+    CannotAuthoriseJoin(RestrictedDenial),
     #[error("shard: {0}")]
     Shard(#[from] saltator_shard::ShardError),
     #[error("storage: {0}")]
     Storage(String),
     #[error("codec: {0}")]
     Codec(String),
+}
+
+/// Why a restricted join couldn't be authorised — chooses the federation
+/// errcode (see [`RestrictedAuth`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestrictedDenial {
+    /// Fails all conditions → `403 M_FORBIDDEN`.
+    Forbidden,
+    /// Conditions un-evaluable here → `400 M_UNABLE_TO_AUTHORISE_JOIN`.
+    CannotValidate,
+    /// Condition met but no local authoriser → `400 M_UNABLE_TO_GRANT_JOIN`.
+    CannotGrant,
 }
 
 type Result<T> = std::result::Result<T, RoomError>;
@@ -132,6 +153,29 @@ pub struct SendJoinResult {
 /// user while the knock is pending.
 pub struct SendKnockResult {
     pub knock_room_state: Vec<serde_json::Value>,
+}
+
+/// Whether — and how — a restricted / `knock_restricted` join can be
+/// authorised from this server's view of the room (MSC3083/MSC3787). Only
+/// the authorising *decision*; the auth rules validate the resulting event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestrictedAuth {
+    /// The room is not restricted, or the joiner is already joined/invited —
+    /// build a plain join with no `join_authorised_via_users_server`.
+    NotNeeded,
+    /// The joiner meets an allow condition; stamp this local user (a joined
+    /// member with invite power) as the authorising user.
+    Authorised(OwnedUserId),
+    /// The joiner meets none of the allow conditions we can fully evaluate
+    /// → `403 M_FORBIDDEN` (fails all conditions).
+    FailsConditions,
+    /// An allow condition names a room we hold no state for, so we cannot
+    /// tell → `400 M_UNABLE_TO_AUTHORISE_JOIN` (the caller should fail over
+    /// to another resident).
+    CannotValidate,
+    /// A condition is met, but no local member can invite → `400
+    /// M_UNABLE_TO_GRANT_JOIN` (the caller should fail over).
+    CannotGrant,
 }
 
 /// Stripped-state event types served on a knock (mirrors invite stripped
@@ -496,7 +540,27 @@ impl RoomServer {
         room_id: &ruma::RoomId,
         user_id: &UserId,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
-        self.make_membership_template(room_id, user_id, "join")
+        // A restricted / knock_restricted room needs an authorising local
+        // user stamped into the template; a non-restricted room yields
+        // `NotNeeded`. Denials become the spec errcodes at the fed layer.
+        let authoriser = match self.restricted_join_authoriser(room_id, user_id)? {
+            RestrictedAuth::NotNeeded => None,
+            RestrictedAuth::Authorised(u) => Some(u),
+            RestrictedAuth::FailsConditions => {
+                return Err(RoomError::CannotAuthoriseJoin(RestrictedDenial::Forbidden))
+            }
+            RestrictedAuth::CannotValidate => {
+                return Err(RoomError::CannotAuthoriseJoin(
+                    RestrictedDenial::CannotValidate,
+                ))
+            }
+            RestrictedAuth::CannotGrant => {
+                return Err(RoomError::CannotAuthoriseJoin(
+                    RestrictedDenial::CannotGrant,
+                ))
+            }
+        };
+        self.make_membership_template(room_id, user_id, "join", authoriser.as_deref())
     }
 
     /// Build an unsigned `m.room.member` leave template — the `GET
@@ -507,7 +571,7 @@ impl RoomServer {
         room_id: &ruma::RoomId,
         user_id: &UserId,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
-        self.make_membership_template(room_id, user_id, "leave")
+        self.make_membership_template(room_id, user_id, "leave", None)
     }
 
     /// Build an unsigned `m.room.member` knock template — the `GET
@@ -518,7 +582,159 @@ impl RoomServer {
         room_id: &ruma::RoomId,
         user_id: &UserId,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
-        self.make_membership_template(room_id, user_id, "knock")
+        self.make_membership_template(room_id, user_id, "knock", None)
+    }
+
+    /// Decide whether `joiner` may join the restricted / `knock_restricted`
+    /// room `room_id`, and if so which local user authorises it
+    /// (MSC3083/MSC3787). Returns [`RestrictedAuth::NotNeeded`] for any room
+    /// whose join rule is not restricted (so callers can invoke it
+    /// unconditionally). This is only the authorising decision — the auth
+    /// rules independently validate the resulting event.
+    pub fn restricted_join_authoriser(
+        &self,
+        room_id: &ruma::RoomId,
+        joiner: &UserId,
+    ) -> Result<RestrictedAuth> {
+        let store = self.store();
+        let Some(meta) = store.meta(room_id.as_str()).map_err(storage_err)? else {
+            // We don't hold the room — nothing to authorise locally.
+            return Ok(RestrictedAuth::NotNeeded);
+        };
+        let version = RoomVersion::parse(&meta.version)?;
+        let state = store
+            .resolve_group(room_id.as_str(), meta.current_group)
+            .map_err(storage_err)?;
+
+        let content_of = |ty: &str, sk: &str| -> Result<Option<CanonicalJsonObject>> {
+            let Some(event_id) = state.get(&(ty.to_owned(), sk.to_owned())) else {
+                return Ok(None);
+            };
+            let Some(obj) = self.load_raw(&store, event_id)? else {
+                return Ok(None);
+            };
+            Ok(Some(obj))
+        };
+        let membership_of = |st: &std::collections::BTreeMap<(String, String), String>,
+                             user: &str|
+         -> Result<String> {
+            let Some(event_id) = st.get(&("m.room.member".to_owned(), user.to_owned())) else {
+                return Ok("leave".to_owned());
+            };
+            let Some(obj) = self.load_raw(&store, event_id)? else {
+                return Ok("leave".to_owned());
+            };
+            Ok(obj
+                .get("content")
+                .and_then(|c| c.as_object())
+                .and_then(|c| c.get("membership"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("leave")
+                .to_owned())
+        };
+
+        // Join rule + allow list (both live in the join_rules event content).
+        let join_rules_ev = content_of("m.room.join_rules", "")?;
+        let jr_content = join_rules_ev
+            .as_ref()
+            .and_then(|e| e.get("content"))
+            .and_then(|c| c.as_object());
+        let join_rule = jr_content
+            .and_then(|c| c.get("join_rule"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("invite");
+        if !matches!(join_rule, "restricted" | "knock_restricted") {
+            return Ok(RestrictedAuth::NotNeeded);
+        }
+
+        // An already-joined or -invited user needs no authoriser (auth rule
+        // 5.3.5.1 allows the join outright).
+        if matches!(
+            membership_of(&state, joiner.as_str())?.as_str(),
+            "join" | "invite"
+        ) {
+            return Ok(RestrictedAuth::NotNeeded);
+        }
+
+        // Evaluate the `allow` conditions.
+        let entries = match jr_content.and_then(|c| c.get("allow")) {
+            Some(CanonicalJsonValue::Array(a)) => a.clone(),
+            // Malformed / missing `allow` degrades to invite-only.
+            _ => return Ok(RestrictedAuth::FailsConditions),
+        };
+        let mut condition_met = false;
+        let mut uncheckable = false;
+        for entry in &entries {
+            let CanonicalJsonValue::Object(o) = entry else {
+                continue;
+            };
+            if o.get("type").and_then(|v| v.as_str()) != Some("m.room_membership") {
+                continue;
+            }
+            let Some(allowed_room) = o.get("room_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            match store.meta(allowed_room).map_err(storage_err)? {
+                None => uncheckable = true,
+                Some(m2) => {
+                    let s2 = store
+                        .resolve_group(allowed_room, m2.current_group)
+                        .map_err(storage_err)?;
+                    if membership_of(&s2, joiner.as_str())? == "join" {
+                        condition_met = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !condition_met {
+            return Ok(if uncheckable {
+                RestrictedAuth::CannotValidate
+            } else {
+                RestrictedAuth::FailsConditions
+            });
+        }
+
+        // A condition is met — pick a local member with invite power to be
+        // the authorising user. Any powered local member works (MSC3083 does
+        // not require a room *creator*); prefer the highest power for a
+        // stable, unambiguous choice.
+        let Some(create_raw) = content_of("m.room.create", "")? else {
+            return Err(RoomError::Malformed("room has no create event".into()));
+        };
+        let create = IdentifiedPdu::from_canonical(&create_raw, version)
+            .map_err(|e| RoomError::Malformed(e.to_string()))?;
+        let pl = content_of("m.room.power_levels", "")?
+            .map(|raw| IdentifiedPdu::from_canonical(&raw, version))
+            .transpose()
+            .map_err(|e| RoomError::Malformed(e.to_string()))?;
+        let power = RoomPowerLevels::resolve(version, &create, pl.as_ref())
+            .map_err(|e| RoomError::Malformed(e.to_string()))?;
+
+        let our_name = self.signer.server_name();
+        let mut best: Option<(OwnedUserId, PowerLevel)> = None;
+        for (ty, sk) in state.keys() {
+            if ty != "m.room.member" {
+                continue;
+            }
+            let Ok(uid) = OwnedUserId::try_from(sk.clone()) else {
+                continue;
+            };
+            if uid.server_name() != our_name {
+                continue;
+            }
+            if membership_of(&state, sk)? != "join" {
+                continue;
+            }
+            let level = power.user(&uid);
+            if level.satisfies(power.invite) && best.as_ref().is_none_or(|(_, b)| level > *b) {
+                best = Some((uid, level));
+            }
+        }
+        Ok(match best {
+            Some((u, _)) => RestrictedAuth::Authorised(u),
+            None => RestrictedAuth::CannotGrant,
+        })
     }
 
     fn make_membership_template(
@@ -526,6 +742,7 @@ impl RoomServer {
         room_id: &ruma::RoomId,
         user_id: &UserId,
         membership: &str,
+        authoriser: Option<&UserId>,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
         let store = self.store();
         let meta = store
@@ -546,7 +763,13 @@ impl RoomServer {
             depth = depth.max(prev.depth);
         }
 
-        let content = serde_json::json!({ "membership": membership });
+        let mut content = serde_json::json!({ "membership": membership });
+        // A restricted join names the authorising user; stamping it before
+        // `auth_types_for_event` ensures that user's membership is pulled
+        // into `auth_events` (so the auth check can verify their power).
+        if let Some(authoriser) = authoriser {
+            content["join_authorised_via_users_server"] = authoriser.as_str().into();
+        }
         let content_obj = canonicalize(content)?;
         let auth_types = auth::auth_types_for_event(
             version,
@@ -728,6 +951,17 @@ impl RoomServer {
     /// co-signed by us. The caller must have trusted the origin's keys.
     pub async fn send_join(&self, raw: CanonicalJsonObject) -> Result<SendJoinResult> {
         let (version, room_id, _is_create) = self.classify(&raw)?;
+        // Co-sign BEFORE validating/persisting. A restricted join names an
+        // authorising user on THIS server, and auth rule 4.2 requires the
+        // event to be signed by that user's homeserver (us) — so our
+        // signature must be present when `process` verifies it, and the
+        // stored + relayed event must carry it. Co-signing re-runs the
+        // (identical) content hash and merges our signature alongside the
+        // joiner's; it does not change the event ID (signatures are excluded
+        // from the reference hash), so the joiner's `{eventId}` still matches.
+        let mut signed = raw;
+        self.signer.hash_and_sign_event(&mut signed, version)?;
+
         // Verify + persist through the normal pipeline (signature, hash,
         // auth against join rules).
         let outcome = {
@@ -736,7 +970,8 @@ impl RoomServer {
             // membership so the outbound sender relays it to the room's other
             // servers (spec "Joining Rooms": "The resident server must also
             // send the event to other servers participating in the room").
-            self.process(raw, version, &room_id, false, true).await?
+            self.process(signed.clone(), version, &room_id, false, true)
+                .await?
         };
         match &outcome {
             Outcome::Accepted { .. } | Outcome::Duplicate { .. } => {}
@@ -744,21 +979,8 @@ impl RoomServer {
                 return Err(RoomError::Malformed(format!("join rejected: {reason}")));
             }
         }
-        let event_id = outcome.event_id().to_string();
 
         let store = self.store();
-        // Co-sign the accepted join (resident adds its signature).
-        let mut event = store
-            .event(&event_id)
-            .map_err(storage_err)?
-            .ok_or_else(|| RoomError::MissingEvents(vec![event_id.clone()]))?;
-        let mut signed: CanonicalJsonObject =
-            serde_json::from_slice(&event.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
-        // Re-runs the (identical) content hash and merges our signature in
-        // alongside the joiner's.
-        self.signer.hash_and_sign_event(&mut signed, version)?;
-        event.raw = raw_bytes(&signed)?;
-
         // Current room state, and the transitive auth chain behind it.
         let meta = store
             .meta(room_id.as_str())

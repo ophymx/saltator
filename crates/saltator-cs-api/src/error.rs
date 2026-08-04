@@ -191,6 +191,10 @@ impl From<RoomError> for ApiError {
                 "M_UNSUPPORTED_ROOM_VERSION",
                 e.to_string(),
             ),
+            // A restricted join this server can't authorise, surfaced to a
+            // local client — there's no failover for a local caller, so it's
+            // a plain forbidden.
+            RoomError::CannotAuthoriseJoin(_) => Self::forbidden(e.to_string()),
             RoomError::MissingEvents(_)
             | RoomError::StateRes(_)
             | RoomError::Sign(_)
