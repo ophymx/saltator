@@ -626,6 +626,102 @@ async fn resident_fans_out_send_join_membership_to_other_members() {
     our_rooms.shutdown().await.unwrap();
 }
 
+/// Banning a *remote* user delivers the ban to that user's server even though
+/// the ban removes them from the room's current membership: as of the ban that
+/// server is still a recipient, and otherwise would never learn its user is
+/// gone (the delivery half of Complement's TestUnbanViaInvite — alice@hs1 must
+/// see her ban in a room hosted elsewhere).
+#[tokio::test]
+async fn ban_of_remote_user_reaches_their_server() {
+    use saltator_federation::{spawn_sender, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    // Our server hosts a public room; alice is the creator (power 100).
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
+    let (room_id, _) = our_rooms
+        .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        our_rooms
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+    }
+    let room = ruma::RoomId::parse(&room_id).unwrap();
+
+    // Capture our outbound at a single mock endpoint (destination name ignored).
+    let peer = MockPeer::start("capture.test").await;
+    let sender = spawn_sender(
+        our_rooms.clone(),
+        Arc::new(FederationClient::with_base_url(
+            hs_signer.clone(),
+            peer.base_url.clone(),
+        )),
+        hs.clone(),
+    );
+
+    // bob (on b.test) joins, then alice bans him — bob's server is now the only
+    // *remote* server and the ban removes it from current membership.
+    let bob = peer_joins_our_room(&our_rooms, &room, "b.test", "bob").await;
+    our_rooms
+        .send_state(
+            &room,
+            &alice,
+            "m.room.member",
+            &bob,
+            json!({"membership": "ban"}),
+        )
+        .await
+        .expect("alice bans bob");
+
+    // The ban must be delivered to bob's server despite it no longer being a
+    // joined member.
+    let mut delivered = false;
+    for _ in 0..50 {
+        if peer.received().iter().any(|txn| {
+            txn.origin == "hs.test"
+                && txn.pdus.iter().any(|p| {
+                    p.get("type").and_then(|t| t.as_str()) == Some("m.room.member")
+                        && p.get("state_key").and_then(|s| s.as_str()) == Some(bob.as_str())
+                        && p.get("content")
+                            .and_then(|c| c.get("membership"))
+                            .and_then(|m| m.as_str())
+                            == Some("ban")
+                })
+        }) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        delivered,
+        "ban of a remote user was not delivered to their server: {:?}",
+        peer.received()
+    );
+
+    sender.abort();
+    our_rooms.shutdown().await.unwrap();
+}
+
 /// A PDU whose origin is denied by the room's m.room.server_acl is dropped
 /// on inbound /send, while the same origin is unaffected in a room that
 /// allows it (Complement TestACLs).
