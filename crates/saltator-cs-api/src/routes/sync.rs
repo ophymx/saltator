@@ -389,12 +389,14 @@ async fn build_sync(
                     .insert(room_id, build_invited_room(state, auth, &room_id_str, &m)?);
             }
             // Newly-left rooms ride incremental syncs — even when forgotten,
-            // so other devices still learn about the leave. Older leaves are
-            // opt-in via the include_leave filter (initial or full-state),
-            // where forgotten rooms stay hidden.
+            // so other devices still learn about the leave. On an initial sync
+            // a non-forgotten leave/ban is surfaced too: otherwise a user who
+            // was banned/left before their first sync would see the room in
+            // neither `join` nor `leave` (it would simply vanish). Older leaves
+            // on *incremental* syncs are opt-in via the include_leave filter.
             "leave" | "ban"
                 if (!initial && m.seq > since.user)
-                    || (!m.forgotten && include_leave && (initial || full_state)) =>
+                    || (!m.forgotten && (initial || (include_leave && full_state))) =>
             {
                 resp.rooms.leave.insert(
                     room_id,
