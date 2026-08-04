@@ -325,7 +325,7 @@ fn apply_edu(sink: &dyn crate::EduSink, origin: &str, edu: &serde_json::Value) {
 /// determinable) and the per-PDU result object (`{}` on success, or
 /// `{"error": ...}`). On a missing-events failure, attempt to fill the gap
 /// from `origin` and retry once.
-async fn process_pdu(
+pub(crate) async fn process_pdu(
     state: &FedState,
     origin: &str,
     pdu: serde_json::Value,
