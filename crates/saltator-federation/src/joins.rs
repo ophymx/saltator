@@ -169,11 +169,40 @@ pub async fn make_join(
         Err(saltator_roomserver::RoomError::UnknownRoom(_)) => {
             Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room"))
         }
+        Err(saltator_roomserver::RoomError::CannotAuthoriseJoin(denial)) => {
+            Err(restricted_denial(denial))
+        }
         Err(e) => Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
             &e.to_string(),
         )),
+    }
+}
+
+/// Map a restricted-join denial to its spec error (MSC3083 "Restricted
+/// rooms"). The 400s tell the requesting server to fail over to another
+/// resident; the 403 is a definitive rejection.
+fn restricted_denial(
+    denial: saltator_roomserver::RestrictedDenial,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    use saltator_roomserver::RestrictedDenial::*;
+    match denial {
+        Forbidden => err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "You are not permitted to join this room",
+        ),
+        CannotValidate => err(
+            StatusCode::BAD_REQUEST,
+            "M_UNABLE_TO_AUTHORISE_JOIN",
+            "This server cannot validate any of the join conditions",
+        ),
+        CannotGrant => err(
+            StatusCode::BAD_REQUEST,
+            "M_UNABLE_TO_GRANT_JOIN",
+            "This server cannot grant the join; try another server",
+        ),
     }
 }
 

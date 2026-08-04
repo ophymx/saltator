@@ -778,3 +778,129 @@ async fn backfill_and_get_missing_events_walk_the_dag() {
 
     env.server.shutdown().await.unwrap();
 }
+
+/// Restricted joins (MSC3083): the resident picks a local member with invite
+/// power to authorise a joiner who is in an allow-listed room, and reports
+/// the spec's distinct "can't authorise" outcomes otherwise.
+#[tokio::test]
+async fn restricted_join_authoriser_selects_and_denies() {
+    use saltator_roomserver::RestrictedAuth;
+    let env = start_env().await;
+    let s = &env.server;
+    let alice = user("alice");
+    let carol = user("carol");
+
+    // An allowed (public) room that carol is a member of.
+    let (allowed, oc) = s
+        .create_room(&alice, RoomVersion::V10, serde_json::Map::new())
+        .await
+        .unwrap();
+    accepted(&oc);
+    accepted(
+        &s.send_state(
+            &allowed,
+            &alice,
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        )
+        .await
+        .unwrap(),
+    );
+    accepted(
+        &s.send_state(
+            &allowed,
+            &alice,
+            "m.room.join_rules",
+            "",
+            json!({"join_rule": "public"}),
+        )
+        .await
+        .unwrap(),
+    );
+    accepted(
+        &s.send_state(
+            &allowed,
+            &carol,
+            "m.room.member",
+            carol.as_str(),
+            json!({"membership": "join"}),
+        )
+        .await
+        .unwrap(),
+    );
+
+    // The restricted room: alice (creator, invite power) is its only member.
+    let (room, oc) = s
+        .create_room(&alice, RoomVersion::V10, serde_json::Map::new())
+        .await
+        .unwrap();
+    accepted(&oc);
+    accepted(
+        &s.send_state(
+            &room,
+            &alice,
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        )
+        .await
+        .unwrap(),
+    );
+    let set_allow = |allow: serde_json::Value| json!({"join_rule": "restricted", "allow": allow});
+    accepted(
+        &s.send_state(
+            &room,
+            &alice,
+            "m.room.join_rules",
+            "",
+            set_allow(json!([{"type": "m.room_membership", "room_id": allowed.as_str()}])),
+        )
+        .await
+        .unwrap(),
+    );
+
+    let room_ref = RoomId::parse(room.as_str()).unwrap();
+
+    // carol is in the allowed room -> authorised via alice (the only local
+    // member of the restricted room with invite power).
+    assert_eq!(
+        s.restricted_join_authoriser(&room_ref, &carol).unwrap(),
+        RestrictedAuth::Authorised(alice.clone()),
+    );
+    // ...and make_join stamps that authoriser into the template content.
+    let (_v, template) = s.make_join_template(&room_ref, &carol).unwrap();
+    let stamped = template
+        .get("content")
+        .and_then(|c| c.as_object())
+        .and_then(|c| c.get("join_authorised_via_users_server"))
+        .and_then(|v| v.as_str());
+    assert_eq!(stamped, Some(alice.as_str()));
+
+    // dave is in no allowed room we hold -> fails all conditions (403).
+    let dave = user("dave");
+    assert_eq!(
+        s.restricted_join_authoriser(&room_ref, &dave).unwrap(),
+        RestrictedAuth::FailsConditions,
+    );
+
+    // An allow entry naming a room we don't hold -> can't validate (400,
+    // fail over). Point the allow list at an unknown room.
+    accepted(
+        &s.send_state(
+            &room,
+            &alice,
+            "m.room.join_rules",
+            "",
+            set_allow(json!([{"type": "m.room_membership", "room_id": "!nope:hs.test"}])),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        s.restricted_join_authoriser(&room_ref, &carol).unwrap(),
+        RestrictedAuth::CannotValidate,
+    );
+
+    env.server.shutdown().await.unwrap();
+}

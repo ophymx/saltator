@@ -358,6 +358,7 @@ pub async fn create_room(
                 "invite",
                 None,
                 extra,
+                None,
             )
             .await;
         }
@@ -430,13 +431,17 @@ async fn send_membership(
         membership,
         reason,
         Default::default(),
+        None,
     )
     .await
 }
 
 /// `extra` carries client-supplied custom member-event content (the
 /// legacy /join body contract). Reserved fields are applied on top so a
-/// body can't spoof membership or profile.
+/// body can't spoof membership or profile. `authorised_via`, when set,
+/// stamps `join_authorised_via_users_server` — a server-chosen restricted
+/// join authoriser, never client-supplied (the client value is stripped).
+#[allow(clippy::too_many_arguments)]
 async fn send_membership_with(
     state: &CsState,
     room_id: &RoomId,
@@ -445,6 +450,7 @@ async fn send_membership_with(
     membership: &str,
     reason: Option<String>,
     mut extra: serde_json::Map<String, serde_json::Value>,
+    authorised_via: Option<&str>,
 ) -> Result<ruma::OwnedEventId> {
     for reserved in [
         "membership",
@@ -457,6 +463,9 @@ async fn send_membership_with(
     }
     let mut content = serde_json::Value::Object(extra);
     content["membership"] = membership.into();
+    if let Some(authoriser) = authorised_via {
+        content["join_authorised_via_users_server"] = authoriser.into();
+    }
     if let Some(reason) = reason {
         content["reason"] = reason.into();
     }
@@ -549,14 +558,38 @@ async fn join_with_body(
     // other server to join through.
     let (hosted, meta_exists) = room_hosted_locally(state, room_id)?;
     if hosted {
-        local_pipeline_join(state, auth, room_id, reason, body).await?;
+        // A restricted / knock_restricted room needs an authorising local
+        // user stamped on the join. If we hold the room but can't authorise
+        // (no eligible local member, or we can't verify the allow
+        // conditions), another resident might — fall back to a remote join.
+        match state
+            .rooms
+            .restricted_join_authoriser(room_id, &auth.user_id)
+            .map_err(internal)?
+        {
+            saltator_roomserver::RestrictedAuth::NotNeeded => {
+                local_pipeline_join(state, auth, room_id, reason, body, None).await?;
+            }
+            saltator_roomserver::RestrictedAuth::Authorised(authoriser) => {
+                local_pipeline_join(state, auth, room_id, reason, body, Some(authoriser)).await?;
+            }
+            saltator_roomserver::RestrictedAuth::FailsConditions => {
+                return Err(ApiError::forbidden(
+                    "You are not permitted to join this room",
+                ));
+            }
+            saltator_roomserver::RestrictedAuth::CannotValidate
+            | saltator_roomserver::RestrictedAuth::CannotGrant => {
+                join_remote(state, auth, room_id, via).await?;
+            }
+        }
     } else {
         match join_remote(state, auth, room_id, via).await {
             Ok(()) => {}
             // No route to a resident (e.g. a v12 room we created whose
             // id names no server): rejoin our own copy rather than fail.
             Err(e) if meta_exists && e.status == axum::http::StatusCode::NOT_FOUND => {
-                local_pipeline_join(state, auth, room_id, reason, body).await?;
+                local_pipeline_join(state, auth, room_id, reason, body, None).await?;
             }
             Err(e) => return Err(e),
         }
@@ -576,6 +609,7 @@ async fn local_pipeline_join(
     room_id: &RoomId,
     reason: Option<String>,
     body: serde_json::Map<String, serde_json::Value>,
+    authoriser: Option<ruma::OwnedUserId>,
 ) -> Result<()> {
     // Joining twice is a no-op: the existing membership event stands
     // (a fresh identical join would mint a new event ID).
@@ -591,6 +625,7 @@ async fn local_pipeline_join(
         "join",
         reason,
         body,
+        authoriser.as_deref().map(|u| u.as_str()),
     )
     .await?;
     Ok(())
@@ -1732,12 +1767,23 @@ pub async fn send_state_event(
     auth: Auth,
     Ar(req): Ar<send_state_event::v3::Request>,
 ) -> Result<Ra<send_state_event::v3::Response>> {
-    let content: serde_json::Value = serde_json::from_str(req.body.json().get())
+    let mut content: serde_json::Value = serde_json::from_str(req.body.json().get())
         .map_err(|e| ApiError::bad_json(e.to_string()))?;
     // m.room.create is only ever the room's first event; a client can never
     // send another. Reject with 400 (not the pipeline's auth 403).
     if req.event_type == ruma::events::StateEventType::RoomCreate {
         return Err(ApiError::bad_json("Cannot send a m.room.create event"));
+    }
+    // `join_authorised_via_users_server` is server-controlled — set only when
+    // this server authorises a restricted join, never by the client. Strip it
+    // from a client-sent member event so a bogus value (e.g. a profile update
+    // that echoes a stale field) can't reach event verification, which would
+    // choke trying to parse it as a user ID (Complement
+    // TestRestrictedRoomsLocalJoin's join→join step sends `"unused"`).
+    if req.event_type == ruma::events::StateEventType::RoomMember {
+        if let Some(obj) = content.as_object_mut() {
+            obj.remove("join_authorised_via_users_server");
+        }
     }
     if req.event_type == ruma::events::StateEventType::RoomCanonicalAlias {
         validate_canonical_alias(&state, req.room_id.as_str(), &content)?;
