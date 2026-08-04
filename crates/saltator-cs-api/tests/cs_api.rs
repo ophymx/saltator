@@ -2078,6 +2078,110 @@ async fn v12_upgrade_sets_additional_creators() {
     env.shutdown().await;
 }
 
+/// MSC4289 creator power-level rules for a v12 room: the default PL requires
+/// PL150 to send `m.room.tombstone`; a PL event (via createRoom override or a
+/// later state PUT) that lists a creator in `users` is a bad request (400).
+/// Complement TestMSC4289PrivilegedRoomCreators.
+#[tokio::test]
+async fn v12_creator_power_level_rules() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let alice_id = format!("@alice:{SERVER}");
+
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"room_version": "12", "preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+
+    // Default PL requires 150 to send m.room.tombstone.
+    let (_s, pl) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{enc}/state/m.room.power_levels/"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(
+        pl["events"]["m.room.tombstone"].as_i64(),
+        Some(150),
+        "tombstone PL default: {pl}"
+    );
+
+    // A later PL state PUT that lists the creator in users → 400.
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc}/state/m.room.power_levels/"),
+            Some(&alice),
+            Some(json!({"users": {alice_id.clone(): 100}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "creator in PL PUT: {body}");
+
+    // createRoom with an override listing the creator → 400.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({
+                "room_version": "12",
+                "preset": "public_chat",
+                "power_level_content_override": {"users": {alice_id.clone(): 100}},
+            })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "creator in override: {body}"
+    );
+
+    // An *additional* creator also may not be listed in a PL `users` map.
+    let bob = format!("@bob:{SERVER}");
+    let (status, room2) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({
+                "room_version": "12",
+                "preset": "public_chat",
+                "creation_content": {"additional_creators": [bob]},
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room2}");
+    let enc2 = room2["room_id"]
+        .as_str()
+        .unwrap()
+        .replace('!', "%21")
+        .replace(':', "%3A");
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc2}/state/m.room.power_levels/"),
+            Some(&alice),
+            Some(json!({"users": {bob.clone(): 100}})),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "additional creator in PL: {body}"
+    );
+
+    env.shutdown().await;
+}
+
 /// Unknown endpoints 404 and wrong methods 405, both with an
 /// M_UNRECOGNIZED body (spec "API standards"; TestUnknownEndpoints).
 #[tokio::test]
@@ -4662,8 +4766,10 @@ async fn complement_shaped_regressions() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let bob_since = body["next_batch"].as_str().unwrap().to_owned();
 
-    // Public room; v12 power-level override listing the creator must be
-    // sanitized (MSC4289), not rejected.
+    // Public room with a power-level override. In a v12 room the creator has
+    // infinite power and must not be listed in `users` (MSC4289) — an override
+    // that lists one is rejected (see v12_creator_power_level_rules), so this
+    // sets only `users_default`.
     let (status, body) = env
         .req(
             "POST",
@@ -4674,8 +4780,7 @@ async fn complement_shaped_regressions() {
                 "preset": "public_chat",
                 "name": "Complement Room",
                 "topic": "regressions",
-                "power_level_content_override":
-                    {"users": {format!("@alice:{SERVER}"): 100}, "users_default": 0},
+                "power_level_content_override": {"users_default": 0},
             })),
         )
         .await;

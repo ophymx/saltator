@@ -167,11 +167,19 @@ pub async fn create_room(
             users.insert(invitee.to_string(), 100.into());
         }
     }
+    // MSC4289 (v12+): sending `m.room.tombstone` (upgrading the room) requires
+    // power level 150 — above the max ordinary level, so only creators (with
+    // infinite power) can do it. Seed the default `events` map accordingly.
+    let events = if version.privileged_creators() {
+        serde_json::json!({ "m.room.tombstone": 150 })
+    } else {
+        serde_json::json!({})
+    };
     // Spell out the spec defaults: clients (and Complement) expect the
     // created power-level event to be complete, not sparse.
     let mut pl_content: serde_json::Value = serde_json::json!({
         "ban": 50,
-        "events": {},
+        "events": events,
         "events_default": 0,
         "invite": 0,
         "kick": 50,
@@ -184,6 +192,21 @@ pub async fn create_room(
     if let Some(overrides) = &req.power_level_content_override {
         let overrides: serde_json::Value = serde_json::from_str(overrides.json().get())
             .map_err(|e| ApiError::bad_json(format!("power_level_content_override: {e}")))?;
+        // MSC4289 (v12+): creators have infinite power and MUST NOT appear in
+        // the PL `users` map (auth rule 10.4). A client override that lists one
+        // is a bad request (400), not silently sanitized.
+        if version.privileged_creators() {
+            if let Some(users) = overrides.get("users").and_then(|u| u.as_object()) {
+                let is_creator = |u: &str| {
+                    u == auth.user_id.as_str() || additional_creators.iter().any(|c| c == u)
+                };
+                if users.keys().any(|k| is_creator(k)) {
+                    return Err(ApiError::bad_json(
+                        "power_level_content_override.users must not contain a room creator",
+                    ));
+                }
+            }
+        }
         merge_json(&mut pl_content, &overrides);
     }
     // Privileged-creator versions (v12+): creators have infinite power and
@@ -1452,6 +1475,47 @@ fn validate_canonical_alias(
     Ok(())
 }
 
+/// MSC4289 (v12+): whether a proposed `m.room.power_levels` content lists a
+/// room creator (the `m.room.create` sender or an `additional_creators` entry)
+/// in its `users` map — which the create-event auth rule (§10.4) forbids.
+/// Pre-v12 rooms have no privileged creators, so this is always false there.
+fn power_levels_lists_creator(
+    state: &CsState,
+    room_id: &str,
+    content: &serde_json::Value,
+) -> Result<bool> {
+    let version = room_version(&room_meta(&state.rooms, room_id)?)?;
+    if !version.privileged_creators() {
+        return Ok(false);
+    }
+    let Some(users) = content.get("users").and_then(|u| u.as_object()) else {
+        return Ok(false);
+    };
+    let mut creators: std::collections::BTreeSet<String> = Default::default();
+    if let Some(id) =
+        current_state(&state.rooms, room_id)?.get(&("m.room.create".to_owned(), String::new()))
+    {
+        if let Some(create) = raw_event(&state.rooms, id)? {
+            let create: serde_json::Value = serde_json::to_value(&create).map_err(internal)?;
+            if let Some(s) = create.get("sender").and_then(|v| v.as_str()) {
+                creators.insert(s.to_owned());
+            }
+            if let Some(arr) = create
+                .get("content")
+                .and_then(|c| c.get("additional_creators"))
+                .and_then(|v| v.as_array())
+            {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        creators.insert(s.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    Ok(users.keys().any(|k| creators.contains(k)))
+}
+
 pub async fn send_state_event(
     State(state): State<Arc<CsState>>,
     auth: Auth,
@@ -1466,6 +1530,16 @@ pub async fn send_state_event(
     }
     if req.event_type == ruma::events::StateEventType::RoomCanonicalAlias {
         validate_canonical_alias(&state, req.room_id.as_str(), &content)?;
+    }
+    // MSC4289 (v12+): a power-levels event whose `users` map lists a room
+    // creator is invalid (auth rule 10.4). Surface it as a bad request (400)
+    // rather than the pipeline's 403.
+    if req.event_type == ruma::events::StateEventType::RoomPowerLevels
+        && power_levels_lists_creator(&state, req.room_id.as_str(), &content)?
+    {
+        return Err(ApiError::bad_json(
+            "power_levels.users must not contain a room creator",
+        ));
     }
     // Setting identical state twice is idempotent: return the standing
     // event rather than minting a duplicate.
