@@ -63,6 +63,7 @@ TestCannotSendNonLeaveViaSendLeaveV1
 TestCannotSendNonLeaveViaSendLeaveV2
 TestContentMediaV1
 TestEventAuth
+TestFederationRoomsInvite
 TestFederationThumbnail
 TestGetMissingEventsGapFilling
 TestInboundFederationKeys
