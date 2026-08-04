@@ -182,7 +182,13 @@ pub async fn create_room(
         "ban": 50,
         "events": events,
         "events_default": 0,
-        "invite": 0,
+        // Matches Synapse's generated createRoom default: inviting requires
+        // moderator power (50), so a plain member (users_default 0) cannot
+        // invite. The bare spec default for an *absent* `invite` key is 0,
+        // but the generated event spells it out — and Complement (written
+        // against Synapse) asserts this, e.g. TestRestrictedRoomsRemoteJoin-
+        // LocalUser expects a member's invite to be 403.
+        "invite": 50,
         "kick": 50,
         "notifications": { "room": 50 },
         "redact": 50,
