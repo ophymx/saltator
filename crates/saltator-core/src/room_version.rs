@@ -8,13 +8,15 @@ use serde::{Deserialize, Serialize};
 
 /// A room version supported by Saltator.
 ///
-/// Versions 9–12 are implemented (spec.md §3; 9/10 for federation reach —
+/// Versions 8–12 are implemented (spec.md §3; 8/9/10 for federation reach —
 /// they share v11's event format, differing only in the create event's
-/// `creator` field, power-level strictness, and redaction rules).
-/// Versions ≤8 (and the pre-reference-hash formats of 1/2) are out of
-/// scope for v1.
+/// `creator` field, power-level strictness, and redaction rules). v8 is the
+/// version that introduced restricted join rules. The pre-reference-hash
+/// formats of 1/2 (and everything ≤7) are out of scope for v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RoomVersion {
+    #[serde(rename = "8")]
+    V8,
     #[serde(rename = "9")]
     V9,
     #[serde(rename = "10")]
@@ -47,6 +49,7 @@ impl RoomVersion {
 
     pub fn parse(s: &str) -> Result<Self, UnsupportedRoomVersion> {
         match s {
+            "8" => Ok(Self::V8),
             "9" => Ok(Self::V9),
             "10" => Ok(Self::V10),
             "11" => Ok(Self::V11),
@@ -57,6 +60,7 @@ impl RoomVersion {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::V8 => "8",
             Self::V9 => "9",
             Self::V10 => "10",
             Self::V11 => "11",
@@ -65,7 +69,7 @@ impl RoomVersion {
     }
 
     /// Every supported version, oldest first (capabilities, `?ver=`).
-    pub const ALL: &'static [Self] = &[Self::V9, Self::V10, Self::V11, Self::V12];
+    pub const ALL: &'static [Self] = &[Self::V8, Self::V9, Self::V10, Self::V11, Self::V12];
 
     /// v12+: the room ID is the create event's reference hash with a `!`
     /// sigil, and the create event itself carries no `room_id` property.
@@ -102,7 +106,7 @@ impl RoomVersion {
 
     pub fn state_res(self) -> StateResVersion {
         match self {
-            Self::V9 | Self::V10 | Self::V11 => StateResVersion::V2,
+            Self::V8 | Self::V9 | Self::V10 | Self::V11 => StateResVersion::V2,
             Self::V12 => StateResVersion::V2_1,
         }
     }
@@ -110,6 +114,7 @@ impl RoomVersion {
     /// The corresponding ruma identifier.
     pub fn ruma_id(self) -> ruma::RoomVersionId {
         match self {
+            Self::V8 => ruma::RoomVersionId::V8,
             Self::V9 => ruma::RoomVersionId::V9,
             Self::V10 => ruma::RoomVersionId::V10,
             Self::V11 => ruma::RoomVersionId::V11,
@@ -133,11 +138,12 @@ mod tests {
 
     #[test]
     fn parse_and_roundtrip() {
+        assert_eq!(RoomVersion::parse("8").unwrap(), RoomVersion::V8);
         assert_eq!(RoomVersion::parse("9").unwrap(), RoomVersion::V9);
         assert_eq!(RoomVersion::parse("10").unwrap(), RoomVersion::V10);
         assert_eq!(RoomVersion::parse("11").unwrap(), RoomVersion::V11);
         assert_eq!(RoomVersion::parse("12").unwrap(), RoomVersion::V12);
-        assert!(RoomVersion::parse("8").is_err());
+        assert!(RoomVersion::parse("7").is_err());
         assert!(RoomVersion::parse("org.example.custom").is_err());
         for &v in RoomVersion::ALL {
             assert_eq!(RoomVersion::parse(v.as_str()).unwrap(), v);
