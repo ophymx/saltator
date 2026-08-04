@@ -1939,6 +1939,56 @@ async fn v12_create_event_semantics() {
     env.shutdown().await;
 }
 
+/// MSC4289 (room v12): a malformed `creation_content.additional_creators` is a
+/// bad *request* → 400 `M_BAD_JSON` (spec: createRoom returns 400 for a
+/// malformed body), not the 403 the create-event auth rule would raise. A
+/// well-formed value still succeeds. Complement
+/// TestMSC4289PrivilegedRoomCreators_AdditionalValidation.
+#[tokio::test]
+async fn v12_additional_creators_request_validation() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+
+    let create = |ac: Value| {
+        let env = &env;
+        let alice = &alice;
+        async move {
+            env.req(
+                "POST",
+                "/_matrix/client/v3/createRoom",
+                Some(alice),
+                Some(json!({
+                    "room_version": "12",
+                    "preset": "public_chat",
+                    "creation_content": {"additional_creators": ac},
+                })),
+            )
+            .await
+        }
+    };
+
+    for bad in [
+        json!("not-an-array"),
+        json!(["@foo:example.com", 42]),
+        json!(["@foo:example.com", "not-a-user-id"]),
+        json!(["@invalid:dom$ain$.com"]),
+    ] {
+        let (status, body) = create(bad.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "want 400 for {bad}: {body}"
+        );
+        assert_eq!(body["errcode"], "M_BAD_JSON", "{body}");
+    }
+
+    // Valid additional_creators still succeed (auth accepts them).
+    let (status, body) = create(json!(["@foo:example.com", "@bar:baz.code"])).await;
+    assert_eq!(status, StatusCode::OK, "valid additional_creators: {body}");
+
+    env.shutdown().await;
+}
+
 /// Unknown endpoints 404 and wrong methods 405, both with an
 /// M_UNRECOGNIZED body (spec "API standards"; TestUnknownEndpoints).
 #[tokio::test]

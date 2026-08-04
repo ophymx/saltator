@@ -80,6 +80,25 @@ pub async fn create_room(
                 .map_err(|e| ApiError::bad_json(format!("creation_content: {e}")))?,
             None => serde_json::Map::new(),
         };
+    // MSC4289 (room v12+): a malformed `additional_creators` is a bad *request*
+    // (400), not an auth rejection (403). Validate the client-supplied value as
+    // an array of valid user-ID strings up front — mirroring the create-event
+    // auth rule (rooms/v12 §1.4) but surfacing it as request validation.
+    if version.privileged_creators() {
+        if let Some(v) = creation_content.get("additional_creators") {
+            let valid = v.as_array().is_some_and(|arr| {
+                arr.iter().all(|e| {
+                    e.as_str()
+                        .is_some_and(|s| ruma::OwnedUserId::try_from(s).is_ok())
+                })
+            });
+            if !valid {
+                return Err(ApiError::bad_json(
+                    "creation_content.additional_creators must be an array of user IDs",
+                ));
+            }
+        }
+    }
     // MSC4289: in a privileged-creator room (v12+) created as a
     // trusted_private_chat, the invited users join the creator set — merge
     // them into `additional_creators` (keeping any the client supplied).
