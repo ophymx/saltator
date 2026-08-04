@@ -5011,12 +5011,14 @@ async fn client_joins_a_remote_room_via_federation() {
     a_rooms.shutdown().await.unwrap();
 }
 
-/// A ban of a local user, authored by a remote room host and delivered over
-/// federation, is applied on the user's home server and surfaces in that
-/// user's `/sync` `leave` section. This is the receiving half of Complement's
-/// TestUnbanViaInvite: alice@hs1 joins a room hosted on hs2, bob@hs2 bans her,
-/// and alice must see her ban even though the room lives on another server and
-/// was imported via send_join.
+/// A federated ban of a local user must surface in that user's `/sync` in the
+/// `leave` section — and must never leak into `join`. This guards a cross-shard
+/// consistency bug behind Complement's TestUnbanViaInvite: the membership index
+/// (user shard) is a projection of the room shard and trails it, so a sync that
+/// reads a stale "join" membership while the room-shard timeline already holds
+/// the ban would classify the room as joined (ban in its timeline) and only
+/// later move it to an empty `leave`, so the transition is never observed in
+/// `leave`. hs2 hosts, alice@hs1 remote-joins, bob bans her.
 #[tokio::test]
 async fn federated_ban_of_local_user_surfaces_in_sync() {
     let dir = tempfile::tempdir().unwrap();
@@ -5090,8 +5092,7 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
     }
     let proj = spawn_membership_projection(hs1_users.clone(), hs1_rooms.clone());
 
-    // Separate key servers break the mutual auth dependency (each fed surface
-    // verifies the other's requests against the other's published keys).
+    // Separate key servers break the mutual auth dependency.
     let hs1_key_base = spawn_fed("hs1", hs1_signer.clone(), None, None).await;
     let hs2_key_base = spawn_fed("hs2", hs2_signer.clone(), None, None).await;
     let hs2_fed_base = spawn_fed(
@@ -5135,7 +5136,8 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
     );
     let hs1_router = saltator_cs_api::router(cs);
 
-    // alice registers and joins the remote room via hs2.
+    // alice registers and joins the remote room via hs2, then syncs to obtain
+    // a baseline token from *before* the ban.
     let alice_tok = reg(&hs1_router, "alice").await;
     let (status, body) = oneshot(
         &hs1_router,
@@ -5149,8 +5151,6 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "remote join failed: {body}");
-
-    // Initial sync: alice sees the room joined; capture the since token.
     let (_s, sync0) = oneshot(
         &hs1_router,
         "GET",
@@ -5165,9 +5165,7 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
     );
     let since = sync0["next_batch"].as_str().unwrap().to_owned();
 
-    // hs2's real outbound sender, aimed at hs1 — this is the delivery path
-    // under test (the ban must be relayed even though it removes hs1 from
-    // current membership).
+    // hs2's real outbound sender, aimed at hs1.
     let hs2_sender = saltator_federation::spawn_sender(
         hs2_rooms.clone(),
         Arc::new(FederationClient::with_base_url(
@@ -5177,7 +5175,7 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
         ruma::OwnedServerName::try_from("hs2").unwrap(),
     );
 
-    // --- bob bans alice on hs2; the sender must deliver it to hs1. ---
+    // bob bans alice; the sender delivers the ban to hs1.
     let alice_uid = "@alice:hs1";
     let out = hs2_rooms
         .send_state(
@@ -5194,28 +5192,8 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
         "ban not accepted on the host: {out:?}"
     );
 
-    // Wait until the ban has actually landed + projected on hs1, so we test
-    // the same ordering Complement hits: the ban is already applied *before*
-    // alice's first (initial) sync.
-    let mut applied = false;
-    for _ in 0..100 {
-        if hs1_users
-            .store()
-            .memberships(alice_uid)
-            .unwrap_or_default()
-            .into_iter()
-            .any(|(r, m)| r == room_id.as_str() && m.membership == "ban")
-        {
-            applied = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(applied, "sender never delivered the ban to hs1");
-
-    // --- MustSyncUntil semantics: fresh initial sync, then incrementals.
-    // Alice must see the ban even though it predates her first sync. ---
-    let _ = since;
+    // Incremental syncs from the pre-ban token: the ban must appear in `leave`
+    // and must NEVER appear in `join` (the projection-lag classification bug).
     let has_ban = |section: &Value| {
         section["events"].as_array().is_some_and(|es| {
             es.iter().any(|e| {
@@ -5225,26 +5203,31 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
             })
         })
     };
-    let mut token = String::new();
-    let mut seen = false;
-    for _ in 0..20 {
-        let path = if token.is_empty() {
-            "/_matrix/client/v3/sync".to_owned()
-        } else {
-            format!("/_matrix/client/v3/sync?since={token}")
-        };
-        let (_s, sync) = oneshot(&hs1_router, "GET", &path, Some(&alice_tok), None).await;
-        token = sync["next_batch"].as_str().unwrap_or_default().to_owned();
+    let mut seen_in_leave = false;
+    for _ in 0..100 {
+        let (_s, sync) = oneshot(
+            &hs1_router,
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={since}"),
+            Some(&alice_tok),
+            None,
+        )
+        .await;
+        let join = &sync["rooms"]["join"][room_id.as_str()];
+        assert!(
+            !has_ban(&join["timeline"]) && !has_ban(&join["state"]),
+            "ban leaked into the JOIN section (sync read a stale membership): {sync}"
+        );
         let leave = &sync["rooms"]["leave"][room_id.as_str()];
         if has_ban(&leave["timeline"]) || has_ban(&leave["state"]) {
-            seen = true;
+            seen_in_leave = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        seen,
-        "alice never saw her federated ban via MustSyncUntil-style syncing (ban predated the first sync)"
+        seen_in_leave,
+        "alice never saw her federated ban in the /sync leave section"
     );
 
     hs2_sender.abort();
