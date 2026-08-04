@@ -190,6 +190,24 @@ fn respond(resp: v3::Response) -> Result<axum::response::Response> {
                     .entry("limited")
                     .or_insert(serde_json::Value::Bool(false));
             }
+            // A joined room always carries an `ephemeral` object with an
+            // `events` array. ruma omits it when empty, but clients (and
+            // Complement's "no ephemeral events" assertions) expect the empty
+            // array to be present rather than the whole field missing.
+            if section == "join" {
+                if let Some(events) = room
+                    .as_object_mut()
+                    .map(|r| {
+                        r.entry("ephemeral")
+                            .or_insert_with(|| serde_json::json!({}))
+                    })
+                    .and_then(|e| e.as_object_mut())
+                {
+                    events
+                        .entry("events")
+                        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                }
+            }
         }
     }
     Ok(axum::Json(v).into_response())
@@ -1041,6 +1059,16 @@ pub async fn set_read_markers(
             None,
         )
         .await?;
+        // A public read receipt set via read_markers federates just like one
+        // set via the /receipt endpoint (spec "Receipts"); without this the
+        // other servers in the room never see it.
+        crate::routes::edu::broadcast_receipt(
+            &state,
+            req.room_id.as_str(),
+            auth.user_id.as_str(),
+            event_id.as_str(),
+            None,
+        );
     }
     if let Some(event_id) = &req.private_read_receipt {
         write_receipt(

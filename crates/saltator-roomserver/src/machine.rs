@@ -163,6 +163,7 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
             rejected: Some(rejected.clone()),
             history_idx: None,
             imported: false,
+            relay: false,
         };
         ctx.put(
             T_EVENT,
@@ -209,6 +210,9 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
         rejected: None,
         history_idx: None,
         imported: false,
+        // Resident-applied send_join/send_leave memberships fan out; the
+        // pipeline sets this only on those paths.
+        relay: cmd.relay,
     };
     ctx.put(
         T_EVENT,
@@ -314,6 +318,7 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
             rejected: None,
             history_idx: None,
             imported: true,
+            relay: false,
         };
         ctx.put(
             T_EVENT,
@@ -353,6 +358,7 @@ fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomRes
         rejected: None,
         history_idx: None,
         imported: true,
+        relay: false,
     };
     ctx.put(
         T_EVENT,
@@ -439,6 +445,7 @@ fn apply_import_segment(ctx: &mut ApplyCtx<'_>, cmd: &ImportSegment) -> StoreRes
             rejected: None,
             history_idx: None,
             imported: true,
+            relay: false,
         };
         ctx.put(
             T_EVENT,
@@ -486,6 +493,7 @@ fn apply_import_segment(ctx: &mut ApplyCtx<'_>, cmd: &ImportSegment) -> StoreRes
             rejected: None,
             history_idx: None,
             imported: false,
+            relay: false,
         };
         ctx.put(
             T_EVENT,
@@ -589,6 +597,7 @@ fn apply_import_history(ctx: &mut ApplyCtx<'_>, cmd: &ImportHistory) -> StoreRes
                 rejected: None,
                 history_idx: Some(idx),
                 imported: true,
+                relay: false,
             },
         };
         let raw: CanonicalJsonObject =

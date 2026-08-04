@@ -84,6 +84,17 @@ pub struct StoredEvent {
     /// (written before this field) readable as `false`.
     #[serde(default)]
     pub imported: bool,
+    /// True for a membership we applied as the *resident* of a
+    /// `send_join`/`send_leave` handshake — the joining/leaving server chose
+    /// us to service its membership. Per spec ("Joining Rooms" / "Leaving
+    /// Rooms") the resident "must also send the event to other servers
+    /// participating in the room", so the outbound sender fans these out even
+    /// though their `sender` is remote. Ordinary events received from another
+    /// origin (via `/send`) have this `false`: distributing those is that
+    /// origin's job, not ours. `#[serde(default)]` keeps older records
+    /// readable as `false`.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 /// A state snapshot or delta. Resolving a group walks the parent chain to
@@ -228,6 +239,10 @@ pub struct AppendEvent {
     /// redact the (locally known, same-room) target — precomputed by the
     /// pipeline; the apply just writes the `T_REDACT` redirect.
     pub redacts: Option<String>,
+    /// Carried onto [`StoredEvent::relay`]: set when we applied this event as
+    /// the resident of a `send_join`/`send_leave` handshake and must fan the
+    /// membership out to the room's other servers.
+    pub relay: bool,
 }
 
 /// A durable read receipt (`m.receipt` — receipts survive restart; only

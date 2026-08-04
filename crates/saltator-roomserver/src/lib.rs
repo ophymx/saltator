@@ -308,7 +308,7 @@ impl RoomServer {
         };
 
         let _guard = self.lock_room(room_id.as_str()).await;
-        let outcome = self.process(raw, version, &room_id, true).await?;
+        let outcome = self.process(raw, version, &room_id, true, false).await?;
         Ok((room_id, outcome))
     }
 
@@ -342,7 +342,9 @@ impl RoomServer {
     pub async fn ingest_pdu(&self, raw: CanonicalJsonObject) -> Result<Outcome> {
         let (version, room_id, is_create) = self.classify(&raw)?;
         let _guard = self.lock_room(room_id.as_str()).await;
-        self.process(raw, version, &room_id, is_create).await
+        // Ordinary inbound PDU: its origin is responsible for distributing it,
+        // so we do not relay it onward.
+        self.process(raw, version, &room_id, is_create, false).await
     }
 
     /// Verify a single PDU's structure, signature, and content hash against
@@ -490,7 +492,10 @@ impl RoomServer {
     pub async fn send_leave(&self, raw: CanonicalJsonObject) -> Result<Outcome> {
         let (version, room_id, _is_create) = self.classify(&raw)?;
         let _guard = self.lock_room(room_id.as_str()).await;
-        self.process(raw, version, &room_id, false).await
+        // We are the resident servicing this leave/reject handshake: flag the
+        // membership so the outbound sender relays it to the room's other
+        // servers (spec "Leaving Rooms").
+        self.process(raw, version, &room_id, false, true).await
     }
 
     /// The room's current forward extremities (the DAG leaves). Empty if
@@ -641,7 +646,11 @@ impl RoomServer {
         // auth against join rules).
         let outcome = {
             let _guard = self.lock_room(room_id.as_str()).await;
-            self.process(raw, version, &room_id, false).await?
+            // We are the resident servicing this join handshake: flag the
+            // membership so the outbound sender relays it to the room's other
+            // servers (spec "Joining Rooms": "The resident server must also
+            // send the event to other servers participating in the room").
+            self.process(raw, version, &room_id, false, true).await?
         };
         match &outcome {
             Outcome::Accepted { .. } | Outcome::Duplicate { .. } => {}
@@ -1037,7 +1046,9 @@ impl RoomServer {
         // here must still be the room's tip when the proposal lands.
         let _guard = self.lock_room(room_id.as_str()).await;
         let (raw, version) = self.build_local(room_id, sender, event_type, state_key, content)?;
-        self.process(raw, version, &room_id.to_owned(), false).await
+        // Locally authored: the sender's `is_local` check fans it out already.
+        self.process(raw, version, &room_id.to_owned(), false, false)
+            .await
     }
 
     /// Determine room version and room ID of a PDU prior to validation.
@@ -1147,6 +1158,10 @@ impl RoomServer {
         version: RoomVersion,
         room_id: &OwnedRoomId,
         is_create: bool,
+        // True only for the resident-side `send_join`/`send_leave` handshake:
+        // the accepted membership is flagged so the outbound sender fans it
+        // out to the room's other servers (spec "Joining/Leaving Rooms").
+        relay: bool,
     ) -> Result<Outcome> {
         // -- 1. validate: format, then signatures/hash.
         let mut raw = raw;
@@ -1427,6 +1442,7 @@ impl RoomServer {
             next_group,
             create_version: is_create.then(|| version.as_str().to_owned()),
             redacts,
+            relay,
         };
         self.propose(cmd).await
     }
@@ -1518,6 +1534,7 @@ impl RoomServer {
             next_group,
             create_version: None,
             redacts: None,
+            relay: false,
         };
         self.propose(cmd).await
     }

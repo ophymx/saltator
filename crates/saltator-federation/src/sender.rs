@@ -1,6 +1,8 @@
-//! Outbound federation: tail the room change stream and push locally
-//! originated events to the remote servers that share each room (spec
-//! §5.4 "Outbound").
+//! Outbound federation: tail the room change stream and push events to the
+//! remote servers that share each room (spec §5.4 "Outbound"). We send an
+//! event when we originated it (local `sender`) or when we applied it as the
+//! resident of a `send_join`/`send_leave` handshake — the spec requires the
+//! resident to distribute the new membership to the room's other servers.
 //!
 //! Out-queue ownership (spec.md §4.2): every replica of a room shard applies
 //! every event, so every node sees it on the change stream. To avoid N-way
@@ -81,8 +83,13 @@ async fn run(
     }
 }
 
-/// Forward one event to every remote server in its room, if we originated
-/// it. Events received from other servers are not relayed onward in M3.
+/// Forward one event to the remote servers in its room. We send an event
+/// when either we originated it (`sender` on our server) or we applied it as
+/// the *resident* of a `send_join`/`send_leave` handshake (`relay`), in which
+/// case the spec ("Joining/Leaving Rooms") requires us to distribute the new
+/// membership to the room's other servers even though its `sender` is remote.
+/// Ordinary events received from another origin are that origin's to
+/// distribute, so we do not relay them onward.
 async fn deliver(
     rooms: &RoomServer,
     client: &FederationClient,
@@ -113,24 +120,33 @@ async fn deliver(
     if stored.imported {
         return;
     }
-    // Only forward events our own users/server produced.
-    let is_local = raw
+    // The `sender`'s server: ours means we originated the event and must
+    // distribute it; a remote one is only ours to distribute when we applied
+    // it as the resident of a send_join/send_leave handshake (`relay`).
+    let sender_server = raw
         .get("sender")
         .and_then(|s| s.as_str())
         .and_then(|s| ruma::UserId::parse(s).ok())
-        .map(|u| u.server_name() == server_name)
-        .unwrap_or(false);
-    if !is_local {
+        .map(|u| u.server_name().as_str().to_owned());
+    let is_local = sender_server.as_deref() == Some(server_name.as_str());
+    if !is_local && !stored.relay {
         return;
     }
 
-    let destinations = match rooms.remote_servers_in_room(room_id, server_name.as_str()) {
+    let mut destinations = match rooms.remote_servers_in_room(room_id, server_name.as_str()) {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(error = %e, room_id, "sender: resolve destinations");
             return;
         }
     };
+    // Never send a relayed membership back to the server that authored it and
+    // handed it to us (the joining/leaving server already has it, and it is
+    // now a member so `remote_servers_in_room` lists it). No-op for local
+    // events, whose sender-server is us and thus already excluded.
+    if let Some(origin) = sender_server.as_deref() {
+        destinations.retain(|d| d.as_str() != origin);
+    }
     if destinations.is_empty() {
         return;
     }

@@ -6663,6 +6663,45 @@ async fn outbound_federated_invite_round_trip() {
     b_users.shutdown().await.unwrap();
 }
 
+/// A joined room's `/sync` always carries an `ephemeral` object with an
+/// `events` array, even when there is no ephemeral activity. ruma omits an
+/// empty ephemeral, but clients and Complement (TestACLsForEDUs asserts
+/// `ephemeral.events` has size 0 in an EDU-free room) expect the empty array
+/// to be present rather than the whole field missing. Guards the respond()
+/// post-processing that re-adds it.
+#[tokio::test]
+async fn joined_room_sync_always_has_ephemeral_events() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let (status, room) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{room}");
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+
+    // A fresh (initial) sync — the path where the empty ephemeral was omitted.
+    let body = env
+        .sync_until(&alice, |b| b["rooms"]["join"].get(&room_id).is_some())
+        .await;
+    let ephemeral = &body["rooms"]["join"][&room_id]["ephemeral"];
+    assert!(
+        ephemeral["events"].is_array(),
+        "joined room sync must carry an ephemeral.events array even when empty: {body}"
+    );
+    assert_eq!(
+        ephemeral["events"].as_array().unwrap().len(),
+        0,
+        "a room with no ephemeral activity should have an empty events array: {body}"
+    );
+
+    env.shutdown().await;
+}
+
 /// An inbound `m.receipt` EDU from a remote server surfaces that user's
 /// read receipt in a local member's `/sync` (federated read receipts).
 #[tokio::test]
