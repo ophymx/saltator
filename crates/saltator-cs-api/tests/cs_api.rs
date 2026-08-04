@@ -9197,3 +9197,107 @@ async fn room_summary_allowed_room_ids() {
 
     env.shutdown().await;
 }
+
+/// Local knocking over the CS API: a room whose join rule is `knock`
+/// accepts `POST /knock/{roomId}` from a local user, the knock surfaces in
+/// the knocker's `/sync` under `rooms.knock` with the reason, and knocks on
+/// a non-knock room are refused with 403.
+#[tokio::test]
+async fn local_knock_surfaces_in_sync() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw").await;
+    let bob = env.register("bob", "bob-pw").await;
+    let bob_id = format!("@bob:{SERVER}");
+
+    // Alice creates an invite-only room.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "private_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().unwrap().to_owned();
+
+    // Knocking while the join rule is still `invite` is forbidden.
+    let (status, _) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/knock/{room_id}"),
+            Some(&bob),
+            Some(json!({"reason": "too early"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Alice opens the room to knocking.
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/state/m.room.join_rules/"),
+            Some(&alice),
+            Some(json!({"join_rule": "knock"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Bob knocks, with a reason.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/knock/{room_id}"),
+            Some(&bob),
+            Some(json!({"reason": "let me in"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["room_id"], room_id);
+
+    // The knock surfaces in Bob's sync under rooms.knock, carrying his own
+    // stripped knock membership with the reason.
+    let body = env
+        .sync_until(&bob, |b| b["rooms"]["knock"].get(&room_id).is_some())
+        .await;
+    let events = body["rooms"]["knock"][&room_id]["knock_state"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let bob_knock = events
+        .iter()
+        .find(|e| e["type"] == "m.room.member" && e["state_key"] == bob_id)
+        .unwrap_or_else(|| panic!("bob's knock member event missing: {events:?}"));
+    assert_eq!(bob_knock["content"]["membership"], "knock");
+    assert_eq!(bob_knock["content"]["reason"], "let me in");
+
+    // Alice (in the room) sees Bob's knock as a normal state/timeline event.
+    let a_body = env
+        .sync_until(&alice, |b| {
+            b["rooms"]["join"][&room_id]["timeline"]["events"]
+                .as_array()
+                .map(|evs| {
+                    evs.iter().any(|e| {
+                        e["type"] == "m.room.member"
+                            && e["state_key"] == bob_id
+                            && e["content"]["membership"] == "knock"
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .await;
+    let _ = a_body;
+
+    // A repeat knock is idempotent (still 200).
+    let (status, _) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/knock/{room_id}"),
+            Some(&bob),
+            Some(json!({"reason": "again"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    env.shutdown().await;
+}

@@ -127,6 +127,25 @@ pub struct SendJoinResult {
     pub auth_chain: Vec<CanonicalJsonObject>,
 }
 
+/// The `PUT /send_knock` response payload: the stripped current room state
+/// (`knock_room_state`) that lets the knocking server show the room to its
+/// user while the knock is pending.
+pub struct SendKnockResult {
+    pub knock_room_state: Vec<serde_json::Value>,
+}
+
+/// Stripped-state event types served on a knock (mirrors invite stripped
+/// state): enough to identify the room without leaking its contents.
+const KNOCK_STATE_TYPES: &[&str] = &[
+    "m.room.create",
+    "m.room.join_rules",
+    "m.room.canonical_alias",
+    "m.room.name",
+    "m.room.avatar",
+    "m.room.topic",
+    "m.room.encryption",
+];
+
 /// Event IDs referenced by an event's `auth_events` (v3+ list-of-strings
 /// form; v1 tuple form is not produced by this server).
 fn auth_event_ids(obj: &CanonicalJsonObject) -> Vec<String> {
@@ -491,6 +510,17 @@ impl RoomServer {
         self.make_membership_template(room_id, user_id, "leave")
     }
 
+    /// Build an unsigned `m.room.member` knock template — the `GET
+    /// /make_knock` response. The knocking server fills in
+    /// `origin`/`origin_server_ts`/`reason`/`event_id` and signs.
+    pub fn make_knock_template(
+        &self,
+        room_id: &ruma::RoomId,
+        user_id: &UserId,
+    ) -> Result<(RoomVersion, CanonicalJsonObject)> {
+        self.make_membership_template(room_id, user_id, "knock")
+    }
+
     fn make_membership_template(
         &self,
         room_id: &ruma::RoomId,
@@ -754,6 +784,52 @@ impl RoomServer {
             state,
             auth_chain,
         })
+    }
+
+    /// Apply a remote server's signed knock event (`PUT /send_knock`).
+    /// Verifies + persists it through the normal pipeline (signature, hash,
+    /// auth against the room's `knock`/`knock_restricted` join rule) with
+    /// `relay=true` so the outbound sender distributes the knock to the
+    /// room's other servers. Returns the stripped current room state for
+    /// the knocking server to show its user (spec "Knocking Rooms").
+    pub async fn send_knock(&self, raw: CanonicalJsonObject) -> Result<SendKnockResult> {
+        let (version, room_id, _is_create) = self.classify(&raw)?;
+        let knocker = str_of(&raw, "state_key")?.to_owned();
+        let outcome = {
+            let _guard = self.lock_room(room_id.as_str()).await;
+            self.process(raw, version, &room_id, false, true).await?
+        };
+        match &outcome {
+            Outcome::Accepted { .. } | Outcome::Duplicate { .. } => {}
+            Outcome::Rejected { reason, .. } => {
+                return Err(RoomError::Malformed(format!("knock rejected: {reason}")));
+            }
+        }
+
+        // Stripped current state (create in full per MSC4311) plus the
+        // knocker's own membership event — enough to identify the room.
+        let store = self.store();
+        let meta = store
+            .meta(room_id.as_str())
+            .map_err(storage_err)?
+            .ok_or_else(|| RoomError::UnknownRoom(room_id.to_string()))?;
+        let state_map = store
+            .resolve_group(room_id.as_str(), meta.current_group)
+            .map_err(storage_err)?;
+        let mut wanted: Vec<(String, String)> = KNOCK_STATE_TYPES
+            .iter()
+            .map(|t| ((*t).to_owned(), String::new()))
+            .collect();
+        wanted.push(("m.room.member".to_owned(), knocker));
+        let mut knock_room_state = Vec::new();
+        for key in wanted {
+            if let Some(event_id) = state_map.get(&key) {
+                if let Some(obj) = self.load_raw(&store, event_id)? {
+                    knock_room_state.push(stripped_state_event(&obj));
+                }
+            }
+        }
+        Ok(SendKnockResult { knock_room_state })
     }
 
     /// Import a room from a `send_join` response: trust the resident's
@@ -1709,6 +1785,40 @@ fn canonicalize(value: serde_json::Value) -> Result<CanonicalJsonObject> {
 
 fn raw_bytes(raw: &CanonicalJsonObject) -> Result<Vec<u8>> {
     serde_json::to_vec(raw).map_err(|e| RoomError::Codec(e.to_string()))
+}
+
+/// Stripped-state form of an event (`content`/`sender`/`state_key`/`type`),
+/// used for `knock_room_state`. The `m.room.create` event is served in full
+/// (MSC4311): the knocking server needs its `origin_server_ts` and, in v12,
+/// full content to verify the room.
+fn stripped_state_event(raw: &CanonicalJsonObject) -> serde_json::Value {
+    let is_create = matches!(
+        raw.get("type"),
+        Some(CanonicalJsonValue::String(t)) if t == "m.room.create"
+    );
+    let keys: &[&str] = if is_create {
+        &[
+            "content",
+            "sender",
+            "state_key",
+            "type",
+            "origin_server_ts",
+            "auth_events",
+            "depth",
+            "hashes",
+            "prev_events",
+            "signatures",
+        ]
+    } else {
+        &["content", "sender", "state_key", "type"]
+    };
+    let mut out = serde_json::Map::new();
+    for key in keys {
+        if let Some(v) = raw.get(*key) {
+            out.insert((*key).to_owned(), serde_json::Value::from(v.clone()));
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 fn str_of<'a>(obj: &'a CanonicalJsonObject, key: &str) -> Result<&'a str> {

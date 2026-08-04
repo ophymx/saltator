@@ -328,6 +328,18 @@ pub enum UserCommand {
         /// Stripped-state event JSON, one entry per event.
         stripped_state: Vec<Vec<u8>>,
     },
+    /// Record a pending knock on a remote room (received back over the
+    /// `/send_knock` response). Writes a `knock` membership plus the
+    /// stripped `knock_room_state` so `/sync` surfaces it, and wakes the
+    /// user's sync.
+    RecordRemoteKnock {
+        user_id: String,
+        room_id: String,
+        sender: String,
+        event_id: String,
+        /// Stripped-state event JSON, one entry per event.
+        stripped_state: Vec<Vec<u8>>,
+    },
     /// Reject/leave a remote room: set `leave` membership and clear the
     /// pending-invite stripped state.
     RecordRemoteLeave {

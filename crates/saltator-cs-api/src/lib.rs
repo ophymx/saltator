@@ -305,6 +305,7 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
                 post(rooms::join_by_id_or_alias),
             )
             .route(&p("/rooms/{room_id}/join"), post(rooms::join_room))
+            .route(&p("/knock/{room_id_or_alias}"), post(rooms::knock_room))
             .route(&p("/rooms/{room_id}/leave"), post(rooms::leave_room))
             .route(&p("/rooms/{room_id}/upgrade"), post(rooms::upgrade_room))
             .route(&p("/rooms/{room_id}/forget"), post(rooms::forget_room))

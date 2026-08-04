@@ -190,6 +190,142 @@ pub async fn leave_remote_room(
     Ok(())
 }
 
+/// A resident server's `send_knock` response.
+#[derive(Debug)]
+pub struct KnockResponse {
+    /// The stripped room state (`knock_room_state`) identifying the room.
+    pub knock_room_state: Vec<serde_json::Value>,
+    /// Our signed knock membership event.
+    pub event: CanonicalJsonObject,
+    /// The room version the resident reported.
+    pub room_version: RoomVersion,
+}
+
+/// Errors from the outbound knock handshake. Carries the remote's HTTP
+/// status so the client-facing `/knock` can surface a 403 (not permitted)
+/// or 404 (unknown room) rather than a blanket gateway error.
+#[derive(Debug, thiserror::Error)]
+pub enum KnockError {
+    #[error("federation transport: {0}")]
+    Transport(OutboundError),
+    #[error("malformed response: {0}")]
+    Malformed(&'static str),
+    #[error("unsupported room version: {0}")]
+    UnsupportedVersion(String),
+    #[error("could not sign knock event: {0}")]
+    Sign(String),
+}
+
+impl KnockError {
+    /// The HTTP status the resident returned, when the failure was a
+    /// federation status error.
+    pub fn remote_status(&self) -> Option<u16> {
+        match self {
+            KnockError::Transport(OutboundError::Status(code, _)) => Some(*code),
+            _ => None,
+        }
+    }
+}
+
+/// Knock on a remote room: run the make_knock / send_knock handshake
+/// against `destination` (spec "Knocking Rooms"). `reason`, if given, rides
+/// on the knock membership content.
+pub async fn knock_remote_room(
+    client: &FederationClient,
+    signer: &ServerSigner,
+    destination: &str,
+    room_id: &str,
+    user_id: &str,
+    reason: Option<&str>,
+) -> Result<KnockResponse, KnockError> {
+    // make_knock: GET the template.
+    let ver_query = SUPPORTED_VERSIONS
+        .iter()
+        .map(|v| format!("ver={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let make_path = format!(
+        "/_matrix/federation/v1/make_knock/{}/{}?{}",
+        encode_segment(room_id),
+        encode_segment(user_id),
+        ver_query,
+    );
+    let make = client
+        .get(destination, &make_path)
+        .await
+        .map_err(KnockError::Transport)?;
+
+    let room_version = make
+        .get("room_version")
+        .and_then(|v| v.as_str())
+        .ok_or(KnockError::Malformed("make_knock without room_version"))?;
+    let version = RoomVersion::parse(room_version)
+        .map_err(|_| KnockError::UnsupportedVersion(room_version.to_owned()))?;
+    let template = match make.get("event") {
+        Some(serde_json::Value::Object(_)) => make["event"].clone(),
+        _ => return Err(KnockError::Malformed("make_knock without event template")),
+    };
+
+    // Fill + sign the template into a real knock PDU.
+    let mut knock = match CanonicalJsonValue::try_from(template) {
+        Ok(CanonicalJsonValue::Object(o)) => o,
+        _ => return Err(KnockError::Malformed("event template is not an object")),
+    };
+    knock_expect_str(&knock, "type", "m.room.member")?;
+    knock_expect_str(&knock, "sender", user_id)?;
+    knock_expect_str(&knock, "state_key", user_id)?;
+    if knock.get("room_id").and_then(|v| v.as_str()) != Some(room_id) {
+        return Err(KnockError::Malformed("template room_id mismatch"));
+    }
+    // The knocking server owns origin_server_ts and the optional reason.
+    stamp_origin_ts(&mut knock);
+    if let Some(reason) = reason {
+        if let Some(CanonicalJsonValue::Object(content)) = knock.get_mut("content") {
+            content.insert(
+                "reason".to_owned(),
+                CanonicalJsonValue::String(reason.to_owned()),
+            );
+        }
+    }
+    signer
+        .hash_and_sign_event(&mut knock, version)
+        .map_err(|e| KnockError::Sign(e.to_string()))?;
+
+    let event_id = saltator_core::event::event_id(&knock, version)
+        .map_err(|e| KnockError::Sign(format!("event id: {e}")))?
+        .to_string();
+    let knock_value = serde_json::Value::from(CanonicalJsonValue::Object(knock.clone()));
+
+    // send_knock: submit the signed event, receive the stripped room state.
+    let send_path = format!(
+        "/_matrix/federation/v1/send_knock/{}/{}",
+        encode_segment(room_id),
+        encode_segment(&event_id),
+    );
+    let resp = client
+        .put(destination, &send_path, &knock_value)
+        .await
+        .map_err(KnockError::Transport)?;
+
+    let knock_room_state = match resp.get("knock_room_state") {
+        Some(serde_json::Value::Array(a)) => a.clone(),
+        _ => Vec::new(),
+    };
+
+    Ok(KnockResponse {
+        knock_room_state,
+        event: knock,
+        room_version: version,
+    })
+}
+
+fn knock_expect_str(obj: &CanonicalJsonObject, key: &str, want: &str) -> Result<(), KnockError> {
+    match obj.get(key) {
+        Some(CanonicalJsonValue::String(s)) if s == want => Ok(()),
+        _ => Err(KnockError::Malformed("template field mismatch")),
+    }
+}
+
 /// Stamp `origin_server_ts` with our current time — the joining/leaving
 /// server owns this field, and make_join/make_leave templates omit it.
 fn stamp_origin_ts(obj: &mut CanonicalJsonObject) {
@@ -251,6 +387,19 @@ pub enum JoinError {
     UnsupportedVersion(String),
     #[error("could not sign join event: {0}")]
     Sign(String),
+}
+
+impl JoinError {
+    /// The HTTP status the resident returned, when the failure was a
+    /// federation status error. A 403 is a definitive rejection (the
+    /// resident won't let this user join), so the caller propagates it
+    /// rather than trying other candidates.
+    pub fn remote_status(&self) -> Option<u16> {
+        match self {
+            JoinError::Transport(OutboundError::Status(code, _)) => Some(*code),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

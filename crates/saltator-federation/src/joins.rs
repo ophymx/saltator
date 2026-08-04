@@ -64,6 +64,89 @@ fn require_membership_event(
     }
 }
 
+/// `GET /_matrix/federation/v1/make_knock/{roomId}/{userId}`. Returns an
+/// unsigned knock template; the knocking server fills, signs, and submits it
+/// via `/send_knock` (spec "Knocking Rooms").
+pub async fn make_knock(
+    State(state): State<Arc<FedState>>,
+    Path((room_id, user_id)): Path<(String, String)>,
+    _auth: Authenticated,
+) -> FedResult {
+    let Some(rooms) = state.rooms.clone() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
+    };
+    let room = ruma::RoomId::parse(&room_id)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad room id"))?;
+    let user = ruma::UserId::parse(&user_id)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad user id"))?;
+
+    match rooms.make_knock_template(&room, &user) {
+        Ok((version, template)) => Ok(axum::Json(serde_json::json!({
+            "room_version": version.as_str(),
+            "event": CanonicalJsonValue::Object(template),
+        }))),
+        Err(saltator_roomserver::RoomError::UnknownRoom(_)) => {
+            Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room"))
+        }
+        Err(e) => Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        )),
+    }
+}
+
+/// `PUT /_matrix/federation/v1/send_knock/{roomId}/{eventId}`: apply a
+/// remote server's signed knock and return the stripped room state.
+pub async fn send_knock(
+    State(state): State<Arc<FedState>>,
+    Path((_room_id, _event_id)): Path<(String, String)>,
+    auth: Authenticated,
+) -> FedResult {
+    let Some(rooms) = state.rooms.clone() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
+    };
+
+    // Trust the knocking server's keys before verifying its signed event.
+    let now = crate::now_ms();
+    if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
+        if let Some(set) = keys.get(&auth.origin) {
+            rooms.trust_keys(&auth.origin, set.clone());
+        }
+    }
+
+    let body: serde_json::Value = auth.json().map_err(|_| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "M_NOT_JSON",
+            "knock event is not valid JSON",
+        )
+    })?;
+    let raw: CanonicalJsonObject = match CanonicalJsonValue::try_from(body) {
+        Ok(CanonicalJsonValue::Object(o)) => o,
+        _ => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "M_BAD_JSON",
+                "knock event is not an object",
+            ))
+        }
+    };
+    // spec: /send_knock accepts only an m.room.member knock with
+    // state_key == sender; anything else is a 400.
+    require_membership_event(&raw, "knock")?;
+
+    match rooms.send_knock(raw).await {
+        Ok(result) => Ok(axum::Json(serde_json::json!({
+            "knock_room_state": result.knock_room_state,
+        }))),
+        Err(saltator_roomserver::RoomError::UnknownRoom(_)) => {
+            Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room"))
+        }
+        Err(e) => Err(err(StatusCode::FORBIDDEN, "M_FORBIDDEN", &e.to_string())),
+    }
+}
+
 /// `GET /_matrix/federation/v1/make_join/{roomId}/{userId}`.
 pub async fn make_join(
     State(state): State<Arc<FedState>>,

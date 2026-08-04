@@ -23,7 +23,8 @@ pub use backfill::fetch_backfill;
 pub use http_client::build_http_client;
 pub use inbound::{AuthRejection, Authenticated};
 pub use join_client::{
-    join_remote_room, leave_remote_room, resident_of_room, JoinError, JoinResponse,
+    join_remote_room, knock_remote_room, leave_remote_room, resident_of_room, JoinError,
+    JoinResponse, KnockError, KnockResponse,
 };
 pub use keys::{trust_event_servers, KeyCache, KeyError};
 pub use media::parse_multipart_file;
@@ -166,6 +167,14 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route(
             "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
             get(joins::make_join),
+        )
+        .route(
+            "/_matrix/federation/v1/make_knock/{room_id}/{user_id}",
+            get(joins::make_knock),
+        )
+        .route(
+            "/_matrix/federation/v1/send_knock/{room_id}/{event_id}",
+            put(joins::send_knock),
         )
         .route(
             "/_matrix/federation/v1/event_auth/{room_id}/{event_id}",
