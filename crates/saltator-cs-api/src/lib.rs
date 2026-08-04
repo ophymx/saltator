@@ -176,7 +176,8 @@ impl CsState {
 /// Build the client-server router. Serve this on the client listener.
 pub fn router(state: Arc<CsState>) -> axum::Router {
     use routes::{
-        account, backup, keys, media, push, relations, rooms, search, session, sync, to_device,
+        account, backup, keys, media, push, relations, rooms, search, session, spaces, sync,
+        to_device,
     };
 
     let mut app = axum::Router::new()
@@ -401,6 +402,10 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
             get(rooms::timestamp_to_event),
+        )
+        .route(
+            "/_matrix/client/v1/rooms/{room_id}/hierarchy",
+            get(spaces::get_hierarchy),
         );
 
     // -- media (authenticated endpoints only, Matrix 1.11+)

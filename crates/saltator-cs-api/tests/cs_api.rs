@@ -8672,3 +8672,237 @@ async fn imported_room_sync_includes_send_join_state() {
 
     env.shutdown().await;
 }
+
+/// Spaces summary (`GET /rooms/{roomId}/hierarchy`, MSC2946): a space tree is
+/// walked depth-first, non-space children are not expanded, `children_state`
+/// reflects the `m.space.child` links, and `suggested_only` / `max_depth` /
+/// `limit`+`from` shape the result. Mirrors Complement's TestClientSpacesSummary.
+#[tokio::test]
+async fn spaces_hierarchy_walks_the_tree() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let bob = env.register("bob", "pw").await;
+
+    let enc = |id: &str| {
+        id.replace('!', "%21")
+            .replace(':', "%3A")
+            .replace('$', "%24")
+    };
+
+    let create = |tok: String, body: Value| {
+        let env = &env;
+        async move {
+            let (s, r) = env
+                .req(
+                    "POST",
+                    "/_matrix/client/v3/createRoom",
+                    Some(&tok),
+                    Some(body),
+                )
+                .await;
+            assert_eq!(s, StatusCode::OK, "{r}");
+            r["room_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let space = |name: &str| json!({"preset": "public_chat", "name": name, "creation_content": {"type": "m.space"}});
+    let world_readable_room = |name: &str| {
+        json!({"preset": "public_chat", "name": name, "initial_state": [{
+            "type": "m.room.history_visibility", "state_key": "",
+            "content": {"history_visibility": "world_readable"}
+        }]})
+    };
+
+    let root = create(alice.clone(), space("Root")).await;
+    let r1 = create(
+        alice.clone(),
+        json!({"preset": "public_chat", "name": "R1"}),
+    )
+    .await;
+    let ss1 = create(alice.clone(), space("Sub-Space 1")).await;
+    let r2 = create(
+        alice.clone(),
+        json!({"preset": "public_chat", "name": "R2"}),
+    )
+    .await;
+    let ss2 = create(alice.clone(), space("SS2")).await;
+    let r3 = create(
+        alice.clone(),
+        json!({"preset": "public_chat", "name": "R3"}),
+    )
+    .await;
+    // bob owns r4 (world-readable, alice not joined) and r5.
+    let r4 = create(bob.clone(), world_readable_room("R4")).await;
+    let r5 = create(bob.clone(), json!({"preset": "public_chat", "name": "R5"})).await;
+    // Borrow as `&str` (Copy) so the query closures below don't move it.
+    let alice: &str = &alice;
+
+    // Child links. A small gap keeps origin_server_ts strictly increasing so
+    // sibling order is deterministic (the real test round-trips through /sync).
+    let link = |parent: String, child: String, extra: Value| {
+        let env = &env;
+        let enc = &enc;
+        async move {
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            let mut content = json!({"via": [SERVER]});
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    content[k] = v.clone();
+                }
+            }
+            let (s, r) = env
+                .req(
+                    "PUT",
+                    &format!(
+                        "/_matrix/client/v3/rooms/{}/state/m.space.child/{}",
+                        enc(&parent),
+                        enc(&child)
+                    ),
+                    Some(alice),
+                    Some(content),
+                )
+                .await;
+            assert_eq!(s, StatusCode::OK, "{r}");
+        }
+    };
+
+    link(root.clone(), r1.clone(), json!({"suggested": true})).await;
+    link(root.clone(), ss1.clone(), json!({})).await;
+    link(root.clone(), r2.clone(), json!({"suggested": true})).await;
+    // r2 is not a space, so this child is never expanded (R5 must not appear).
+    link(r2.clone(), r5.clone(), json!({})).await;
+    link(ss1.clone(), ss2.clone(), json!({})).await;
+    link(ss2.clone(), r3.clone(), json!({})).await;
+    link(ss2.clone(), r4.clone(), json!({})).await;
+
+    let hierarchy = |query: &str| {
+        let env = &env;
+        let enc = &enc;
+        let root = &root;
+        let query = query.to_owned();
+        async move {
+            let (s, r) = env
+                .req(
+                    "GET",
+                    &format!("/_matrix/client/v1/rooms/{}/hierarchy{}", enc(root), query),
+                    Some(alice),
+                    None,
+                )
+                .await;
+            assert_eq!(s, StatusCode::OK, "{r}");
+            r
+        }
+    };
+    let room_ids = |r: &Value| -> Vec<String> {
+        r["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|room| room["room_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let children_of = |r: &Value, id: &str| -> Vec<String> {
+        let room = r["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|room| room["room_id"] == id)
+            .unwrap();
+        room["children_state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["state_key"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Whole graph: every room reachable through spaces, R5 excluded.
+    let all = hierarchy("").await;
+    let mut got = room_ids(&all);
+    got.sort();
+    let mut want = vec![
+        root.clone(),
+        r1.clone(),
+        r2.clone(),
+        r3.clone(),
+        r4.clone(),
+        ss1.clone(),
+        ss2.clone(),
+    ];
+    want.sort();
+    assert_eq!(got, want, "whole graph: {all}");
+    assert!(
+        !room_ids(&all).contains(&r5),
+        "R5 under a non-space must not appear"
+    );
+    // ss1 is a space.
+    let ss1_room = all["rooms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|room| room["room_id"] == ss1.as_str())
+        .unwrap();
+    assert_eq!(ss1_room["room_type"], "m.space", "{ss1_room}");
+    // Links in send order.
+    assert_eq!(
+        children_of(&all, &root),
+        vec![r1.clone(), ss1.clone(), r2.clone()]
+    );
+    assert_eq!(children_of(&all, &ss2), vec![r3.clone(), r4.clone()]);
+
+    // max_depth=1: root's direct children only (no ss2 under ss1).
+    let d1 = hierarchy("?max_depth=1").await;
+    let mut got = room_ids(&d1);
+    got.sort();
+    let mut want = vec![root.clone(), r1.clone(), r2.clone(), ss1.clone()];
+    want.sort();
+    assert_eq!(got, want, "max_depth=1: {d1}");
+
+    // suggested_only: only suggested links are followed, and shown.
+    let sug = hierarchy("?suggested_only=true").await;
+    let mut got = room_ids(&sug);
+    got.sort();
+    let mut want = vec![root.clone(), r1.clone(), r2.clone()];
+    want.sort();
+    assert_eq!(got, want, "suggested_only: {sug}");
+    assert_eq!(children_of(&sug, &root), vec![r1.clone(), r2.clone()]);
+
+    // Pagination: DFS pre-order split across two pages.
+    let page1 = hierarchy("?limit=4").await;
+    assert_eq!(
+        room_ids(&page1),
+        vec![root.clone(), r1.clone(), ss1.clone(), ss2.clone()],
+        "page1: {page1}"
+    );
+    let next = page1["next_batch"].as_str().expect("next_batch");
+    let page2 = hierarchy(&format!("?from={next}")).await;
+    assert_eq!(
+        room_ids(&page2),
+        vec![r3.clone(), r4.clone(), r2.clone()],
+        "page2: {page2}"
+    );
+    assert!(page2.get("next_batch").is_none(), "no more pages: {page2}");
+
+    // Redacting a link (empty content) drops it from the tree.
+    let (s, r) = env
+        .req(
+            "PUT",
+            &format!(
+                "/_matrix/client/v3/rooms/{}/state/m.space.child/{}",
+                enc(&root),
+                enc(&ss1)
+            ),
+            Some(alice),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    let redacted = hierarchy("").await;
+    let mut got = room_ids(&redacted);
+    got.sort();
+    let mut want = vec![root.clone(), r1.clone(), r2.clone()];
+    want.sort();
+    assert_eq!(got, want, "after redacting root->ss1: {redacted}");
+    assert_eq!(children_of(&redacted, &root), vec![r1.clone(), r2.clone()]);
+
+    env.shutdown().await;
+}

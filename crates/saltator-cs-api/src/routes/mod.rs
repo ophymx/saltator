@@ -8,5 +8,6 @@ pub mod relations;
 pub mod rooms;
 pub mod search;
 pub mod session;
+pub mod spaces;
 pub mod sync;
 pub mod to_device;
