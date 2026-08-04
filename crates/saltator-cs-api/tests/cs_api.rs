@@ -2454,6 +2454,47 @@ async fn is_direct_invite_carries_flag() {
         "invite must carry is_direct: {invite}"
     );
 
+    // After bob joins, his join event carries the invite as prev_content
+    // (with is_direct) and the inviter as prev_sender (spec: UnsignedData).
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+    let (status, _) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/join/{enc}"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let sync = env
+        .sync_until(&bob, |b| b["rooms"]["join"].get(&room_id).is_some())
+        .await;
+    let join = sync["rooms"]["join"][&room_id]["timeline"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["type"] == "m.room.member"
+                && e["state_key"] == bob_id
+                && e["content"]["membership"] == "join"
+        })
+        .expect("bob's join event in timeline");
+    assert_eq!(
+        join["unsigned"]["prev_content"]["membership"],
+        json!("invite"),
+        "prev_content.membership: {join}"
+    );
+    assert_eq!(
+        join["unsigned"]["prev_content"]["is_direct"],
+        json!(true),
+        "prev_content.is_direct: {join}"
+    );
+    assert_eq!(
+        join["unsigned"]["prev_sender"],
+        json!(format!("@alice:{SERVER}")),
+        "prev_sender: {join}"
+    );
+
     env.shutdown().await;
 }
 

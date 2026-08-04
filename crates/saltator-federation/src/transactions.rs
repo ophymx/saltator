@@ -365,8 +365,66 @@ pub(crate) async fn process_pdu(
                 (precomputed, error_result("missing prev/auth events"))
             }
         }
+        Err(RoomError::UnknownRoom(_)) => {
+            // A membership change for a room we don't host. If it removes a
+            // *local* user who has a pending out-of-band invite here (an
+            // invite being rescinded/kicked), reflect it as a leave so their
+            // /sync observes it — we otherwise have no state for the room.
+            if apply_out_of_band_leave(state, &raw).await {
+                (precomputed, serde_json::json!({}))
+            } else {
+                (precomputed, error_result("unknown room"))
+            }
+        }
         Err(e) => (precomputed, error_result(&e.to_string())),
     }
+}
+
+/// Turn a leave/ban `m.room.member` for a *local* user who currently holds a
+/// pending out-of-band invite into a recorded leave — the invitee's server
+/// learning the invite was rescinded, for a room it does not host.
+async fn apply_out_of_band_leave(state: &FedState, raw: &CanonicalJsonObject) -> bool {
+    let Some(users) = &state.users else {
+        return false;
+    };
+    let str_of = |k: &str| match raw.get(k) {
+        Some(CanonicalJsonValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    if str_of("type") != Some("m.room.member") {
+        return false;
+    }
+    let membership = raw
+        .get("content")
+        .and_then(|c| c.as_object())
+        .and_then(|c| c.get("membership"))
+        .and_then(|m| match m {
+            CanonicalJsonValue::String(s) => Some(s.as_str()),
+            _ => None,
+        });
+    if !matches!(membership, Some("leave" | "ban")) {
+        return false;
+    }
+    let (Some(target), Some(room_id)) = (str_of("state_key"), str_of("room_id")) else {
+        return false;
+    };
+    let is_local = ruma::UserId::parse(target)
+        .map(|u| u.server_name() == state.server_name)
+        .unwrap_or(false);
+    if !is_local {
+        return false;
+    }
+    // Only act on a standing invite; ignore otherwise (we don't host the room).
+    let has_invite = users
+        .store()
+        .membership(target, room_id)
+        .ok()
+        .flatten()
+        .is_some_and(|e| e.membership == "invite");
+    if !has_invite {
+        return false;
+    }
+    users.record_remote_leave(target, room_id).await.is_ok()
 }
 
 fn outcome_result(outcome: Outcome) -> (Option<String>, serde_json::Value) {
