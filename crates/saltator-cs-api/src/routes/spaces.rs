@@ -23,13 +23,56 @@ use saltator_roomserver::RoomServer;
 
 use crate::error::ApiError;
 use crate::extract::Auth;
-use crate::room_util::{current_state, membership_in};
+use crate::room_util::{current_state, membership_in, room_meta};
 use crate::CsState;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::internal(e)
+}
+
+/// `GET /_matrix/client/v1/room_summary/{roomIdOrAlias}` (MSC3266): a
+/// summary of one room, including `allowed_room_ids` for restricted rooms
+/// and the caller's `membership`. Aliases resolve through the local
+/// directory. Federation via `?via=` is not yet wired — a room this server
+/// does not host is 404.
+pub async fn get_room_summary(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Path(room_id_or_alias): Path<String>,
+) -> Result<axum::Json<Value>> {
+    let user = auth.user_id.as_str();
+    let room_id = if room_id_or_alias.starts_with('#') {
+        crate::routes::rooms::resolve_alias(&state, &room_id_or_alias)?.to_string()
+    } else {
+        room_id_or_alias
+    };
+
+    let summary = room_summary(&state.rooms, &room_id)
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::not_found("Room not found."))?;
+
+    // Accessible if the caller is a member, or the room is peekable (public /
+    // knockable / world-readable) — otherwise it stays hidden (spec: 404).
+    let current = current_state(&state.rooms, &room_id)?;
+    let membership = membership_in(&state.rooms, &current, user)?;
+    let peekable = matches!(
+        summary.join_rule.as_str(),
+        "public" | "knock" | "knock_restricted"
+    ) || summary.world_readable;
+    if !matches!(membership.as_str(), "join" | "invite" | "knock") && !peekable {
+        return Err(ApiError::not_found("Room not found."));
+    }
+
+    let mut out = summary.summary;
+    let obj = out.as_object_mut().expect("summary is an object");
+    obj.insert("membership".into(), membership.into());
+    obj.insert(
+        "room_version".into(),
+        room_meta(&state.rooms, &room_id)?.version.into(),
+    );
+    Ok(axum::Json(out))
 }
 
 /// A room resolved for the hierarchy: its summary chunk (minus
