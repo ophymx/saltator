@@ -123,9 +123,9 @@ TestWriteMDirectAccountData
 # membership relayed to the room's servers, and the knocker's stripped
 # knock_room_state surfaced under /sync `rooms.knock`. Gated for the
 # MSC3787 (v10, knock_restricted) variants — the plain v7 tests stay red
-# because room version 7 is unsupported here.
-# (TestKnockRoomsInPublicRoomsDirectory* is not gated: it needs
-# /publicRooms to emit a `join_rule` for public rooms, which ruma elides as
-# the default — a separate directory-serialization follow-up, not knocking.)
+# because room version 7 is unsupported here. The directory variant also
+# needed /publicRooms to emit a `join_rule` for public rooms (ruma elides
+# the default), fixed by the directory response post-processing.
 TestKnockingInMSC3787Room
 TestCannotSendKnockViaSendKnockInMSC3787Room
+TestKnockRoomsInPublicRoomsDirectoryInMSC3787Room

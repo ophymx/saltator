@@ -2949,23 +2949,45 @@ fn directory_chunks(
 pub async fn public_rooms(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_public_rooms::v3::Request>,
-) -> Result<Ra<get_public_rooms::v3::Response>> {
+) -> Result<axum::response::Response> {
     let (chunks, total) = directory_chunks(&state, None, req.limit)?;
     let mut resp = get_public_rooms::v3::Response::new(chunks);
     resp.total_room_count_estimate = ruma::UInt::try_from(total).ok();
-    Ok(Ra(resp))
+    directory_response(resp)
 }
 
 pub async fn public_rooms_filtered(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_public_rooms_filtered::v3::Request>,
-) -> Result<Ra<get_public_rooms_filtered::v3::Response>> {
+) -> Result<axum::response::Response> {
     let (chunks, total) =
         directory_chunks(&state, req.filter.generic_search_term.as_deref(), req.limit)?;
     let mut resp = get_public_rooms_filtered::v3::Response::new();
     resp.chunk = chunks;
     resp.total_room_count_estimate = ruma::UInt::try_from(total).ok();
-    Ok(Ra(resp))
+    directory_response(resp)
+}
+
+/// Serialize a public-rooms directory response, filling in `join_rule` for
+/// any chunk that lacks it. ruma (0.24) omits the field when it equals the
+/// default (`public`) via `skip_serializing_if`, but clients — and
+/// Complement's public-rooms-directory test — expect every chunk to carry a
+/// `join_rule`. A missing key therefore unambiguously means `public`.
+fn directory_response<T: ruma::api::OutgoingResponse>(resp: T) -> Result<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let http = resp
+        .try_into_http_response::<Vec<u8>>()
+        .map_err(|e| ApiError::internal(format!("response encode: {e}")))?;
+    let mut v: serde_json::Value = serde_json::from_slice(http.body()).map_err(internal)?;
+    if let Some(chunk) = v.get_mut("chunk").and_then(|c| c.as_array_mut()) {
+        for room in chunk.iter_mut() {
+            if let Some(obj) = room.as_object_mut() {
+                obj.entry("join_rule")
+                    .or_insert_with(|| serde_json::Value::String("public".to_owned()));
+            }
+        }
+    }
+    Ok(axum::Json(v).into_response())
 }
 
 pub async fn get_visibility(

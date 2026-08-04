@@ -4859,6 +4859,9 @@ async fn complement_shaped_regressions() {
     assert_eq!(chunk["room_id"], room_id.as_str(), "{body}");
     assert_eq!(chunk["name"], "Complement Room");
     assert_eq!(chunk["topic"], "regressions");
+    // join_rule must be present even for public rooms — ruma elides the
+    // default ("public"), so the directory response fills it back in.
+    assert_eq!(chunk["join_rule"], "public", "{body}");
     let (status, body) = env
         .req(
             "POST",
