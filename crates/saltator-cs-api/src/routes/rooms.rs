@@ -678,6 +678,7 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
 
     let mut resp = None;
     let mut last_err = String::new();
+    let mut forbidden: Option<String> = None;
     for destination in &candidates {
         match saltator_federation::join_remote_room(
             &fed.client,
@@ -692,10 +693,25 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
                 resp = Some(r);
                 break;
             }
-            Err(e) => last_err = e.to_string(),
+            Err(e) => {
+                // A 403 is the resident's definitive verdict (not invited to
+                // a restricted/invite room, banned, …): propagate it rather
+                // than falling through to another candidate — otherwise a
+                // fake or unrelated server that 404s would mask the real
+                // reason (Complement TestKnockingInMSC3787Room's federated
+                // "join without invite should fail" wants the 403).
+                if e.remote_status() == Some(403) {
+                    forbidden = Some(e.to_string());
+                    break;
+                }
+                last_err = e.to_string();
+            }
         }
     }
     let Some(resp) = resp else {
+        if let Some(reason) = forbidden {
+            return Err(ApiError::forbidden(reason));
+        }
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_GATEWAY,
             "M_UNKNOWN",
@@ -1148,6 +1164,19 @@ async fn knock_remote(
                 break;
             }
             Err(e) => {
+                // A 403 is the resident's definitive verdict (banned,
+                // already joined/invited, or the room doesn't accept
+                // knocks): propagate it immediately. Falling through to
+                // another candidate would let an unrelated server that 404s
+                // (e.g. a Complement test server also in the room, which has
+                // no /make_knock) mask the real 403 —
+                // TestKnockingInMSC3787Room's federated "banned cannot
+                // knock" wants the 403.
+                if e.remote_status() == Some(403) {
+                    last_status = Some(403);
+                    last_err = e.to_string();
+                    break;
+                }
                 last_status = e.remote_status();
                 last_err = e.to_string();
             }

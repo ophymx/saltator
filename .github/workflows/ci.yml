@@ -209,12 +209,13 @@ jobs:
           # device-list stream tracking) are red until their milestone and
           # burn full timeouts on every push (~6 min of the suite). Skipped
           # per-push; the weekly scheduled run is unfiltered. Knocking now
-          # works in MSC3787 (v10) rooms, so only the v7-only knock tests
-          # (TestKnocking, TestKnockRoomsInPublicRoomsDirectory,
-          # TestCannotSendNonKnockViaSendKnock — v7 is unsupported here) stay
-          # skipped; the *InMSC3787Room variants run and are gated. The knock
-          # RESTRICTED-join tests still fall under the RestrictedRooms bucket.
-          SKIP_DEFERRED: ${{ github.event_name != 'schedule' && '-skip=^TestKnocking$|^TestKnockRoomsInPublicRoomsDirectory$|^TestCannotSendNonKnockViaSendKnock$|RestrictedRooms|TestDeviceListsUpdateOverFederation' || '' }}
+          # works in MSC3787 (v10) rooms, so the gated *InMSC3787Room knock
+          # tests run; still skipped are the v7-only tests (TestKnocking,
+          # TestCannotSendNonKnockViaSendKnock — v7 is unsupported here), the
+          # public-rooms-directory knock tests (both versions — they need a
+          # /publicRooms join_rule fix, tracked separately), and the knock
+          # RESTRICTED-join tests (under the RestrictedRooms bucket).
+          SKIP_DEFERRED: ${{ github.event_name != 'schedule' && '-skip=^TestKnocking$|TestKnockRoomsInPublicRoomsDirectory|^TestCannotSendNonKnockViaSendKnock$|RestrictedRooms|TestDeviceListsUpdateOverFederation' || '' }}
         # The federation suite is the root `tests` package (not
         # `tests/csapi`). `|| true` here so the raw `go test` exit never
         # decides the job — the must-pass gate below does. Coverage is

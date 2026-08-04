@@ -389,6 +389,19 @@ pub enum JoinError {
     Sign(String),
 }
 
+impl JoinError {
+    /// The HTTP status the resident returned, when the failure was a
+    /// federation status error. A 403 is a definitive rejection (the
+    /// resident won't let this user join), so the caller propagates it
+    /// rather than trying other candidates.
+    pub fn remote_status(&self) -> Option<u16> {
+        match self {
+            JoinError::Transport(OutboundError::Status(code, _)) => Some(*code),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::resident_of_room;
