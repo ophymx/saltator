@@ -22,6 +22,7 @@
 //! that is a per-room async lock around steps 2–5, so reads of applied
 //! state during precomputation are stable.
 
+pub mod hierarchy;
 mod machine;
 mod signer;
 mod types;

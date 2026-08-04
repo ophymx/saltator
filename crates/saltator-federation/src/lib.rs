@@ -3,6 +3,7 @@
 //! request authentication.
 
 mod backfill;
+mod hierarchy;
 mod http_client;
 mod inbound;
 mod join_client;
@@ -150,6 +151,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route("/_matrix/key/v2/server", get(serve_server_keys))
         .route("/_matrix/federation/v1/version", get(serve_version))
         .route("/_matrix/federation/v1/query/profile", get(query::profile))
+        .route(
+            "/_matrix/federation/v1/hierarchy/{room_id}",
+            get(hierarchy::serve_hierarchy),
+        )
         .route(
             "/_matrix/federation/v1/query/directory",
             get(query::directory),
