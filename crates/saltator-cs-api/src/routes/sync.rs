@@ -197,7 +197,10 @@ fn respond(resp: v3::Response) -> Result<axum::response::Response> {
             if section == "join" {
                 if let Some(events) = room
                     .as_object_mut()
-                    .map(|r| r.entry("ephemeral").or_insert_with(|| serde_json::json!({})))
+                    .map(|r| {
+                        r.entry("ephemeral")
+                            .or_insert_with(|| serde_json::json!({}))
+                    })
                     .and_then(|e| e.as_object_mut())
                 {
                     events
