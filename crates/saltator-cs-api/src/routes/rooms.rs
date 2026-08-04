@@ -1767,12 +1767,23 @@ pub async fn send_state_event(
     auth: Auth,
     Ar(req): Ar<send_state_event::v3::Request>,
 ) -> Result<Ra<send_state_event::v3::Response>> {
-    let content: serde_json::Value = serde_json::from_str(req.body.json().get())
+    let mut content: serde_json::Value = serde_json::from_str(req.body.json().get())
         .map_err(|e| ApiError::bad_json(e.to_string()))?;
     // m.room.create is only ever the room's first event; a client can never
     // send another. Reject with 400 (not the pipeline's auth 403).
     if req.event_type == ruma::events::StateEventType::RoomCreate {
         return Err(ApiError::bad_json("Cannot send a m.room.create event"));
+    }
+    // `join_authorised_via_users_server` is server-controlled — set only when
+    // this server authorises a restricted join, never by the client. Strip it
+    // from a client-sent member event so a bogus value (e.g. a profile update
+    // that echoes a stale field) can't reach event verification, which would
+    // choke trying to parse it as a user ID (Complement
+    // TestRestrictedRoomsLocalJoin's join→join step sends `"unused"`).
+    if req.event_type == ruma::events::StateEventType::RoomMember {
+        if let Some(obj) = content.as_object_mut() {
+            obj.remove("join_authorised_via_users_server");
+        }
     }
     if req.event_type == ruma::events::StateEventType::RoomCanonicalAlias {
         validate_canonical_alias(&state, req.room_id.as_str(), &content)?;

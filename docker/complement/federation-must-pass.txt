@@ -129,3 +129,20 @@ TestWriteMDirectAccountData
 TestKnockingInMSC3787Room
 TestCannotSendKnockViaSendKnockInMSC3787Room
 TestKnockRoomsInPublicRoomsDirectoryInMSC3787Room
+# 2026-08-04: restricted-room joins (MSC3083/MSC3787). The resident picks a
+# local invite-powered member to authorise a joiner who is in an allow-listed
+# room and stamps join_authorised_via_users_server (make_join + local join);
+# send_join co-signs before validating so auth rule 4.2 sees the resident
+# signature. Local + remote join, both v8 and v10, and the power-level
+# authoriser-selection variants. NOT yet gated: RemoteJoinLocalUser /
+# RemoteJoinFailOver (cross-server invite-power / power-level propagation) and
+# SpacesSummaryFederation — still under investigation.
+TestRestrictedRoomsLocalJoin
+TestRestrictedRoomsLocalJoinInMSC3787Room
+TestRestrictedRoomsRemoteJoin
+TestRestrictedRoomsRemoteJoinInMSC3787Room
+TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
+TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
+TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
+TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
+TestRestrictedRoomsSpacesSummaryLocal
