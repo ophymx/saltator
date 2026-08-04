@@ -2414,7 +2414,7 @@ fn parse_topo_token(token: &str) -> Result<PaginationBound> {
 
 // -- aliases / directory ---------------------------------------------------------
 
-fn resolve_alias(state: &CsState, alias: &str) -> Result<OwnedRoomId> {
+pub(crate) fn resolve_alias(state: &CsState, alias: &str) -> Result<OwnedRoomId> {
     let entry = state
         .users
         .store()

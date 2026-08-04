@@ -9117,3 +9117,83 @@ async fn spaces_hierarchy_spans_federation() {
 
     proj.abort();
 }
+
+/// GET /_matrix/client/v1/room_summary/{roomIdOrAlias} (MSC3266): the summary
+/// carries allowed_room_ids for a restricted room and omits it otherwise.
+/// Mirrors Complement's TestRoomSummaryAllowedRoomIDs.
+#[tokio::test]
+async fn room_summary_allowed_room_ids() {
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let enc = |id: &str| id.replace('!', "%21").replace(':', "%3A");
+
+    let create = |body: Value| {
+        let env = &env;
+        let alice = alice.as_str();
+        async move {
+            let (s, r) = env
+                .req(
+                    "POST",
+                    "/_matrix/client/v3/createRoom",
+                    Some(alice),
+                    Some(body),
+                )
+                .await;
+            assert_eq!(s, StatusCode::OK, "{r}");
+            r["room_id"].as_str().unwrap().to_owned()
+        }
+    };
+
+    let space = create(json!({
+        "preset": "public_chat",
+        "creation_content": {"type": "m.space"}
+    }))
+    .await;
+    let restricted = create(json!({
+        "preset": "public_chat",
+        "room_version": "8",
+        "initial_state": [{
+            "type": "m.room.join_rules",
+            "state_key": "",
+            "content": {
+                "join_rule": "restricted",
+                "allow": [{"type": "m.room_membership", "room_id": space}]
+            }
+        }]
+    }))
+    .await;
+    let invite = create(json!({"preset": "private_chat"})).await;
+
+    // Restricted room: join_rule + allowed_room_ids present.
+    let (s, r) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v1/room_summary/{}", enc(&restricted)),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert_eq!(r["room_id"], restricted.as_str(), "{r}");
+    assert_eq!(r["join_rule"], "restricted", "{r}");
+    assert_eq!(r["allowed_room_ids"], json!([space]), "{r}");
+    assert_eq!(r["membership"], "join", "{r}");
+
+    // Invite-only room: allowed_room_ids omitted.
+    let (s, r) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v1/room_summary/{}", enc(&invite)),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{r}");
+    assert_eq!(r["room_id"], invite.as_str(), "{r}");
+    assert!(
+        r.get("allowed_room_ids").is_none(),
+        "allowed_room_ids must be absent: {r}"
+    );
+
+    env.shutdown().await;
+}

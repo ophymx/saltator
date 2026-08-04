@@ -406,6 +406,10 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_matrix/client/v1/rooms/{room_id}/hierarchy",
             get(spaces::get_hierarchy),
+        )
+        .route(
+            "/_matrix/client/v1/room_summary/{room_id_or_alias}",
+            get(spaces::get_room_summary),
         );
 
     // -- media (authenticated endpoints only, Matrix 1.11+)
