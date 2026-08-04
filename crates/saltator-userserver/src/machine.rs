@@ -519,6 +519,43 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             );
             Ok(UserResponse::Ok)
         }
+        UserCommand::RecordRemoteKnock {
+            user_id,
+            room_id,
+            sender,
+            event_id,
+            stripped_state,
+        } => {
+            let seq = emit_user_change(ctx, user_id)?;
+            let mkey = user_key(user_id, room_id);
+            ctx.put(
+                T_MEMBERSHIP,
+                &mkey,
+                enc(
+                    "membership encode",
+                    &MembershipEntry {
+                        membership: "knock".to_owned(),
+                        event_id: event_id.clone(),
+                        sender: sender.clone(),
+                        // Not from the room-shard projection: room_seq 0 so a
+                        // later projected membership always wins (see the
+                        // remote-invite note above). The knocking user is the
+                        // sender of their own knock.
+                        room_seq: 0,
+                        seq,
+                        forgotten: false,
+                    },
+                )?,
+            );
+            // The stripped `knock_room_state` reuses the invite-state table;
+            // a leave (rescind) clears it just like a rejected invite.
+            ctx.put(
+                T_INVITE_STATE,
+                &mkey,
+                enc("knock state encode", stripped_state)?,
+            );
+            Ok(UserResponse::Ok)
+        }
         UserCommand::RecordRemoteLeave { user_id, room_id } => {
             let seq = emit_user_change(ctx, user_id)?;
             let mkey = user_key(user_id, room_id);

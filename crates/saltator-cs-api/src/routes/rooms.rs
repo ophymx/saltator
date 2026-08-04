@@ -8,6 +8,7 @@ use ruma::api::client::alias::{create_alias, delete_alias, get_alias};
 use ruma::api::client::directory::{
     get_public_rooms, get_public_rooms_filtered, get_room_visibility, set_room_visibility,
 };
+use ruma::api::client::knock::knock_room;
 use ruma::api::client::membership::{
     ban_user, forget_room, get_member_events, invite_user, join_room_by_id,
     join_room_by_id_or_alias, joined_members, joined_rooms, kick_user, leave_room, unban_user,
@@ -496,25 +497,12 @@ async fn send_membership_with(
 /// Shared body handling for the two join endpoints: `reason` is spec'd,
 /// everything else rides along as custom member-event content. A room we
 /// don't host is joined over federation.
-async fn join_with_body(
-    state: &CsState,
-    auth: &Auth,
-    room_id: &RoomId,
-    via: &[String],
-    mut body: serde_json::Map<String, serde_json::Value>,
-) -> Result<()> {
-    let reason = body
-        .remove("reason")
-        .and_then(|v| v.as_str().map(ToOwned::to_owned));
-    body.remove("third_party_signed");
-
-    // Local room: the normal pipeline. Knowing the room isn't enough —
-    // once every local user has left, our fork of the DAG is stale (we
-    // stopped receiving events), so a rejoin goes back through a resident
-    // like a fresh remote join; the handshake re-imports current state and
-    // seeds the backfill frontier with what we missed. Local-pipeline
-    // rejoin remains for rooms we still participate in and rooms with no
-    // other server to join through.
+/// Whether we can service a membership change from our own copy of the
+/// room (vs. having to go through a resident over federation). Returns
+/// `(hosted, meta_exists)`. A room we know (`meta_exists`) is only "hosted"
+/// while we still participate — once every local user has left, our fork of
+/// the DAG is stale and a rejoin/knock must go through a resident.
+fn room_hosted_locally(state: &CsState, room_id: &RoomId) -> Result<(bool, bool)> {
     let meta_exists = state
         .rooms
         .store()
@@ -537,6 +525,29 @@ async fn join_with_body(
             state.federation.is_none() || we_created || no_remote_route
         }
     };
+    Ok((hosted, meta_exists))
+}
+
+async fn join_with_body(
+    state: &CsState,
+    auth: &Auth,
+    room_id: &RoomId,
+    via: &[String],
+    mut body: serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let reason = body
+        .remove("reason")
+        .and_then(|v| v.as_str().map(ToOwned::to_owned));
+    body.remove("third_party_signed");
+
+    // Local room: the normal pipeline. Knowing the room isn't enough —
+    // once every local user has left, our fork of the DAG is stale (we
+    // stopped receiving events), so a rejoin goes back through a resident
+    // like a fresh remote join; the handshake re-imports current state and
+    // seeds the backfill frontier with what we missed. Local-pipeline
+    // rejoin remains for rooms we still participate in and rooms with no
+    // other server to join through.
+    let (hosted, meta_exists) = room_hosted_locally(state, room_id)?;
     if hosted {
         local_pipeline_join(state, auth, room_id, reason, body).await?;
     } else {
@@ -1034,6 +1045,162 @@ pub async fn join_by_id_or_alias(
     };
     join_with_body(&state, &auth, &room_id, &via, body).await?;
     Ok(Ra(join_room_by_id_or_alias::v3::Response::new(room_id)))
+}
+
+/// `POST /_matrix/client/v3/knock/{roomIdOrAlias}`: request permission to
+/// join a room whose join rule is `knock`/`knock_restricted`. A local room
+/// sends the knock membership directly; a remote room goes through the
+/// make_knock/send_knock handshake.
+pub async fn knock_room(
+    State(state): State<Arc<CsState>>,
+    auth: Auth,
+    Path(room_id_or_alias): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    Jb(body): Jb,
+) -> Result<Ra<knock_room::v3::Response>> {
+    let id_or_alias = ruma::OwnedRoomOrAliasId::try_from(room_id_or_alias)
+        .map_err(|e| ApiError::invalid_param(format!("room_id_or_alias: {e}")))?;
+    let via = join_via_hints(query.as_deref());
+    let room_id: OwnedRoomId = match id_or_alias.try_into() {
+        Ok(room_id) => room_id,
+        Err(alias) if alias.server_name() != state.config.server_name => {
+            resolve_remote_alias(&state, alias.as_str()).await?.0
+        }
+        Err(alias) => resolve_alias(&state, alias.as_str())?,
+    };
+    let reason = body
+        .get("reason")
+        .and_then(|v| v.as_str().map(ToOwned::to_owned));
+
+    let (hosted, _) = room_hosted_locally(&state, &room_id)?;
+    if hosted {
+        send_membership(
+            &state,
+            &room_id,
+            &auth.user_id,
+            &auth.user_id,
+            "knock",
+            reason,
+        )
+        .await?;
+    } else {
+        knock_remote(&state, &auth, &room_id, &via, reason).await?;
+    }
+    Ok(Ra(knock_room::v3::Response::new(room_id)))
+}
+
+/// The remote half of a knock: run the make_knock/send_knock handshake
+/// through a resident, then record the pending knock (with its stripped
+/// `knock_room_state`) so it surfaces in the knocker's `/sync`.
+async fn knock_remote(
+    state: &CsState,
+    auth: &Auth,
+    room_id: &RoomId,
+    via: &[String],
+    reason: Option<String>,
+) -> Result<()> {
+    let Some(fed) = &state.federation else {
+        return Err(ApiError::not_found("Unknown room"));
+    };
+    let our_name = state.config.server_name.as_str();
+    let mut candidates: Vec<String> = Vec::new();
+    let push = |server: String, candidates: &mut Vec<String>| {
+        if server != our_name && !candidates.contains(&server) {
+            candidates.push(server);
+        }
+    };
+    for hint in via {
+        push(hint.clone(), &mut candidates);
+    }
+    if let Some(resident) = saltator_federation::resident_of_room(room_id.as_str()) {
+        push(resident, &mut candidates);
+    }
+    if let Ok(servers) = state
+        .rooms
+        .remote_servers_in_room(room_id.as_str(), our_name)
+    {
+        for server in servers {
+            push(server, &mut candidates);
+        }
+    }
+    if candidates.is_empty() {
+        return Err(ApiError::not_found(
+            "Cannot determine a server to knock through",
+        ));
+    }
+
+    let mut resp = None;
+    let mut last_status = None;
+    let mut last_err = String::new();
+    for destination in &candidates {
+        match saltator_federation::knock_remote_room(
+            &fed.client,
+            &fed.signer,
+            destination,
+            room_id.as_str(),
+            auth.user_id.as_str(),
+            reason.as_deref(),
+        )
+        .await
+        {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(e) => {
+                last_status = e.remote_status();
+                last_err = e.to_string();
+            }
+        }
+    }
+    let Some(resp) = resp else {
+        // Surface the resident's own verdict where it is meaningful: a 403
+        // (banned, already joined/invited, or the room doesn't accept
+        // knocks) and 404 (unknown room) are the errors a client acts on.
+        return Err(match last_status {
+            Some(403) => ApiError::forbidden(format!("knock rejected: {last_err}")),
+            Some(404) => ApiError::not_found("Unknown room"),
+            _ => ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "M_UNKNOWN",
+                format!("remote knock failed: {last_err}"),
+            ),
+        });
+    };
+
+    let event_id = saltator_core::event::event_id(&resp.event, resp.room_version)
+        .map(|i| i.to_string())
+        .unwrap_or_default();
+    let mut stripped: Vec<Vec<u8>> = Vec::new();
+    for item in &resp.knock_room_state {
+        if let Ok(bytes) = serde_json::to_vec(item) {
+            stripped.push(bytes);
+        }
+    }
+    // Ensure the knocker's own (stripped) knock member event is present —
+    // a resident that curated it out of knock_room_state would otherwise
+    // leave the knocker's /sync without their membership event.
+    let member_stripped = serde_json::json!({
+        "type": "m.room.member",
+        "state_key": auth.user_id.as_str(),
+        "sender": auth.user_id.as_str(),
+        "content": resp.event.get("content").map(|c| serde_json::Value::from(c.clone())),
+    });
+    if let Ok(bytes) = serde_json::to_vec(&member_stripped) {
+        stripped.push(bytes);
+    }
+    state
+        .users
+        .record_remote_knock(
+            auth.user_id.as_str(),
+            room_id.as_str(),
+            auth.user_id.as_str(),
+            &event_id,
+            stripped,
+        )
+        .await
+        .map_err(internal)?;
+    Ok(())
 }
 
 /// The server-routing hints on a join request: `?server_name=` (and the

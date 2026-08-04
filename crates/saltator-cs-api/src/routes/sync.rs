@@ -168,7 +168,11 @@ pub async fn sync_events(
             presence: state.presence.generation(),
         };
         let resp = build_sync(&state, &auth, since, now_pos, &filter, req.full_state).await?;
+        // ruma's `Rooms::is_empty` (0.24) ignores the `knock` map, so a
+        // knock-only update would otherwise look empty and block the
+        // long-poll until timeout — check it explicitly.
         let empty = resp.rooms.is_empty()
+            && resp.rooms.knock.is_empty()
             && resp.account_data.is_empty()
             && resp.presence.is_empty()
             && resp.to_device.events.is_empty()
@@ -193,9 +197,23 @@ pub async fn sync_events(
 /// object exists.
 fn respond(resp: v3::Response) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
+    // ruma 0.24's `Rooms::is_empty` omits the `knock` map from the check,
+    // so `skip_serializing_if` drops the whole `rooms` object when the only
+    // update is a knock. Serialize the knock map ourselves and splice it
+    // back in after ruma encodes the rest.
+    let knock = resp.rooms.knock.clone();
     let http = ruma::api::OutgoingResponse::try_into_http_response::<Vec<u8>>(resp)
         .map_err(|e| internal(format!("response encode: {e}")))?;
     let mut v: serde_json::Value = serde_json::from_slice(http.body()).map_err(internal)?;
+    if !knock.is_empty() {
+        let knock_json = serde_json::to_value(&knock).map_err(internal)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.entry("rooms")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .map(|rooms| rooms.insert("knock".to_owned(), knock_json));
+        }
+    }
     for section in ["join", "leave"] {
         let rooms = v
             .get_mut("rooms")
@@ -404,6 +422,11 @@ async fn build_sync(
                 resp.rooms
                     .invite
                     .insert(room_id, build_invited_room(state, auth, &room_id_str, &m)?);
+            }
+            "knock" if initial || m.seq > since.user => {
+                resp.rooms
+                    .knock
+                    .insert(room_id, build_knocked_room(state, auth, &room_id_str)?);
             }
             // Newly-left rooms ride incremental syncs — even when forgotten,
             // so other devices still learn about the leave. Older leaves are
@@ -879,6 +902,55 @@ fn build_invited_room(
     let mut invited = v3::InvitedRoom::new();
     invited.invite_state.events = events;
     Ok(invited)
+}
+
+/// The `rooms.knock.{roomId}` sync section: stripped `knock_state` for a
+/// room the caller has knocked upon. A hosted room's state is stripped
+/// live; a remote room's stripped state was stored on the user shard by
+/// the `/send_knock` response (reusing the invite-state table).
+fn build_knocked_room(state: &CsState, auth: &Auth, room_id: &str) -> Result<v3::KnockedRoom> {
+    let rooms = &state.rooms;
+    let store = rooms.store();
+    let mut events = Vec::new();
+    let Some(meta) = store.meta(room_id).map_err(internal)? else {
+        // A room we don't host: a knock we placed over federation, whose
+        // stripped state the /send_knock response stored on the user shard.
+        if let Some(stripped) = state
+            .users
+            .store()
+            .invite_state(auth.user_id.as_str(), room_id)
+            .map_err(internal)?
+        {
+            let mut knocked = v3::KnockedRoom::new();
+            knocked.knock_state.events = stripped
+                .iter()
+                .filter_map(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                .filter_map(|v| to_raw(&v).ok())
+                .collect();
+            return Ok(knocked);
+        }
+        return Ok(v3::KnockedRoom::new());
+    };
+    let current = store
+        .resolve_group(room_id, meta.current_group)
+        .map_err(internal)?;
+    let mut wanted: Vec<(String, String)> = INVITE_STATE_TYPES
+        .iter()
+        .map(|t| (t.to_string(), String::new()))
+        .collect();
+    // The knocker's own membership event carries the reason and confirms
+    // the knock state.
+    wanted.push(("m.room.member".to_owned(), auth.user_id.to_string()));
+    for key in wanted {
+        if let Some(event_id) = current.get(&key) {
+            if let Some(raw) = raw_event(rooms, event_id)? {
+                events.push(to_raw(&stripped_event(&raw))?);
+            }
+        }
+    }
+    let mut knocked = v3::KnockedRoom::new();
+    knocked.knock_state.events = events;
+    Ok(knocked)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -652,6 +652,151 @@ async fn leave_client_rejects_over_federation() {
     );
 }
 
+/// The make_knock/send_knock handshake: B knocks on A's knock_restricted
+/// room, A applies the knock and returns stripped `knock_room_state` that
+/// carries the create event and B's own knock membership (with reason). A
+/// non-knock room (public) rejects the knock with a propagated 403.
+#[tokio::test]
+async fn knock_client_drives_the_full_handshake() {
+    use saltator_federation::{knock_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let a_name: OwnedServerName = "a.test".try_into().unwrap();
+    let b_name: OwnedServerName = "b.test".try_into().unwrap();
+    let (a_signer, _) = ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let (b_signer, _) = ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let b_signer = Arc::new(b_signer);
+
+    // A hosts a v10 knock_restricted room, plus a public room to reject on.
+    let rooms = start_rooms("ka", a_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:a.test").unwrap();
+    let make_room = |join_rule: &'static str| {
+        let rooms = rooms.clone();
+        let alice = alice.clone();
+        async move {
+            let (room_id, _) = rooms
+                .create_room(&alice, RoomVersion::V10, serde_json::Map::new())
+                .await
+                .unwrap();
+            for (ty, sk, content) in [
+                (
+                    "m.room.member",
+                    alice.as_str(),
+                    json!({"membership": "join"}),
+                ),
+                (
+                    "m.room.power_levels",
+                    "",
+                    json!({"users": {alice.as_str(): 100}}),
+                ),
+                ("m.room.join_rules", "", json!({"join_rule": join_rule})),
+            ] {
+                rooms
+                    .send_state(&room_id, &alice, ty, sk, content)
+                    .await
+                    .unwrap();
+            }
+            room_id
+        }
+    };
+    let knock_room_id = make_room("knock_restricted").await;
+    let public_room_id = make_room("public").await;
+
+    let b_key_base = spawn(router(Arc::new(FedState::new(
+        b_name.clone(),
+        b_signer.clone(),
+        Vec::<OldVerifyKey>::new(),
+    ))))
+    .await;
+    let a_state = Arc::new(FedState {
+        server_name: a_name.clone(),
+        signer: a_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: KeyCache::with_base_url(b_key_base),
+        rooms: Some(rooms.clone()),
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let a_base = spawn(router(a_state)).await;
+    let client = FederationClient::with_base_url(b_signer.clone(), a_base);
+
+    // --- Success: knock on the knock_restricted room.
+    let resp = knock_remote_room(
+        &client,
+        &b_signer,
+        "a.test",
+        knock_room_id.as_str(),
+        "@bob:b.test",
+        Some("let me in"),
+    )
+    .await
+    .expect("knock handshake succeeds");
+
+    assert_eq!(resp.room_version, RoomVersion::V10);
+    let has_create = resp
+        .knock_room_state
+        .iter()
+        .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("m.room.create"));
+    assert!(
+        has_create,
+        "knock_room_state missing create: {:?}",
+        resp.knock_room_state
+    );
+    let bob_knock = resp
+        .knock_room_state
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(|t| t.as_str()) == Some("m.room.member")
+                && e.get("state_key").and_then(|s| s.as_str()) == Some("@bob:b.test")
+        })
+        .expect("bob's knock member event in stripped state");
+    assert_eq!(
+        bob_knock
+            .pointer("/content/membership")
+            .and_then(|m| m.as_str()),
+        Some("knock")
+    );
+    assert_eq!(
+        bob_knock
+            .pointer("/content/reason")
+            .and_then(|m| m.as_str()),
+        Some("let me in"),
+        "reason should ride on the knock content"
+    );
+
+    // A knocked user knocking again is idempotent (accepted, not an error).
+    knock_remote_room(
+        &client,
+        &b_signer,
+        "a.test",
+        knock_room_id.as_str(),
+        "@bob:b.test",
+        Some("again"),
+    )
+    .await
+    .expect("re-knock succeeds");
+
+    // --- Rejection: the public room does not accept knocks -> 403.
+    let err = knock_remote_room(
+        &client,
+        &b_signer,
+        "a.test",
+        public_room_id.as_str(),
+        "@bob:b.test",
+        None,
+    )
+    .await
+    .expect_err("knock on a public room is rejected");
+    assert_eq!(
+        err.remote_status(),
+        Some(403),
+        "a room that doesn't accept knocks returns 403: {err}"
+    );
+}
+
 /// RoomServer::event_auth_chain returns an event's transitive auth events
 /// (the /event_auth endpoint's body); unknown events give None.
 #[tokio::test]

@@ -118,3 +118,12 @@ TestUnbanViaInvite
 TestUnknownEndpoints
 TestUserAppearsInChangedDeviceListOnJoinOverFederation
 TestWriteMDirectAccountData
+# 2026-08-04: federated knocking (spec "Knocking Rooms"). make_knock /
+# send_knock over federation + the CS POST /knock endpoint, the knock
+# membership relayed to the room's servers, and the knocker's stripped
+# knock_room_state surfaced under /sync `rooms.knock`. Gated for the
+# MSC3787 (v10, knock_restricted) variants — the plain v7 tests stay red
+# because room version 7 is unsupported here.
+TestKnockingInMSC3787Room
+TestKnockRoomsInPublicRoomsDirectoryInMSC3787Room
+TestCannotSendKnockViaSendKnockInMSC3787Room

@@ -732,6 +732,26 @@ impl UserServer {
         .await
     }
 
+    /// Record a pending knock on a remote room (from a `/send_knock`
+    /// response) so it surfaces in the knocking user's `/sync`.
+    pub async fn record_remote_knock(
+        &self,
+        user_id: &str,
+        room_id: &str,
+        sender: &str,
+        event_id: &str,
+        stripped_state: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        self.expect_ok(&UserCommand::RecordRemoteKnock {
+            user_id: user_id.to_owned(),
+            room_id: room_id.to_owned(),
+            sender: sender.to_owned(),
+            event_id: event_id.to_owned(),
+            stripped_state,
+        })
+        .await
+    }
+
     /// Reject a pending remote invite (or leave a remote room): set `leave`
     /// membership and clear the stored invite state.
     pub async fn record_remote_leave(&self, user_id: &str, room_id: &str) -> Result<()> {
