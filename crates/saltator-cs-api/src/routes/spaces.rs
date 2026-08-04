@@ -7,7 +7,8 @@
 //! expanded; a non-space child is returned but not descended into.
 //!
 //! A child this server does not host is fetched from a `via` server over
-//! `GET /_matrix/federation/v1/hierarchy/{roomId}` (federation fallback).
+//! `GET /_matrix/federation/v1/hierarchy/{roomId}` (federation fallback), so
+//! a space tree spanning multiple servers is returned whole.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,11 +16,14 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use serde_json::{json, Value};
 
+use saltator_roomserver::hierarchy::{
+    child_link_from_stripped, ordered_children, room_summary, ChildLink,
+};
 use saltator_roomserver::RoomServer;
 
 use crate::error::ApiError;
 use crate::extract::Auth;
-use crate::room_util::{current_state, membership_in, raw_event};
+use crate::room_util::{current_state, membership_in};
 use crate::CsState;
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -28,77 +32,33 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::internal(e)
 }
 
-/// One valid `m.space.child` link out of a space, already resolved to the
-/// pieces the traversal and the `children_state` output both need.
-pub(crate) struct ChildLink {
-    /// Target room ID (the child event's `state_key`).
-    pub target: String,
-    /// A valid `order` key if present (else `None`); drives child ordering.
-    order: Option<String>,
-    /// `origin_server_ts` of the `m.space.child` event; the fallback sort key.
-    ts: i64,
-    /// `content.suggested == true`.
-    suggested: bool,
-    /// The link event as a stripped state event (`content`, `sender`,
-    /// `state_key`, `type`, `origin_server_ts`) for `children_state`.
-    stripped: Value,
-}
-
 /// A room resolved for the hierarchy: its summary chunk (minus
 /// `children_state`, which is rendered per-request to honour
-/// `suggested_only`), its ordered child links, and whether it is a space.
-pub(crate) struct Node {
-    summary: Value,
-    pub(crate) children: Vec<ChildLink>,
-    pub(crate) is_space: bool,
+/// `suggested_only`), its child links, and whether it is a space.
+struct Node {
+    /// The summary object, without `children_state`.
+    base: Value,
+    children: Vec<ChildLink>,
+    is_space: bool,
+    /// Whether the requesting user is allowed to see this room. Remote nodes
+    /// are always visible (the responding server already applied its filter).
     viewable: bool,
 }
 
 impl Node {
-    /// Child links to follow / render, in spec order: children with a valid
-    /// `order` key sorted lexicographically first, then the rest by
-    /// `origin_server_ts` ascending, ties broken by target room ID.
-    fn ordered_children(&self, suggested_only: bool) -> Vec<&ChildLink> {
-        let mut v: Vec<&ChildLink> = self
-            .children
-            .iter()
-            .filter(|c| !suggested_only || c.suggested)
-            .collect();
-        v.sort_by(|a, b| match (&a.order, &b.order) {
-            (Some(x), Some(y)) => x.cmp(y).then(a.ts.cmp(&b.ts)).then(a.target.cmp(&b.target)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.ts.cmp(&b.ts).then(a.target.cmp(&b.target)),
-        });
-        v
-    }
-
-    /// The full summary chunk, including a `children_state` filtered by
-    /// `suggested_only`.
+    /// The full summary chunk, including a `children_state` filtered and
+    /// ordered per `suggested_only`.
     fn chunk(&self, suggested_only: bool) -> Value {
-        let children_state: Vec<Value> = self
-            .ordered_children(suggested_only)
+        let children_state: Vec<Value> = ordered_children(&self.children, suggested_only)
             .into_iter()
             .map(|c| c.stripped.clone())
             .collect();
-        let mut chunk = self.summary.clone();
+        let mut chunk = self.base.clone();
         chunk
             .as_object_mut()
             .expect("summary is an object")
             .insert("children_state".into(), Value::Array(children_state));
         chunk
-    }
-}
-
-/// A valid `order` key: a string of at most 50 characters, all in the
-/// printable ASCII range `\x20..=\x7E` (spec "Ordering of children").
-/// Anything else is treated as absent.
-fn valid_order(content: &Value) -> Option<String> {
-    let s = content.get("order")?.as_str()?;
-    if s.len() <= 50 && s.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
-        Some(s.to_owned())
-    } else {
-        None
     }
 }
 
@@ -120,8 +80,7 @@ fn viewable(
     let by_rule = match join_rule {
         "public" | "knock" | "knock_restricted" => true,
         "restricted" => {
-            // The user meets the restriction if they are joined to any of the
-            // allowed rooms.
+            // The user meets the restriction if joined to any allowed room.
             let mut met = false;
             for allowed in allowed_room_ids {
                 let Ok(st) = current_state(rooms, allowed) else {
@@ -140,149 +99,97 @@ fn viewable(
 }
 
 /// Build the node for a locally-hosted room, or `None` if this server does
-/// not host it (federation fallback handles those).
-pub(crate) fn local_node(state: &CsState, room_id: &str, user_id: &str) -> Result<Option<Node>> {
-    if state
-        .rooms
-        .store()
-        .meta(room_id)
-        .map_err(internal)?
-        .is_none()
-    {
+/// not host it (the federation fallback handles those).
+fn local_node(state: &CsState, room_id: &str, user_id: &str) -> Result<Option<Node>> {
+    let Some(summary) = room_summary(&state.rooms, room_id).map_err(internal)? else {
         return Ok(None);
-    }
-    let current = current_state(&state.rooms, room_id)?;
-
-    let str_field = |ev_type: &str, key: &str| -> Result<Option<String>> {
-        Ok(
-            crate::room_util::state_content_in(&state.rooms, &current, ev_type)?
-                .as_ref()
-                .and_then(|c| c.get(key))
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned),
-        )
     };
-
-    let mut joined: u64 = 0;
-    let mut children: Vec<ChildLink> = Vec::new();
-    for ((ev_type, state_key), event_id) in &current {
-        if ev_type == "m.room.member" {
-            if membership_in(&state.rooms, &current, state_key)? == "join" {
-                joined += 1;
-            }
-            continue;
-        }
-        if ev_type != "m.space.child" {
-            continue;
-        }
-        let Some(raw) = raw_event(&state.rooms, event_id)? else {
-            continue;
-        };
-        let ev: Value = serde_json::to_value(raw).map_err(internal)?;
-        let content = ev.get("content").cloned().unwrap_or(Value::Null);
-        // A link is valid iff `content.via` is present as an array; removing
-        // the link is done by omitting `via`.
-        if !content.get("via").map(Value::is_array).unwrap_or(false) {
-            continue;
-        }
-        let ts = ev
-            .get("origin_server_ts")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        children.push(ChildLink {
-            target: state_key.clone(),
-            order: valid_order(&content),
-            ts,
-            suggested: content
-                .get("suggested")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            stripped: json!({
-                "type": "m.space.child",
-                "state_key": state_key,
-                "content": content,
-                "sender": ev.get("sender").cloned().unwrap_or(Value::Null),
-                "origin_server_ts": ts,
-            }),
-        });
-    }
-
-    let room_type = crate::room_util::state_content_in(&state.rooms, &current, "m.room.create")?
-        .as_ref()
-        .and_then(|c| c.get("type"))
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned);
-    let is_space = room_type.as_deref() == Some("m.space");
-
-    let join_rules =
-        crate::room_util::state_content_in(&state.rooms, &current, "m.room.join_rules")?;
-    let join_rule = join_rules
-        .as_ref()
-        .and_then(|c| c.get("join_rule"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("invite")
-        .to_owned();
-    let allowed_room_ids: Vec<String> = join_rules
-        .as_ref()
-        .and_then(|c| c.get("allow"))
-        .and_then(|v| v.as_array())
-        .map(|allow| {
-            allow
-                .iter()
-                .filter(|a| a.get("type").and_then(Value::as_str) == Some("m.room_membership"))
-                .filter_map(|a| a.get("room_id").and_then(Value::as_str))
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let world_readable = str_field("m.room.history_visibility", "history_visibility")?.as_deref()
-        == Some("world_readable");
-    let guest_can_join =
-        str_field("m.room.guest_access", "guest_access")?.as_deref() == Some("can_join");
-
+    let current = current_state(&state.rooms, room_id)?;
     let viewable = viewable(
         &state.rooms,
         &current,
-        &join_rule,
-        world_readable,
-        &allowed_room_ids,
+        &summary.join_rule,
+        summary.world_readable,
+        &summary.allowed_room_ids,
         user_id,
     )?;
-
-    let mut summary = json!({
-        "room_id": room_id,
-        "num_joined_members": joined,
-        "world_readable": world_readable,
-        "guest_can_join": guest_can_join,
-        "join_rule": join_rule,
-    });
-    let obj = summary.as_object_mut().expect("summary is an object");
-    if let Some(name) = str_field("m.room.name", "name")? {
-        obj.insert("name".into(), name.into());
-    }
-    if let Some(topic) = str_field("m.room.topic", "topic")? {
-        obj.insert("topic".into(), topic.into());
-    }
-    if let Some(alias) = str_field("m.room.canonical_alias", "alias")? {
-        obj.insert("canonical_alias".into(), alias.into());
-    }
-    if let Some(avatar) = str_field("m.room.avatar", "url")? {
-        obj.insert("avatar_url".into(), avatar.into());
-    }
-    if let Some(rt) = &room_type {
-        obj.insert("room_type".into(), rt.clone().into());
-    }
-    if !allowed_room_ids.is_empty() {
-        obj.insert("allowed_room_ids".into(), json!(allowed_room_ids));
-    }
-
     Ok(Some(Node {
-        summary,
-        children,
-        is_space,
+        base: summary.summary,
+        children: summary.children,
+        is_space: summary.is_space,
         viewable,
     }))
+}
+
+/// Fetch a room this server does not host from one of its `via` servers'
+/// federation `/hierarchy` endpoint, returning a node built from the
+/// responding server's summary of that room. `None` if no `via` server
+/// answers.
+async fn remote_node(
+    state: &CsState,
+    room_id: &str,
+    via: &[String],
+    suggested_only: bool,
+) -> Option<Node> {
+    let fed = state.federation.as_ref()?;
+    let enc = room_id
+        .replace('!', "%21")
+        .replace(':', "%3A")
+        .replace('$', "%24");
+    let path = format!("/_matrix/federation/v1/hierarchy/{enc}?suggested_only={suggested_only}");
+    for server in via {
+        if server == state.config.server_name.as_str() {
+            continue;
+        }
+        let Ok(resp) = fed.client.get(server, &path).await else {
+            continue;
+        };
+        let Some(room) = resp.get("room").filter(|r| r.is_object()) else {
+            continue;
+        };
+        let is_space = room.get("room_type").and_then(Value::as_str) == Some("m.space");
+        let children: Vec<ChildLink> = room
+            .get("children_state")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(child_link_from_stripped).collect())
+            .unwrap_or_default();
+        // Strip children_state from the base — chunk() re-renders it.
+        let mut base = room.clone();
+        if let Some(obj) = base.as_object_mut() {
+            obj.remove("children_state");
+        }
+        return Some(Node {
+            base,
+            children,
+            is_space,
+            viewable: true,
+        });
+    }
+    None
+}
+
+/// The `via` servers named on a child link, for reaching a child this server
+/// does not host.
+fn link_via(link: &ChildLink) -> Vec<String> {
+    link.stripped
+        .get("content")
+        .and_then(|c| c.get("via"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The server-name component of a room ID (`!local:server`), for reaching a
+/// remote root when the client gave no routing hint.
+fn server_of(room_id: &str) -> Vec<String> {
+    room_id
+        .split_once(':')
+        .map(|(_, s)| vec![s.to_owned()])
+        .unwrap_or_default()
 }
 
 /// Pagination cursor for `next_batch` / `from`: the flat DFS offset plus the
@@ -334,8 +241,7 @@ pub async fn get_hierarchy(
     let user = auth.user_id.as_str();
 
     // Params. On a paginated request the cursor is authoritative for the
-    // walk-shaping filters; if the client re-sends a conflicting value the
-    // spec requires a 400.
+    // walk-shaping filters; a conflicting re-sent value is a 400 (spec).
     let mut suggested_only = q
         .get("suggested_only")
         .map(|v| v == "true")
@@ -370,22 +276,27 @@ pub async fn get_hierarchy(
         max_depth = cur.max_depth;
     }
 
-    // The root must exist and be visible to the caller.
-    let root =
-        local_node(&state, &room_id, user)?.ok_or_else(|| ApiError::not_found("Unknown room"))?;
+    // Resolve the root (local, else via the room ID's own server).
+    let root = match local_node(&state, &room_id, user)? {
+        Some(n) => n,
+        None => remote_node(&state, &room_id, &server_of(&room_id), suggested_only)
+            .await
+            .ok_or_else(|| ApiError::not_found("Unknown room"))?,
+    };
     if !root.viewable {
         return Err(ApiError::forbidden("You are not allowed to view this room"));
     }
 
-    // Depth-first pre-order walk over local nodes, caching each resolved
-    // node so its chunk can be rendered after paging.
+    // Depth-first pre-order walk, caching each resolved node so its chunk can
+    // be rendered after paging. The stack carries the `via` servers for a
+    // room this server may not host.
     let mut nodes: HashMap<String, Node> = HashMap::new();
     let mut ordered: Vec<String> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
-    let mut stack: Vec<(String, u64)> = vec![(room_id.clone(), 0)];
+    let mut stack: Vec<(String, u64, Vec<String>)> = vec![(room_id.clone(), 0, Vec::new())];
     nodes.insert(room_id.clone(), root);
 
-    while let Some((rid, depth)) = stack.pop() {
+    while let Some((rid, depth, via)) = stack.pop() {
         if !visited.insert(rid.clone()) {
             continue;
         }
@@ -393,7 +304,10 @@ pub async fn get_hierarchy(
             Some(n) => n,
             None => match local_node(&state, &rid, user)? {
                 Some(n) => n,
-                None => continue,
+                None => match remote_node(&state, &rid, &via, suggested_only).await {
+                    Some(n) => n,
+                    None => continue,
+                },
             },
         };
         if !node.viewable {
@@ -403,9 +317,12 @@ pub async fn get_hierarchy(
         let descend = node.is_space && max_depth.is_none_or(|md| depth < md);
         if descend {
             // Reverse so the first child is popped (visited) next.
-            for child in node.ordered_children(suggested_only).into_iter().rev() {
-                if !visited.contains(&child.target) {
-                    stack.push((child.target.clone(), depth + 1));
+            for link in ordered_children(&node.children, suggested_only)
+                .into_iter()
+                .rev()
+            {
+                if !visited.contains(&link.target) {
+                    stack.push((link.target.clone(), depth + 1, link_via(link)));
                 }
             }
         }

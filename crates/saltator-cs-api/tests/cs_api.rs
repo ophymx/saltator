@@ -8906,3 +8906,214 @@ async fn spaces_hierarchy_walks_the_tree() {
 
     env.shutdown().await;
 }
+
+/// Spaces over federation (MSC2946): a space tree spanning two servers is
+/// returned whole from the querying server. hs1 hosts the root space (and r1,
+/// r4); hs2 hosts a leaf (r2) and a sub-space (ss2) whose child points back to
+/// hs1's r4. hs1's /hierarchy must fetch the hs2 rooms over the federation
+/// hierarchy endpoint and keep walking back into itself. Mirrors
+/// TestFederatedClientSpaces.
+#[tokio::test]
+async fn spaces_hierarchy_spans_federation() {
+    let dir = tempfile::tempdir().unwrap();
+    let pct = |s: &str| -> String {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    };
+
+    // --- hs2 hosts r2 (leaf) and ss2 (sub-space); both public/world-readable.
+    let (hs2_rooms, hs2_signer) = start_fed_rooms("hs2", dir.path()).await;
+    let bob = ruma::OwnedUserId::try_from("@bob:hs2").unwrap();
+    let make_hs2 = |space: bool| {
+        let hs2_rooms = hs2_rooms.clone();
+        let bob = bob.clone();
+        async move {
+            let mut cc = serde_json::Map::new();
+            if space {
+                cc.insert("type".into(), "m.space".into());
+            }
+            let (room_id, _) = hs2_rooms
+                .create_room(&bob, saltator_core::RoomVersion::V11, cc)
+                .await
+                .unwrap();
+            for (ty, sk, content) in [
+                ("m.room.member", bob.as_str(), json!({"membership": "join"})),
+                ("m.room.join_rules", "", json!({"join_rule": "public"})),
+                (
+                    "m.room.history_visibility",
+                    "",
+                    json!({"history_visibility": "world_readable"}),
+                ),
+            ] {
+                hs2_rooms
+                    .send_state(&room_id, &bob, ty, sk, content)
+                    .await
+                    .unwrap();
+            }
+            room_id
+        }
+    };
+    let r2 = make_hs2(false).await;
+    let ss2 = make_hs2(true).await;
+
+    // --- hs1: full stack (alice). ---
+    let hs1_dir = dir.path().join("hs1full");
+    std::fs::create_dir_all(&hs1_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&hs1_dir.join("db")).unwrap());
+    let hs1_name = ruma::OwnedServerName::try_from("hs1").unwrap();
+    let (hs1_signer, _) =
+        saltator_roomserver::ServerSigner::generate(hs1_name.clone(), "1".to_owned());
+    let hs1_signer = Arc::new(hs1_signer);
+    let hs1_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        hs1_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let hs1_users = UserServer::start(
+        1,
+        engine,
+        hs1_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [hs1_rooms.shard_handle(), hs1_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+    let proj = spawn_membership_projection(hs1_users.clone(), hs1_rooms.clone());
+
+    // Mutual key servers + hs2's authenticated hierarchy surface for hs1.
+    let hs1_key_base = spawn_fed("hs1", hs1_signer.clone(), None, None).await;
+    let hs2_key_base = spawn_fed("hs2", hs2_signer.clone(), None, None).await;
+    let hs2_fed_base = spawn_fed(
+        "hs2",
+        hs2_signer.clone(),
+        Some(hs2_rooms.clone()),
+        Some(hs1_key_base),
+    )
+    .await;
+
+    let media = MediaStore::open(hs1_dir.join("media")).unwrap();
+    let cs = CsState::new(
+        hs1_users.clone(),
+        hs1_rooms.clone(),
+        media,
+        CsConfig {
+            server_name: hs1_name,
+            default_room_version: saltator_core::RoomVersion::V11,
+            registration_enabled: true,
+            max_upload_size: 1024 * 1024,
+            well_known_client: None,
+            rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
+            allow_internal_fetch: true,
+        },
+    )
+    .with_federation(
+        Arc::new(FederationClient::with_base_url(
+            hs1_signer.clone(),
+            hs2_fed_base.clone(),
+        )),
+        hs1_signer.clone(),
+        Arc::new(KeyCache::with_base_url(hs2_key_base.clone())),
+    );
+    let router = saltator_cs_api::router(cs);
+
+    let alice = reg(&router, "alice").await;
+    let create = |body: Value| {
+        let router = &router;
+        let alice = alice.as_str();
+        async move {
+            let (s, r) = oneshot(
+                router,
+                "POST",
+                "/_matrix/client/v3/createRoom",
+                Some(alice),
+                Some(body),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{r}");
+            r["room_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let root = create(
+        json!({"preset": "public_chat", "name": "Root", "creation_content": {"type": "m.space"}}),
+    )
+    .await;
+    let r1 = create(json!({"preset": "public_chat", "name": "R1"})).await;
+    // r4 lives on hs1 but is only reachable through hs2's ss2.
+    let r4 = create(json!({"preset": "public_chat", "name": "R4"})).await;
+
+    // ss2 (hs2) links back to r4 (hs1).
+    hs2_rooms
+        .send_state(
+            &ss2,
+            &bob,
+            "m.space.child",
+            r4.as_str(),
+            json!({"via": ["hs1"]}),
+        )
+        .await
+        .unwrap();
+
+    // root (hs1) links to r1 (local), r2 (hs2), ss2 (hs2).
+    for (child, via) in [
+        (r1.as_str(), "hs1"),
+        (r2.as_str(), "hs2"),
+        (ss2.as_str(), "hs2"),
+    ] {
+        let (s, r) = oneshot(
+            &router,
+            "PUT",
+            &format!(
+                "/_matrix/client/v3/rooms/{}/state/m.space.child/{}",
+                pct(&root),
+                pct(child)
+            ),
+            Some(&alice),
+            Some(json!({"via": [via]})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "link {child}: {r}");
+    }
+
+    let (s, body) = oneshot(
+        &router,
+        "GET",
+        &format!("/_matrix/client/v1/rooms/{}/hierarchy", pct(&root)),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let mut got: Vec<String> = body["rooms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|room| room["room_id"].as_str().unwrap().to_owned())
+        .collect();
+    got.sort();
+    let mut want = vec![
+        root.clone(),
+        r1.clone(),
+        r2.to_string(),
+        ss2.to_string(),
+        r4.clone(),
+    ];
+    want.sort();
+    assert_eq!(got, want, "federated hierarchy: {body}");
+
+    proj.abort();
+}
