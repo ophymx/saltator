@@ -216,6 +216,11 @@ pub struct MediaMeta {
     /// arrived yet.
     #[serde(default)]
     pub pending: bool,
+    /// The content-addressed blob this media ID points at. `None` means
+    /// the media ID *is* the blob ID (async uploads, URL-preview caches,
+    /// and media stored before upload IDs became unique per upload).
+    #[serde(default)]
+    pub blob: Option<String>,
 }
 
 /// One membership change extracted from the room change stream.

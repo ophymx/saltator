@@ -7900,6 +7900,7 @@ async fn client_downloads_remote_media_over_federation() {
                 size: png.len() as u64,
                 created_ts: 0,
                 pending: false,
+                blob: None,
             },
         )
         .await
