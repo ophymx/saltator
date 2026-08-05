@@ -83,8 +83,9 @@ struct Node {
     base: Value,
     children: Vec<ChildLink>,
     is_space: bool,
-    /// Whether the requesting user is allowed to see this room. Remote nodes
-    /// are always visible (the responding server already applied its filter).
+    /// Whether the requesting user is allowed to see this room. For a
+    /// remote node the responding server only vouches for *this server*;
+    /// the per-user rules are applied here from the chunk's fields.
     viewable: bool,
 }
 
@@ -173,6 +174,7 @@ async fn remote_node(
     room_id: &str,
     via: &[String],
     suggested_only: bool,
+    user_id: &str,
 ) -> Option<Node> {
     let fed = state.federation.as_ref()?;
     let enc = room_id
@@ -201,11 +203,44 @@ async fn remote_node(
         if let Some(obj) = base.as_object_mut() {
             obj.remove("children_state");
         }
+        // The responding server vouches only that *some* user of ours
+        // could feasibly see the room ("the requesting server is
+        // responsible for filtering the results further down for the
+        // user's request"); apply the per-user rules from the chunk's own
+        // fields. Membership join/invite needs no check here — a room one
+        // of our users is in is hosted locally and never reaches this
+        // path.
+        let join_rule = room
+            .get("join_rule")
+            .and_then(Value::as_str)
+            .unwrap_or("invite");
+        let world_readable = room
+            .get("world_readable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let allowed: Vec<String> = room
+            .get("allowed_room_ids")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let by_rule = match join_rule {
+            "public" | "knock" | "knock_restricted" => true,
+            "restricted" => allowed.iter().any(|allowed_room| {
+                current_state(&state.rooms, allowed_room).is_ok_and(|st| {
+                    membership_in(&state.rooms, &st, user_id).is_ok_and(|m| m == "join")
+                })
+            }),
+            _ => false,
+        };
         return Some(Node {
             base,
             children,
             is_space,
-            viewable: true,
+            viewable: by_rule || world_readable,
         });
     }
     None
@@ -322,7 +357,7 @@ pub async fn get_hierarchy(
     // Resolve the root (local, else via the room ID's own server).
     let root = match local_node(&state, &room_id, user)? {
         Some(n) => n,
-        None => remote_node(&state, &room_id, &server_of(&room_id), suggested_only)
+        None => remote_node(&state, &room_id, &server_of(&room_id), suggested_only, user)
             .await
             .ok_or_else(|| ApiError::not_found("Unknown room"))?,
     };
@@ -347,7 +382,7 @@ pub async fn get_hierarchy(
             Some(n) => n,
             None => match local_node(&state, &rid, user)? {
                 Some(n) => n,
-                None => match remote_node(&state, &rid, &via, suggested_only).await {
+                None => match remote_node(&state, &rid, &via, suggested_only, user).await {
                     Some(n) => n,
                     None => continue,
                 },

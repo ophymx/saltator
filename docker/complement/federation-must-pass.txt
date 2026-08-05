@@ -146,3 +146,15 @@ TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
 TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
 TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12
 TestRestrictedRoomsSpacesSummaryLocal
+# 2026-08-05: the rest of the restricted bucket. RemoteJoinLocalUser fell
+# out of the preset-aware invite power level (PR #26); FailOver needed
+# Synapse-parity join candidates (client-named remote servers are the whole
+# list) + refusing to vouch for allow-room membership without a joined
+# local user there; SpacesSummaryFederation needed origin-accessibility on
+# the federation /hierarchy (fail closed on unverifiable restrictions) and
+# per-user filtering of remote chunks in the CS walker.
+TestRestrictedRoomsRemoteJoinLocalUser
+TestRestrictedRoomsRemoteJoinLocalUserInMSC3787Room
+TestRestrictedRoomsRemoteJoinFailOver
+TestRestrictedRoomsRemoteJoinFailOverInMSC3787Room
+TestRestrictedRoomsSpacesSummaryFederation

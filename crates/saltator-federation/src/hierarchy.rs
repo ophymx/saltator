@@ -26,15 +26,43 @@ fn err(status: StatusCode, errcode: &str, msg: &str) -> (StatusCode, axum::Json<
     )
 }
 
-/// Whether a peeking remote server may be shown this room: its state is
-/// world-readable, or its join rules let a server route a join/knock. Rooms
-/// that fail this are reported as `inaccessible_children`.
-fn peekable(summary: &RoomSummary) -> bool {
-    summary.world_readable
+/// Whether the requesting server (`origin`) may be shown this room (spec:
+/// children "the requesting server could feasibly peek/join"): its state
+/// is world-readable, its join rules let any server join or knock, the
+/// origin already participates in it, or — for a `restricted` room — we
+/// can *verify* the origin has a user in an allow room. Verification
+/// requires our own participation in that allow room (our copy is stale
+/// otherwise), so an unverifiable restriction fails closed: the room goes
+/// to `inaccessible_children` and the requester may try another server
+/// (TestRestrictedRoomsSpacesSummaryFederation's initial leg).
+fn accessible_to(
+    rooms: &saltator_roomserver::RoomServer,
+    our_name: &str,
+    origin: &str,
+    room_id: &str,
+    summary: &RoomSummary,
+) -> bool {
+    if summary.world_readable
         || matches!(
             summary.join_rule.as_str(),
-            "public" | "knock" | "knock_restricted" | "restricted"
+            "public" | "knock" | "knock_restricted"
         )
+    {
+        return true;
+    }
+    if rooms.server_in_room(room_id, origin).unwrap_or(false) {
+        return true;
+    }
+    if summary.join_rule == "restricted" {
+        for allowed in &summary.allowed_room_ids {
+            if rooms.server_in_room(allowed, our_name).unwrap_or(false)
+                && rooms.server_in_room(allowed, origin).unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Render a room summary to the wire chunk, attaching its ordered,
@@ -56,7 +84,7 @@ pub async fn serve_hierarchy(
     State(state): State<Arc<FedState>>,
     Path(room_id): Path<String>,
     RawQuery(query): RawQuery,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> FedResult {
     let Some(rooms) = &state.rooms else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
@@ -66,6 +94,7 @@ pub async fn serve_hierarchy(
         .unwrap_or_default()
         .split('&')
         .any(|p| p == "suggested_only=true");
+    let our_name = state.server_name.as_str();
 
     let summary = room_summary(rooms, &room_id)
         .map_err(|e| {
@@ -76,11 +105,22 @@ pub async fn serve_hierarchy(
             )
         })?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room"))?;
+    // The requested room itself is subject to the same accessibility rule
+    // as children — a summary the origin may not feasibly see is a 404,
+    // not a disclosure.
+    if !accessible_to(rooms, our_name, &auth.origin, &room_id, &summary) {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "Room is not accessible to the requesting server",
+        ));
+    }
 
     let room = chunk(&summary, suggested_only);
 
-    // Immediate children: hosted-and-peekable ones get a summary chunk; the
-    // rest are reported as inaccessible so the requester can try elsewhere.
+    // Immediate children: hosted-and-accessible ones get a summary chunk;
+    // the rest are reported as inaccessible so the requester can try
+    // elsewhere.
     let mut children = Vec::new();
     let mut inaccessible = Vec::new();
     for link in ordered_children(&summary.children, suggested_only) {
@@ -91,7 +131,9 @@ pub async fn serve_hierarchy(
                 &e.to_string(),
             )
         })? {
-            Some(child) if peekable(&child) => children.push(chunk(&child, suggested_only)),
+            Some(child) if accessible_to(rooms, our_name, &auth.origin, &link.target, &child) => {
+                children.push(chunk(&child, suggested_only))
+            }
             _ => inaccessible.push(link.target.clone()),
         }
     }
