@@ -680,7 +680,30 @@ impl RoomServer {
                     let s2 = store
                         .resolve_group(allowed_room, m2.current_group)
                         .map_err(storage_err)?;
-                    if membership_of(&s2, joiner.as_str())? == "join" {
+                    // Our copy of the allow room is authoritative only
+                    // while one of our users is joined to it — once the
+                    // last local member leaves we stop receiving its
+                    // events, so any membership read would be stale.
+                    // Synapse likewise refuses to vouch from a room it no
+                    // longer participates in (M_UNABLE_TO_AUTHORISE_JOIN;
+                    // TestRestrictedRoomsRemoteJoinFailOver's second leg).
+                    let our_name = self.signer.server_name();
+                    let mut participating = false;
+                    for (ty, sk) in s2.keys() {
+                        if ty != "m.room.member" {
+                            continue;
+                        }
+                        let Ok(uid) = OwnedUserId::try_from(sk.clone()) else {
+                            continue;
+                        };
+                        if uid.server_name() == our_name && membership_of(&s2, sk)? == "join" {
+                            participating = true;
+                            break;
+                        }
+                    }
+                    if !participating {
+                        uncheckable = true;
+                    } else if membership_of(&s2, joiner.as_str())? == "join" {
                         condition_met = true;
                         break;
                     }
