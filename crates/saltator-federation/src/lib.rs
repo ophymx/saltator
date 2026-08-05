@@ -240,6 +240,53 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
             "/_matrix/federation/v1/user/devices/{user_id}",
             get(user_keys::user_devices),
         )
+        // ---- Spec'd endpoints we do NOT implement yet ----
+        // Explicit stubs so the gap is visible here rather than discovered
+        // mid-investigation (see docs/federation-conformance.md "Endpoint
+        // inventory"). Behaviour matches the fallback (404 M_UNRECOGNIZED,
+        // the spec's signal for an unimplemented endpoint), so gating tests
+        // like TestUnknownEndpoints are unaffected.
+        //
+        // Well-defined, planned (implement these proactively):
+        .route(
+            "/_matrix/federation/v1/state/{room_id}",
+            get(not_implemented),
+        )
+        .route(
+            "/_matrix/federation/v1/state_ids/{room_id}",
+            get(not_implemented),
+        )
+        .route(
+            "/_matrix/federation/v1/timestamp_to_event/{room_id}",
+            get(not_implemented),
+        )
+        .route(
+            "/_matrix/federation/v1/publicRooms",
+            get(not_implemented).post(not_implemented),
+        )
+        // Key notary (spec "Querying keys through another server").
+        .route("/_matrix/key/v2/query/{server_name}", get(not_implemented))
+        .route("/_matrix/key/v2/query", post(not_implemented))
+        // Justified absent — see the conformance doc before implementing:
+        // v1 invite serves only room versions 1-2 (we support v8+); a 404
+        // here is exactly the signal that makes senders stay on v2.
+        .route(
+            "/_matrix/federation/v1/invite/{room_id}/{event_id}",
+            put(not_implemented),
+        )
+        // 3PID invites need an identity-server integration we don't have.
+        .route(
+            "/_matrix/federation/v1/exchange_third_party_invite/{room_id}",
+            put(not_implemented),
+        )
+        // OpenID for integration managers.
+        .route(
+            "/_matrix/federation/v1/openid/userinfo",
+            get(not_implemented),
+        )
+        // Policy servers (spec v1.18).
+        .route("/_matrix/policy/v1/sign", post(not_implemented))
+        // ---- end stubs ----
         // Unknown federation/key path → 404, wrong method on a known path
         // → 405, both with the M_UNRECOGNIZED body the spec expects.
         .fallback(|| async { unrecognized(axum::http::StatusCode::NOT_FOUND) })
@@ -247,6 +294,13 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
             unrecognized(axum::http::StatusCode::METHOD_NOT_ALLOWED)
         })
         .with_state(state)
+}
+
+/// Stub for a spec'd endpoint we have not implemented: same 404
+/// `M_UNRECOGNIZED` the fallback produces, but the route registration
+/// makes the gap explicit (and grep-able) in the router above.
+async fn not_implemented() -> axum::response::Response {
+    unrecognized(axum::http::StatusCode::NOT_FOUND)
 }
 
 /// A Matrix `M_UNRECOGNIZED` error response with the given status.

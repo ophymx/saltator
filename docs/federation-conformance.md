@@ -292,3 +292,48 @@ Cause: no application-service support yet. Out of scope until AS lands.
 
 Each landed feature adds its now-green top-level tests to
 `docker/complement/federation-must-pass.txt`.
+
+---
+
+## Endpoint inventory (server-server API, spec v1.19)
+
+Coverage map of every endpoint in the spec's server-server surface
+(`matrix-spec data/api/server-server/*.yaml`, pinned v1.19) against
+`saltator-federation`'s router. **Consult this FIRST when a federation
+test reddens** — before instrumenting, check whether an endpoint the flow
+depends on is simply absent. (Learned the hard way: `GET /event/{eventId}`
+was missing and only surfaced at the bottom of the TestUnbanViaInvite race
+investigation, 2026-08-04.)
+
+### Served
+`/version` · `/key/v2/server` · `/send/{txnId}` ·
+`/make_join` `/send_join` (v1+v2) · `/make_leave` `/send_leave` (v1+v2) ·
+`/make_knock` `/send_knock` · `/invite` (v2) ·
+`/event/{eventId}` · `/event_auth` · `/backfill` · `/get_missing_events` ·
+`/hierarchy` · `/query/directory` · `/query/profile` ·
+`/user/devices` · `/user/keys/claim` · `/user/keys/query` ·
+`/media/download` · `/media/thumbnail`
+
+### Missing — well-defined, implement proactively
+- `GET /state/{roomId}` — we *consume* this in gap-fill anchoring
+  (`transactions.rs`) but do not serve it; a peer healing a gap against us
+  fails. Read-only view over data we already hold.
+- `GET /state_ids/{roomId}` — same family; Synapse prefers it for joins
+  and gap healing.
+- `GET /timestamp_to_event/{roomId}` — blocks the federation leaf of
+  `TestJumpToDateEndpoint` (see Group 2).
+- `GET`+`POST /publicRooms` — room directory over federation.
+- `GET /key/v2/query/{serverName}` + `POST /key/v2/query` — key notary.
+
+### Missing — justified absent (do not re-derive)
+- `PUT /invite` v1 — only needed for room versions 1–2; we support v8+.
+- `PUT /exchange_third_party_invite` — identity-server 3PID invites; out
+  of scope until 3PID lands.
+- `GET /openid/userinfo` — OpenID for integration managers; niche.
+- `POST /sign` — policy servers (added v1.18); niche.
+- `/.well-known/matrix/server` — deployment-level delegation, typically
+  the reverse proxy's job, not the homeserver process.
+
+Keep this section current: when adding a route, move it to **Served**; when
+the spec pin advances, re-run the diff (extract paths from the spec YAML,
+compare with `grep -oE '"/_matrix[^"]*"' crates/saltator-federation/src/lib.rs`).

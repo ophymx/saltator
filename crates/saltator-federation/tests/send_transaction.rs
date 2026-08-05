@@ -323,3 +323,48 @@ async fn send_fills_dag_gap_via_get_missing_events() {
         "B has msg2"
     );
 }
+
+/// The not-implemented stubs answer exactly like the fallback — 404
+/// `M_UNRECOGNIZED` on the spec'd method, 405 on a wrong method — so
+/// registering them changes nothing observable (TestUnknownEndpoints
+/// parity) while making the coverage gap explicit in the router.
+#[tokio::test]
+async fn unimplemented_spec_endpoints_answer_unrecognized() {
+    let name: OwnedServerName = SERVER.try_into().unwrap();
+    let (signer, _) = ServerSigner::generate(name.clone(), "1".to_owned());
+    let signer = Arc::new(signer);
+    let state = Arc::new(FedState {
+        server_name: name,
+        signer,
+        old_keys: Vec::new(),
+        key_cache: std::sync::Arc::new(KeyCache::new()),
+        rooms: None,
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let base = spawn(router(state)).await;
+    let http = reqwest::Client::new();
+
+    for path in [
+        "/_matrix/federation/v1/state/!r:hs.test",
+        "/_matrix/federation/v1/state_ids/!r:hs.test",
+        "/_matrix/federation/v1/timestamp_to_event/!r:hs.test",
+        "/_matrix/federation/v1/publicRooms",
+        "/_matrix/key/v2/query/other.test",
+        "/_matrix/federation/v1/openid/userinfo",
+    ] {
+        let resp = http.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "{path}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["errcode"], "M_UNRECOGNIZED", "{path}");
+    }
+    // Wrong method on a stubbed path → 405, like any recognised route.
+    let resp = http
+        .delete(format!("{base}/_matrix/federation/v1/publicRooms"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+}
