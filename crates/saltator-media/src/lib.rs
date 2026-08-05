@@ -212,15 +212,49 @@ fn fan_out(media_id: &str) -> Result<PathBuf> {
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or(MediaError::BadId)?;
     tokio::fs::create_dir_all(parent).await?;
-    let tmp = path.with_extension("tmp");
+    // The temp name must be unique per writer: media IDs are
+    // content-addressed, so concurrent uploads of the same bytes target
+    // the same path — with a shared temp name the first rename removes
+    // the file out from under the second (spurious ENOENT on the first
+    // burst of duplicate uploads after startup).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{seq}"));
     tokio::fs::write(&tmp, bytes).await?;
-    tokio::fs::rename(&tmp, path).await?;
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e.into());
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concurrent uploads of identical bytes target the same
+    /// content-addressed path; every writer must succeed (regression:
+    /// a shared temp name let one writer's rename steal the file out
+    /// from under the others — spurious ENOENT under duplicate bursts).
+    #[tokio::test]
+    async fn concurrent_duplicate_stores_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(MediaStore::open(dir.path()).unwrap());
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store.store(b"same bytes every time").await
+            }));
+        }
+        let mut ids = Vec::new();
+        for t in tasks {
+            ids.push(t.await.unwrap().expect("concurrent duplicate store"));
+        }
+        ids.dedup();
+        assert_eq!(ids.len(), 1, "all writers agree on the media id");
+        assert!(store.read(&ids[0]).await.unwrap().is_some());
+    }
 
     #[tokio::test]
     async fn store_read_roundtrip_and_dedup() {

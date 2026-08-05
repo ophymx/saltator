@@ -349,3 +349,17 @@ direct Complement coverage — Complement's notary tests are a TODO comment,
 Keep this section current: when adding a route, move it to **Served**; when
 the spec pin advances, re-run the diff (extract paths from the spec YAML,
 compare with `grep -oE '"/_matrix[^"]*"' crates/saltator-federation/src/lib.rs`).
+
+---
+
+## Sweep 2026-08-05 (main @ 6914cc2, local, full unfiltered suite)
+
+**17 top-level failures out of ~96** — the complete remaining gap:
+
+| Cluster | Tests | Status |
+|---|---|---|
+| Room v6/v7 only | TestKnocking, TestKnockRoomsInPublicRoomsDirectory, TestCannotSendNonKnockViaSendKnock, TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6 | Justified red (server supports v8+ only) |
+| Application services | TestJoinFederatedRoomFromApplicationServiceBridgeUser, TestJumpToDateEndpoint (deployment needs an AS) | Out of scope until AS lands (Group 12) |
+| Media | TestMediaFilenames, TestMediaWithoutFileName, TestRemotePngThumbnail (legacy /media/v3 subtests) | FIXED on branch media-remote-and-upload-race: legacy remote fetch + duplicate-upload temp race + raw-body federation media fallback |
+| E2EE over federation | TestDeviceListsUpdateOverFederation[OnRoomJoin], TestToDeviceMessagesOverFederation, TestFederationKeyUploadQuery | Next major bucket: device-list EDU fanout, to-device EDU delivery, cross-server key upload/query |
+| Missing-events / auth-chain family | TestInboundCanReturnMissingEvents, TestOutboundFederationEventSizeGetMissingEvents, TestCorruptedAuthChain, TestInboundFederationRejectsEventsWithRejectedAuthEvents | Next tractable batch: siblings of gated TestGetMissingEventsGapFilling / TestEventAuth; MockPeer-reproducible |

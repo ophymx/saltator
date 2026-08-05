@@ -37,7 +37,12 @@ pub async fn upload(
             "Upload too large",
         ));
     }
-    let media_id = state.media.store(&req.file).await?;
+    // The blob is content-addressed (dedup), but each upload gets its own
+    // media ID: identical bytes uploaded under different filenames are
+    // distinct media with distinct metadata (Complement's
+    // TestMediaFilenames uploads one file body under many names).
+    let blob = state.media.store(&req.file).await?;
+    let media_id = random_media_id();
     state
         .users
         .put_media(
@@ -49,6 +54,7 @@ pub async fn upload(
                 size: req.file.len() as u64,
                 created_ts: now_ms(),
                 pending: false,
+                blob: Some(blob),
             },
         )
         .await?;
@@ -152,6 +158,7 @@ pub async fn preview_url(
                             size: bytes.len() as u64,
                             created_ts: now_ms(),
                             pending: false,
+                            blob: None,
                         },
                     )
                     .await?;
@@ -295,14 +302,7 @@ pub async fn create_async(
     auth: Auth,
     _req: Ar<create_mxc_uri::v1::Request>,
 ) -> Result<Ra<create_mxc_uri::v1::Response>> {
-    // Reserved IDs are random (content-addressing needs the content).
-    let media_id = {
-        use base64::Engine as _;
-        use rand::RngCore as _;
-        let mut bytes = [0u8; 24];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    };
+    let media_id = random_media_id();
     state
         .users
         .put_media(
@@ -314,6 +314,7 @@ pub async fn create_async(
                 size: 0,
                 created_ts: now_ms(),
                 pending: true,
+                blob: None,
             },
         )
         .await?;
@@ -366,10 +367,26 @@ pub async fn upload_async(
                 size: req.file.len() as u64,
                 created_ts: meta.created_ts,
                 pending: false,
+                blob: None,
             },
         )
         .await?;
     Ok(axum::Json(serde_json::json!({})))
+}
+
+/// A fresh random media ID (base64url, 24 bytes of entropy).
+fn random_media_id() -> String {
+    use base64::Engine as _;
+    use rand::RngCore as _;
+    let mut bytes = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The blob ID a media entry's bytes live under (the media ID itself for
+/// entries predating unique upload IDs and for async uploads).
+fn blob_of<'a>(meta: &'a MediaMeta, media_id: &'a str) -> &'a str {
+    meta.blob.as_deref().unwrap_or(media_id)
 }
 
 fn not_yet_uploaded() -> ApiError {
@@ -412,25 +429,51 @@ async fn fetch_remote_media(
     state: &CsState,
     server_name: &ruma::ServerName,
     media_id: &str,
-) -> Result<(Vec<u8>, Option<String>)> {
+) -> Result<(Vec<u8>, Option<String>, Option<String>)> {
     let fed = state
         .federation
         .as_ref()
         .ok_or_else(|| ApiError::not_found("Remote media not available"))?;
     let path = format!("/_matrix/federation/v1/media/download/{media_id}");
-    let (body, ct_header) = fed
-        .client
-        .get_raw(server_name.as_str(), &path)
-        .await
-        .map_err(|e| {
-            ApiError::new(
-                axum::http::StatusCode::BAD_GATEWAY,
-                "M_UNKNOWN",
-                format!("remote media fetch failed: {e}"),
-            )
-        })?;
-    saltator_federation::parse_multipart_file(&ct_header.unwrap_or_default(), &body)
-        .ok_or_else(|| ApiError::not_found("Malformed remote media response"))
+    let fetched = match fed.client.get_raw(server_name.as_str(), &path).await {
+        Ok(v) => Ok(v),
+        Err(first) => {
+            // Servers predating the authenticated federation media
+            // endpoint (and Complement's synthetic peer, whose authed
+            // route rejects every request) serve the legacy
+            // `/_matrix/media/*/download/{origin}/{mediaId}` route over
+            // the federation connection instead — the same fallback
+            // Synapse performs.
+            let legacy = format!(
+                "/_matrix/media/v3/download/{}/{media_id}",
+                server_name.as_str()
+            );
+            fed.client
+                .get_raw(server_name.as_str(), &legacy)
+                .await
+                .map_err(|_| first)
+        }
+    };
+    let (body, ct_header) = fetched.map_err(|e| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "M_UNKNOWN",
+            format!("remote media fetch failed: {e}"),
+        )
+    })?;
+    let ct = ct_header.unwrap_or_default();
+    if let Some(parsed) = saltator_federation::parse_multipart_file(&ct, &body) {
+        return Ok(parsed);
+    }
+    // Not multipart: some servers (and Complement's synthetic peer) answer
+    // the federation media endpoint with the raw file and its
+    // Content-Type. A multipart header that failed to parse is still an
+    // error — raw fallback only when the response never claimed multipart.
+    if !ct.to_ascii_lowercase().starts_with("multipart/") {
+        let content_type = (!ct.is_empty()).then_some(ct);
+        return Ok((body, content_type, None));
+    }
+    Err(ApiError::not_found("Malformed remote media response"))
 }
 
 pub async fn download(
@@ -439,13 +482,14 @@ pub async fn download(
     Ar(req): Ar<get_content::v1::Request>,
 ) -> Result<axum::response::Response> {
     if is_remote(&state, &req.server_name) {
-        let (bytes, ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
-        return Ok(blob_response(bytes, ct, None));
+        let (bytes, ct, filename) =
+            fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
+        return Ok(blob_response(bytes, ct, filename));
     }
     let meta = lookup_meta(&state, &req.server_name, &req.media_id)?;
     let bytes = state
         .media
-        .read(&req.media_id)
+        .read(blob_of(&meta, &req.media_id))
         .await?
         .ok_or_else(|| ApiError::not_found("Media content missing"))?;
     Ok(blob_response(bytes, meta.content_type, meta.filename))
@@ -457,13 +501,13 @@ pub async fn download_named(
     Ar(req): Ar<get_content_as_filename::v1::Request>,
 ) -> Result<axum::response::Response> {
     if is_remote(&state, &req.server_name) {
-        let (bytes, ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
+        let (bytes, ct, _) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
         return Ok(blob_response(bytes, ct, Some(req.filename.clone())));
     }
     let meta = lookup_meta(&state, &req.server_name, &req.media_id)?;
     let bytes = state
         .media
-        .read(&req.media_id)
+        .read(blob_of(&meta, &req.media_id))
         .await?
         .ok_or_else(|| ApiError::not_found("Media content missing"))?;
     Ok(blob_response(
@@ -488,15 +532,15 @@ pub async fn thumbnail(
     );
     let bytes = if is_remote(&state, &req.server_name) {
         // Fetch the full remote media and thumbnail it in memory.
-        let (file, _ct) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
+        let (file, _ct, _) = fetch_remote_media(&state, &req.server_name, &req.media_id).await?;
         MediaStore::thumbnail_bytes(file, width, height, method)
             .await
             .map_err(|e| ApiError::not_found(format!("cannot thumbnail remote media: {e}")))?
     } else {
-        lookup_meta(&state, &req.server_name, &req.media_id)?;
+        let meta = lookup_meta(&state, &req.server_name, &req.media_id)?;
         state
             .media
-            .thumbnail(&req.media_id, width, height, method)
+            .thumbnail(blob_of(&meta, &req.media_id), width, height, method)
             .await?
             .ok_or_else(|| ApiError::not_found("Media content missing"))?
     };
@@ -532,6 +576,17 @@ fn legacy_meta(state: &CsState, server_name: &str, media_id: &str) -> Result<Med
         return Err(not_yet_uploaded());
     }
     Ok(meta)
+}
+
+/// The remote server named by a legacy path segment, `None` when it names
+/// us (the local path applies) — a malformed name is a 404.
+fn legacy_remote(state: &CsState, server_name: &str) -> Result<Option<ruma::OwnedServerName>> {
+    if server_name == state.config.server_name.as_str() {
+        return Ok(None);
+    }
+    ruma::OwnedServerName::try_from(server_name)
+        .map(Some)
+        .map_err(|_| ApiError::not_found("Invalid server name"))
 }
 
 /// Content-types safe to render inline in a browser. Everything else
@@ -586,10 +641,14 @@ pub async fn download_legacy(
     State(state): State<Arc<CsState>>,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response> {
+    if let Some(remote) = legacy_remote(&state, &server_name)? {
+        let (bytes, ct, filename) = fetch_remote_media(&state, &remote, &media_id).await?;
+        return Ok(blob_response(bytes, ct, filename));
+    }
     let meta = legacy_meta(&state, &server_name, &media_id)?;
     let bytes = state
         .media
-        .read(&media_id)
+        .read(blob_of(&meta, &media_id))
         .await?
         .ok_or_else(|| ApiError::not_found("Media content missing"))?;
     Ok(blob_response(bytes, meta.content_type, meta.filename))
@@ -603,10 +662,14 @@ pub async fn download_named_legacy(
         String,
     )>,
 ) -> Result<axum::response::Response> {
+    if let Some(remote) = legacy_remote(&state, &server_name)? {
+        let (bytes, ct, _) = fetch_remote_media(&state, &remote, &media_id).await?;
+        return Ok(blob_response(bytes, ct, Some(file_name)));
+    }
     let meta = legacy_meta(&state, &server_name, &media_id)?;
     let bytes = state
         .media
-        .read(&media_id)
+        .read(blob_of(&meta, &media_id))
         .await?
         .ok_or_else(|| ApiError::not_found("Media content missing"))?;
     Ok(blob_response(bytes, meta.content_type, Some(file_name)))
@@ -617,7 +680,6 @@ pub async fn thumbnail_legacy(
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<axum::response::Response> {
-    legacy_meta(&state, &server_name, &media_id)?;
     let dim = |key: &str| -> u32 {
         q.get(key)
             .and_then(|v| v.parse::<u32>().ok())
@@ -628,9 +690,24 @@ pub async fn thumbnail_legacy(
         Some("crop") => ThumbMethod::Crop,
         _ => ThumbMethod::Scale,
     };
+    if let Some(remote) = legacy_remote(&state, &server_name)? {
+        // Fetch the full remote media and thumbnail it in memory, like the
+        // authenticated endpoint.
+        let (file, _ct, _) = fetch_remote_media(&state, &remote, &media_id).await?;
+        let bytes = MediaStore::thumbnail_bytes(file, dim("width"), dim("height"), method)
+            .await
+            .map_err(|e| ApiError::not_found(format!("cannot thumbnail remote media: {e}")))?;
+        return Ok(blob_response(bytes, Some("image/png".to_owned()), None));
+    }
+    let meta = legacy_meta(&state, &server_name, &media_id)?;
     let bytes = state
         .media
-        .thumbnail(&media_id, dim("width"), dim("height"), method)
+        .thumbnail(
+            blob_of(&meta, &media_id),
+            dim("width"),
+            dim("height"),
+            method,
+        )
         .await?
         .ok_or_else(|| ApiError::not_found("Media content missing"))?;
     Ok(blob_response(bytes, Some("image/png".to_owned()), None))

@@ -37,14 +37,17 @@ pub async fn download(
         Ok(Some(m)) if !m.pending => m,
         _ => return not_found(),
     };
-    let bytes = match media.read(&media_id).await {
+    // Upload IDs are distinct from the content-addressed blob they point
+    // at; entries without a `blob` predate that split (the ID is the blob).
+    let blob = meta.blob.clone().unwrap_or_else(|| media_id.clone());
+    let bytes = match media.read(&blob).await {
         Ok(Some(b)) => b,
         _ => return not_found(),
     };
     let content_type = meta
         .content_type
         .unwrap_or_else(|| "application/octet-stream".to_owned());
-    let body = build_multipart(&content_type, &bytes);
+    let body = build_multipart(&content_type, &bytes, meta.filename.as_deref());
     (
         [(
             header::CONTENT_TYPE,
@@ -73,10 +76,10 @@ pub async fn thumbnail(
     let (Some(users), Some(media)) = (&state.users, &state.media) else {
         return not_found();
     };
-    match users.store().media(&media_id) {
-        Ok(Some(m)) if !m.pending => {}
+    let blob = match users.store().media(&media_id) {
+        Ok(Some(m)) if !m.pending => m.blob.clone().unwrap_or_else(|| media_id.clone()),
         _ => return not_found(),
-    }
+    };
     let (mut width, mut height, mut method) = (96u32, 96u32, ThumbMethod::Scale);
     for (k, v) in parse_query(query.as_deref().unwrap_or_default()) {
         match k.as_str() {
@@ -86,13 +89,13 @@ pub async fn thumbnail(
             _ => {}
         }
     }
-    match media.thumbnail(&media_id, width, height, method).await {
+    match media.thumbnail(&blob, width, height, method).await {
         Ok(Some(png)) => (
             [(
                 header::CONTENT_TYPE,
                 format!("multipart/mixed; boundary={BOUNDARY}"),
             )],
-            build_multipart("image/png", &png),
+            build_multipart("image/png", &png, None),
         )
             .into_response(),
         _ => not_found(),
@@ -107,27 +110,36 @@ fn parse_query(q: &str) -> Vec<(String, String)> {
 }
 
 /// Build the `multipart/mixed` federation media body: an empty JSON
-/// metadata part, then the file part.
-pub fn build_multipart(content_type: &str, file: &[u8]) -> Vec<u8> {
+/// metadata part, then the file part. `filename`, when present, rides the
+/// file part's `Content-Disposition` so the requesting server can serve
+/// the upload's name to its own clients (Synapse does the same; the
+/// Complement filename tests read it back over federation).
+pub fn build_multipart(content_type: &str, file: &[u8], filename: Option<&str>) -> Vec<u8> {
     let mut out = Vec::with_capacity(file.len() + 256);
     let mut push = |s: &str| out.extend_from_slice(s.as_bytes());
     push(&format!("--{BOUNDARY}\r\n"));
     push("Content-Type: application/json\r\n\r\n");
     push("{}\r\n");
     push(&format!("--{BOUNDARY}\r\n"));
-    push(&format!("Content-Type: {content_type}\r\n\r\n"));
+    push(&format!("Content-Type: {content_type}\r\n"));
+    let disposition = ruma::http_headers::ContentDisposition::new(
+        ruma::http_headers::ContentDispositionType::Attachment,
+    )
+    .with_filename(filename.map(ToOwned::to_owned));
+    push(&format!("Content-Disposition: {disposition}\r\n\r\n"));
     out.extend_from_slice(file);
     out.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
     out
 }
 
 /// Parse a `multipart/mixed` federation media response, returning the file
-/// bytes and its declared `Content-Type`. `content_type_header` is the
-/// response's Content-Type (carrying the boundary).
+/// bytes, its declared `Content-Type`, and any `Content-Disposition`
+/// filename. `content_type_header` is the response's Content-Type
+/// (carrying the boundary).
 pub fn parse_multipart_file(
     content_type_header: &str,
     body: &[u8],
-) -> Option<(Vec<u8>, Option<String>)> {
+) -> Option<(Vec<u8>, Option<String>, Option<String>)> {
     let boundary = content_type_header
         .split(';')
         .find_map(|p| p.trim().strip_prefix("boundary="))
@@ -159,7 +171,10 @@ pub fn parse_multipart_file(
         if file.ends_with(b"\r\n") {
             file = &file[..file.len() - 2];
         }
-        return Some((file.to_vec(), content_type));
+        let filename = header_value(headers, "content-disposition")
+            .and_then(|v| v.parse::<ruma::http_headers::ContentDisposition>().ok())
+            .and_then(|d| d.filename);
+        return Some((file.to_vec(), content_type, filename));
     }
     None
 }
@@ -212,18 +227,19 @@ mod tests {
     #[test]
     fn multipart_roundtrip() {
         let file = b"\x89PNG\r\n\x1a\nbinary\x00data";
-        let body = build_multipart("image/png", file);
-        let (got, ct) =
+        let body = build_multipart("image/png", file, Some("pic.png"));
+        let (got, ct, name) =
             parse_multipart_file(&format!("multipart/mixed; boundary={BOUNDARY}"), &body)
                 .expect("parse");
         assert_eq!(got, file);
         assert_eq!(ct.as_deref(), Some("image/png"));
+        assert_eq!(name.as_deref(), Some("pic.png"));
     }
 
     #[test]
     fn parses_quoted_boundary() {
-        let body = build_multipart("text/plain", b"hi");
-        let (got, _) =
+        let body = build_multipart("text/plain", b"hi", None);
+        let (got, _, _) =
             parse_multipart_file(&format!("multipart/mixed; boundary=\"{BOUNDARY}\""), &body)
                 .unwrap();
         assert_eq!(got, b"hi");

@@ -158,3 +158,13 @@ TestRestrictedRoomsRemoteJoinLocalUserInMSC3787Room
 TestRestrictedRoomsRemoteJoinFailOver
 TestRestrictedRoomsRemoteJoinFailOverInMSC3787Room
 TestRestrictedRoomsSpacesSummaryFederation
+# 2026-08-05: the media bucket, including the historically-flaky
+# TestMediaWithoutFileNameCSMediaV1 — the "flake" was six real bugs
+# (duplicate-upload temp race, legacy endpoints without remote fetch,
+# multipart-only remote parsing, content-addressed upload IDs colliding on
+# filename metadata, no legacy-federation-route fallback, and filenames not
+# carried over the federation media codec). Gated after 3 consecutive fully
+# green local runs of the whole media set.
+TestMediaFilenames
+TestMediaWithoutFileName
+TestMediaWithoutFileNameCSMediaV1
