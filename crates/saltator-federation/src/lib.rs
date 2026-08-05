@@ -197,6 +197,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
             get(media::thumbnail),
         )
         .route(
+            "/_matrix/federation/v1/event/{event_id}",
+            get(backfill::event),
+        )
+        .route(
             "/_matrix/federation/v1/backfill/{room_id}",
             get(backfill::backfill),
         )

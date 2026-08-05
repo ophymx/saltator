@@ -516,6 +516,7 @@ impl MockPeer {
                 put(serve_send_join),
             )
             .route("/_matrix/federation/v1/send/{txn_id}", put(serve_send))
+            .route("/_matrix/federation/v1/event/{event_id}", get(serve_event))
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -650,6 +651,33 @@ async fn serve_send_join(
         _ => return Json(json!({"errcode": "M_BAD_JSON", "error": "join is not an object"})),
     };
     Json(room.accept_join(join))
+}
+
+/// `GET /event/{eventId}`: serve one of the peer's events in transaction
+/// form (spec "Retrieving events") — lets tests exercise the by-ID
+/// missing-event recovery path.
+async fn serve_event(
+    State(inner): State<Arc<PeerInner>>,
+    Path(event_id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let rooms = inner.rooms.lock().unwrap();
+    for room in rooms.values() {
+        if room.events.contains_key(&event_id) {
+            let pdu = serde_json::Value::from(CanonicalJsonValue::Object(room.raw(&event_id)));
+            return Json(json!({
+                "origin": inner.name.as_str(),
+                "origin_server_ts": now_ms(),
+                "pdus": [pdu],
+            }))
+            .into_response();
+        }
+    }
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({ "errcode": "M_NOT_FOUND", "error": "unknown event" })),
+    )
+        .into_response()
 }
 
 async fn serve_send(

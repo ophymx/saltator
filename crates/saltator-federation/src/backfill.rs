@@ -75,6 +75,44 @@ pub async fn backfill(
     })))
 }
 
+/// `GET /_matrix/federation/v1/event/{eventId}` (spec "Retrieving events"):
+/// a single event by ID, in transaction form. Unlike `/get_missing_events`
+/// this serves events the requester names directly — needed mid-`/invite`,
+/// when the invited server must fetch the invite's prev events but we have
+/// not yet stored the invite itself and so cannot walk back from it.
+pub async fn event(
+    State(state): State<Arc<FedState>>,
+    Path(event_id): Path<String>,
+    _auth: Authenticated,
+) -> FedResult {
+    let Some(rooms) = state.rooms.clone() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
+    };
+    let stored = rooms
+        .store()
+        .event(&event_id)
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            )
+        })?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Event not found"))?;
+    let pdu: serde_json::Value = serde_json::from_slice(&stored.raw).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        )
+    })?;
+    Ok(axum::Json(serde_json::json!({
+        "origin": state.server_name.as_str(),
+        "origin_server_ts": crate::now_ms(),
+        "pdus": [pdu],
+    })))
+}
+
 /// `POST /_matrix/federation/v1/get_missing_events/{roomId}`.
 pub async fn get_missing_events(
     State(state): State<Arc<FedState>>,

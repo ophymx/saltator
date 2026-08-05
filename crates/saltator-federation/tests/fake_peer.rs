@@ -162,6 +162,89 @@ async fn peer_pushed_message_is_ingested() {
     our_rooms.shutdown().await.unwrap();
 }
 
+/// A PDU citing a prev event we never received is recovered by fetching
+/// that event by ID (`GET /event/{id}`) from the origin — the path taken
+/// when `/get_missing_events` cannot help. This is the shape of an invite
+/// arriving mid-`/invite` handshake: the origin has not stored the invite
+/// yet, so it cannot walk back from it, but serves its prev events by ID
+/// (the peer here has no `/get_missing_events` route at all).
+#[tokio::test]
+async fn pdu_with_undelivered_prev_is_recovered_via_event_fetch() {
+    use saltator_federation::{join_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    let peer = MockPeer::start("peer.test").await;
+    let room_id = peer.make_room(RoomVersion::V11, "charlie");
+
+    // Our server joins + imports the room.
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let client = Arc::new(FederationClient::with_base_url(
+        hs_signer.clone(),
+        peer.base_url.clone(),
+    ));
+    let resp = join_remote_room(&client, &hs_signer, "peer.test", &room_id, "@alice:hs.test")
+        .await
+        .expect("join");
+    our_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import");
+
+    let our_fed = Arc::new(FedState {
+        server_name: hs.clone(),
+        signer: hs_signer.clone(),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(peer.base_url.clone())),
+        rooms: Some(our_rooms.clone()),
+        users: None,
+        client: Some(client),
+        edu_sink: None,
+        media: None,
+    });
+    let our_base = spawn(router(our_fed)).await;
+
+    // The peer authors two chained messages but delivers only the second:
+    // its prev is unknown to us, so ingest must recover `first` from the
+    // peer before `second` can be accepted.
+    let charlie = "@charlie:peer.test";
+    let first_id = peer.with_room(&room_id, |room| {
+        room.message(charlie, json!({"msgtype": "m.text", "body": "one"}))
+    });
+    let second_id = peer.with_room(&room_id, |room| {
+        room.event_with_prev(
+            charlie,
+            "m.room.message",
+            None,
+            json!({"msgtype": "m.text", "body": "two"}),
+            vec![first_id.clone()],
+        )
+    });
+    let second = peer.with_room(&room_id, |room| room.raw(&second_id));
+
+    let out = peer
+        .send_transaction(&our_base, "hs.test", vec![second])
+        .await;
+    assert_eq!(
+        &out["pdus"][&second_id],
+        &json!({}),
+        "PDU with undelivered prev should ingest after /event recovery: {out}"
+    );
+    assert!(
+        our_rooms.store().event(&first_id).unwrap().is_some(),
+        "missing prev not recovered from the origin"
+    );
+    assert!(
+        our_rooms.store().event(&second_id).unwrap().is_some(),
+        "delivered PDU not persisted"
+    );
+
+    our_rooms.shutdown().await.unwrap();
+}
+
 /// An event whose `auth_events` cite a *rejected* event is itself rejected,
 /// while a normal sentinel alongside it is accepted (the core rule behind
 /// Complement's TestInboundFederationRejectsEventsWithRejectedAuthEvents).
