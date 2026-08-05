@@ -98,12 +98,20 @@ impl ServerResolver {
     /// Try `_matrix-fed._tcp.{host}` then the deprecated `_matrix._tcp`,
     /// falling back to the default federation port on `host`.
     async fn resolve_srv_or_default(&self, host: &str) -> ResolvedServer {
-        for service in ["_matrix-fed._tcp.", "_matrix._tcp."] {
-            if let Some(addr) = self.lookup_srv(&format!("{service}{host}")).await {
-                return plan_srv(host, addr);
-            }
+        // Both lookups run concurrently — the common case is that neither
+        // record exists, and doing them in series pays two full DNS timeouts
+        // on the latency path of the first request to a server. Preference
+        // still goes to `_matrix-fed._tcp` when both answer.
+        let fed_name = format!("_matrix-fed._tcp.{host}");
+        let deprecated_name = format!("_matrix._tcp.{host}");
+        let (fed, deprecated) = tokio::join!(
+            self.lookup_srv(&fed_name),
+            self.lookup_srv(&deprecated_name),
+        );
+        match fed.or(deprecated) {
+            Some(addr) => plan_srv(host, addr),
+            None => plan_default(host),
         }
-        plan_default(host)
     }
 
     /// Look up an SRV record and resolve its target to a socket address.

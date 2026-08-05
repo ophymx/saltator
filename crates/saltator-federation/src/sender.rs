@@ -92,7 +92,7 @@ async fn run(
 /// distribute, so we do not relay them onward.
 async fn deliver(
     rooms: &RoomServer,
-    client: &FederationClient,
+    client: &Arc<FederationClient>,
     server_name: &OwnedServerName,
     room_id: &str,
     event_id: &str,
@@ -140,6 +140,16 @@ async fn deliver(
             return;
         }
     };
+    // Warm a connection to every server in the room, before the filtering
+    // below narrows this down to the ones this event goes to. A server we
+    // don't send *this* event to (typically the origin of a membership it
+    // just handed us) is still one we will send to later, and doing it here
+    // means the discovery + TLS handshake happens while the room is quiet
+    // rather than in front of the next state change. `warm` is idempotent,
+    // so re-running it per event costs a set lookup.
+    for server in &destinations {
+        client.warm(server);
+    }
     // Never send a relayed membership back to the server that authored it and
     // handed it to us (the joining/leaving server already has it, and it is
     // now a member so `remote_servers_in_room` lists it). No-op for local
