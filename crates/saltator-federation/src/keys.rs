@@ -48,6 +48,9 @@ struct CachedKeys {
     keys: PublicKeyMap,
     /// min(server's valid_until_ts, fetch time + 7d) per spec.
     valid_until_ms: u64,
+    /// The verified response body as served by the origin (its signature
+    /// intact) — what the notary endpoints re-serve under our co-signature.
+    raw: CanonicalJsonObject,
 }
 
 /// Fetches and caches remote servers' signing keys.
@@ -125,6 +128,47 @@ impl KeyCache {
             .expect("key cache poisoned")
             .insert(server.to_owned(), cached);
         Ok(keys)
+    }
+
+    /// The raw verified `/key/v2/server` response for `server` (origin
+    /// signature intact), fetching when the cached copy is stale or older
+    /// than `min_valid_ms`. On a failed fetch, falls back to a stale
+    /// cached copy — the spec has notaries serve an expired key rather
+    /// than nothing. `None` only when we have never seen the server's keys
+    /// and cannot reach it.
+    pub async fn raw_keys_for(
+        &self,
+        server: &str,
+        now_ms: u64,
+        min_valid_ms: u64,
+    ) -> Option<CanonicalJsonObject> {
+        if let Some(entry) = self.cache.lock().expect("key cache poisoned").get(server) {
+            if entry.valid_until_ms > now_ms && entry.valid_until_ms >= min_valid_ms {
+                return Some(entry.raw.clone());
+            }
+        }
+        match self.fetch(server, now_ms).await {
+            Ok(cached) => {
+                let raw = cached.raw.clone();
+                self.cache
+                    .lock()
+                    .expect("key cache poisoned")
+                    .insert(server.to_owned(), cached);
+                Some(raw)
+            }
+            Err(e) => {
+                let stale = self
+                    .cache
+                    .lock()
+                    .expect("key cache poisoned")
+                    .get(server)
+                    .map(|entry| entry.raw.clone());
+                if stale.is_some() {
+                    tracing::debug!(server, error = %e, "notary: serving stale cached keys");
+                }
+                stale
+            }
+        }
     }
 
     async fn fetch(&self, server: &str, now_ms: u64) -> Result<CachedKeys, KeyError> {
@@ -211,6 +255,7 @@ fn parse_and_verify(
     Ok(CachedKeys {
         keys,
         valid_until_ms,
+        raw: object,
     })
 }
 

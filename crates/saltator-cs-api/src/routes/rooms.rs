@@ -1992,39 +1992,12 @@ pub async fn timestamp_to_event(
         .ok_or_else(|| ApiError::invalid_param("ts: required integer (ms)"))?;
     let backward = matches!(q.get("dir").map(String::as_str), Some("b"));
 
-    let store = state.rooms.store();
-    // Oldest-first scan; tuples compare by (ts, seq) so ties resolve to the
-    // earliest event forwards and the latest backwards.
-    let mut best: Option<(u64, u64, String)> = None;
-    for (seq, id) in store
-        .room_timeline(&room_id, 0, None, usize::MAX, false)
+    match state
+        .rooms
+        .timestamp_to_event(&room_id, ts, backward)
         .map_err(internal)?
     {
-        let Some(raw) = raw_event(&state.rooms, &id)? else {
-            continue;
-        };
-        let ots = match raw.get("origin_server_ts") {
-            Some(ruma::CanonicalJsonValue::Integer(i)) => match u64::try_from(i64::from(*i)) {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-            _ => continue,
-        };
-        let matches_dir = if backward { ots <= ts } else { ots >= ts };
-        if !matches_dir {
-            continue;
-        }
-        let better = match &best {
-            None => true,
-            Some((bts, bseq, _)) if backward => (ots, seq) > (*bts, *bseq),
-            Some((bts, bseq, _)) => (ots, seq) < (*bts, *bseq),
-        };
-        if better {
-            best = Some((ots, seq, id));
-        }
-    }
-    match best {
-        Some((ots, _, id)) => Ok(axum::Json(serde_json::json!({
+        Some((id, ots)) => Ok(axum::Json(serde_json::json!({
             "event_id": id,
             "origin_server_ts": ots,
         }))),
@@ -2889,167 +2862,34 @@ pub async fn get_room_aliases(
     Ok(Ra(room_aliases::v3::Response::new(aliases)))
 }
 
-/// Content of the room's current `(event_type, "")` state event, if any.
-fn state_content_of(
-    state: &CsState,
-    current: &crate::room_util::StateMap,
-    event_type: &str,
-) -> Result<Option<serde_json::Value>> {
-    crate::room_util::state_content_in(&state.rooms, current, event_type)
-}
-
-/// Directory listing entry for one published room.
-fn public_chunk(
-    state: &CsState,
-    room_id: &str,
-) -> Result<Option<ruma::directory::PublicRoomsChunk>> {
-    if state
-        .rooms
-        .store()
-        .meta(room_id)
-        .map_err(internal)?
-        .is_none()
-    {
-        return Ok(None);
-    }
-    let current = current_state(&state.rooms, room_id)?;
-    let str_field = |content: &Option<serde_json::Value>, key: &str| -> Option<String> {
-        content
-            .as_ref()?
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned)
-    };
-
-    let mut joined = 0u32;
-    for ((event_type, _), event_id) in &current {
-        if event_type != "m.room.member" {
-            continue;
-        }
-        if let Some(raw) = raw_event(&state.rooms, event_id)? {
-            let membership = raw
-                .get("content")
-                .and_then(|c| c.as_object())
-                .and_then(|c| c.get("membership"))
-                .and_then(|m| m.as_str());
-            if membership == Some("join") {
-                joined += 1;
-            }
-        }
-    }
-
-    let mut chunk: ruma::directory::PublicRoomsChunk = ruma::directory::PublicRoomsChunkInit {
-        num_joined_members: joined.into(),
-        room_id: OwnedRoomId::try_from(room_id.to_owned()).map_err(internal)?,
-        world_readable: false,
-        guest_can_join: false,
-    }
-    .into();
-    chunk.name = str_field(&state_content_of(state, &current, "m.room.name")?, "name");
-    chunk.topic = str_field(&state_content_of(state, &current, "m.room.topic")?, "topic");
-    chunk.canonical_alias = str_field(
-        &state_content_of(state, &current, "m.room.canonical_alias")?,
-        "alias",
-    )
-    .and_then(|a| a.try_into().ok());
-    chunk.avatar_url =
-        str_field(&state_content_of(state, &current, "m.room.avatar")?, "url").map(|u| u.into());
-    chunk.world_readable = str_field(
-        &state_content_of(state, &current, "m.room.history_visibility")?,
-        "history_visibility",
-    )
-    .as_deref()
-        == Some("world_readable");
-    chunk.guest_can_join = str_field(
-        &state_content_of(state, &current, "m.room.guest_access")?,
-        "guest_access",
-    )
-    .as_deref()
-        == Some("can_join");
-    chunk.join_rule = str_field(
-        &state_content_of(state, &current, "m.room.join_rules")?,
-        "join_rule",
-    )
-    .as_deref()
-    .unwrap_or("public")
-    .into();
-    Ok(Some(chunk))
-}
-
-fn directory_chunks(
-    state: &CsState,
-    search_term: Option<&str>,
-    limit: Option<ruma::UInt>,
-) -> Result<(Vec<ruma::directory::PublicRoomsChunk>, u64)> {
-    let mut chunks = Vec::new();
-    for room_id in state.users.store().public_rooms().map_err(internal)? {
-        let Some(chunk) = public_chunk(state, &room_id)? else {
-            continue;
-        };
-        if let Some(term) = search_term {
-            let term = term.to_lowercase();
-            let matches = [
-                chunk.name.as_deref().unwrap_or(""),
-                chunk.topic.as_deref().unwrap_or(""),
-                chunk.canonical_alias.as_ref().map_or("", |a| a.as_str()),
-            ]
-            .iter()
-            .any(|f| f.to_lowercase().contains(&term));
-            if !matches {
-                continue;
-            }
-        }
-        chunks.push(chunk);
-    }
-    let total = chunks.len() as u64;
-    if let Some(limit) = limit {
-        chunks.truncate(u64::from(limit) as usize);
-    }
-    Ok((chunks, total))
-}
-
 pub async fn public_rooms(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_public_rooms::v3::Request>,
 ) -> Result<axum::response::Response> {
-    let (chunks, total) = directory_chunks(&state, None, req.limit)?;
-    let mut resp = get_public_rooms::v3::Response::new(chunks);
-    resp.total_room_count_estimate = ruma::UInt::try_from(total).ok();
-    directory_response(resp)
+    use axum::response::IntoResponse;
+    let body = saltator_federation::directory_body(
+        &state.users,
+        &state.rooms,
+        None,
+        req.limit.map(u64::from),
+    )
+    .map_err(ApiError::internal)?;
+    Ok(axum::Json(body).into_response())
 }
 
 pub async fn public_rooms_filtered(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_public_rooms_filtered::v3::Request>,
 ) -> Result<axum::response::Response> {
-    let (chunks, total) =
-        directory_chunks(&state, req.filter.generic_search_term.as_deref(), req.limit)?;
-    let mut resp = get_public_rooms_filtered::v3::Response::new();
-    resp.chunk = chunks;
-    resp.total_room_count_estimate = ruma::UInt::try_from(total).ok();
-    directory_response(resp)
-}
-
-/// Serialize a public-rooms directory response, filling in `join_rule` for
-/// any chunk that lacks it. ruma (0.24) omits the field when it equals the
-/// default (`public`) via `skip_serializing_if`, but clients — and
-/// Complement's public-rooms-directory test — expect every chunk to carry a
-/// `join_rule`. A missing key therefore unambiguously means `public`.
-fn directory_response<T: ruma::api::OutgoingResponse>(resp: T) -> Result<axum::response::Response> {
     use axum::response::IntoResponse;
-    let http = resp
-        .try_into_http_response::<Vec<u8>>()
-        .map_err(|e| ApiError::internal(format!("response encode: {e}")))?;
-    let mut v: serde_json::Value = serde_json::from_slice(http.body()).map_err(internal)?;
-    if let Some(chunk) = v.get_mut("chunk").and_then(|c| c.as_array_mut()) {
-        for room in chunk.iter_mut() {
-            if let Some(obj) = room.as_object_mut() {
-                obj.entry("join_rule")
-                    .or_insert_with(|| serde_json::Value::String("public".to_owned()));
-            }
-        }
-    }
-    Ok(axum::Json(v).into_response())
+    let body = saltator_federation::directory_body(
+        &state.users,
+        &state.rooms,
+        req.filter.generic_search_term.as_deref(),
+        req.limit.map(u64::from),
+    )
+    .map_err(ApiError::internal)?;
+    Ok(axum::Json(body).into_response())
 }
 
 pub async fn get_visibility(

@@ -113,6 +113,168 @@ pub async fn event(
     })))
 }
 
+/// Shared implementation of `GET /state/{roomId}` and `GET
+/// /state_ids/{roomId}` (spec "Retrieving events"): the fully resolved
+/// room state *before* the event named by `?event_id=`, plus its auth
+/// chain — what a peer uses to heal a DAG gap it cannot walk back over.
+/// Requester's server must be in the room.
+async fn state_common(
+    state: &FedState,
+    room_id: &str,
+    query: Option<String>,
+    origin: &str,
+    ids_only: bool,
+) -> FedResult {
+    let Some(rooms) = state.rooms.clone() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
+    };
+    let internal = |e: &dyn std::fmt::Display| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        )
+    };
+    if !rooms
+        .server_in_room(room_id, origin)
+        .map_err(|e| internal(&e))?
+    {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "Requesting server is not in the room",
+        ));
+    }
+    let mut event_id = None;
+    for pair in query.unwrap_or_default().split('&') {
+        if let Some((k, val)) = pair.split_once('=') {
+            if k == "event_id" {
+                event_id = Some(percent_decode(val));
+            }
+        }
+    }
+    let Some(event_id) = event_id else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "event_id: required",
+        ));
+    };
+    let Some((pdus, auth_chain)) = rooms
+        .state_before_event(room_id, &event_id)
+        .map_err(|e| internal(&e))?
+    else {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "State at that event is not known",
+        ));
+    };
+    let body = if ids_only {
+        let ids = |v: Vec<(String, ruma::CanonicalJsonObject)>| {
+            v.into_iter().map(|(id, _)| id).collect::<Vec<_>>()
+        };
+        serde_json::json!({
+            "pdu_ids": ids(pdus),
+            "auth_chain_ids": ids(auth_chain),
+        })
+    } else {
+        serde_json::json!({
+            "pdus": pdu_array(pdus.into_iter().map(|(_, o)| o).collect()),
+            "auth_chain": pdu_array(auth_chain.into_iter().map(|(_, o)| o).collect()),
+        })
+    };
+    Ok(axum::Json(body))
+}
+
+/// `GET /_matrix/federation/v1/state/{roomId}?event_id=`.
+pub async fn state(
+    State(state): State<Arc<FedState>>,
+    Path(room_id): Path<String>,
+    RawQuery(query): RawQuery,
+    auth: Authenticated,
+) -> FedResult {
+    state_common(&state, &room_id, query, &auth.origin, false).await
+}
+
+/// `GET /_matrix/federation/v1/state_ids/{roomId}?event_id=`.
+pub async fn state_ids(
+    State(state): State<Arc<FedState>>,
+    Path(room_id): Path<String>,
+    RawQuery(query): RawQuery,
+    auth: Authenticated,
+) -> FedResult {
+    state_common(&state, &room_id, query, &auth.origin, true).await
+}
+
+/// `GET /_matrix/federation/v1/timestamp_to_event/{roomId}?ts=&dir=`
+/// (MSC3030): the event closest to `ts`, for a remote server whose local
+/// copy of the room cannot answer (it then backfills the returned event).
+/// Requester's server must be in the room — event IDs must not leak to
+/// strangers.
+pub async fn timestamp_to_event(
+    State(state): State<Arc<FedState>>,
+    Path(room_id): Path<String>,
+    RawQuery(query): RawQuery,
+    auth: Authenticated,
+) -> FedResult {
+    let Some(rooms) = state.rooms.clone() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
+    };
+    let in_room = rooms.server_in_room(&room_id, &auth.origin).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        )
+    })?;
+    if !in_room {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "Requesting server is not in the room",
+        ));
+    }
+    let mut ts: Option<u64> = None;
+    let mut backward = false;
+    for pair in query.unwrap_or_default().split('&') {
+        let Some((k, val)) = pair.split_once('=') else {
+            continue;
+        };
+        match k {
+            "ts" => ts = percent_decode(val).parse().ok(),
+            "dir" => backward = percent_decode(val) == "b",
+            _ => {}
+        }
+    }
+    let Some(ts) = ts else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "ts: required integer (ms)",
+        ));
+    };
+    match rooms
+        .timestamp_to_event(&room_id, ts, backward)
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            )
+        })? {
+        Some((id, ots)) => Ok(axum::Json(serde_json::json!({
+            "event_id": id,
+            "origin_server_ts": ots,
+        }))),
+        None => Err(err(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "No event found for the given timestamp",
+        )),
+    }
+}
+
 /// `POST /_matrix/federation/v1/get_missing_events/{roomId}`.
 pub async fn get_missing_events(
     State(state): State<Arc<FedState>>,

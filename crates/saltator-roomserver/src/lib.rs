@@ -819,6 +819,61 @@ impl RoomServer {
             .unwrap_or_default())
     }
 
+    /// The timeline event closest to `ts` (MSC3030 "jump to date"), shared
+    /// by the CS and federation `timestamp_to_event` endpoints. Forwards
+    /// (`backward == false`) returns the first event at or after `ts`,
+    /// backwards the last at or before; ties break by timeline order
+    /// (earliest forwards, latest backwards). `None` when no event
+    /// qualifies. Serves from the local timeline only; chasing history we
+    /// don't hold (the federated fallback) is the caller's concern.
+    pub fn timestamp_to_event(
+        &self,
+        room_id: &str,
+        ts: u64,
+        backward: bool,
+    ) -> Result<Option<(String, u64)>> {
+        let store = self.store();
+        let mut best: Option<(u64, u64, String)> = None;
+        for (seq, id) in store
+            .room_timeline(room_id, 0, None, usize::MAX, false)
+            .map_err(storage_err)?
+        {
+            let Some(stored) = store.event(&id).map_err(storage_err)? else {
+                continue;
+            };
+            let raw: serde_json::Value = match serde_json::from_slice(&stored.raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(ots) = raw.get("origin_server_ts").and_then(|t| t.as_u64()) else {
+                continue;
+            };
+            let matches_dir = if backward { ots <= ts } else { ots >= ts };
+            if !matches_dir {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some((bts, bseq, _)) if backward => (ots, seq) > (*bts, *bseq),
+                Some((bts, bseq, _)) => (ots, seq) < (*bts, *bseq),
+            };
+            if better {
+                best = Some((ots, seq, id));
+            }
+        }
+        Ok(best.map(|(ots, _, id)| (id, ots)))
+    }
+
+    /// Whether `server` currently has a joined user in the room — the
+    /// membership check inbound federation endpoints apply before serving
+    /// room data (state, timestamps) to a caller.
+    pub fn server_in_room(&self, room_id: &str, server: &str) -> Result<bool> {
+        Ok(self
+            .remote_servers_in_room(room_id, "")?
+            .iter()
+            .any(|s| s == server))
+    }
+
     /// The room's current `m.room.server_acl`, if any is set.
     pub fn server_acl(&self, room_id: &str) -> Result<Option<saltator_core::acl::ServerAcl>> {
         let store = self.store();
@@ -1330,6 +1385,88 @@ impl RoomServer {
         };
         let seed: BTreeSet<String> = auth_event_ids(&event).into_iter().collect();
         Ok(Some(self.collect_auth_chain(&store, seed)?))
+    }
+
+    /// The resolved room state *before* `event_id` and that state's auth
+    /// chain, as `(event_id, raw)` pairs — the payload of the federation
+    /// `/state` and `/state_ids` endpoints. Matches Synapse's semantics:
+    /// the event's own `(type, state_key)` entry is replaced by the entry
+    /// it superseded (recovered via `auth_events`, like
+    /// [`Self::prev_state_content`]) or dropped if there was none.
+    /// `Ok(None)` when we don't hold the event, it is rejected, or it
+    /// belongs to another room.
+    #[allow(clippy::type_complexity)]
+    pub fn state_before_event(
+        &self,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<
+        Option<(
+            Vec<(String, CanonicalJsonObject)>,
+            Vec<(String, CanonicalJsonObject)>,
+        )>,
+    > {
+        let store = self.store();
+        let Some(stored) = store.event(event_id).map_err(storage_err)? else {
+            return Ok(None);
+        };
+        if stored.state_group_after == 0 {
+            return Ok(None); // rejected: no state known at it
+        }
+        let raw: serde_json::Value =
+            serde_json::from_slice(&stored.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
+        if raw.get("room_id").and_then(|v| v.as_str()) != Some(room_id) {
+            return Ok(None);
+        }
+        let mut state = store
+            .resolve_group(room_id, stored.state_group_after)
+            .map_err(storage_err)?;
+
+        // `state_group_after` includes a state event itself — back it out.
+        if let (Some(etype), Some(skey)) = (
+            raw.get("type").and_then(|v| v.as_str()),
+            raw.get("state_key").and_then(|v| v.as_str()),
+        ) {
+            let key = (etype.to_owned(), skey.to_owned());
+            let mut replaced = false;
+            for auth_id in raw
+                .get("auth_events")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()))
+                .into_iter()
+                .flatten()
+            {
+                let Some(ae) = self.load_raw(&store, auth_id)? else {
+                    continue;
+                };
+                if ae.get("type").and_then(|v| v.as_str()) == Some(etype)
+                    && ae.get("state_key").and_then(|v| v.as_str()) == Some(skey)
+                {
+                    state.insert(key.clone(), auth_id.to_owned());
+                    replaced = true;
+                    break;
+                }
+            }
+            if !replaced {
+                state.remove(&key);
+            }
+        }
+
+        let mut pdus = Vec::new();
+        let mut auth_seed = BTreeSet::new();
+        for id in state.values() {
+            let Some(obj) = self.load_raw(&store, id)? else {
+                continue;
+            };
+            auth_seed.extend(auth_event_ids(&obj));
+            pdus.push((id.clone(), obj));
+        }
+        let auth_chain = self
+            .collect_auth_chain(&store, auth_seed)?
+            .into_iter()
+            .filter_map(|obj| self.pdu_event_id(&obj).map(|id| (id.to_string(), obj)))
+            .collect();
+        Ok(Some((pdus, auth_chain)))
     }
 
     fn collect_auth_chain(

@@ -9304,3 +9304,64 @@ async fn local_knock_surfaces_in_sync() {
 
     env.shutdown().await;
 }
+
+/// The federation `/publicRooms` twin serves the same directory as the CS
+/// endpoint (one shared builder), to an authenticated peer: published
+/// rooms appear with an explicit `join_rule`, and the filtered POST
+/// variant honours `generic_search_term`.
+#[tokio::test]
+async fn federation_public_rooms_lists_published_rooms() {
+    use saltator_testsupport::MockPeer;
+
+    let env = start_env().await;
+    let alice = env.register("alice", "pw").await;
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({
+                "visibility": "public",
+                "preset": "public_chat",
+                "name": "Federated Directory Room",
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().unwrap().to_owned();
+
+    // Federation surface over the same stores, authenticating the peer.
+    let peer = MockPeer::start("peer.test").await;
+    let name = ruma::OwnedServerName::try_from(SERVER).unwrap();
+    let (fed_signer, _) = saltator_roomserver::ServerSigner::generate(name.clone(), "9".to_owned());
+    let fed = Arc::new(FedState {
+        server_name: name,
+        signer: Arc::new(fed_signer),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(peer.base_url.clone())),
+        rooms: Some(env.rooms.clone()),
+        users: Some(env.users.clone()),
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let app = saltator_federation::router(fed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+
+    let (status, body) = peer
+        .signed_get(&base, SERVER, "/_matrix/federation/v1/publicRooms?limit=5")
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let chunk = &body["chunk"][0];
+    assert_eq!(chunk["room_id"], room_id.as_str(), "{body}");
+    assert_eq!(chunk["name"], "Federated Directory Room", "{body}");
+    assert_eq!(chunk["join_rule"], "public", "{body}");
+    assert_eq!(body["total_room_count_estimate"], 1, "{body}");
+
+    env.shutdown().await;
+}

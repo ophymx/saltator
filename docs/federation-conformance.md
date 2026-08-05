@@ -292,3 +292,60 @@ Cause: no application-service support yet. Out of scope until AS lands.
 
 Each landed feature adds its now-green top-level tests to
 `docker/complement/federation-must-pass.txt`.
+
+---
+
+## Endpoint inventory (server-server API, spec v1.19)
+
+Coverage map of every endpoint in the spec's server-server surface
+(`matrix-spec data/api/server-server/*.yaml`, pinned v1.19) against
+`saltator-federation`'s router. **Consult this FIRST when a federation
+test reddens** — before instrumenting, check whether an endpoint the flow
+depends on is simply absent. (Learned the hard way: `GET /event/{eventId}`
+was missing and only surfaced at the bottom of the TestUnbanViaInvite race
+investigation, 2026-08-04.)
+
+### Served
+`/version` · `/key/v2/server` · `/key/v2/query` (GET+POST, notary) ·
+`/send/{txnId}` ·
+`/make_join` `/send_join` (v1+v2) · `/make_leave` `/send_leave` (v1+v2) ·
+`/make_knock` `/send_knock` · `/invite` (v2) ·
+`/event/{eventId}` · `/event_auth` · `/backfill` · `/get_missing_events` ·
+`/state` · `/state_ids` · `/timestamp_to_event` ·
+`/hierarchy` · `/publicRooms` (GET+POST) ·
+`/query/directory` · `/query/profile` ·
+`/user/devices` · `/user/keys/claim` · `/user/keys/query` ·
+`/media/download` · `/media/thumbnail`
+
+(2026-08-05 batch closed the whole "well-defined missing" set: `/state`,
+`/state_ids`, `/timestamp_to_event`, federation `/publicRooms` — one shared
+directory builder with the CS handlers — and the key notary. None had
+direct Complement coverage — Complement's notary tests are a TODO comment,
+`TestJumpToDateEndpoint` is blocked on application-service support, and
+`/state[_ids]` only appears with Complement's synthetic server serving
+*us* — so coverage is local: `fake_peer.rs` + `cs_api.rs` tests.)
+
+### Known follow-ups
+- **Requester-in-room checks**: the new `/state`, `/state_ids`, and
+  `/timestamp_to_event` verify the caller's server is in the room, but the
+  older `/backfill`, `/event`, `/event_auth`, and `/hierarchy` serve any
+  authenticated server (Synapse gates all of these with
+  `assert_host_in_room`). Hardening follow-up.
+- **CS `timestamp_to_event` federated fallback**: when the local timeline
+  can't answer for a remote room, the CS handler should query other
+  servers' federation endpoint and backfill the result (needed for the
+  federation leaf of `TestJumpToDateEndpoint`, itself blocked on AS
+  support — see Group 12).
+
+### Missing — justified absent (do not re-derive)
+- `PUT /invite` v1 — only needed for room versions 1–2; we support v8+.
+- `PUT /exchange_third_party_invite` — identity-server 3PID invites; out
+  of scope until 3PID lands.
+- `GET /openid/userinfo` — OpenID for integration managers; niche.
+- `POST /sign` — policy servers (added v1.18); niche.
+- `/.well-known/matrix/server` — deployment-level delegation, typically
+  the reverse proxy's job, not the homeserver process.
+
+Keep this section current: when adding a route, move it to **Served**; when
+the spec pin advances, re-run the diff (extract paths from the spec YAML,
+compare with `grep -oE '"/_matrix[^"]*"' crates/saltator-federation/src/lib.rs`).
