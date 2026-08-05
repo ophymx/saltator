@@ -256,9 +256,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         Some(ca) => saltator_federation::FederationClient::with_ca(signer.clone(), ca),
         None => saltator_federation::FederationClient::new(signer.clone()),
     });
-    // The CS import paths (remote join, backfill) verify fetched events, so
-    // they need their own key cache to look up authoring servers' keys.
-    let cs_key_cache = Arc::new(match &outbound_ca {
+    // One key cache for the whole process. The CS import paths (remote join,
+    // backfill) verify fetched events and so learn the authoring servers'
+    // keys; inbound federation auth needs those same keys. Keeping separate
+    // caches made every server pay a fresh key fetch — a full cold HTTPS
+    // round trip, ~55ms — inside the auth extractor on the first request it
+    // received from a server it had just finished talking to.
+    let key_cache = Arc::new(match &outbound_ca {
         Some(ca) => saltator_federation::KeyCache::with_ca(ca),
         None => saltator_federation::KeyCache::new(),
     });
@@ -280,7 +284,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             allow_internal_fetch: cfg.client.allow_internal_fetch,
         },
     )
-    .with_federation(fed_client.clone(), signer.clone(), cs_key_cache);
+    .with_federation(fed_client.clone(), signer.clone(), key_cache.clone());
     // Typing/presence maps are shared with the federation surface (inbound
     // EDUs update them).
     let cs_typing = cs_state.typing_map();
@@ -291,10 +295,6 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let cs_listener = tokio::net::TcpListener::bind(cfg.listeners.client).await?;
     tracing::info!(listen = %cfg.listeners.client, "client-server API listening");
 
-    let key_cache = match &outbound_ca {
-        Some(ca) => saltator_federation::KeyCache::with_ca(ca),
-        None => saltator_federation::KeyCache::new(),
-    };
     let edu_sink = Arc::new(saltator_cs_api::EphemeralEduSink::new(
         cs_typing.clone(),
         cs_presence.clone(),

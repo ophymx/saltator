@@ -353,10 +353,16 @@ pub(crate) async fn process_pdu(
 
     match rooms.ingest_pdu(raw.clone()).await {
         Ok(outcome) => outcome_result(outcome),
-        Err(RoomError::MissingEvents(_)) => {
+        Err(RoomError::MissingEvents(missing)) => {
             // Gap: fetch the events between what we have and this PDU, then
-            // retry. If the fetch or retry fails, report the error.
-            if fill_gap(state, origin, &raw).await {
+            // retry. `/get_missing_events` walks back from this PDU, which
+            // only works once the origin has stored it — not the case for an
+            // invite mid-`/invite` handshake (the origin ingests it only
+            // after we co-sign), so fall back to fetching the named missing
+            // events directly via `/event`. If both fail, report the error.
+            if fill_gap(state, origin, &raw).await
+                || fetch_missing_by_id(state, origin, missing).await
+            {
                 match rooms.ingest_pdu(raw).await {
                     Ok(outcome) => outcome_result(outcome),
                     Err(e) => (precomputed, error_result(&e.to_string())),
@@ -577,6 +583,80 @@ async fn fill_gap(state: &FedState, origin: &str, pdu: &CanonicalJsonObject) -> 
             ingested > 0
         }
     }
+}
+
+/// Fetch specifically-named missing events from `origin` via `/event/{id}`
+/// and ingest them, walking further missing references up to
+/// `GAP_FILL_LIMIT` fetches. This covers the case `/get_missing_events`
+/// structurally cannot: a PDU handed to us before the origin has stored it
+/// (an invite mid-`/invite` handshake), where the origin cannot walk back
+/// from the PDU but can serve its prev/auth events by ID. Returns whether
+/// anything was ingested (worth an ingest retry by the caller).
+async fn fetch_missing_by_id(state: &FedState, origin: &str, missing: Vec<String>) -> bool {
+    let (Some(rooms), Some(client)) = (&state.rooms, &state.client) else {
+        return false;
+    };
+    trust_origin_keys(state, origin).await;
+
+    let mut ingested = false;
+    let mut fetches = 0usize;
+    // Depth-first: an event whose own prevs are missing goes back on the
+    // queue behind them, so ancestors ingest first. The fetch budget bounds
+    // the walk; a cycle or an uncooperative origin just exhausts it.
+    let mut queue = missing;
+    let mut retried: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(id) = queue.pop() {
+        if fetches >= GAP_FILL_LIMIT {
+            break;
+        }
+        fetches += 1;
+        let path = format!("/_matrix/federation/v1/event/{}", path_encode(&id));
+        let resp = match client.get(origin, &path).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, event_id = %id, "gap fill: /event fetch failed");
+                continue;
+            }
+        };
+        let Some(pdu) = resp
+            .get("pdus")
+            .and_then(|p| p.as_array())
+            .and_then(|p| p.first())
+        else {
+            continue;
+        };
+        let obj = match CanonicalJsonValue::try_from(pdu.clone()) {
+            Ok(CanonicalJsonValue::Object(o)) => o,
+            _ => continue,
+        };
+        match rooms.ingest_pdu(obj).await {
+            Ok(Outcome::Accepted { .. }) | Ok(Outcome::Duplicate { .. }) => ingested = true,
+            Err(RoomError::MissingEvents(more)) if retried.insert(id.clone()) => {
+                // Ancestors first, then this event again — once.
+                queue.push(id);
+                queue.extend(more);
+            }
+            _ => {}
+        }
+    }
+    ingested
+}
+
+/// Percent-encode an event ID for use as a URL path segment.
+fn path_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            '+' => out.push_str("%2B"),
+            '&' => out.push_str("%26"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Load `origin`'s current signing keys into the room server's trusted set

@@ -5065,7 +5065,7 @@ async fn spawn_fed(
         server_name: name,
         signer,
         old_keys: Vec::<OldVerifyKey>::new(),
-        key_cache,
+        key_cache: std::sync::Arc::new(key_cache),
         rooms: None,
         users: None,
         client: None,
@@ -5626,7 +5626,7 @@ async fn client_joins_a_remote_room_by_remote_alias() {
         server_name: a_name.clone(),
         signer: a_signer.clone(),
         old_keys: Vec::<OldVerifyKey>::new(),
-        key_cache: KeyCache::with_base_url(b_key_base),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(b_key_base)),
         rooms: Some(a_rooms.clone()),
         users: Some(a_users.clone()),
         client: None,
@@ -6627,7 +6627,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
         server_name: b_name.clone(),
         signer: b_signer.clone(),
         old_keys: Vec::<OldVerifyKey>::new(),
-        key_cache: KeyCache::with_base_url(a_base.clone()),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_base.clone())),
         rooms: Some(b_rooms.clone()),
         users: None,
         client: Some(Arc::new(FederationClient::with_base_url(
@@ -6789,7 +6789,7 @@ async fn inbound_federated_invite_appears_in_sync() {
         server_name: b_name.clone(),
         signer: b_signer.clone(),
         old_keys: Vec::new(),
-        key_cache: KeyCache::with_base_url(a_key_base),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
         client: None,
@@ -7050,7 +7050,7 @@ async fn outbound_federated_invite_round_trip() {
         server_name: ruma::OwnedServerName::try_from("b.test").unwrap(),
         signer: b_signer.clone(),
         old_keys: Vec::new(),
-        key_cache: KeyCache::with_base_url(a_key_base),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
         client: None,
@@ -7233,7 +7233,7 @@ async fn receipt_edu_over_federation_surfaces_in_sync() {
         server_name: ruma::OwnedServerName::try_from("b.test").unwrap(),
         signer: b_signer.clone(),
         old_keys: Vec::new(),
-        key_cache: KeyCache::with_base_url(a_key_base),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
         client: None,
@@ -7340,7 +7340,7 @@ async fn to_device_over_federation_round_trip() {
         server_name: ruma::OwnedServerName::try_from("b.test").unwrap(),
         signer: b_signer.clone(),
         old_keys: Vec::new(),
-        key_cache: KeyCache::with_base_url(a_key_base),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
         client: None,
@@ -7476,7 +7476,7 @@ async fn federated_key_query_claim_and_device_list_update() {
         server_name: ruma::OwnedServerName::try_from("b.test").unwrap(),
         signer: b_signer.clone(),
         old_keys: Vec::new(),
-        key_cache: KeyCache::with_base_url(a_key_base),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
         client: None,
@@ -7717,7 +7717,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
         server_name: b_name.clone(),
         signer: b_signer.clone(),
         old_keys: Vec::new(),
-        key_cache: KeyCache::with_base_url(a_key_base),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
         rooms: Some(b_rooms.clone()),
         users: Some(b_users.clone()),
         client: None,
@@ -7910,7 +7910,7 @@ async fn client_downloads_remote_media_over_federation() {
         server_name: a_name.clone(),
         signer: a_signer.clone(),
         old_keys: Vec::new(),
-        key_cache: KeyCache::new(),
+        key_cache: std::sync::Arc::new(KeyCache::new()),
         rooms: Some(a_rooms.clone()),
         users: Some(a_users.clone()),
         client: None,
@@ -7926,7 +7926,7 @@ async fn client_downloads_remote_media_over_federation() {
     let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
     // A authenticates B against B's keys.
     let a_fed = Arc::new(FedState {
-        key_cache: KeyCache::with_base_url(b_key_base),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(b_key_base)),
         ..Arc::try_unwrap(a_fed).ok().unwrap()
     });
     let a_base = {
@@ -8144,7 +8144,7 @@ async fn client_queries_remote_profile_and_directory() {
         server_name: a_name.clone(),
         signer: a_signer.clone(),
         old_keys: Vec::new(),
-        key_cache: KeyCache::new(),
+        key_cache: std::sync::Arc::new(KeyCache::new()),
         rooms: Some(a_rooms.clone()),
         users: Some(a_users.clone()),
         client: None,
@@ -8158,7 +8158,7 @@ async fn client_queries_remote_profile_and_directory() {
     let b_signer = Arc::new(b_signer);
     let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
     let a_fed = Arc::new(FedState {
-        key_cache: KeyCache::with_base_url(b_key_base),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(b_key_base)),
         ..Arc::try_unwrap(a_fed).ok().unwrap()
     });
     let a_base = {

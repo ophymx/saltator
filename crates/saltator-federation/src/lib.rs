@@ -76,8 +76,12 @@ pub struct FedState {
     pub signer: Arc<ServerSigner>,
     /// Snapshot taken at startup; rotation is an offline operation.
     pub old_keys: Vec<OldVerifyKey>,
-    /// Fetches and caches calling servers' keys for inbound auth.
-    pub key_cache: KeyCache,
+    /// Fetches and caches calling servers' keys for inbound auth. Shared
+    /// (not owned) so a key learned on one path is available on the others:
+    /// the CS API trusts a remote server's keys while performing a remote
+    /// join, and inbound auth must not re-fetch them on the latency path of
+    /// that server's first request to us.
+    pub key_cache: Arc<KeyCache>,
     /// The room pipeline inbound PDUs route into. `None` in key-only
     /// deployments and auth-only tests.
     pub rooms: Option<Arc<RoomServer>>,
@@ -106,7 +110,7 @@ impl FedState {
             server_name,
             signer,
             old_keys,
-            key_cache: KeyCache::new(),
+            key_cache: Arc::new(KeyCache::new()),
             rooms: None,
             users: None,
             client: None,
@@ -191,6 +195,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route(
             "/_matrix/federation/v1/media/thumbnail/{media_id}",
             get(media::thumbnail),
+        )
+        .route(
+            "/_matrix/federation/v1/event/{event_id}",
+            get(backfill::event),
         )
         .route(
             "/_matrix/federation/v1/backfill/{room_id}",
