@@ -696,10 +696,18 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
     let Some(fed) = &state.federation else {
         return Err(ApiError::not_found("Unknown room"));
     };
-    // Candidate residents, in order: the client's explicit `?server_name=`
-    // hints (it may know a resident the room id doesn't name — e.g. a v12
-    // room, or one whose id-server refuses), then the server in the room id
-    // (pre-v12), then any server in our (possibly stale) copy of the room.
+    // Candidate residents. When the client names *remote* servers
+    // (`?server_name=` / `via`), those are the WHOLE list — Synapse only
+    // ever augments with the inviter's domain, never the room-id server or
+    // its own state, and TestRestrictedRoomsRemoteJoinFailOver depends on
+    // that: a join routed `via=[hs2]` must fail outright when hs2 cannot
+    // authorise it, not quietly fail over to a server the client never
+    // named. A hint naming *us* is not a remote route (it means "your
+    // call" — e.g. a local restricted join failing over to remote,
+    // TestRestrictedRoomsRemoteJoinLocalUser routes `via=[hs1]` from an
+    // hs1 user), so when no remote hint survives we fall back to the
+    // server in the room id (pre-v12) and then any server in our
+    // (possibly stale) copy.
     let our_name = state.config.server_name.as_str();
     let mut candidates: Vec<String> = Vec::new();
     let push = |server: String, candidates: &mut Vec<String>| {
@@ -710,15 +718,17 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
     for hint in via {
         push(hint.clone(), &mut candidates);
     }
-    if let Some(resident) = saltator_federation::resident_of_room(room_id.as_str()) {
-        push(resident, &mut candidates);
-    }
-    if let Ok(servers) = state
-        .rooms
-        .remote_servers_in_room(room_id.as_str(), our_name)
-    {
-        for server in servers {
-            push(server, &mut candidates);
+    if candidates.is_empty() {
+        if let Some(resident) = saltator_federation::resident_of_room(room_id.as_str()) {
+            push(resident, &mut candidates);
+        }
+        if let Ok(servers) = state
+            .rooms
+            .remote_servers_in_room(room_id.as_str(), our_name)
+        {
+            for server in servers {
+                push(server, &mut candidates);
+            }
         }
     }
     if candidates.is_empty() {
@@ -1179,15 +1189,20 @@ async fn knock_remote(
     for hint in via {
         push(hint.clone(), &mut candidates);
     }
-    if let Some(resident) = saltator_federation::resident_of_room(room_id.as_str()) {
-        push(resident, &mut candidates);
-    }
-    if let Ok(servers) = state
-        .rooms
-        .remote_servers_in_room(room_id.as_str(), our_name)
-    {
-        for server in servers {
-            push(server, &mut candidates);
+    // Client-named remote servers are the whole list (Synapse parity —
+    // see the join candidate selection above); fall back to derived
+    // servers only when no remote hint survives.
+    if candidates.is_empty() {
+        if let Some(resident) = saltator_federation::resident_of_room(room_id.as_str()) {
+            push(resident, &mut candidates);
+        }
+        if let Ok(servers) = state
+            .rooms
+            .remote_servers_in_room(room_id.as_str(), our_name)
+        {
+            for server in servers {
+                push(server, &mut candidates);
+            }
         }
     }
     if candidates.is_empty() {
