@@ -429,12 +429,18 @@ async fn build_sync(
                     .insert(room_id, build_knocked_room(state, auth, &room_id_str)?);
             }
             // Newly-left rooms ride incremental syncs — even when forgotten,
-            // so other devices still learn about the leave. Older leaves are
-            // opt-in via the include_leave filter (initial or full-state),
-            // where forgotten rooms stay hidden.
+            // so other devices still learn about the leave. On initial (or
+            // full-state) syncs, rooms the user was banned or kicked from
+            // (leave by another sender) are always sent down — the user may
+            // never have synced the removal, and it would otherwise be lost
+            // behind the advancing since token (Synapse does the same). A
+            // self-authored leave is opt-in via the include_leave filter,
+            // and forgotten rooms stay hidden.
             "leave" | "ban"
                 if (!initial && m.seq > since.user)
-                    || (!m.forgotten && include_leave && (initial || full_state)) =>
+                    || (!m.forgotten
+                        && (initial || full_state)
+                        && (include_leave || m.membership == "ban" || m.sender != *user_id)) =>
             {
                 resp.rooms.leave.insert(
                     room_id,
