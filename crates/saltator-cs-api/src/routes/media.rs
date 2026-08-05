@@ -429,8 +429,19 @@ async fn fetch_remote_media(
                 format!("remote media fetch failed: {e}"),
             )
         })?;
-    saltator_federation::parse_multipart_file(&ct_header.unwrap_or_default(), &body)
-        .ok_or_else(|| ApiError::not_found("Malformed remote media response"))
+    let ct = ct_header.unwrap_or_default();
+    if let Some(parsed) = saltator_federation::parse_multipart_file(&ct, &body) {
+        return Ok(parsed);
+    }
+    // Not multipart: some servers (and Complement's synthetic peer) answer
+    // the federation media endpoint with the raw file and its
+    // Content-Type. A multipart header that failed to parse is still an
+    // error — raw fallback only when the response never claimed multipart.
+    if !ct.to_ascii_lowercase().starts_with("multipart/") {
+        let content_type = (!ct.is_empty()).then_some(ct);
+        return Ok((body, content_type));
+    }
+    Err(ApiError::not_found("Malformed remote media response"))
 }
 
 pub async fn download(
@@ -534,6 +545,17 @@ fn legacy_meta(state: &CsState, server_name: &str, media_id: &str) -> Result<Med
     Ok(meta)
 }
 
+/// The remote server named by a legacy path segment, `None` when it names
+/// us (the local path applies) — a malformed name is a 404.
+fn legacy_remote(state: &CsState, server_name: &str) -> Result<Option<ruma::OwnedServerName>> {
+    if server_name == state.config.server_name.as_str() {
+        return Ok(None);
+    }
+    ruma::OwnedServerName::try_from(server_name)
+        .map(Some)
+        .map_err(|_| ApiError::not_found("Invalid server name"))
+}
+
 /// Content-types safe to render inline in a browser. Everything else
 /// (notably `text/html` and `image/svg+xml`) is served as an attachment so
 /// attacker-uploaded markup can't execute script on the media origin.
@@ -586,6 +608,10 @@ pub async fn download_legacy(
     State(state): State<Arc<CsState>>,
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::response::Response> {
+    if let Some(remote) = legacy_remote(&state, &server_name)? {
+        let (bytes, ct) = fetch_remote_media(&state, &remote, &media_id).await?;
+        return Ok(blob_response(bytes, ct, None));
+    }
     let meta = legacy_meta(&state, &server_name, &media_id)?;
     let bytes = state
         .media
@@ -603,6 +629,10 @@ pub async fn download_named_legacy(
         String,
     )>,
 ) -> Result<axum::response::Response> {
+    if let Some(remote) = legacy_remote(&state, &server_name)? {
+        let (bytes, ct) = fetch_remote_media(&state, &remote, &media_id).await?;
+        return Ok(blob_response(bytes, ct, Some(file_name)));
+    }
     let meta = legacy_meta(&state, &server_name, &media_id)?;
     let bytes = state
         .media
@@ -617,7 +647,6 @@ pub async fn thumbnail_legacy(
     axum::extract::Path((server_name, media_id)): axum::extract::Path<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<axum::response::Response> {
-    legacy_meta(&state, &server_name, &media_id)?;
     let dim = |key: &str| -> u32 {
         q.get(key)
             .and_then(|v| v.parse::<u32>().ok())
@@ -628,6 +657,16 @@ pub async fn thumbnail_legacy(
         Some("crop") => ThumbMethod::Crop,
         _ => ThumbMethod::Scale,
     };
+    if let Some(remote) = legacy_remote(&state, &server_name)? {
+        // Fetch the full remote media and thumbnail it in memory, like the
+        // authenticated endpoint.
+        let (file, _ct) = fetch_remote_media(&state, &remote, &media_id).await?;
+        let bytes = MediaStore::thumbnail_bytes(file, dim("width"), dim("height"), method)
+            .await
+            .map_err(|e| ApiError::not_found(format!("cannot thumbnail remote media: {e}")))?;
+        return Ok(blob_response(bytes, Some("image/png".to_owned()), None));
+    }
+    legacy_meta(&state, &server_name, &media_id)?;
     let bytes = state
         .media
         .thumbnail(&media_id, dim("width"), dim("height"), method)
