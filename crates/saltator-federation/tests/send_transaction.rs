@@ -347,14 +347,7 @@ async fn unimplemented_spec_endpoints_answer_unrecognized() {
     let base = spawn(router(state)).await;
     let http = reqwest::Client::new();
 
-    for path in [
-        "/_matrix/federation/v1/state/!r:hs.test",
-        "/_matrix/federation/v1/state_ids/!r:hs.test",
-        "/_matrix/federation/v1/timestamp_to_event/!r:hs.test",
-        "/_matrix/federation/v1/publicRooms",
-        "/_matrix/key/v2/query/other.test",
-        "/_matrix/federation/v1/openid/userinfo",
-    ] {
+    for path in ["/_matrix/federation/v1/openid/userinfo"] {
         let resp = http.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(resp.status(), 404, "{path}");
         let body: serde_json::Value = resp.json().await.unwrap();

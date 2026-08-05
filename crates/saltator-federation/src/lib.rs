@@ -3,6 +3,7 @@
 //! request authentication.
 
 mod backfill;
+mod directory;
 mod hierarchy;
 mod http_client;
 mod inbound;
@@ -20,6 +21,7 @@ mod user_keys;
 mod xmatrix;
 
 pub use backfill::fetch_backfill;
+pub use directory::directory_body;
 pub use http_client::build_http_client;
 pub use inbound::{AuthRejection, Authenticated};
 pub use join_client::{
@@ -240,34 +242,32 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
             "/_matrix/federation/v1/user/devices/{user_id}",
             get(user_keys::user_devices),
         )
-        // ---- Spec'd endpoints we do NOT implement yet ----
+        .route(
+            "/_matrix/federation/v1/state/{room_id}",
+            get(backfill::state),
+        )
+        .route(
+            "/_matrix/federation/v1/state_ids/{room_id}",
+            get(backfill::state_ids),
+        )
+        .route(
+            "/_matrix/federation/v1/timestamp_to_event/{room_id}",
+            get(backfill::timestamp_to_event),
+        )
+        .route(
+            "/_matrix/federation/v1/publicRooms",
+            get(directory::public_rooms_get).post(directory::public_rooms_post),
+        )
+        // Key notary (spec "Querying keys through another server").
+        .route("/_matrix/key/v2/query/{server_name}", get(notary_query_one))
+        .route("/_matrix/key/v2/query", post(notary_query_batch))
+        // ---- Spec'd endpoints we deliberately do NOT implement ----
         // Explicit stubs so the gap is visible here rather than discovered
         // mid-investigation (see docs/federation-conformance.md "Endpoint
         // inventory"). Behaviour matches the fallback (404 M_UNRECOGNIZED,
         // the spec's signal for an unimplemented endpoint), so gating tests
         // like TestUnknownEndpoints are unaffected.
         //
-        // Well-defined, planned (implement these proactively):
-        .route(
-            "/_matrix/federation/v1/state/{room_id}",
-            get(not_implemented),
-        )
-        .route(
-            "/_matrix/federation/v1/state_ids/{room_id}",
-            get(not_implemented),
-        )
-        .route(
-            "/_matrix/federation/v1/timestamp_to_event/{room_id}",
-            get(not_implemented),
-        )
-        .route(
-            "/_matrix/federation/v1/publicRooms",
-            get(not_implemented).post(not_implemented),
-        )
-        // Key notary (spec "Querying keys through another server").
-        .route("/_matrix/key/v2/query/{server_name}", get(not_implemented))
-        .route("/_matrix/key/v2/query", post(not_implemented))
-        // Justified absent — see the conformance doc before implementing:
         // v1 invite serves only room versions 1-2 (we support v8+); a 404
         // here is exactly the signal that makes senders stay on v2.
         .route(
@@ -294,6 +294,79 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
             unrecognized(axum::http::StatusCode::METHOD_NOT_ALLOWED)
         })
         .with_state(state)
+}
+
+/// Build a notary response (spec "Querying keys through another server"):
+/// each requested server's raw signed key publication — ours directly,
+/// others from the key cache (fetched or stale) — co-signed by us so the
+/// requester can pin trust on this notary. Unreachable/unknown servers
+/// are simply omitted, like Synapse.
+async fn notary_response(state: &FedState, requests: Vec<(String, u64)>) -> serde_json::Value {
+    let now = now_ms();
+    let mut server_keys = Vec::new();
+    for (server, min_valid_ms) in requests {
+        let obj = if server == state.server_name.as_str() {
+            server_keys_object(state).ok()
+        } else {
+            state
+                .key_cache
+                .raw_keys_for(&server, now, min_valid_ms)
+                .await
+        };
+        let Some(mut obj) = obj else {
+            continue;
+        };
+        if let Err(e) = state.signer.sign_json(&mut obj) {
+            tracing::error!(error = %e, server, "notary: co-signing key response");
+            continue;
+        }
+        server_keys.push(CanonicalJsonValue::Object(obj));
+    }
+    serde_json::Value::from(CanonicalJsonValue::Object(CanonicalJsonObject::from_iter(
+        [(
+            "server_keys".to_owned(),
+            CanonicalJsonValue::Array(server_keys),
+        )],
+    )))
+}
+
+/// `GET /_matrix/key/v2/query/{serverName}` — unauthenticated, like
+/// `/key/v2/server`.
+async fn notary_query_one(
+    State(state): State<Arc<FedState>>,
+    axum::extract::Path(server_name): axum::extract::Path<String>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(notary_response(&state, vec![(server_name, 0)]).await)
+}
+
+/// `POST /_matrix/key/v2/query` — the batch variant:
+/// `{"server_keys": {server: {key_id: {"minimum_valid_until_ts": ts}}}}`.
+/// An empty criteria object means "any key"; we honour the strictest
+/// `minimum_valid_until_ts` given for a server.
+async fn notary_query_batch(
+    State(state): State<Arc<FedState>>,
+    body: Option<axum::Json<serde_json::Value>>,
+) -> axum::Json<serde_json::Value> {
+    let mut requests = Vec::new();
+    if let Some(map) = body
+        .as_ref()
+        .and_then(|b| b.0.get("server_keys"))
+        .and_then(|v| v.as_object())
+    {
+        for (server, criteria) in map {
+            let min_valid = criteria
+                .as_object()
+                .map(|c| {
+                    c.values()
+                        .filter_map(|v| v.get("minimum_valid_until_ts").and_then(|t| t.as_u64()))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            requests.push((server.clone(), min_valid));
+        }
+    }
+    axum::Json(notary_response(&state, requests).await)
 }
 
 /// Stub for a spec'd endpoint we have not implemented: same 404

@@ -162,6 +162,238 @@ async fn peer_pushed_message_is_ingested() {
     our_rooms.shutdown().await.unwrap();
 }
 
+/// The federation `timestamp_to_event` endpoint answers a member server's
+/// query with the closest event, and refuses the query for an unknown
+/// room (the requester-in-room gate).
+#[tokio::test]
+async fn timestamp_to_event_serves_member_servers() {
+    use saltator_federation::{join_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    let peer = MockPeer::start("peer.test").await;
+    let room_id = peer.make_room(RoomVersion::V11, "charlie");
+
+    // Our server joins + imports the room (charlie@peer.test is a member,
+    // so peer.test passes the requester-in-room check).
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let client = FederationClient::with_base_url(hs_signer.clone(), peer.base_url.clone());
+    let resp = join_remote_room(&client, &hs_signer, "peer.test", &room_id, "@alice:hs.test")
+        .await
+        .expect("join");
+    our_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import");
+
+    let our_fed = Arc::new(FedState {
+        server_name: hs.clone(),
+        signer: hs_signer.clone(),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(peer.base_url.clone())),
+        rooms: Some(our_rooms.clone()),
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let our_base = spawn(router(our_fed)).await;
+
+    // Backwards from far in the future → the newest timeline event (our
+    // alice's join, the only post-import timeline entry). Forwards from 0
+    // would equally find the oldest.
+    let (status, body) = peer
+        .signed_get(
+            &our_base,
+            "hs.test",
+            &format!(
+                "/_matrix/federation/v1/timestamp_to_event/{}?ts=99999999999999&dir=b",
+                room_id.replace('!', "%21")
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["event_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with('$'),
+        "{body}"
+    );
+    assert!(body["origin_server_ts"].is_u64(), "{body}");
+
+    // A room we host nothing of → the requester is not "in the room" → 403.
+    let (status, body) = peer
+        .signed_get(
+            &our_base,
+            "hs.test",
+            "/_matrix/federation/v1/timestamp_to_event/%21unknown:peer.test?ts=1&dir=f",
+        )
+        .await;
+    assert_eq!(status, 403, "{body}");
+
+    our_rooms.shutdown().await.unwrap();
+}
+
+/// `/state` and `/state_ids` serve a member server the resolved state
+/// *before* the named event: a query at charlie's join must show the room
+/// pre-join (no charlie member entry among the pdus), and the `_ids`
+/// variant must agree with the full variant.
+#[tokio::test]
+async fn state_at_event_serves_pre_event_snapshot() {
+    use saltator_federation::{join_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    let peer = MockPeer::start("peer.test").await;
+    let room_id = peer.make_room(RoomVersion::V11, "charlie");
+
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let client = FederationClient::with_base_url(hs_signer.clone(), peer.base_url.clone());
+    let resp = join_remote_room(&client, &hs_signer, "peer.test", &room_id, "@alice:hs.test")
+        .await
+        .expect("join");
+    let alice_join_id = saltator_core::event::event_id(&resp.event, RoomVersion::V11)
+        .unwrap()
+        .to_string();
+    our_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import");
+
+    let our_fed = Arc::new(FedState {
+        server_name: hs.clone(),
+        signer: hs_signer.clone(),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(peer.base_url.clone())),
+        rooms: Some(our_rooms.clone()),
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let our_base = spawn(router(our_fed)).await;
+
+    // State before alice's own join: her member event must NOT be present.
+    let path = format!(
+        "/_matrix/federation/v1/state/{}?event_id={}",
+        room_id.replace('!', "%21"),
+        alice_join_id.replace('$', "%24"),
+    );
+    let (status, body) = peer.signed_get(&our_base, "hs.test", &path).await;
+    assert_eq!(status, 200, "{body}");
+    let pdus = body["pdus"].as_array().expect("pdus array");
+    assert!(
+        pdus.iter().any(|p| p["type"] == "m.room.create"),
+        "state missing create"
+    );
+    assert!(
+        !pdus
+            .iter()
+            .any(|p| p["type"] == "m.room.member" && p["state_key"] == "@alice:hs.test"),
+        "state at alice's join must precede the join itself"
+    );
+    assert!(
+        !body["auth_chain"].as_array().unwrap().is_empty(),
+        "auth chain empty"
+    );
+
+    // The ids variant agrees with the full variant.
+    let ids_path = format!(
+        "/_matrix/federation/v1/state_ids/{}?event_id={}",
+        room_id.replace('!', "%21"),
+        alice_join_id.replace('$', "%24"),
+    );
+    let (status, ids_body) = peer.signed_get(&our_base, "hs.test", &ids_path).await;
+    assert_eq!(status, 200, "{ids_body}");
+    // Raw v3+ PDUs carry no event_id field, so compare cardinality and
+    // shape: one id per pdu, all id-shaped.
+    let id_list = ids_body["pdu_ids"].as_array().unwrap();
+    assert_eq!(id_list.len(), pdus.len(), "{ids_body}");
+    assert!(
+        id_list
+            .iter()
+            .all(|v| v.as_str().unwrap_or_default().starts_with('$')),
+        "{ids_body}"
+    );
+
+    our_rooms.shutdown().await.unwrap();
+}
+
+/// The key notary serves another server's signed key publication under
+/// our co-signature: the returned object keeps the peer's own signature
+/// and gains ours, so a requester can pin trust on the notary. Our own
+/// server name resolves locally without a fetch.
+#[tokio::test]
+async fn key_notary_co_signs_peer_keys() {
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    let peer = MockPeer::start("peer.test").await;
+    let our_fed = Arc::new(FedState {
+        server_name: hs.clone(),
+        signer: hs_signer.clone(),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(peer.base_url.clone())),
+        rooms: None,
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+    });
+    let our_base = spawn(router(our_fed)).await;
+    let http = reqwest::Client::new();
+
+    // Single-server GET (unauthenticated, like /key/v2/server).
+    let body: serde_json::Value = http
+        .get(format!("{our_base}/_matrix/key/v2/query/peer.test"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let keys = body["server_keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 1, "{body}");
+    assert_eq!(keys[0]["server_name"], "peer.test", "{body}");
+    let sigs = keys[0]["signatures"].as_object().unwrap();
+    assert!(sigs.contains_key("peer.test"), "origin signature kept");
+    assert!(sigs.contains_key("hs.test"), "notary co-signature added");
+
+    // Batch POST: the peer plus ourselves; an unknown server is omitted.
+    let body: serde_json::Value = http
+        .post(format!("{our_base}/_matrix/key/v2/query"))
+        .json(&json!({"server_keys": {
+            "peer.test": {},
+            "hs.test": {},
+            "unreachable.test": {},
+        }}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = body["server_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|k| k["server_name"].as_str())
+        .collect();
+    assert_eq!(names.len(), 2, "{body}");
+    assert!(
+        names.contains(&"peer.test") && names.contains(&"hs.test"),
+        "{body}"
+    );
+}
+
 /// A PDU citing a prev event we never received is recovered by fetching
 /// that event by ID (`GET /event/{id}`) from the origin — the path taken
 /// when `/get_missing_events` cannot help. This is the shape of an invite

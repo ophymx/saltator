@@ -306,24 +306,36 @@ was missing and only surfaced at the bottom of the TestUnbanViaInvite race
 investigation, 2026-08-04.)
 
 ### Served
-`/version` · `/key/v2/server` · `/send/{txnId}` ·
+`/version` · `/key/v2/server` · `/key/v2/query` (GET+POST, notary) ·
+`/send/{txnId}` ·
 `/make_join` `/send_join` (v1+v2) · `/make_leave` `/send_leave` (v1+v2) ·
 `/make_knock` `/send_knock` · `/invite` (v2) ·
 `/event/{eventId}` · `/event_auth` · `/backfill` · `/get_missing_events` ·
-`/hierarchy` · `/query/directory` · `/query/profile` ·
+`/state` · `/state_ids` · `/timestamp_to_event` ·
+`/hierarchy` · `/publicRooms` (GET+POST) ·
+`/query/directory` · `/query/profile` ·
 `/user/devices` · `/user/keys/claim` · `/user/keys/query` ·
 `/media/download` · `/media/thumbnail`
 
-### Missing — well-defined, implement proactively
-- `GET /state/{roomId}` — we *consume* this in gap-fill anchoring
-  (`transactions.rs`) but do not serve it; a peer healing a gap against us
-  fails. Read-only view over data we already hold.
-- `GET /state_ids/{roomId}` — same family; Synapse prefers it for joins
-  and gap healing.
-- `GET /timestamp_to_event/{roomId}` — blocks the federation leaf of
-  `TestJumpToDateEndpoint` (see Group 2).
-- `GET`+`POST /publicRooms` — room directory over federation.
-- `GET /key/v2/query/{serverName}` + `POST /key/v2/query` — key notary.
+(2026-08-05 batch closed the whole "well-defined missing" set: `/state`,
+`/state_ids`, `/timestamp_to_event`, federation `/publicRooms` — one shared
+directory builder with the CS handlers — and the key notary. None had
+direct Complement coverage — Complement's notary tests are a TODO comment,
+`TestJumpToDateEndpoint` is blocked on application-service support, and
+`/state[_ids]` only appears with Complement's synthetic server serving
+*us* — so coverage is local: `fake_peer.rs` + `cs_api.rs` tests.)
+
+### Known follow-ups
+- **Requester-in-room checks**: the new `/state`, `/state_ids`, and
+  `/timestamp_to_event` verify the caller's server is in the room, but the
+  older `/backfill`, `/event`, `/event_auth`, and `/hierarchy` serve any
+  authenticated server (Synapse gates all of these with
+  `assert_host_in_room`). Hardening follow-up.
+- **CS `timestamp_to_event` federated fallback**: when the local timeline
+  can't answer for a remote room, the CS handler should query other
+  servers' federation endpoint and backfill the result (needed for the
+  federation leaf of `TestJumpToDateEndpoint`, itself blocked on AS
+  support — see Group 12).
 
 ### Missing — justified absent (do not re-derive)
 - `PUT /invite` v1 — only needed for room versions 1–2; we support v8+.

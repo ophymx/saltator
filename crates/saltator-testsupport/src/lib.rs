@@ -584,6 +584,25 @@ impl MockPeer {
             .unwrap()
     }
 
+    /// Signed GET against the server under test (`our_base`, named
+    /// `our_name`), authenticated as this peer. Returns (status, body).
+    pub async fn signed_get(
+        &self,
+        our_base: &str,
+        our_name: &str,
+        path_and_query: &str,
+    ) -> (u16, serde_json::Value) {
+        let auth = sign_request(&self.signer, "GET", path_and_query, our_name, None).unwrap();
+        let resp = reqwest::Client::new()
+            .get(format!("{our_base}{path_and_query}"))
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap())
+    }
+
     /// Transactions our server has pushed to this peer (its outbound).
     pub fn received(&self) -> Vec<ReceivedTxn> {
         self.inner.received.lock().unwrap().clone()
