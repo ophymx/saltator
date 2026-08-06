@@ -12,3 +12,4 @@
 /docker/interop/certs/
 /docker/interop/synapse-data/
 __pycache__/
+/.cargo/

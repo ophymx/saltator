@@ -55,5 +55,20 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rustls = "0.23"
 rcgen = "0.13"
 
+# `release` is the everyday optimized profile: what CI ships to the
+# Complement image and what local iteration rebuilds after every edit.
+# No LTO and incremental on — LTO re-runs per *binary* at link time
+# (each integration-test file is its own binary) and disables nothing a
+# network-bound homeserver would notice, while costing minutes per
+# rebuild. Measured on the dev box (8 cores / 15 GiB): a one-touch
+# rebuild of the daemon went 148s → 6s after this split (plus mold +
+# sccache from the README's local-acceleration recipe).
 [profile.release]
+incremental = true
+
+# Actual distribution builds: `cargo build --profile dist`. Carries the
+# LTO the old release profile had.
+[profile.dist]
+inherits = "release"
 lto = "thin"
+incremental = false

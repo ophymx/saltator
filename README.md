@@ -52,6 +52,17 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Iterate in the default (dev) profile; build `--release` only for the
+Complement image. The `release` profile carries no LTO — distribution
+builds (`cargo build --profile dist`) do.
+
+Optional local acceleration (a machine-local, gitignored
+`.cargo/config.toml`): `rustc-wrapper = "sccache"` to cache dependency
+compiles, mold as the linker (`linker = "clang"`,
+`rustflags = ["-C", "link-arg=-fuse-ld=mold"]` — one binary per
+integration-test file makes link time dominate test builds), and cap
+`jobs` below core count if rustc pushes the machine into swap.
+
 ## License
 
 Licensed under either of
