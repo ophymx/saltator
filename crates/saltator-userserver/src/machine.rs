@@ -10,8 +10,8 @@ use crate::types::{
     KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, SessionCmd, TokenEntry,
     TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS,
     T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS,
-    T_DIRECTORY, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP,
-    T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE,
+    T_DIRECTORY, T_EDU_OUTBOX, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
+    T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -343,6 +343,10 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             };
             device.display_name = display_name.clone();
             ctx.put(T_DEVICE, &dkey, enc("device encode", &device)?);
+            // A rename is a device-list change (spec: "changes in device
+            // information such as the device's human-readable name") —
+            // peers and the user's other devices must re-query.
+            log_key_change(ctx, user_id)?;
             Ok(UserResponse::Ok)
         }
         UserCommand::SetProfile {
@@ -850,6 +854,34 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             log_key_change(ctx, user_id)?;
             Ok(UserResponse::Ok)
         }
+        UserCommand::QueueOutboundEdus { entries } => {
+            for edu in entries {
+                // The emitted seq keys the row (unique, ordered) and wakes
+                // the EDU sender through the change stream.
+                let seq = ctx.emit(enc(
+                    "user change encode",
+                    &UserChangePayload::User {
+                        user_id: String::new(),
+                    },
+                )?);
+                let mut key = Vec::with_capacity(edu.destination.len() + 9);
+                key.extend_from_slice(edu.destination.as_bytes());
+                key.push(0);
+                key.extend_from_slice(&seq.to_be_bytes());
+                ctx.put(T_EDU_OUTBOX, &key, edu.json.clone());
+            }
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::AckOutboundEdus { destination, up_to } => {
+            let start = user_key(destination, "");
+            let mut end = destination.as_bytes().to_vec();
+            end.push(0);
+            end.extend_from_slice(&(up_to + 1).to_be_bytes());
+            for (key, _) in ctx.range(T_EDU_OUTBOX, &start, &end)? {
+                ctx.delete(T_EDU_OUTBOX, &key);
+            }
+            Ok(UserResponse::Ok)
+        }
         UserCommand::ChangePassword {
             user_id,
             password_hash,
@@ -1175,6 +1207,39 @@ impl UserStore {
                 .range(T_KEY_CHANGE, &start, &upto.saturating_add(1).to_be_bytes())?
         {
             out.push(dec("key change decode", &v)?);
+        }
+        Ok(out)
+    }
+
+    /// Destinations with pending outbox EDUs.
+    pub fn edu_outbox_destinations(&self) -> StoreResult<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        for (k, _) in self.read.range(T_EDU_OUTBOX, &[], &[0xff; 256])? {
+            let dest = k
+                .split(|b| *b == 0)
+                .next()
+                .map(|d| String::from_utf8_lossy(d).into_owned())
+                .unwrap_or_default();
+            if out.last().map(String::as_str) != Some(dest.as_str()) {
+                out.push(dest);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Pending outbox EDUs for a destination, oldest first: `(seq, EDU
+    /// JSON)`, at most `limit` (a `/send` transaction fits 100 EDUs).
+    pub fn edu_outbox(&self, destination: &str, limit: usize) -> StoreResult<Vec<(u64, Vec<u8>)>> {
+        let start = user_key(destination, "");
+        let mut out = Vec::new();
+        for (k, v) in self.read.range(T_EDU_OUTBOX, &start, &prefix_end(&start))? {
+            if out.len() >= limit {
+                break;
+            }
+            let seq_bytes: [u8; 8] = k[start.len()..]
+                .try_into()
+                .map_err(|_| StoreError::Engine("outbox key: bad seq".into()))?;
+            out.push((u64::from_be_bytes(seq_bytes), v));
         }
         Ok(out)
     }

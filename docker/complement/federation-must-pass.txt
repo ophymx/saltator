@@ -187,3 +187,15 @@ TestInboundFederationRejectsEventsWithRejectedAuthEvents
 # processes fresh and is accepted. Gated to lock the behaviour in; the
 # Group 6b "remains" note in docs/federation-conformance.md was stale.
 TestUnrejectRejectedEvents
+# 2026-08-05: E2EE over federation. A durable outbound EDU outbox in the
+# user shard (to-device messages + device-list updates retry with backoff
+# and survive restarts — the spec gives those EDUs no receiver-side
+# recovery); m.device_list_update on device rename and on room join (the
+# on-join announce is replay-marked so receivers don't double-report the
+# user in device_lists.changed); the joiner's own id in their
+# device_lists.changed; unsigned.device_display_name served in keys
+# queries. 3 consecutive green local runs of the whole set.
+TestDeviceListsUpdateOverFederation
+TestDeviceListsUpdateOverFederationOnRoomJoin
+TestToDeviceMessagesOverFederation
+TestFederationKeyUploadQuery

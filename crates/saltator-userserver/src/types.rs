@@ -78,6 +78,13 @@ pub const T_FALLBACK_KEY: u8 = APP_TABLE_MIN + 19;
 /// `user_id ++ 0x00 ++ kind → raw key JSON` — cross-signing keys, kind ∈
 /// `master` | `self_signing` | `user_signing`.
 pub const T_CROSS_SIGNING: u8 = APP_TABLE_MIN + 20;
+/// `destination ++ 0x00 ++ seq (u64 BE) → EDU JSON` — the durable outbound
+/// EDU outbox. To-device messages and device-list updates queue here (the
+/// spec gives them no receiver-side recovery, so the *sender* owns
+/// delivery); the federation EDU sender drains per destination with
+/// retry/backoff, acking on success. Survives restarts — unlike typing/
+/// presence, which stay fire-and-forget. `seq` is the user-shard seq.
+pub const T_EDU_OUTBOX: u8 = APP_TABLE_MIN + 21;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -415,6 +422,20 @@ pub enum UserCommand {
     RecordKeyChange {
         user_id: String,
     },
+    /// Queue outbound federation EDUs into the durable per-destination
+    /// outbox (to-device messages, device-list updates). The EDU sender
+    /// drains and acks them; queueing through the state machine makes the
+    /// pending set survive restarts and replicate with the shard.
+    QueueOutboundEdus {
+        entries: Vec<OutboundEdu>,
+    },
+    /// Drop delivered outbox EDUs: everything at outbox seq `<= up_to`
+    /// for the destination, once a `/send` transaction carrying them
+    /// succeeded.
+    AckOutboundEdus {
+        destination: String,
+        up_to: u64,
+    },
     /// Replace the account password (`/account/password`) and, when
     /// `logout_others`, delete every device except `keep_device` — the
     /// session that made the change survives.
@@ -524,6 +545,15 @@ pub struct BackupVersionMeta {
 pub struct ToDeviceMessage {
     pub user_id: String,
     pub device_id: String,
+    pub json: Vec<u8>,
+}
+
+/// One outbound federation EDU headed for the durable outbox
+/// ([`T_EDU_OUTBOX`]): the complete EDU object (`edu_type` + `content`)
+/// as raw JSON, and the server it must reach.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundEdu {
+    pub destination: String,
     pub json: Vec<u8>,
 }
 

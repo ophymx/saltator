@@ -28,7 +28,7 @@ use saltator_store::{Keyspace, KvEngine};
 pub use machine::{UserApp, UserStore};
 pub use types::{
     Account, AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimRequest, ClaimedKey, Device,
-    KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry, Profile, SessionCmd,
+    KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry, OutboundEdu, Profile, SessionCmd,
     ToDeviceMessage, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse,
 };
 
@@ -445,6 +445,26 @@ impl UserServer {
     pub async fn record_key_change(&self, user_id: &str) -> Result<()> {
         self.expect_ok(&UserCommand::RecordKeyChange {
             user_id: user_id.to_owned(),
+        })
+        .await
+    }
+
+    /// Queue outbound federation EDUs into the durable outbox — the EDU
+    /// sender drains and acks them, so delivery survives destination
+    /// downtime and our own restarts.
+    pub async fn queue_outbound_edus(&self, entries: Vec<OutboundEdu>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.expect_ok(&UserCommand::QueueOutboundEdus { entries })
+            .await
+    }
+
+    /// Drop delivered outbox EDUs for `destination` at seq `<= up_to`.
+    pub async fn ack_outbound_edus(&self, destination: &str, up_to: u64) -> Result<()> {
+        self.expect_ok(&UserCommand::AckOutboundEdus {
+            destination: destination.to_owned(),
+            up_to,
         })
         .await
     }

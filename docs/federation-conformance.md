@@ -280,10 +280,36 @@ a `PeerRoom` scenario. `TestJoinViaRoomIDAndServerName` needs the
 `?server_name=` join hint threaded through to `join_remote` (so a v12 room
 whose ID names no server still routes) — small follow-up.
 
-## Group 9 — Federated key query / to-device edge cases  ·  M  ·  peer
-Tests: `TestFederationKeyUploadQuery`, `TestToDeviceMessagesOverFederation`.
-Cause: implemented already; a specific edge case fails (e.g. device-list
-stream field, to-device delivery timing). Re-triage from a fresh log.
+## Group 9 — E2EE over federation  ·  L  ·  2-node + synthetic
+Tests: `TestFederationKeyUploadQuery`, `TestToDeviceMessagesOverFederation`,
+`TestDeviceListsUpdateOverFederation`, `TestDeviceListsUpdateOverFederationOnRoomJoin`.
+Status (2026-08-05): DONE — all four (every subtest) 3× green locally,
+gated. The pieces:
+- **Durable outbound EDU outbox** (`T_EDU_OUTBOX` in the user shard,
+  `QueueOutboundEdus`/`AckOutboundEdus`): to-device messages and
+  device-list updates queue durably (replicated, survives restarts) and a
+  leader-owned drainer (`spawn_edu_sender`) delivers per destination with
+  exponential backoff (0.5s→8s), ≤100 EDUs/txn, stable txn ids, acking
+  only on success. The spec gives these EDUs no receiver-side recovery
+  (to-device has no query fallback at all; device-list resync triggers
+  only on a *noticed* prev_id gap), so the sender owns delivery — this is
+  what passes the interrupted/stopped-server legs, including the one that
+  restarts the *sender*. `/sendToDevice` awaits the queue write, so its
+  200 OK implies durability. Typing/presence/receipts stay fire-and-forget.
+- **On-join device-list announce** (spec "Device Management": send when a
+  user "joins a room which contains servers which are not already
+  receiving updates"; upstream Synapse skips the test for this): every
+  join queues an `m.device_list_update` per device to the room's remote
+  servers, marked `org.saltator.replay` — an introduction, not a change —
+  so our receiver skips the `device_lists.changed` log for it (the join
+  projection already notified clients; logging it again breaks the
+  exact-set assertion in TestDeviceListsUpdateOverFederation). Foreign
+  servers ignore the namespaced field and reconcile via their caches.
+- The joiner's **own user id** joins their `device_lists.changed` on join
+  ("their other devices may need to know").
+- **Device rename** logs a key change in the state machine and broadcasts
+  `m.device_list_update`; `/keys/query` (CS and federation) serves
+  `unsigned.device_display_name`.
 
 ## Group 10 — Sync state filtering over federation  ·  M  ·  synthetic
 Tests: `TestSyncOmitsStateChangeOnFilteredEvents`.
@@ -394,5 +420,5 @@ compare with `grep -oE '"/_matrix[^"]*"' crates/saltator-federation/src/lib.rs`)
 | Room v6/v7 only | TestKnocking, TestKnockRoomsInPublicRoomsDirectory, TestCannotSendNonKnockViaSendKnock, TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6 | Justified red (server supports v8+ only) |
 | Application services | TestJoinFederatedRoomFromApplicationServiceBridgeUser, TestJumpToDateEndpoint (deployment needs an AS) | Out of scope until AS lands (Group 12) |
 | Media | TestMediaFilenames, TestMediaWithoutFileName, TestRemotePngThumbnail (legacy /media/v3 subtests) | FIXED on branch media-remote-and-upload-race: legacy remote fetch + duplicate-upload temp race + raw-body federation media fallback |
-| E2EE over federation | TestDeviceListsUpdateOverFederation[OnRoomJoin], TestToDeviceMessagesOverFederation, TestFederationKeyUploadQuery | Next major bucket: device-list EDU fanout, to-device EDU delivery, cross-server key upload/query |
+| E2EE over federation | TestDeviceListsUpdateOverFederation[OnRoomJoin], TestToDeviceMessagesOverFederation, TestFederationKeyUploadQuery | CLOSED 2026-08-05 (e2ee-federation branch): all four 3× green + gated — durable EDU outbox, on-join replay announce, rename propagation. See Group 9 |
 | Missing-events / auth-chain family | TestInboundCanReturnMissingEvents, TestOutboundFederationEventSizeGetMissingEvents, TestCorruptedAuthChain, TestInboundFederationRejectsEventsWithRejectedAuthEvents | CLOSED 2026-08-05 (federation-missing-events branch): all four 3× green locally + gated. See Group 6b for the auth-chain/rejection machinery; the size test needed codepoint (not byte) field limits pre-v11 + Synapse-parity guest_access preset events |

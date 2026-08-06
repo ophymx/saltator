@@ -143,6 +143,20 @@ async fn apply_device_list_edu(
     {
         return;
     }
+    // A replay (our on-join announcement) introduces the sender's device
+    // list to a server that may not have been receiving updates — it does
+    // not assert a *change*. The join itself already surfaced the user in
+    // local `device_lists.changed` (membership projection), so logging the
+    // replay too would show the user changed twice across sync windows
+    // and break exact-set clients (TestDeviceListsUpdateOverFederation).
+    if edu
+        .get("content")
+        .and_then(|c| c.get("org.saltator.replay"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return;
+    }
     if let Err(e) = users.record_key_change(user_id).await {
         tracing::warn!(error = %e, origin, "device-list EDU apply failed");
     }
