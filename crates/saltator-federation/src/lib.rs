@@ -5,6 +5,7 @@
 mod backfill;
 mod directory;
 mod edu_sender;
+mod fetcher;
 mod hierarchy;
 mod http_client;
 mod inbound;
