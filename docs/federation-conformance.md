@@ -198,7 +198,11 @@ Status (2026-08-05): DONE for `TestCorruptedAuthChain`,
   (`RoomServer::filter_events_for_server`, Synapse's
   `filter_events_for_server`): events under `joined`/`invited` visibility
   where the requesting server had no such member go out redacted.
-`TestUnrejectRejectedEvents` remains (un-rejection on later evidence).
+`TestUnrejectRejectedEvents`: already green on main (confirmed 3× locally
+2026-08-05, gated) — no un-rejection machinery needed: the first `/send` of
+an event whose prev is unfetchable errors *without storing* the event, so
+the re-send after the prev arrives processes fresh and is accepted, which
+is exactly the observable the test asserts. Group 6b is fully closed.
 
 ## Group 7 — Invite / ban over federation  ·  M  ·  mixed
 Tests: `TestFederationRejectInvite`, `TestFederationRoomsInvite`,
