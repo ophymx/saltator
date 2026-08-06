@@ -508,13 +508,10 @@ async fn build_sync(
     // "newly visible users" for the presence section below.
     let mut newly_visible: std::collections::BTreeSet<String> = Default::default();
     if !initial {
-        let (dl_changed, dl_left) = crate::routes::keys::device_list_deltas(
-            state,
-            user_id,
-            &my_joined_rooms,
-            since.user,
-            now.user,
-        )?;
+        let (dl_changed, dl_left) =
+            state
+                .e2ee()
+                .device_list_deltas(user_id, &my_joined_rooms, since.user, now.user)?;
         for user in dl_changed {
             newly_visible.insert(user.clone());
             if let Ok(uid) = ruma::OwnedUserId::try_from(user) {

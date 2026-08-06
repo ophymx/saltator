@@ -144,22 +144,34 @@ mod tests {
     #[test]
     fn burst_then_refill() {
         let limiter = RateLimiter::new();
-        let cfg = RateLimitConfig {
+        // Exhaustion bucket: a near-zero rate so scheduler preemption
+        // between checks can never refill it (at 1000/s a single
+        // milliseconds-long stall made the third check pass and the test
+        // flake under parallel load).
+        let slow = RateLimitConfig {
             enabled: true,
-            message_rate: 1000.0,
+            message_rate: 0.001,
             message_burst: 2,
             ..RateLimitConfig::default()
         };
-        assert!(limiter.check(&cfg, Kind::Message, "@a:x").is_ok());
-        assert!(limiter.check(&cfg, Kind::Message, "@a:x").is_ok());
-        let retry = limiter.check(&cfg, Kind::Message, "@a:x").unwrap_err();
+        assert!(limiter.check(&slow, Kind::Message, "@a:x").is_ok());
+        assert!(limiter.check(&slow, Kind::Message, "@a:x").is_ok());
+        let retry = limiter.check(&slow, Kind::Message, "@a:x").unwrap_err();
         assert!(retry >= 1, "{retry}");
         // Distinct keys and classes have their own buckets.
-        assert!(limiter.check(&cfg, Kind::Message, "@b:x").is_ok());
-        assert!(limiter.check(&cfg, Kind::Login, "@a:x").is_ok());
-        // At 1000/s the bucket refills within a few ms.
+        assert!(limiter.check(&slow, Kind::Message, "@b:x").is_ok());
+        assert!(limiter.check(&slow, Kind::Login, "@a:x").is_ok());
+        // Refill bucket: fast rate, and waiting longer only helps — the
+        // assertion is monotonic in elapsed time, so it cannot flake.
+        let fast = RateLimitConfig {
+            enabled: true,
+            message_rate: 1000.0,
+            message_burst: 1,
+            ..RateLimitConfig::default()
+        };
+        assert!(limiter.check(&fast, Kind::Message, "@c:x").is_ok());
         std::thread::sleep(std::time::Duration::from_millis(5));
-        assert!(limiter.check(&cfg, Kind::Message, "@a:x").is_ok());
+        assert!(limiter.check(&fast, Kind::Message, "@c:x").is_ok());
     }
 
     #[test]

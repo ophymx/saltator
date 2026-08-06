@@ -397,12 +397,9 @@ pub async fn update_device(
         .await?;
     // A rename changes the device list (the display name rides in
     // /keys/query `unsigned.device_display_name`) — announce it.
-    crate::routes::edu::broadcast_device_list_update(
-        &state,
-        auth.user_id.as_str(),
-        req.device_id.as_str(),
-        false,
-    );
+    state
+        .e2ee()
+        .broadcast_update(auth.user_id.as_str(), req.device_id.as_str(), false);
     Ok(Ra(update_device::v3::Response::new()))
 }
 
@@ -448,12 +445,9 @@ pub async fn delete_device(
         .users
         .delete_device(&auth.user_id, req.device_id.as_str())
         .await?;
-    crate::routes::edu::broadcast_device_list_update(
-        &state,
-        auth.user_id.as_str(),
-        req.device_id.as_str(),
-        true,
-    );
+    state
+        .e2ee()
+        .broadcast_update(auth.user_id.as_str(), req.device_id.as_str(), true);
     Ok(Ra(delete_device::v3::Response::new()))
 }
 
@@ -489,12 +483,9 @@ pub async fn change_password(
         )
         .await?;
     for device_id in others {
-        crate::routes::edu::broadcast_device_list_update(
-            &state,
-            auth.user_id.as_str(),
-            &device_id,
-            true,
-        );
+        state
+            .e2ee()
+            .broadcast_update(auth.user_id.as_str(), &device_id, true);
     }
     Ok(Ra(change_password::v3::Response::new()))
 }
@@ -517,12 +508,9 @@ pub async fn deactivate(
         .collect();
     state.users.deactivate(&auth.user_id).await?;
     for device_id in devices {
-        crate::routes::edu::broadcast_device_list_update(
-            &state,
-            auth.user_id.as_str(),
-            &device_id,
-            true,
-        );
+        state
+            .e2ee()
+            .broadcast_update(auth.user_id.as_str(), &device_id, true);
     }
     Ok(Ra(deactivate::v3::Response::new(
         ThirdPartyIdRemovalStatus::Success,

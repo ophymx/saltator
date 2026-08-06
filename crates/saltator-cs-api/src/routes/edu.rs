@@ -43,82 +43,6 @@ pub(crate) fn room_destinations(state: &CsState, room_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Announce a local user's device-list change (identity keys published,
-/// a device renamed or deleted) to every remote server sharing a room
-/// with them (`m.device_list_update`). Queued through the durable outbox
-/// — the spec requires these reach every sharing server, and a receiver
-/// only resyncs when it *notices* a gap, so delivery must survive
-/// destination downtime and our own restarts.
-pub(crate) fn broadcast_device_list_update(
-    state: &Arc<CsState>,
-    user_id: &str,
-    device_id: &str,
-    deleted: bool,
-) {
-    let dests = presence_destinations(state, user_id);
-    queue_device_list_update(state, dests, user_id, device_id, deleted, false);
-}
-
-/// Queue one `m.device_list_update` for `user_id`/`device_id` to each
-/// destination, via the durable outbox. `replay` marks an on-join
-/// announcement: it introduces the device list to servers newly sharing a
-/// room (spec "Device Management") without asserting a change — our
-/// receiver skips the `changed` log for replays (the join projection
-/// already notified clients), and foreign servers ignore the namespaced
-/// field and reconcile through their own caches.
-pub(crate) fn queue_device_list_update(
-    state: &CsState,
-    dests: Vec<String>,
-    user_id: &str,
-    device_id: &str,
-    deleted: bool,
-    replay: bool,
-) {
-    if dests.is_empty() {
-        return;
-    }
-    let mut content = serde_json::json!({
-        "user_id": user_id,
-        "device_id": device_id,
-        // Monotonic per sender. We do no gap tracking of our own — the
-        // receivers' resync path covers missed updates.
-        "stream_id": now_ms(),
-    });
-    if deleted {
-        content["deleted"] = true.into();
-    }
-    if replay {
-        content["org.saltator.replay"] = true.into();
-    }
-    let edu = serde_json::json!({
-        "edu_type": "m.device_list_update",
-        "content": content,
-    });
-    queue_edus(state, dests, &edu);
-}
-
-/// Queue `edu` to each destination through the durable outbox. Spawned so
-/// callers (client handlers) don't block on the shard write; the outbox
-/// makes delivery itself durable once queued.
-pub(crate) fn queue_edus(state: &CsState, destinations: Vec<String>, edu: &serde_json::Value) {
-    let Ok(json) = serde_json::to_vec(edu) else {
-        return;
-    };
-    let entries: Vec<saltator_userserver::OutboundEdu> = destinations
-        .into_iter()
-        .map(|destination| saltator_userserver::OutboundEdu {
-            destination,
-            json: json.clone(),
-        })
-        .collect();
-    let users = state.users.clone();
-    tokio::spawn(async move {
-        if let Err(e) = users.queue_outbound_edus(entries).await {
-            tracing::warn!(error = %e, "queueing outbound EDUs failed");
-        }
-    });
-}
-
 /// Federate a local user's read receipt to the remote servers in the room
 /// (`m.receipt` EDU, spec "Receipts"). Only public `m.read` receipts
 /// federate — private receipts and fully-read markers stay local. The
@@ -156,22 +80,8 @@ pub(crate) fn broadcast_receipt(
 }
 
 /// Remote servers sharing any joined room with `user_id` — the audience
-/// for a presence update.
+/// for a presence update. (The membership walk lives in the e2ee
+/// service; presence shares the audience computation.)
 pub(crate) fn presence_destinations(state: &CsState, user_id: &str) -> Vec<String> {
-    let Ok(memberships) = state.users.store().memberships(user_id) else {
-        return Vec::new();
-    };
-    let mut servers = std::collections::BTreeSet::new();
-    for (room_id, m) in memberships {
-        if m.membership != "join" {
-            continue;
-        }
-        if let Ok(remote) = state
-            .rooms
-            .remote_servers_in_room(&room_id, state.config.server_name.as_str())
-        {
-            servers.extend(remote);
-        }
-    }
-    servers.into_iter().collect()
+    state.e2ee().sharing_servers(user_id)
 }

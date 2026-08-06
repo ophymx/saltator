@@ -78,12 +78,9 @@ pub async fn upload_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body)
         .await?;
     // New identity keys are a device-list change remote peers care about.
     if announces {
-        crate::routes::edu::broadcast_device_list_update(
-            &state,
-            auth.user_id.as_str(),
-            &auth.device_id,
-            false,
-        );
+        state
+            .e2ee()
+            .broadcast_update(auth.user_id.as_str(), &auth.device_id, false);
     }
 
     // The spec requires the algorithm keys the client uploaded to appear
@@ -320,12 +317,9 @@ pub async fn device_signing_upload(
             .users
             .set_cross_signing_keys(&auth.user_id, master, self_signing, user_signing)
             .await?;
-        crate::routes::edu::broadcast_device_list_update(
-            &state,
-            auth.user_id.as_str(),
-            &auth.device_id,
-            false,
-        );
+        state
+            .e2ee()
+            .broadcast_update(auth.user_id.as_str(), &auth.device_id, false);
     }
     Ok(axum::Json(json!({})))
 }
@@ -355,83 +349,11 @@ pub async fn signatures_upload(
     }
     if !targets.is_empty() {
         state.users.add_signatures(&auth.user_id, targets).await?;
-        crate::routes::edu::broadcast_device_list_update(
-            &state,
-            auth.user_id.as_str(),
-            &auth.device_id,
-            false,
-        );
+        state
+            .e2ee()
+            .broadcast_update(auth.user_id.as_str(), &auth.device_id, false);
     }
     Ok(axum::Json(json!({ "failures": {} })))
-}
-
-/// The `device_lists` deltas for `user_id` over the user-shard window
-/// `(since, upto]`: users whose keys must be re-queried (`changed`) and
-/// users the caller no longer shares any room with (`left`). Later log
-/// entries override earlier ones, so a leave-then-rejoin nets to
-/// `changed`.
-pub(crate) fn device_list_deltas(
-    state: &CsState,
-    user_id: &str,
-    my_joined_rooms: &std::collections::BTreeSet<String>,
-    since: u64,
-    upto: u64,
-) -> Result<(
-    std::collections::BTreeSet<String>,
-    std::collections::BTreeSet<String>,
-)> {
-    let store = state.users.store();
-    let shares_room = |other: &str| -> Result<bool> {
-        Ok(store
-            .memberships(other)
-            .map_err(ApiError::internal)?
-            .iter()
-            .any(|(rid, m)| m.membership == "join" && my_joined_rooms.contains(rid)))
-    };
-    let mut changed = std::collections::BTreeSet::new();
-    let mut left = std::collections::BTreeSet::new();
-    for entry in store.key_changes(since, upto).map_err(ApiError::internal)? {
-        match entry.membership {
-            // The device list itself changed: visible if we share a room.
-            None => {
-                if entry.user_id == user_id || shares_room(&entry.user_id)? {
-                    left.remove(&entry.user_id);
-                    changed.insert(entry.user_id);
-                }
-            }
-            Some((room_id, true)) => {
-                if entry.user_id == user_id {
-                    // We joined: everyone already there is newly tracked —
-                    // including ourselves (our other devices may need to
-                    // re-establish sessions with the room's members;
-                    // TestDeviceListsUpdateOverFederation asserts the
-                    // joiner's own id in `changed`).
-                    for member in crate::room_util::joined_member_ids(&state.rooms, &room_id)? {
-                        left.remove(&member);
-                        changed.insert(member);
-                    }
-                } else if my_joined_rooms.contains(&room_id) {
-                    left.remove(&entry.user_id);
-                    changed.insert(entry.user_id);
-                }
-            }
-            Some((room_id, false)) => {
-                if entry.user_id == user_id {
-                    // We left: members there we share nothing else with.
-                    for member in crate::room_util::joined_member_ids(&state.rooms, &room_id)? {
-                        if member != user_id && !shares_room(&member)? {
-                            changed.remove(&member);
-                            left.insert(member);
-                        }
-                    }
-                } else if my_joined_rooms.contains(&room_id) && !shares_room(&entry.user_id)? {
-                    changed.remove(&entry.user_id);
-                    left.insert(entry.user_id);
-                }
-            }
-        }
-    }
-    Ok((changed, left))
 }
 
 /// `GET /_matrix/client/v3/keys/changes?from=..&to=..`: device-list
@@ -460,7 +382,10 @@ pub async fn key_changes(
         .filter(|(_, m)| m.membership == "join")
         .map(|(rid, _)| rid)
         .collect();
-    let (changed, left) = device_list_deltas(&state, auth.user_id.as_str(), &my_rooms, from, to)?;
+    let (changed, left) =
+        state
+            .e2ee()
+            .device_list_deltas(auth.user_id.as_str(), &my_rooms, from, to)?;
 
     Ok(axum::Json(json!({ "changed": changed, "left": left })))
 }

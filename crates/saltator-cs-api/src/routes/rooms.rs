@@ -621,30 +621,11 @@ async fn join_with_body(
     crate::routes::push::copy_rules_from_predecessor(state, &auth.user_id, room_id.as_str())
         .await?;
 
-    // Spec "Device Management": a user's device list must be announced to
-    // servers that start sharing a room with them on join
-    // (TestDeviceListsUpdateOverFederationOnRoomJoin — a rule even Synapse
-    // skips upstream). Sent to every remote server in the room: receivers
-    // dedupe (`changed` is a set), so narrowing to strictly-new servers is
-    // an optimisation, not a correctness requirement.
-    let dests = crate::routes::edu::room_destinations(state, room_id.as_str());
-    if !dests.is_empty() {
-        for (device_id, _) in state
-            .users
-            .store()
-            .devices(auth.user_id.as_str())
-            .unwrap_or_default()
-        {
-            crate::routes::edu::queue_device_list_update(
-                state,
-                dests.clone(),
-                auth.user_id.as_str(),
-                &device_id,
-                false,
-                true,
-            );
-        }
-    }
+    // On-join device-list announce (spec "Device Management") — policy
+    // and replay marking live in the e2ee service.
+    state
+        .e2ee()
+        .announce_on_join(auth.user_id.as_str(), room_id.as_str());
     Ok(())
 }
 

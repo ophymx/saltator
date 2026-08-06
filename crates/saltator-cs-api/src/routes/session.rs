@@ -205,12 +205,9 @@ pub async fn logout(
         .users
         .delete_device(&auth.user_id, &auth.device_id)
         .await?;
-    crate::routes::edu::broadcast_device_list_update(
-        &state,
-        auth.user_id.as_str(),
-        &auth.device_id,
-        true,
-    );
+    state
+        .e2ee()
+        .broadcast_update(auth.user_id.as_str(), &auth.device_id, true);
     Ok(Ra(logout::v3::Response::new()))
 }
 
@@ -226,12 +223,9 @@ pub async fn logout_all(
         .unwrap_or_default();
     state.users.delete_all_devices(&auth.user_id).await?;
     for (device_id, _) in devices {
-        crate::routes::edu::broadcast_device_list_update(
-            &state,
-            auth.user_id.as_str(),
-            &device_id,
-            true,
-        );
+        state
+            .e2ee()
+            .broadcast_update(auth.user_id.as_str(), &device_id, true);
     }
     Ok(Ra(logout_all::v3::Response::new()))
 }
