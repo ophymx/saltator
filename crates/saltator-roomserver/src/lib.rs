@@ -22,10 +22,13 @@
 //! that is a per-room async lock around steps 2–5, so reads of applied
 //! state during precomputation are stable.
 
+mod heal;
 pub mod hierarchy;
 mod machine;
 mod signer;
 mod types;
+
+pub use heal::EventFetcher;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
