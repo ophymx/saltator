@@ -67,6 +67,15 @@ pub enum RoomError {
     /// federated missing-event / state fetch of pipeline step 2.
     #[error("events required but not present locally: {0:?}")]
     MissingEvents(Vec<String>),
+    /// The event's `auth_events` reference events not present locally,
+    /// while every prev_event resolves. Distinct from
+    /// [`RoomError::MissingEvents`] because the remedy differs: the named
+    /// events are fetched directly as outliers (`/event`), never via
+    /// `/get_missing_events` — that walk is for timeline gaps, and firing
+    /// it on an auth-only miss trips Complement's
+    /// TestInboundFederationRejectsEventsWithRejectedAuthEvents.
+    #[error("auth events required but not present locally: {0:?}")]
+    MissingAuthEvents(Vec<String>),
     #[error(transparent)]
     Validation(#[from] ValidationError),
     #[error(transparent)]
@@ -460,6 +469,25 @@ impl RoomServer {
         // Ordinary inbound PDU: its origin is responsible for distributing it,
         // so we do not relay it onward.
         self.process(raw, version, &room_id, is_create, false).await
+    }
+
+    /// Like [`Self::ingest_pdu`], but an event whose `auth_events` cite
+    /// events not present locally is stored *rejected* against its auth
+    /// chain instead of failing with [`RoomError::MissingAuthEvents`].
+    /// For use only after fetching the cited events has already been
+    /// tried and failed: an unfetchable auth ancestor makes the event
+    /// permanently unverifiable, and rejecting it (rather than erroring)
+    /// is what lets the events built on top of it resolve as rejected in
+    /// turn and the transaction succeed (Synapse's behaviour;
+    /// Complement's TestCorruptedAuthChain).
+    pub async fn ingest_pdu_rejecting_missing_auth(
+        &self,
+        raw: CanonicalJsonObject,
+    ) -> Result<Outcome> {
+        let (version, room_id, is_create) = self.classify(&raw)?;
+        let _guard = self.lock_room(room_id.as_str()).await;
+        self.process_inner(raw, version, &room_id, is_create, false, true)
+            .await
     }
 
     /// Verify a single PDU's structure, signature, and content hash against
@@ -897,6 +925,91 @@ impl RoomServer {
             .any(|s| s == server))
     }
 
+    /// Apply per-server history visibility to events about to be served
+    /// over federation (`/backfill`, `/get_missing_events` — Synapse's
+    /// `filter_events_for_server`): an event whose visibility at that
+    /// point was `joined`/`invited`, at which `server` had no user with
+    /// the required membership, is replaced by its redacted copy. Events
+    /// under `shared`/`world_readable` (and events whose state we cannot
+    /// resolve — outliers, rejected) pass through unchanged.
+    pub fn filter_events_for_server(
+        &self,
+        room_id: &str,
+        server: &str,
+        events: Vec<CanonicalJsonObject>,
+    ) -> Result<Vec<CanonicalJsonObject>> {
+        let store = self.store();
+        let Some(meta) = store.meta(room_id).map_err(storage_err)? else {
+            return Ok(events);
+        };
+        let version = RoomVersion::parse(&meta.version)?;
+        let mut out = Vec::with_capacity(events.len());
+        for raw in events {
+            let visible = (|| -> Result<bool> {
+                let Some(id) = self.pdu_event_id(&raw) else {
+                    return Ok(true);
+                };
+                let Some(stored) = store.event(id.as_str()).map_err(storage_err)? else {
+                    return Ok(true);
+                };
+                if stored.state_group_after == 0 {
+                    return Ok(true); // no state known: treat as visible
+                }
+                let state = store
+                    .resolve_group(room_id, stored.state_group_after)
+                    .map_err(storage_err)?;
+                let load = |eid: &String| self.load_raw(&store, eid);
+                let vis = state
+                    .get(&("m.room.history_visibility".to_owned(), String::new()))
+                    .and_then(|eid| load(eid).ok().flatten())
+                    .and_then(|ev| {
+                        ev.get("content")
+                            .and_then(|c| c.as_object())
+                            .and_then(|c| c.get("history_visibility"))
+                            .and_then(|v| v.as_str())
+                            .map(ToOwned::to_owned)
+                    })
+                    .unwrap_or_else(|| "shared".to_owned());
+                let required: &[&str] = match vis.as_str() {
+                    "joined" => &["join"],
+                    "invited" => &["join", "invite"],
+                    _ => return Ok(true), // shared / world_readable
+                };
+                for ((ty, sk), eid) in &state {
+                    if ty != "m.room.member" {
+                        continue;
+                    }
+                    let Ok(uid) = OwnedUserId::try_from(sk.clone()) else {
+                        continue;
+                    };
+                    if uid.server_name() != server {
+                        continue;
+                    }
+                    let membership = load(eid)?.and_then(|ev| {
+                        ev.get("content")
+                            .and_then(|c| c.as_object())
+                            .and_then(|c| c.get("membership"))
+                            .and_then(|m| m.as_str())
+                            .map(ToOwned::to_owned)
+                    });
+                    if membership.is_some_and(|m| required.contains(&m.as_str())) {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })()?;
+            if visible {
+                out.push(raw);
+            } else {
+                out.push(
+                    saltator_core::validation::redact(&raw, version)
+                        .map_err(|e| RoomError::Malformed(e.to_string()))?,
+                );
+            }
+        }
+        Ok(out)
+    }
+
     /// The room's current `m.room.server_acl`, if any is set.
     pub fn server_acl(&self, room_id: &str) -> Result<Option<saltator_core::acl::ServerAcl>> {
         let store = self.store();
@@ -1319,6 +1432,57 @@ impl RoomServer {
             })?;
         let version = RoomVersion::parse(&meta.version)?;
 
+        // An event may only enter the snapshot if its *transitive* auth
+        // chain resolves — every reference reachable from its auth_events
+        // is either in this fetch or already in our store. The origin can
+        // refuse to serve an ancestor (Complement's TestCorruptedAuthChain
+        // 404s one on purpose): every event whose auth chain crosses that
+        // hole is unverifiable and must be dropped here, exactly as the
+        // live pipeline would have rejected it, or a forged/unauthorised
+        // state entry could ride the snapshot into current state.
+        let store = self.store();
+        let mut fetched_auth: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for obj in auth_chain.iter().chain(state.iter()).chain(chain.iter()) {
+            if let Ok(id) = event::event_id(obj, version) {
+                fetched_auth.insert(id.to_string(), auth_event_ids(obj));
+            }
+        }
+        let mut verdict: BTreeMap<String, bool> = BTreeMap::new();
+        let mut resolvable = |seed: &str| -> bool {
+            let mut pending = vec![seed.to_owned()];
+            let mut visiting = BTreeSet::new();
+            while let Some(id) = pending.pop() {
+                if verdict.get(&id).copied() == Some(false) {
+                    verdict.insert(seed.to_owned(), false);
+                    return false;
+                }
+                if verdict.contains_key(&id) || !visiting.insert(id.clone()) {
+                    continue;
+                }
+                let refs = match fetched_auth.get(&id) {
+                    Some(refs) => refs.clone(),
+                    // Not part of this fetch: it must already be ours
+                    // (its own chain was checked when it was stored).
+                    None => match store.event(&id) {
+                        Ok(Some(_)) => {
+                            verdict.insert(id, true);
+                            continue;
+                        }
+                        _ => {
+                            verdict.insert(id, false);
+                            verdict.insert(seed.to_owned(), false);
+                            return false;
+                        }
+                    },
+                };
+                pending.extend(refs);
+            }
+            for id in visiting {
+                verdict.insert(id, true);
+            }
+            true
+        };
+
         let mut events = Vec::new();
         let mut seen = BTreeSet::new();
         let mut state_map: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -1335,18 +1499,41 @@ impl RoomServer {
                 depth,
             })
         };
-        for obj in auth_chain.iter().chain(state.iter()) {
+        let mut dropped = 0usize;
+        for (is_state, obj) in auth_chain
+            .iter()
+            .map(|o| (false, o))
+            .chain(state.iter().map(|o| (true, o)))
+        {
             let Some(ev) = import_event(obj) else {
                 continue;
             };
-            if let (Ok(ty), Some(CanonicalJsonValue::String(sk))) =
-                (str_of(obj, "type"), obj.get("state_key"))
-            {
-                state_map.insert((ty.to_owned(), sk.clone()), ev.event_id.clone());
+            if !resolvable(&ev.event_id) {
+                dropped += 1;
+                continue;
+            }
+            // Only the `state` list defines the snapshot: an auth-chain
+            // event with the same (type, state_key) is a *superseded*
+            // entry, and letting it stand in when the state's own entry
+            // was dropped above would resurrect old state (a stale
+            // membership) as current.
+            if is_state {
+                if let (Ok(ty), Some(CanonicalJsonValue::String(sk))) =
+                    (str_of(obj, "type"), obj.get("state_key"))
+                {
+                    state_map.insert((ty.to_owned(), sk.clone()), ev.event_id.clone());
+                }
             }
             if seen.insert(ev.event_id.clone()) {
                 events.push(ev);
             }
+        }
+        if dropped > 0 {
+            tracing::warn!(
+                room_id,
+                dropped,
+                "segment import: dropped snapshot events with unresolvable auth chains"
+            );
         }
 
         let mut timeline = Vec::new();
@@ -1665,8 +1852,49 @@ impl RoomServer {
         Ok((raw, version))
     }
 
+    /// The nearest ancestor state groups behind a rejected event: walk its
+    /// `prev_events` (transitively through further rejected events, bounded)
+    /// collecting the first state group on each branch. Empty when nothing
+    /// in reach carries state.
+    fn groups_behind_rejected(&self, store: &RoomStore, id: &str) -> BTreeSet<u64> {
+        let mut groups = BTreeSet::new();
+        let mut queue = vec![(id.to_owned(), 0usize)];
+        let mut seen = BTreeSet::new();
+        while let Some((id, depth)) = queue.pop() {
+            if depth > 8 || !seen.insert(id.clone()) {
+                continue;
+            }
+            let Ok(Some(obj)) = self.load_raw(store, &id) else {
+                continue;
+            };
+            for prev in prev_event_ids(&obj) {
+                match store.event(&prev) {
+                    Ok(Some(se)) if se.state_group_after != 0 => {
+                        groups.insert(se.state_group_after);
+                    }
+                    Ok(Some(_)) => queue.push((prev, depth + 1)),
+                    _ => {}
+                }
+            }
+        }
+        groups
+    }
+
     /// Pipeline steps 1–5 for one event. Caller holds the room lock.
     async fn process(
+        &self,
+        raw: CanonicalJsonObject,
+        version: RoomVersion,
+        room_id: &OwnedRoomId,
+        is_create: bool,
+        relay: bool,
+    ) -> Result<Outcome> {
+        self.process_inner(raw, version, room_id, is_create, relay, false)
+            .await
+    }
+
+    /// Pipeline steps 1–5 for one event. Caller holds the room lock.
+    async fn process_inner(
         &self,
         raw: CanonicalJsonObject,
         version: RoomVersion,
@@ -1676,6 +1904,10 @@ impl RoomServer {
         // the accepted membership is flagged so the outbound sender fans it
         // out to the room's other servers (spec "Joining/Leaving Rooms").
         relay: bool,
+        // Store the event rejected when auth_events cite locally-absent
+        // events, instead of erroring MissingAuthEvents — see
+        // [`Self::ingest_pdu_rejecting_missing_auth`].
+        reject_missing_auth: bool,
     ) -> Result<Outcome> {
         // -- 1. validate: format, then signatures/hash.
         let mut raw = raw;
@@ -1714,6 +1946,7 @@ impl RoomServer {
 
         // -- 2. fetch auth_events and prev_events.
         let mut missing: Vec<String> = Vec::new();
+        let mut missing_auth: Vec<String> = Vec::new();
         let mut auth_events: Vec<(IdentifiedPdu, bool)> = Vec::new();
         for id in event.auth_events() {
             match store.event(id.as_str()).map_err(storage_err)? {
@@ -1721,23 +1954,53 @@ impl RoomServer {
                     let rejected = se.rejected.is_some();
                     auth_events.push((parse_stored(id.clone(), &se)?, rejected));
                 }
-                None => missing.push(id.to_string()),
+                None => missing_auth.push(id.to_string()),
             }
         }
         let mut prev_groups: BTreeSet<u64> = BTreeSet::new();
         for id in event.prev_events() {
             match store.event(id.as_str()).map_err(storage_err)? {
-                // A prev without a state group (auth-chain-rejected) gives
-                // us no state to work from — treat as unfetchable.
-                Some(se) if se.state_group_after == 0 => missing.push(id.to_string()),
+                // An auth-chain-rejected prev (no state group of its own)
+                // is still a legitimate prev — rejected events stay in the
+                // DAG, and refusing them here would sink every later event
+                // (Complement's RejectsEventsWithRejectedAuthEvents sends a
+                // clean sentinel behind two rejected messages). Its
+                // rejection left the room state unchanged, so its own
+                // prevs' state stands in; only a chain with no resolvable
+                // ancestor is genuinely missing.
+                Some(se) if se.state_group_after == 0 => {
+                    let groups = self.groups_behind_rejected(&store, id.as_str());
+                    if groups.is_empty() {
+                        missing.push(id.to_string());
+                    } else {
+                        prev_groups.extend(groups);
+                    }
+                }
                 Some(se) => {
                     prev_groups.insert(se.state_group_after);
                 }
                 None => missing.push(id.to_string()),
             }
         }
+        // Prev gaps dominate: they need the timeline walk
+        // (`/get_missing_events`), and once filled the retry surfaces any
+        // remaining auth misses.
         if !missing.is_empty() {
             return Err(RoomError::MissingEvents(missing));
+        }
+        if !missing_auth.is_empty() {
+            if reject_missing_auth {
+                return self
+                    .propose_rejected(
+                        room_id,
+                        &event,
+                        &raw,
+                        Rejected::AuthChain(format!("auth events unfetchable: {missing_auth:?}")),
+                        &meta,
+                    )
+                    .await;
+            }
+            return Err(RoomError::MissingAuthEvents(missing_auth));
         }
 
         // Events rejected against their own auth chain never participate

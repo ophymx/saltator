@@ -36,9 +36,9 @@ fn pdu_array(events: Vec<ruma::CanonicalJsonObject>) -> serde_json::Value {
 /// `GET /_matrix/federation/v1/backfill/{roomId}?v=<id>&v=<id>&limit=<n>`.
 pub async fn backfill(
     State(state): State<Arc<FedState>>,
-    Path(_room_id): Path<String>,
+    Path(room_id): Path<String>,
     RawQuery(query): RawQuery,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> FedResult {
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
@@ -68,6 +68,17 @@ pub async fn backfill(
             &e.to_string(),
         )
     })?;
+    // Per-server history visibility: events the origin may not see go out
+    // redacted (spec "Server behaviour"; Synapse filter_events_for_server).
+    let pdus = rooms
+        .filter_events_for_server(&room_id, &auth.origin, pdus)
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            )
+        })?;
     Ok(axum::Json(serde_json::json!({
         "origin": state.server_name.as_str(),
         "origin_server_ts": crate::now_ms(),
@@ -278,7 +289,7 @@ pub async fn timestamp_to_event(
 /// `POST /_matrix/federation/v1/get_missing_events/{roomId}`.
 pub async fn get_missing_events(
     State(state): State<Arc<FedState>>,
-    Path(_room_id): Path<String>,
+    Path(room_id): Path<String>,
     auth: Authenticated,
 ) -> FedResult {
     let Some(rooms) = state.rooms.clone() else {
@@ -309,6 +320,16 @@ pub async fn get_missing_events(
 
     let pdus = rooms
         .get_missing_events(&earliest, &latest, limit, min_depth)
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            )
+        })?;
+    // Per-server history visibility, as in `backfill` above.
+    let pdus = rooms
+        .filter_events_for_server(&room_id, &auth.origin, pdus)
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,

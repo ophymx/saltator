@@ -351,38 +351,62 @@ pub(crate) async fn process_pdu(
         }
     }
 
-    match rooms.ingest_pdu(raw.clone()).await {
-        Ok(outcome) => outcome_result(outcome),
-        Err(RoomError::MissingEvents(missing)) => {
-            // Gap: fetch the events between what we have and this PDU, then
-            // retry. `/get_missing_events` walks back from this PDU, which
-            // only works once the origin has stored it — not the case for an
-            // invite mid-`/invite` handshake (the origin ingests it only
-            // after we co-sign), so fall back to fetching the named missing
-            // events directly via `/event`. If both fail, report the error.
-            if fill_gap(state, origin, &raw).await
-                || fetch_missing_by_id(state, origin, missing).await
-            {
-                match rooms.ingest_pdu(raw).await {
+    let mut tried_gap = false;
+    let mut tried_auth = false;
+    loop {
+        return match rooms.ingest_pdu(raw.clone()).await {
+            Ok(outcome) => outcome_result(outcome),
+            Err(RoomError::MissingEvents(missing)) if !tried_gap => {
+                tried_gap = true;
+                // Prev gap: fetch the events between what we have and this
+                // PDU, then retry. `/get_missing_events` walks back from
+                // this PDU, which only works once the origin has stored it
+                // — not the case for an invite mid-`/invite` handshake
+                // (the origin ingests it only after we co-sign), so fall
+                // back to fetching the named missing events directly via
+                // `/event`. If both fail, report the error.
+                if fill_gap(state, origin, &raw).await
+                    || fetch_missing_by_id(state, origin, missing).await
+                {
+                    continue;
+                }
+                (precomputed, error_result("missing prev events"))
+            }
+            Err(RoomError::MissingAuthEvents(missing)) if !tried_auth => {
+                tried_auth = true;
+                // Auth-only miss (prevs all resolve): the cited events are
+                // outliers to fetch directly via `/event` — NOT a timeline
+                // gap, so `/get_missing_events` must not fire
+                // (RejectsEventsWithRejectedAuthEvents forbids it).
+                // Whether or not the fetch produced anything, retry: the
+                // final arm below settles a still-unfetchable chain.
+                fetch_missing_by_id(state, origin, missing).await;
+                continue;
+            }
+            Err(RoomError::MissingAuthEvents(_)) => {
+                // Fetch already tried: the auth chain is permanently
+                // unverifiable, so the event is stored rejected (no
+                // per-PDU error — Synapse drops it silently and
+                // TestCorruptedAuthChain requires an error-free response).
+                match rooms.ingest_pdu_rejecting_missing_auth(raw).await {
                     Ok(outcome) => outcome_result(outcome),
                     Err(e) => (precomputed, error_result(&e.to_string())),
                 }
-            } else {
-                (precomputed, error_result("missing prev/auth events"))
             }
-        }
-        Err(RoomError::UnknownRoom(_)) => {
-            // A membership change for a room we don't host. If it removes a
-            // *local* user who has a pending out-of-band invite here (an
-            // invite being rescinded/kicked), reflect it as a leave so their
-            // /sync observes it — we otherwise have no state for the room.
-            if apply_out_of_band_leave(state, &raw).await {
-                (precomputed, serde_json::json!({}))
-            } else {
-                (precomputed, error_result("unknown room"))
+            Err(RoomError::UnknownRoom(_)) => {
+                // A membership change for a room we don't host. If it
+                // removes a *local* user who has a pending out-of-band
+                // invite here (an invite being rescinded/kicked), reflect
+                // it as a leave so their /sync observes it — we otherwise
+                // have no state for the room.
+                if apply_out_of_band_leave(state, &raw).await {
+                    (precomputed, serde_json::json!({}))
+                } else {
+                    (precomputed, error_result("unknown room"))
+                }
             }
-        }
-        Err(e) => (precomputed, error_result(&e.to_string())),
+            Err(e) => (precomputed, error_result(&e.to_string())),
+        };
     }
 }
 
@@ -446,7 +470,11 @@ fn outcome_result(outcome: Outcome) -> (Option<String>, serde_json::Value) {
             (Some(event_id.to_string()), serde_json::json!({}))
         }
         Outcome::Rejected { event_id, reason } => {
-            (Some(event_id.to_string()), error_result(&reason))
+            // A rejected event is a *processed* event: Synapse records the
+            // rejection and returns an empty result for the PDU, and
+            // Complement (TestCorruptedAuthChain) asserts no per-PDU error.
+            tracing::debug!(event_id = %event_id, reason, "inbound PDU rejected");
+            (Some(event_id.to_string()), serde_json::json!({}))
         }
     }
 }
@@ -506,7 +534,9 @@ async fn fill_gap(state: &FedState, origin: &str, pdu: &CanonicalJsonObject) -> 
     for obj in &chain {
         match rooms.ingest_pdu(obj.clone()).await {
             Ok(Outcome::Accepted { .. }) | Ok(Outcome::Duplicate { .. }) => ingested += 1,
-            Err(RoomError::MissingEvents(_)) => still_missing = true,
+            Err(RoomError::MissingEvents(_) | RoomError::MissingAuthEvents(_)) => {
+                still_missing = true
+            }
             _ => {}
         }
     }
@@ -522,32 +552,90 @@ async fn fill_gap(state: &FedState, origin: &str, pdu: &CanonicalJsonObject) -> 
     let Some(anchor) = chain.first().and_then(|e| rooms.pdu_event_id(e)) else {
         return ingested > 0;
     };
-    let path = format!(
-        "/_matrix/federation/v1/state/{room_id}?event_id={}",
-        anchor.as_str().replace('%', "%25").replace('&', "%26")
-    );
-    let resp = match client.get(origin, &path).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, room_id, "gap anchor: /state fetch failed");
-            return ingested > 0;
+    // Prefer `/state_ids` at the *prev* of the chain's oldest event (the
+    // snapshot the chain then applies on top of), resolving unknown IDs
+    // via `/event` and tolerating individual failures — Synapse's healing
+    // sequence, and the only one Complement's TestCorruptedAuthChain
+    // serves. Fall back to a whole-state `/state` fetch at the oldest
+    // event itself.
+    let anchor_prev = chain
+        .first()
+        .and_then(|e| e.get("prev_events"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned);
+    let mut chain = chain;
+    let mut snapshot = match &anchor_prev {
+        Some(prev) => fetch_state_by_ids(state, origin, room_id, prev).await,
+        None => None,
+    };
+    // `/state_ids` describes the state *before* `anchor_prev`, so that
+    // event itself lands in neither the snapshot nor the chain — yet the
+    // chain's oldest event cites it (prev and usually auth), and leaving
+    // the one-event hole fails every later resolution that walks through
+    // it (MSC4297's partial-sync tests). Synapse fetches the breach event
+    // and inserts it as an outlier; mirror that by prepending it to the
+    // chain, verified like everything else we import.
+    if snapshot.is_some() {
+        if let Some(prev) = anchor_prev
+            .as_deref()
+            .filter(|p| !matches!(rooms.store().event(p), Ok(Some(_))))
+        {
+            let path = format!("/_matrix/federation/v1/event/{}", path_encode(prev));
+            match client.get(origin, &path).await {
+                Ok(resp) => {
+                    if let Some(Ok(CanonicalJsonValue::Object(obj))) = resp
+                        .get("pdus")
+                        .and_then(|p| p.as_array())
+                        .and_then(|p| p.first())
+                        .map(|pdu| CanonicalJsonValue::try_from(pdu.clone()))
+                    {
+                        crate::keys::trust_event_servers(
+                            &state.key_cache,
+                            rooms,
+                            std::slice::from_ref(&obj),
+                        )
+                        .await;
+                        if rooms.verify_pdu(room_id, &obj) {
+                            chain.insert(0, obj);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, event_id = %prev, "gap anchor: breach-event fetch failed; leaving a hole");
+                }
+            }
         }
-    };
-    let pdu_objects = |key: &str| -> Vec<CanonicalJsonObject> {
-        resp.get(key)
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|e| match CanonicalJsonValue::try_from(e.clone()) {
-                        Ok(CanonicalJsonValue::Object(o)) => Some(o),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let state_events = pdu_objects("pdus");
-    let auth_chain = pdu_objects("auth_chain");
+    }
+    if snapshot.is_none() {
+        let path = format!(
+            "/_matrix/federation/v1/state/{room_id}?event_id={}",
+            anchor.as_str().replace('%', "%25").replace('&', "%26")
+        );
+        let resp = match client.get(origin, &path).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, room_id, "gap anchor: /state fetch failed");
+                return ingested > 0;
+            }
+        };
+        let pdu_objects = |key: &str| -> Vec<CanonicalJsonObject> {
+            resp.get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| match CanonicalJsonValue::try_from(e.clone()) {
+                            Ok(CanonicalJsonValue::Object(o)) => Some(o),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        snapshot = Some((pdu_objects("pdus"), pdu_objects("auth_chain")));
+    }
+    let (state_events, auth_chain) = snapshot.expect("set above");
     if state_events.is_empty() {
         return ingested > 0;
     }
@@ -583,6 +671,87 @@ async fn fill_gap(state: &FedState, origin: &str, pdu: &CanonicalJsonObject) -> 
             ingested > 0
         }
     }
+}
+
+/// Fetch a state snapshot as ID lists (`GET /state_ids?event_id=`) and
+/// resolve each ID to an event — from our store when we already hold it,
+/// else via `GET /event/{id}` from `origin`. Individual fetch failures
+/// leave a hole rather than sinking the snapshot: the auth information
+/// that *is* reachable still gets persisted (TestCorruptedAuthChain
+/// deliberately 404s one auth ancestor). `None` when the `/state_ids`
+/// request itself fails or yields no state.
+async fn fetch_state_by_ids(
+    state: &FedState,
+    origin: &str,
+    room_id: &str,
+    event_id: &str,
+) -> Option<(Vec<CanonicalJsonObject>, Vec<CanonicalJsonObject>)> {
+    let (rooms, client) = (state.rooms.as_ref()?, state.client.as_ref()?);
+    let path = format!(
+        "/_matrix/federation/v1/state_ids/{room_id}?event_id={}",
+        event_id.replace('%', "%25").replace('&', "%26")
+    );
+    let resp = match client.get(origin, &path).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, room_id, "gap anchor: /state_ids fetch failed");
+            return None;
+        }
+    };
+    let ids = |key: &str| -> Vec<String> {
+        resp.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let resolve = |ids: Vec<String>| async move {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(Some(stored)) = rooms.store().event(&id) {
+                if let Ok(obj) = serde_json::from_slice::<serde_json::Value>(&stored.raw)
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| match CanonicalJsonValue::try_from(v) {
+                        Ok(CanonicalJsonValue::Object(o)) => Ok(o),
+                        _ => Err("not an object".to_owned()),
+                    })
+                {
+                    out.push(obj);
+                    continue;
+                }
+            }
+            let path = format!("/_matrix/federation/v1/event/{}", path_encode(&id));
+            match client.get(origin, &path).await {
+                Ok(resp) => {
+                    if let Some(Ok(CanonicalJsonValue::Object(obj))) = resp
+                        .get("pdus")
+                        .and_then(|p| p.as_array())
+                        .and_then(|p| p.first())
+                        .map(|pdu| CanonicalJsonValue::try_from(pdu.clone()))
+                    {
+                        out.push(obj);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, event_id = %id, "gap anchor: /event fetch failed; leaving a hole");
+                }
+            }
+        }
+        out
+    };
+    let pdu_ids = ids("pdu_ids");
+    if pdu_ids.is_empty() {
+        return None;
+    }
+    let state_events = resolve(pdu_ids).await;
+    let auth_chain = resolve(ids("auth_chain_ids")).await;
+    if state_events.is_empty() {
+        return None;
+    }
+    Some((state_events, auth_chain))
 }
 
 /// Fetch specifically-named missing events from `origin` via `/event/{id}`
@@ -629,12 +798,28 @@ async fn fetch_missing_by_id(state: &FedState, origin: &str, missing: Vec<String
             Ok(CanonicalJsonValue::Object(o)) => o,
             _ => continue,
         };
-        match rooms.ingest_pdu(obj).await {
-            Ok(Outcome::Accepted { .. }) | Ok(Outcome::Duplicate { .. }) => ingested = true,
-            Err(RoomError::MissingEvents(more)) if retried.insert(id.clone()) => {
+        match rooms.ingest_pdu(obj.clone()).await {
+            // A *rejected* ingest is still progress: the event is stored
+            // and may satisfy someone's prev/auth reference (a chain of
+            // rejected events in front of a valid one must not strand the
+            // valid one — RejectsEventsWithRejectedAuthEvents' sentinel).
+            Ok(_) => ingested = true,
+            Err(RoomError::MissingEvents(more) | RoomError::MissingAuthEvents(more))
+                if retried.insert(id.clone()) =>
+            {
                 // Ancestors first, then this event again — once.
                 queue.push(id);
                 queue.extend(more);
+            }
+            // Second attempt and its auth ancestors are still absent: they
+            // are unfetchable (the walk above already tried), so store this
+            // event rejected — the settled rejection is what lets
+            // descendants citing it resolve (as rejected) instead of
+            // erroring (TestCorruptedAuthChain's 404'd ancestor).
+            Err(RoomError::MissingAuthEvents(_))
+                if rooms.ingest_pdu_rejecting_missing_auth(obj).await.is_ok() =>
+            {
+                ingested = true;
             }
             _ => {}
         }

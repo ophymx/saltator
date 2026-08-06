@@ -168,3 +168,16 @@ TestRestrictedRoomsSpacesSummaryFederation
 TestMediaFilenames
 TestMediaWithoutFileName
 TestMediaWithoutFileNameCSMediaV1
+# 2026-08-05: the missing-events / auth-chain family. Per-server history
+# visibility on /backfill + /get_missing_events (filter_events_for_server);
+# codepoint (not byte) field limits before room v11 + Synapse-parity
+# guest_access preset events; /state_ids-based gap healing that resolves
+# ids via /event and drops snapshot events whose transitive auth chain
+# cannot be completed; missing *auth* events fetched as outliers (never via
+# /get_missing_events) and settled as rejected when unfetchable, with
+# rejected PDUs returning {} (no error) on /send. 3 consecutive green local
+# runs of the whole set.
+TestInboundCanReturnMissingEvents
+TestOutboundFederationEventSizeGetMissingEvents
+TestCorruptedAuthChain
+TestInboundFederationRejectsEventsWithRejectedAuthEvents
