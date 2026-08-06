@@ -34,7 +34,19 @@ jobs:
         with:
           # Main-only saves; see the fmt+clippy+test job's cache note.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Per-crate compile cache, INCLUDING workspace crates (sound in CI
+      # because incremental is off): a PR touching one crate recompiles
+      # only it and its dependents instead of the whole workspace.
+      # Complements rust-cache, which covers the registry but prunes
+      # workspace artifacts by design.
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Install mold
+        run: sudo apt-get install -y -q mold
       - name: Build saltator (release)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
         run: cargo build --release -p saltator
       - uses: actions/upload-artifact@v7
         with:
@@ -57,7 +69,10 @@ jobs:
           tags: complement-saltator:latest
           load: true
           cache-from: type=gha,scope=complement-image
-          cache-to: type=gha,mode=max,scope=complement-image
+          # mode=min: we only ever load the final image; caching every
+          # intermediate layer was pure 10 GiB-quota burn (dozens of
+          # buildkit blobs) crowding the rust + sccache caches.
+          cache-to: type=gha,mode=min,scope=complement-image
       - name: Export Complement image
         run: docker save complement-saltator:latest | zstd -T0 -o /tmp/complement-image.zst
       - uses: actions/upload-artifact@v7
@@ -92,14 +107,25 @@ jobs:
           # stay off for failed runs — a job that died mid-link could
           # persist a truncated artifact and poison every later run.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Install mold
+        run: sudo apt-get install -y -q mold
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: build tests
         # Compilation is deterministic and, on a cache-key change (any
         # Cargo.toml/lock edit), legitimately long — no timeout. Keeping
         # it in its own step also puts compile failures in the right log.
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
         run: cargo test --workspace --no-run
       - name: run tests
         # Execution is seconds; the timeout exists to catch hangs (e.g. a
@@ -107,6 +133,10 @@ jobs:
         # must never be reachable by slow compiles, which is why the build
         # is a separate, untimeouted step.
         timeout-minutes: 5
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
         run: cargo test --workspace
 
   cluster-smoke:
