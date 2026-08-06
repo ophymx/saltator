@@ -7403,9 +7403,19 @@ async fn to_device_over_federation_round_trip() {
             b_fed_base.clone(),
         )),
         a_signer.clone(),
-        Arc::new(KeyCache::with_base_url(b_fed_base)),
+        Arc::new(KeyCache::with_base_url(b_fed_base.clone())),
     );
     let a_router = saltator_cs_api::router(a_cs);
+    // Remote to-device goes through the durable outbox; drain it like the
+    // daemon does.
+    let a_edu_sender = saltator_federation::spawn_edu_sender(
+        a_users.clone(),
+        Arc::new(FederationClient::with_base_url(
+            a_signer.clone(),
+            b_fed_base,
+        )),
+        ruma::OwnedServerName::try_from("a.test").unwrap(),
+    );
 
     let bob = reg(&b_router, "bob").await;
     let alice = reg(&a_router, "alice").await;
@@ -7453,6 +7463,7 @@ async fn to_device_over_federation_round_trip() {
     assert_eq!(events[0]["content"]["ciphertext"], "remote");
 
     b_proj.abort();
+    a_edu_sender.abort();
     a_rooms.shutdown().await.unwrap();
     a_users.shutdown().await.unwrap();
     b_rooms.shutdown().await.unwrap();

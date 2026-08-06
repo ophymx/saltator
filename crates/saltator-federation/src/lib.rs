@@ -4,6 +4,7 @@
 
 mod backfill;
 mod directory;
+mod edu_sender;
 mod hierarchy;
 mod http_client;
 mod inbound;
@@ -22,6 +23,7 @@ mod xmatrix;
 
 pub use backfill::fetch_backfill;
 pub use directory::directory_body;
+pub use edu_sender::spawn_edu_sender;
 pub use http_client::build_http_client;
 pub use inbound::{AuthRejection, Authenticated};
 pub use join_client::{

@@ -204,11 +204,26 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body):
         };
         let mut per_user = Map::new();
         let keys = store.device_keys(user_id).map_err(ApiError::internal)?;
+        // Device display names ride in `unsigned.device_display_name`,
+        // mirroring what we serve remote peers over federation.
+        let display_names: std::collections::BTreeMap<String, String> = store
+            .devices(user_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, d)| d.display_name.map(|n| (id, n)))
+            .collect();
         for (device_id, raw) in keys {
             if wanted.as_ref().is_some_and(|w| !w.contains(&device_id)) {
                 continue;
             }
-            let value: Value = serde_json::from_slice(&raw).map_err(ApiError::internal)?;
+            let mut value: Value = serde_json::from_slice(&raw).map_err(ApiError::internal)?;
+            if let (Some(obj), Some(name)) = (value.as_object_mut(), display_names.get(&device_id))
+            {
+                obj.entry("unsigned")
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+                    .map(|u| u.insert("device_display_name".to_owned(), name.clone().into()));
+            }
             per_user.insert(device_id, value);
         }
         // Requested users always appear, empty when they have no keys.
@@ -386,12 +401,14 @@ pub(crate) fn device_list_deltas(
             }
             Some((room_id, true)) => {
                 if entry.user_id == user_id {
-                    // We joined: everyone already there is newly tracked.
+                    // We joined: everyone already there is newly tracked —
+                    // including ourselves (our other devices may need to
+                    // re-establish sessions with the room's members;
+                    // TestDeviceListsUpdateOverFederation asserts the
+                    // joiner's own id in `changed`).
                     for member in crate::room_util::joined_member_ids(&state.rooms, &room_id)? {
-                        if member != user_id {
-                            left.remove(&member);
-                            changed.insert(member);
-                        }
+                        left.remove(&member);
+                        changed.insert(member);
                     }
                 } else if my_joined_rooms.contains(&room_id) {
                     left.remove(&entry.user_id);

@@ -332,7 +332,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // Outbound federation: forward locally originated events to remote
     // servers sharing each room.
     let fed_sender =
-        saltator_federation::spawn_sender(rooms.clone(), fed_client, server_name.clone());
+        saltator_federation::spawn_sender(rooms.clone(), fed_client.clone(), server_name.clone());
+    // Durable EDU outbox drainer: to-device messages and device-list
+    // updates retry until the destination takes them, resuming from disk
+    // after a restart.
+    let edu_sender =
+        saltator_federation::spawn_edu_sender(users.clone(), fed_client, server_name.clone());
 
     let mut cs_shutdown = shutdown_rx.clone();
     let cs_task = tokio::spawn(async move {
@@ -388,6 +393,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     cs_task.await??;
     fed_task.await??;
     fed_sender.abort();
+    edu_sender.abort();
     push_delivery.abort();
     reconciler.abort();
     projection.abort();

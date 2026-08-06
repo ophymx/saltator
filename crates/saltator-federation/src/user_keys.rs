@@ -40,11 +40,27 @@ pub async fn keys_query(State(state): State<Arc<FedState>>, auth: Authenticated)
         };
         let mut per_user = Map::new();
         let keys = store.device_keys(user_id).unwrap_or_default();
+        // Device display names ride along in `unsigned.device_display_name`
+        // (spec user-keys schema) so remote clients can label sessions.
+        let display_names: std::collections::BTreeMap<String, String> = store
+            .devices(user_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, d)| d.display_name.map(|n| (id, n)))
+            .collect();
         for (device_id, raw) in keys {
             if wanted.as_ref().is_some_and(|w| !w.contains(&device_id)) {
                 continue;
             }
-            if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&raw) {
+                if let (Some(obj), Some(name)) =
+                    (value.as_object_mut(), display_names.get(&device_id))
+                {
+                    obj.entry("unsigned")
+                        .or_insert_with(|| Value::Object(Map::new()))
+                        .as_object_mut()
+                        .map(|u| u.insert("device_display_name".to_owned(), name.clone().into()));
+                }
                 per_user.insert(device_id, value);
             }
         }

@@ -71,19 +71,29 @@ pub async fn send_to_device(
     }
     state.users.send_to_device(messages).await?;
 
-    // One m.direct_to_device EDU per destination server.
-    for (dest, msgs) in remote {
-        let edu = serde_json::json!({
-            "edu_type": "m.direct_to_device",
-            "content": {
-                "sender": auth.user_id.as_str(),
-                "type": req.event_type.to_string(),
-                "message_id": req.txn_id.as_str(),
-                "messages": msgs,
-            },
-        });
-        crate::routes::edu::send_edu(&state, vec![dest], edu);
-    }
+    // One m.direct_to_device EDU per destination server, through the
+    // durable outbox — awaited, so our 200 OK means the message is on
+    // disk and will be retried until the destination takes it (the spec
+    // gives to-device no receiver-side recovery path).
+    let entries: Vec<saltator_userserver::OutboundEdu> = remote
+        .into_iter()
+        .filter_map(|(dest, msgs)| {
+            let edu = serde_json::json!({
+                "edu_type": "m.direct_to_device",
+                "content": {
+                    "sender": auth.user_id.as_str(),
+                    "type": req.event_type.to_string(),
+                    "message_id": req.txn_id.as_str(),
+                    "messages": msgs,
+                },
+            });
+            Some(saltator_userserver::OutboundEdu {
+                destination: dest,
+                json: serde_json::to_vec(&edu).ok()?,
+            })
+        })
+        .collect();
+    state.users.queue_outbound_edus(entries).await?;
 
     state.txns.mark(
         auth.user_id.as_str(),

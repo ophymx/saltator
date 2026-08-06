@@ -205,14 +205,15 @@ jobs:
         working-directory: complement
         env:
           COMPLEMENT_BASE_IMAGE: complement-saltator:latest
-          # Deferred-feature bucket (federated device-list stream tracking)
-          # is red until its milestone and burns full timeouts on every push.
-          # Skipped per-push; the weekly scheduled run is unfiltered. Knocking
-          # and restricted-room joins (MSC3083/MSC3787) now work, so those
-          # tests run. Still skipped: the v7-only knock tests (TestKnocking,
+          # Skipped per-push (the weekly scheduled run is unfiltered): only
+          # the v7-only knock tests remain (TestKnocking,
           # TestKnockRoomsInPublicRoomsDirectory, TestCannotSendNonKnockVia-
-          # SendKnock — room version 7 is unsupported here).
-          SKIP_DEFERRED: ${{ github.event_name != 'schedule' && '-skip=^TestKnocking$|^TestKnockRoomsInPublicRoomsDirectory$|^TestCannotSendNonKnockViaSendKnock$|TestDeviceListsUpdateOverFederation' || '' }}
+          # SendKnock — room version 7 is unsupported here). The federated
+          # device-list tests came off the list 2026-08-05: the E2EE bucket
+          # (durable EDU outbox + on-join announce) turned them green and
+          # they are gated in federation-must-pass.txt, so skipping them
+          # would itself fail the gate as "missing".
+          SKIP_DEFERRED: ${{ github.event_name != 'schedule' && '-skip=^TestKnocking$|^TestKnockRoomsInPublicRoomsDirectory$|^TestCannotSendNonKnockViaSendKnock$' || '' }}
         # The federation suite is the root `tests` package (not
         # `tests/csapi`). `|| true` here so the raw `go test` exit never
         # decides the job — the must-pass gate below does. Coverage is
