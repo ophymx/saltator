@@ -216,18 +216,20 @@ jobs:
           SKIP_DEFERRED: ${{ github.event_name != 'schedule' && '-skip=^TestKnocking$|^TestKnockRoomsInPublicRoomsDirectory$|^TestCannotSendNonKnockViaSendKnock$' || '' }}
         # The federation suite is the root `tests` package (not
         # `tests/csapi`). `|| true` here so the raw `go test` exit never
-        # decides the job — the must-pass gate below does. Coverage is
-        # early, so the gate is a positive list (regression protection on
-        # the tests we've gotten green), not an allowed-to-fail list.
+        # decides the job — the allowlist gate below does. Flipped
+        # 2026-08-06 from a positive must-pass list to an allowed-to-fail
+        # list (like csapi): coverage reached ~90/96 top-level, so any
+        # failure not on the short annotated list is a regression — and a
+        # brand-new upstream test that fails is caught by default.
         run: go test -json -timeout 30m $SKIP_DEFERRED ./tests | tee /tmp/complement-fed.json || true
-      # Summarize + gate: fails if any must-pass federation test regressed.
+      # Summarize + gate: fails on any leaf failure not in the allowlist.
       # (Logic in scripts/complement-fed-gate.sh — args are the results
-      # JSON, the must-pass list, and the step-summary file.)
+      # JSON, the allowlist, and the step-summary file.)
       - name: Pass-rate summary + regression gate
         run: >-
           bash scripts/complement-fed-gate.sh
           /tmp/complement-fed.json
-          docker/complement/federation-must-pass.txt
+          docker/complement/federation-allowed-failures.txt
           "$GITHUB_STEP_SUMMARY"
 
   synapse-interop:
