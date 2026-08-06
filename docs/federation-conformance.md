@@ -8,7 +8,7 @@ unit tests for server-to-server logic) and only pushed once a substantial
 batch is green locally.
 
 Baseline: run 30770852233 (2026-08-02) has **29** top-level federation
-tests green; **28** are gated in `federation-must-pass.txt` (the media
+tests green; **28** were gated in the then-positive must-pass list (the media
 flake `TestMediaWithoutFileNameCSMediaV1` is excluded). This reflects the
 merged create-event batch (PR #4) plus the `/event_auth` + send-V2 +
 partial jump-to-date/unknown-endpoint batch (PR #5).
@@ -349,8 +349,15 @@ Cause: no application-service support yet. Out of scope until AS lands.
    synthetic-peer blocks) — the long tail.
 9. **Group 11** media race — root-cause separately.
 
-Each landed feature adds its now-green top-level tests to
-`docker/complement/federation-must-pass.txt`.
+GATE FLIP (2026-08-06, after the E2EE bucket brought the suite to 90/96
+top-level): the federation gate is now an **allowed-to-fail list**
+(`docker/complement/federation-allowed-failures.txt`, leaf semantics,
+same shape as csapi) instead of the old positive must-pass list. Landing
+a feature now means *removing* its tests from the allowlist (the gate
+warns when an allowlisted test starts passing); any unlisted failure —
+including a brand-new upstream test — fails CI by default. Remaining
+allowlist: 4 by-design (v6/v7, below the v8 floor), 1 AS-blocked leaf,
+7 JumpToDate leaves (Group 2's two remaining features).
 
 ---
 

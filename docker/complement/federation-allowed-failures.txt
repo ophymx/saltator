@@ -1,0 +1,40 @@
+# Complement federation tests permitted to fail without failing CI.
+#
+# Flipped 2026-08-06 from the old positive must-pass list
+# (federation-must-pass.txt): coverage reached 90/96 top-level, so the
+# natural encoding is this short annotated list of known failures. The
+# gate (scripts/complement-fed-gate.sh) fails on any LEAF failure not
+# listed here — a parent that fails only because of an allowed leaf is
+# ignored, and a brand-new upstream test that fails is a CI failure by
+# default. Entries that start passing are flagged as stale warnings;
+# entries absent from a run are NOT stale (the per-push run -skips the
+# v7-only knock bucket that the weekly unfiltered run lets fail).
+#
+# Enumerated from a full unfiltered local sweep on main @ d77f3fc
+# (2026-08-06, 90/96 top-level green). Keep it minimal and annotated;
+# never park a flaky test here — fix the flake at the source.
+
+# --- By design: room versions below the v8 floor ---
+# Room versions 6/7 are deliberately unsupported (v8+ only; see
+# docs/federation-conformance.md "Missing — justified absent").
+TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
+TestKnocking
+TestKnockRoomsInPublicRoomsDirectory
+TestCannotSendNonKnockViaSendKnock
+
+# --- Blocked on application services (unimplemented feature) ---
+TestJoinFederatedRoomFromApplicationServiceBridgeUser/join_remote_federated_room_as_application_service_user
+
+# --- Jump to date: two known-partial leaves families ---
+# (docs/federation-conformance.md Group 2.) The federation leaves need the
+# GET /_matrix/federation/v1/timestamp_to_event fallback + backfill; the
+# topological leaves need the equal-timestamp tie-break to use topological
+# order instead of (origin_server_ts, seq). The rest of the test passes
+# and is enforced.
+TestJumpToDateEndpoint/parallel/federation/when_looking_backwards_before_the_room_was_created,_should_be_able_to_find_event_that_was_imported
+TestJumpToDateEndpoint/parallel/federation/can_paginate_backwards_after_getting_remote_event_from_timestamp_to_event_endpoint_(end)
+TestJumpToDateEndpoint/parallel/federation/can_paginate_backwards_after_getting_remote_event_from_timestamp_to_event_endpoint_(start)
+TestJumpToDateEndpoint/parallel/federation/looking_forwards,_should_be_able_to_find_event_that_was_sent_before_we_joined
+TestJumpToDateEndpoint/parallel/federation/looking_backwards,_should_be_able_to_find_event_that_was_sent_before_we_joined
+TestJumpToDateEndpoint/parallel/should_find_next_event_topologically_after_given_timestamp_when_all_message_timestamps_are_the_same
+TestJumpToDateEndpoint/parallel/should_find_next_event_topologically_before_given_timestamp_when_all_message_timestamps_are_the_same
