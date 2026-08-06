@@ -21,7 +21,14 @@ CI by default; allowlisted tests keep *running* so the stale check
 ratchets the list downward. Skips stay scoped to the slow,
 permanently-red v7 knock bucket (weekly unfiltered run covers them).
 
-## Step 1 ☐ — `EventFetcher` trait: roomserver owns the ingest loop
+## Step 1 ☑ — `EventFetcher` trait: roomserver owns the ingest loop
+
+DONE: PR #35 (merged 2026-08-06). Healing policy lives in
+`saltator_roomserver::heal`; the federation crate keeps a wire-only
+`fetcher.rs`; the three Complement healing scenarios run as ~10ms
+mock-fetcher unit tests (`roomserver/tests/heal.rs`). Adjacent landings
+the same day: build-speed profile split (PR #36) and CI cache
+discipline / test build-run split (PR #37).
 
 **Problem.** The PDU pipeline (steps 1–5) lives in `saltator-roomserver`
 but the healing choreography — `fill_gap`, `fetch_missing_by_id`,
