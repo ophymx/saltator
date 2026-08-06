@@ -181,3 +181,9 @@ TestInboundCanReturnMissingEvents
 TestOutboundFederationEventSizeGetMissingEvents
 TestCorruptedAuthChain
 TestInboundFederationRejectsEventsWithRejectedAuthEvents
+# 2026-08-05: TestUnrejectRejectedEvents turned out to already pass on main
+# (3x green locally) — a first /send of an event with an unfetchable prev
+# errors without storing it, so the re-send after the prev arrives
+# processes fresh and is accepted. Gated to lock the behaviour in; the
+# Group 6b "remains" note in docs/federation-conformance.md was stale.
+TestUnrejectRejectedEvents
