@@ -60,14 +60,24 @@ pub fn validate_pdu(
 
     let pdu = Pdu::from_canonical(raw).map_err(|e| ValidationError::Malformed(e.to_string()))?;
 
-    if pdu.event_type.len() > MAX_TYPE_BYTES {
+    // Up to room v10 the per-field limits count codepoints, not bytes
+    // (v11 tightened to bytes) — a multi-byte state_key that is ≤255
+    // codepoints is legal in older rooms.
+    let field_len = |s: &str| {
+        if version.strict_byte_limits() {
+            s.len()
+        } else {
+            s.chars().count()
+        }
+    };
+    if field_len(&pdu.event_type) > MAX_TYPE_BYTES {
         return Err(ValidationError::FieldTooLong {
             field: "type",
             limit: MAX_TYPE_BYTES,
         });
     }
     if let Some(sk) = &pdu.state_key {
-        if sk.len() > MAX_STATE_KEY_BYTES {
+        if field_len(sk) > MAX_STATE_KEY_BYTES {
             return Err(ValidationError::FieldTooLong {
                 field: "state_key",
                 limit: MAX_STATE_KEY_BYTES,

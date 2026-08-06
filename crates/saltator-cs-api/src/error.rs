@@ -196,6 +196,7 @@ impl From<RoomError> for ApiError {
             // a plain forbidden.
             RoomError::CannotAuthoriseJoin(_) => Self::forbidden(e.to_string()),
             RoomError::MissingEvents(_)
+            | RoomError::MissingAuthEvents(_)
             | RoomError::StateRes(_)
             | RoomError::Sign(_)
             | RoomError::Shard(_)

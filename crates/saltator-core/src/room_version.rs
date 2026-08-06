@@ -77,6 +77,15 @@ impl RoomVersion {
         self >= Self::V12
     }
 
+    /// Whether event size limits (`type`, `state_key`, …) are measured in
+    /// bytes. Rooms up to v10 measure **codepoints** — a state_key of 70
+    /// four-byte emoji (280 bytes) is legal there, and rejecting it breaks
+    /// older rooms (TestOutboundFederationEventSizeGetMissingEvents). v11
+    /// tightened the limits to bytes.
+    pub fn strict_byte_limits(self) -> bool {
+        self >= Self::V11
+    }
+
     /// Whether the `m.room.create` event is selected into `auth_events`.
     /// v11 and earlier require it; v12 forbids it (the `room_id` implies
     /// it instead).

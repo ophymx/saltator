@@ -248,13 +248,17 @@ pub async fn create_room(
     )
     .await?;
 
-    // 4. preset events.
+    // 4. preset events. Synapse emits an m.room.guest_access event only
+    // when the preset lets guests join (private/trusted private); a
+    // public_chat room gets none (guests default to forbidden). Emitting
+    // an extra event breaks positional assertions in Complement's
+    // /get_missing_events tests.
     let (join_rule, history_visibility, guest_access) = match preset {
-        RoomPreset::PublicChat => ("public", "shared", "forbidden"),
+        RoomPreset::PublicChat => ("public", "shared", None),
         RoomPreset::PrivateChat | RoomPreset::TrustedPrivateChat => {
-            ("invite", "shared", "can_join")
+            ("invite", "shared", Some("can_join"))
         }
-        _ => ("invite", "shared", "can_join"),
+        _ => ("invite", "shared", Some("can_join")),
     };
     send_state_checked(
         &state,
@@ -274,15 +278,17 @@ pub async fn create_room(
         serde_json::json!({ "history_visibility": history_visibility }),
     )
     .await?;
-    send_state_checked(
-        &state,
-        &room_id,
-        &auth.user_id,
-        "m.room.guest_access",
-        "",
-        serde_json::json!({ "guest_access": guest_access }),
-    )
-    .await?;
+    if let Some(guest_access) = guest_access {
+        send_state_checked(
+            &state,
+            &room_id,
+            &auth.user_id,
+            "m.room.guest_access",
+            "",
+            serde_json::json!({ "guest_access": guest_access }),
+        )
+        .await?;
+    }
 
     // 5. initial_state.
     for raw in &req.initial_state {

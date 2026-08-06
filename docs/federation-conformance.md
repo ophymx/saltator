@@ -168,16 +168,37 @@ accepted. Local test (fake-peer, hand-crafting the DAG with
 `PeerRoom::craft`): `event_citing_rejected_auth_event_is_rejected`. The
 harness now crafts arbitrary events (explicit `prev_events` / `auth_events`,
 including a rejected event in a type-permitted slot).
-Remaining for the full `TestInboundFederationRejectsEventsWithRejectedAuthEvents`:
-**outlier fetching** — when an inbound event cites an auth event we don't
-have, fetch it via `/event_auth` (Synapse) or `/event` (Dendrite), evaluate
-it (it transitively cites the rejected event → rejected), and reject the
-citing event. Today a cited-but-missing auth event yields `MissingEvents`
-(the event is dropped, not fetched) — the observable result (a 404 on the
-citing event) may already match, but the fetch path is the remaining piece.
-`TestCorruptedAuthChain` / `TestUnrejectRejectedEvents` build on the same
-machinery; `TestInboundCanReturnMissingEvents` is about *serving*
-`/get_missing_events` with history-visibility filtering (peer joins us).
+Status (2026-08-05): DONE for `TestCorruptedAuthChain`,
+`TestInboundFederationRejectsEventsWithRejectedAuthEvents`, and
+`TestInboundCanReturnMissingEvents` — 3× green locally, gated. The pieces:
+- `RoomError::MissingAuthEvents` split off from `MissingEvents`: an
+  auth-only miss (prevs all resolve) fetches the cited events directly as
+  outliers via `/event` and must NOT fire `/get_missing_events` (the
+  RejectsEvents test forbids the call). Prev gaps keep the timeline walk.
+- An auth chain that stays incomplete after fetching (origin 404s an
+  ancestor) settles as `Rejected::AuthChain`
+  (`ingest_pdu_rejecting_missing_auth`), so descendants citing the event
+  resolve as rejected (§3.3) instead of erroring, and rejected PDUs return
+  `{}` (no per-PDU error) on `/send` — Synapse parity, asserted by
+  TestCorruptedAuthChain's `MustSendTransaction`.
+- Gap healing prefers `/state_ids` at the chain-oldest event's prev
+  (Synapse's sequence — the only one TestCorruptedAuthChain serves),
+  resolving ids via our store then `/event`; `import_segment` drops
+  snapshot events whose transitive auth closure cannot be completed and
+  builds the state map from `pdu_ids` only (an auth-chain event is
+  *superseded* state and must not stand in for a dropped entry).
+  GOTCHA: `/state_ids` describes the state *before* the queried event, so
+  the breach event itself is in neither snapshot nor chain — it must be
+  fetched via `/event` and prepended to the imported chain (Synapse's
+  outlier insertion), or the one-event hole fails later resolutions
+  (caught by the MSC4297 partial-sync tests in the gated regression
+  sweep; the old `/state` path masked it by including the event as
+  state).
+- `/backfill` + `/get_missing_events` apply per-server history visibility
+  (`RoomServer::filter_events_for_server`, Synapse's
+  `filter_events_for_server`): events under `joined`/`invited` visibility
+  where the requesting server had no such member go out redacted.
+`TestUnrejectRejectedEvents` remains (un-rejection on later evidence).
 
 ## Group 7 — Invite / ban over federation  ·  M  ·  mixed
 Tests: `TestFederationRejectInvite`, `TestFederationRoomsInvite`,
@@ -241,7 +262,15 @@ bad-signed unrelated membership, or an event dragged into the auth chain by
 something else no longer blocks the join, while forged auth-critical state is
 still refused. Local test (fake-peer with `unverifiable_state_event`):
 `remote_join_drops_unverifiable_noncritical_state` in cs_api.
-The rest (oversized / bad-JSON-per-version / partition ordering) are the
+**`TestOutboundFederationEventSizeGetMissingEvents` DONE** (2026-08-05, 3×
+green locally, gated): rooms up to v10 measure the per-field size limits
+(`type`, `state_key`, …) in **codepoints**, not bytes — a state_key of 70
+four-byte emoji is legal there (v11 tightened to bytes;
+`RoomVersion::strict_byte_limits`). Also required Synapse parity on preset
+events: `createRoom` emits `m.room.guest_access` only when the preset allows
+guests (private/trusted-private), none for `public_chat` — the extra event
+broke the test's positional assertions.
+The rest (bad-JSON-per-version / partition ordering) are the
 remaining malformed-DAG cases the harness makes reproducible — build each as
 a `PeerRoom` scenario. `TestJoinViaRoomIDAndServerName` needs the
 `?server_name=` join hint threaded through to `join_remote` (so a v12 room
@@ -362,4 +391,4 @@ compare with `grep -oE '"/_matrix[^"]*"' crates/saltator-federation/src/lib.rs`)
 | Application services | TestJoinFederatedRoomFromApplicationServiceBridgeUser, TestJumpToDateEndpoint (deployment needs an AS) | Out of scope until AS lands (Group 12) |
 | Media | TestMediaFilenames, TestMediaWithoutFileName, TestRemotePngThumbnail (legacy /media/v3 subtests) | FIXED on branch media-remote-and-upload-race: legacy remote fetch + duplicate-upload temp race + raw-body federation media fallback |
 | E2EE over federation | TestDeviceListsUpdateOverFederation[OnRoomJoin], TestToDeviceMessagesOverFederation, TestFederationKeyUploadQuery | Next major bucket: device-list EDU fanout, to-device EDU delivery, cross-server key upload/query |
-| Missing-events / auth-chain family | TestInboundCanReturnMissingEvents, TestOutboundFederationEventSizeGetMissingEvents, TestCorruptedAuthChain, TestInboundFederationRejectsEventsWithRejectedAuthEvents | Next tractable batch: siblings of gated TestGetMissingEventsGapFilling / TestEventAuth; MockPeer-reproducible |
+| Missing-events / auth-chain family | TestInboundCanReturnMissingEvents, TestOutboundFederationEventSizeGetMissingEvents, TestCorruptedAuthChain, TestInboundFederationRejectsEventsWithRejectedAuthEvents | CLOSED 2026-08-05 (federation-missing-events branch): all four 3× green locally + gated. See Group 6b for the auth-chain/rejection machinery; the size test needed codepoint (not byte) field limits pre-v11 + Synapse-parity guest_access preset events |
