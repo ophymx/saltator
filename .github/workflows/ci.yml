@@ -31,6 +31,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Main-only saves; see the fmt+clippy+test job's cache note.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build saltator (release)
         run: cargo build --release -p saltator
       - uses: actions/upload-artifact@v7
@@ -81,16 +84,29 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only main mints caches: PRs restore but never save, so cache
+          # contents always come from a green default-branch run and PR
+          # branches stop churning the 10 GiB cache ceiling (evicting
+          # main's entries was a source of surprise-cold builds). Saves
+          # stay off for failed runs — a job that died mid-link could
+          # persist a truncated artifact and poison every later run.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: tests
-        # ~1.75x the step's average runtime (~4 min as of 2026-08-04), so a
-        # hung test (e.g. a multi-node Raft/gRPC deadlock under a constrained
-        # runner) fails fast instead of stalling the job for hours. Bump this
-        # as the suite grows.
-        timeout-minutes: 7
+      - name: build tests
+        # Compilation is deterministic and, on a cache-key change (any
+        # Cargo.toml/lock edit), legitimately long — no timeout. Keeping
+        # it in its own step also puts compile failures in the right log.
+        run: cargo test --workspace --no-run
+      - name: run tests
+        # Execution is seconds; the timeout exists to catch hangs (e.g. a
+        # multi-node Raft/gRPC deadlock under a constrained runner) — it
+        # must never be reachable by slow compiles, which is why the build
+        # is a separate, untimeouted step.
+        timeout-minutes: 5
         run: cargo test --workspace
 
   cluster-smoke:
