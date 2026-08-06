@@ -11,6 +11,7 @@ mod push_gateway;
 mod ratelimit;
 mod room_util;
 mod routes;
+mod services;
 mod txn;
 mod typing;
 
@@ -117,6 +118,15 @@ impl saltator_federation::EduSink for EphemeralEduSink {
 }
 
 impl CsState {
+    /// The E2EE/device-list domain service over this state's shards.
+    pub(crate) fn e2ee(&self) -> services::e2ee::E2ee<'_> {
+        services::e2ee::E2ee {
+            users: &self.users,
+            rooms: &self.rooms,
+            server_name: self.config.server_name.as_str(),
+        }
+    }
+
     pub fn new(
         users: Arc<UserServer>,
         rooms: Arc<RoomServer>,

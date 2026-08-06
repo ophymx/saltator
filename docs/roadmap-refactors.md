@@ -67,7 +67,14 @@ snapshot + breach event) get direct unit tests against a mock fetcher
 (no HTTP, no MockPeer needed for these); full gated sweep unchanged.
 One PR.
 
-## Step 2 ☐ — Domain-service tier (exemplar: E2EE/device-list)
+## Step 2 ☑ — Domain-service tier (exemplar: E2EE/device-list)
+
+DONE (exemplar): the `services::e2ee` module owns device-list deltas
+(self-on-join rule), the sharing-servers audience walk, broadcast /
+on-join announce with the replay policy, and the EDU shape — routes are
+one-liners, and the semantics have service-level tests against real
+shards with no router. The standing rule below now applies to all
+future work.
 
 **Problem.** Protocol domain logic has accreted into route files:
 `device_list_deltas` (sync changed/left semantics) in
