@@ -381,6 +381,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         client: Some(fed_client.clone()),
         edu_sink: Some(edu_sink),
         media: Some(fed_media),
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let fed_router = saltator_federation::router(fed_state);
     // Federation is served over HTTPS when a cert is configured; otherwise

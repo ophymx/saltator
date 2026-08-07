@@ -453,6 +453,25 @@ impl UserServer {
         .await
     }
 
+    /// Queue federation to-device messages with `(origin, message_id)`
+    /// dedupe: a redelivered EDU (the sender is at-least-once) drops
+    /// atomically inside apply, so clients never see duplicates — even
+    /// across our own restart, since the seen-set is replicated state.
+    pub async fn send_to_device_deduped(
+        &self,
+        origin: &str,
+        message_id: &str,
+        messages: Vec<ToDeviceMessage>,
+    ) -> Result<()> {
+        self.expect_ok(&UserCommand::SendToDeviceDeduped {
+            origin: origin.to_owned(),
+            message_id: message_id.to_owned(),
+            ts_ms: now_ms(),
+            messages,
+        })
+        .await
+    }
+
     /// Queue outbound federation EDUs into the durable outbox — the EDU
     /// sender drains and acks them, so delivery survives destination
     /// downtime and our own restarts.

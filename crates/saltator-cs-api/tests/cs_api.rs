@@ -5106,6 +5106,7 @@ async fn spawn_fed(
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     };
     if let Some(r) = rooms {
         state = state.with_rooms(r);
@@ -5669,6 +5670,7 @@ async fn client_joins_a_remote_room_by_remote_alias() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     };
     let a_app = saltator_federation::router(Arc::new(a_state));
     let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6673,6 +6675,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
         ))),
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_router = saltator_federation::router(b_fed);
     let b_fed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6832,6 +6835,7 @@ async fn inbound_federated_invite_appears_in_sync() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -7093,6 +7097,7 @@ async fn outbound_federated_invite_round_trip() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -7276,6 +7281,7 @@ async fn receipt_edu_over_federation_surfaces_in_sync() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -7383,6 +7389,7 @@ async fn to_device_over_federation_round_trip() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -7502,6 +7509,62 @@ async fn to_device_over_federation_round_trip() {
     assert_eq!(events[0]["sender"], "@alice:a.test");
     assert_eq!(events[0]["content"]["ciphertext"], "remote");
 
+    // Decision-3 uniqueness rider: redeliver the identical EDU (same
+    // message_id, fresh outbox row = fresh txn id — an at-least-once
+    // sender's duplicate after a cursor rewind). B's durable message_id
+    // dedupe must drop it: bob must never see the message twice.
+    let dup_edu = serde_json::json!({
+        "edu_type": "m.direct_to_device",
+        "content": {
+            "sender": "@alice:a.test",
+            "type": "m.room.encrypted",
+            "message_id": "fed-td-1",
+            "messages": {"@bob:b.test": {"*": {"ciphertext": "remote"}}},
+        },
+    });
+    a_fedout
+        .enqueue_edus(vec![saltator_fedout::OutboundEdu {
+            destination: "b.test".into(),
+            json: serde_json::to_vec(&dup_edu).unwrap(),
+        }])
+        .await
+        .unwrap();
+    // Wait until the worker has delivered + acked the duplicate (outbox
+    // drains), then count copies in a fresh full sync: the original is
+    // still in the inbox (never acked — earlier polls carried no since
+    // token), so exactly-once means exactly ONE copy total; a failed
+    // dedupe would show two.
+    for _ in 0..200 {
+        if a_fedout.store().edu_outbox("b.test", 1).unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        a_fedout.store().edu_outbox("b.test", 1).unwrap().is_empty(),
+        "duplicate EDU never delivered"
+    );
+    let (_, sync) = oneshot(
+        &b_router,
+        "GET",
+        "/_matrix/client/v3/sync",
+        Some(&bob),
+        None,
+    )
+    .await;
+    let dup_count = sync["to_device"]["events"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|e| e["content"]["ciphertext"] == "remote")
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        dup_count, 1,
+        "client-visible copies != 1 after redelivery: {sync}"
+    );
+
     b_proj.abort();
     a_edu_sender.abort();
     a_rooms.shutdown().await.unwrap();
@@ -7533,6 +7596,7 @@ async fn federated_key_query_claim_and_device_list_update() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -7774,6 +7838,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
         client: None,
         edu_sink: Some(sink),
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
         let app = saltator_federation::router(b_fed);
@@ -7968,6 +8033,7 @@ async fn client_downloads_remote_media_over_federation() {
         client: None,
         edu_sink: None,
         media: Some(a_media.clone()),
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
 
     // Node B: full CS stack, federation client aimed at A.
@@ -8202,6 +8268,7 @@ async fn client_queries_remote_profile_and_directory() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
 
     // B key server so A can authenticate B's queries.
@@ -9396,6 +9463,7 @@ async fn federation_public_rooms_lists_published_rooms() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let app = saltator_federation::router(fed);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -619,3 +619,58 @@ async fn remote_invite_then_projected_join_becomes_join() {
     env.rooms.shutdown().await.unwrap();
     u.shutdown().await.unwrap();
 }
+
+/// Federation to-device dedupe: a redelivered EDU (same origin +
+/// message_id — the at-least-once sender's duplicate) drops whole; a
+/// different message_id delivers. The seen-set is replicated state, so
+/// this holds across restart too.
+#[tokio::test]
+async fn to_device_dedupes_by_origin_and_message_id() {
+    let env = start_env().await;
+    let u = &env.users;
+    let (_, s) = u
+        .register("alice", Some("p"), None, None, false, false)
+        .await
+        .unwrap();
+    let s = s.unwrap();
+    let uid = s.user_id.clone();
+    let dev = s.device_id.to_string();
+    let msg = |body: &str| ToDeviceMessage {
+        user_id: uid.to_string(),
+        device_id: dev.clone(),
+        json: serde_json::to_vec(&json!({
+            "type": "m.room.encrypted", "sender": "@bob:remote.test",
+            "content": {"body": body},
+        }))
+        .unwrap(),
+    };
+
+    u.send_to_device_deduped("remote.test", "m1", vec![msg("first")])
+        .await
+        .unwrap();
+    // The duplicate: same origin + message_id — dropped whole.
+    u.send_to_device_deduped("remote.test", "m1", vec![msg("dup")])
+        .await
+        .unwrap();
+    // Same message_id from a DIFFERENT origin is a different message.
+    u.send_to_device_deduped("other.test", "m1", vec![msg("other")])
+        .await
+        .unwrap();
+    // A fresh message_id from the first origin delivers.
+    u.send_to_device_deduped("remote.test", "m2", vec![msg("second")])
+        .await
+        .unwrap();
+
+    let inbox = u.store().to_device_events(uid.as_str(), &dev, 0).unwrap();
+    let bodies: Vec<String> = inbox
+        .iter()
+        .map(|(_, j)| {
+            serde_json::from_slice::<serde_json::Value>(j).unwrap()["content"]["body"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(bodies, vec!["first", "other", "second"], "{bodies:?}");
+    env.users.shutdown().await.unwrap();
+}

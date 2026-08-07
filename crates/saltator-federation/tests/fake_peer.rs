@@ -165,6 +165,7 @@ async fn peer_pushed_message_is_ingested() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
 
@@ -229,6 +230,7 @@ async fn timestamp_to_event_serves_member_servers() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
 
@@ -307,6 +309,7 @@ async fn state_at_event_serves_pre_event_snapshot() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
 
@@ -377,6 +380,7 @@ async fn key_notary_co_signs_peer_keys() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
     let http = reqwest::Client::new();
@@ -466,6 +470,7 @@ async fn pdu_with_undelivered_prev_is_recovered_via_event_fetch() {
         client: Some(client),
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
 
@@ -542,6 +547,7 @@ async fn event_citing_rejected_auth_event_is_rejected() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
 
@@ -803,6 +809,7 @@ async fn peer_malformed_pdu_is_rejected() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
 
@@ -1136,6 +1143,7 @@ async fn inbound_pdu_from_acl_denied_server_is_dropped() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
 

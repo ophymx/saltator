@@ -85,6 +85,15 @@ pub const T_CROSS_SIGNING: u8 = APP_TABLE_FIRST + 20;
 /// retry/backoff, acking on success. Survives restarts — unlike typing/
 /// presence, which stay fire-and-forget. `seq` is the user-shard seq.
 pub const T_EDU_OUTBOX: u8 = APP_TABLE_FIRST + 21;
+/// `origin ++ 0x00 ++ message_id → postcard(u64 ts_ms)` — federation
+/// to-device dedupe: EDU `message_id`s already applied. Replicated and
+/// written atomically with the inbox insert, so dedupe survives OUR
+/// restart — which is exactly when a sender's redelivery arrives
+/// (at-least-once, docs/design-federation-out.md decision 3).
+pub const T_TO_DEVICE_SEEN: u8 = APP_TABLE_FIRST + 22;
+/// `ts_ms (u64 BE) ++ origin ++ 0x00 ++ message_id → ()` — time index
+/// over [`T_TO_DEVICE_SEEN`] so the horizon prune is a range delete.
+pub const T_TO_DEVICE_SEEN_IDX: u8 = APP_TABLE_FIRST + 23;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -499,6 +508,19 @@ pub enum UserCommand {
         version: u64,
         room_id: Option<String>,
         session_id: Option<String>,
+    },
+    /// Federation to-device delivery with `message_id` dedupe
+    /// (append-only variant; the plain `SendToDevice` remains for local
+    /// sends, which dedupe via client txn ids). If `(origin,
+    /// message_id)` was already applied, the whole EDU's messages are
+    /// dropped — the redelivered duplicate a client must never see.
+    /// `ts_ms` is stamped by the receiving node at propose time and
+    /// drives the deterministic horizon prune.
+    SendToDeviceDeduped {
+        origin: String,
+        message_id: String,
+        ts_ms: u64,
+        messages: Vec<ToDeviceMessage>,
     },
 }
 

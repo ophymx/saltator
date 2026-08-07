@@ -89,6 +89,7 @@ async fn send_transaction_routes_pdus_and_reports_results() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let base = spawn(router(state)).await;
 
@@ -239,6 +240,7 @@ async fn send_fills_dag_gap_via_get_missing_events() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let a_base = spawn(router(a_state)).await;
 
@@ -289,6 +291,7 @@ async fn send_fills_dag_gap_via_get_missing_events() {
         ))),
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_base = spawn(router(b_state)).await;
 
@@ -343,6 +346,7 @@ async fn unimplemented_spec_endpoints_answer_unrecognized() {
         client: None,
         edu_sink: None,
         media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let base = spawn(router(state)).await;
     let http = reqwest::Client::new();
@@ -360,4 +364,95 @@ async fn unimplemented_spec_endpoints_answer_unrecognized() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 405);
+}
+
+/// Transaction replay (spec "Transactions"): a repeated `(origin,
+/// txn_id)` — an at-least-once sender whose ack we lost — returns the
+/// stored response without reprocessing.
+#[tokio::test]
+async fn repeated_transaction_replays_stored_response() {
+    let name: ruma::OwnedServerName = SERVER.try_into().unwrap();
+    let (signer, _) = ServerSigner::generate(name.clone(), "1".to_owned());
+    let signer = std::sync::Arc::new(signer);
+
+    let key_base = spawn(router(Arc::new(FedState::new(
+        name.clone(),
+        signer.clone(),
+        Vec::<OldVerifyKey>::new(),
+    ))))
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
+    let rooms = RoomServer::start(
+        1,
+        engine,
+        signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    rooms
+        .shard_handle()
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    let state = Arc::new(FedState {
+        server_name: name.clone(),
+        signer: signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(key_base)),
+        rooms: Some(rooms.clone()),
+        users: None,
+        client: None,
+        edu_sink: None,
+        media: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
+    });
+    let base = spawn(router(state)).await;
+
+    // A transaction with one unknowable PDU: its per-PDU error is in the
+    // response, which makes replay observable (identical bytes back).
+    let body = json!({
+        "origin": SERVER,
+        "origin_server_ts": 1000,
+        "pdus": [{
+            "type": "m.room.message",
+            "room_id": "!nosuch:hs.test",
+            "sender": format!("@alice:{SERVER}"),
+            "content": {"msgtype": "m.text", "body": "hi"},
+            "depth": 1,
+            "prev_events": ["$missing"],
+            "auth_events": ["$missing"],
+            "origin_server_ts": 1000,
+        }],
+    });
+    let path = "/_matrix/federation/v1/send/replay1";
+    let content = ruma::CanonicalJsonValue::try_from(body.clone()).unwrap();
+    let send = |auth: String| {
+        let base = base.clone();
+        let body = body.clone();
+        async move {
+            let resp = reqwest::Client::new()
+                .put(format!("{base}{path}"))
+                .header(reqwest::header::AUTHORIZATION, auth)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            resp.json::<serde_json::Value>().await.unwrap()
+        }
+    };
+    let auth1 = sign_request(&signer, "PUT", path, SERVER, Some(&content)).unwrap();
+    let first = send(auth1).await;
+    let auth2 = sign_request(&signer, "PUT", path, SERVER, Some(&content)).unwrap();
+    let second = send(auth2).await;
+    assert_eq!(
+        first, second,
+        "replayed txn must return the stored response"
+    );
+
+    rooms.shutdown().await.unwrap();
 }
