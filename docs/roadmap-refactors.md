@@ -121,6 +121,21 @@ per-table); how migrations replicate under Raft (run in the apply loop
 vs on-open per replica with a version fence); interaction with the M4
 snapshot/restore path.
 
+## Step 3.5 ☑ — Split the Raft log from app state (storage layout)
+
+Added 2026-08-06 (user). One shared RocksDB currently holds every
+shard's log AND state, with every write `sync=true`. The durability
+contract is asymmetric — log appends/votes must fsync before the node
+responds; applied state may lag and replay — so the split pays three
+ways: ~half the fsyncs per committed command (state goes async-WAL),
+no LSM compaction interference between append/purge log churn and app
+state, and a `LogStore` seam that makes raft-engine (TiKV's
+purpose-built many-group log store) a swappable follow-up instead of a
+bet. One ordering stays sacred: snapshot persistence fsyncs *before*
+log purge. Node-local format change — free pre-deployment (like the
+step-3 table shift), costly after. Lands before step 4 so the new
+delivery shard is born onto the split layout.
+
 ## Step 4 ☐ — Federation-out shard (durable delivery ownership)
 
 **Problem, two halves.** (a) Delivery state is scattered: the EDU outbox

@@ -411,3 +411,61 @@ async fn migration_supervisor_advances_schema() {
     assert_eq!(handle.schema_versions().unwrap(), (2, 2));
     handle.shutdown().await.unwrap();
 }
+
+/// Split log/state engines (roadmap step 3.5): proposals land, state is
+/// readable, and a restart over the SAME split pair recovers — the log
+/// engine alone carries the replay authority, the state engine may trail
+/// (relaxed WAL) and catch up.
+#[tokio::test]
+async fn split_stores_apply_and_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let stores = saltator_store::Stores::split(
+        Arc::new(RocksEngine::open_log(&dir.path().join("raft")).unwrap()),
+        Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap()),
+    );
+
+    let handle = ShardHandle::start(
+        SHARD,
+        1,
+        stores,
+        Arc::new(KvApp),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    handle
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    set(&handle, "k1", b"v1", false).await;
+    let resp = set(&handle, "k1", b"v2", false).await;
+    assert_eq!(resp.previous.as_deref(), Some(&b"v1"[..]));
+    handle.shutdown().await.unwrap();
+    drop(handle);
+
+    // Restart over the same pair: recovery must see the applied state.
+    let log2: Arc<dyn KvEngine> =
+        Arc::new(RocksEngine::open_log(&dir.path().join("raft")).unwrap());
+    let state2: Arc<dyn KvEngine> = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
+    let handle = ShardHandle::start(
+        SHARD,
+        1,
+        saltator_store::Stores::split(log2, state2),
+        Arc::new(KvApp),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    handle
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    let resp = set(&handle, "k1", b"v3", false).await;
+    assert_eq!(resp.previous.as_deref(), Some(&b"v2"[..]));
+    handle.shutdown().await.unwrap();
+}

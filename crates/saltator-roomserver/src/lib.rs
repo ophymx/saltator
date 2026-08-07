@@ -49,7 +49,7 @@ use saltator_core::state_res::{self, StateIds, StateResError};
 use saltator_core::validation::{self, ValidationError, VerificationError, VerifyOutcome};
 use saltator_core::{Event, RoomVersion};
 use saltator_shard::{ChangeRecord, NodeId, ShardHandle, ShardId, ShardRegistry, TypeConfig};
-use saltator_store::{Keyspace, KvEngine};
+use saltator_store::Keyspace;
 
 pub use machine::{RoomApp, RoomStore};
 pub use signer::{ServerSigner, SignError};
@@ -243,7 +243,7 @@ impl RoomServer {
     /// Start the room shard on this node and return the server handle.
     pub async fn start(
         node_id: NodeId,
-        engine: Arc<dyn KvEngine>,
+        stores: impl Into<saltator_store::Stores>,
         signer: Arc<ServerSigner>,
         network: impl RaftNetworkFactory<TypeConfig>,
         bootstrap_addr: Option<String>,
@@ -252,7 +252,7 @@ impl RoomServer {
         let handle = ShardHandle::start(
             ROOM_SHARD,
             node_id,
-            engine,
+            stores,
             Arc::new(RoomApp),
             network,
             bootstrap_addr,

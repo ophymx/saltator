@@ -60,7 +60,7 @@ impl ShardHandle {
     pub async fn start<A: ShardApp>(
         shard: ShardId,
         node_id: NodeId,
-        engine: Arc<dyn KvEngine>,
+        stores: impl Into<saltator_store::Stores>,
         app: Arc<A>,
         network: impl RaftNetworkFactory<TypeConfig>,
         bootstrap_addr: Option<String>,
@@ -75,11 +75,12 @@ impl ShardHandle {
         };
         let config = Arc::new(config.validate().map_err(raft_err)?);
 
+        let stores = stores.into();
         // Downgrade protection: state written by a newer schema must
         // never be reinterpreted by this binary (see
         // docs/design-schema-migrations.md).
         let app_schema_version = app.schema_version();
-        let stored = crate::storage::stored_schema_version(&*engine, shard)
+        let stored = crate::storage::stored_schema_version(&*stores.state, shard)
             .map_err(|e| ShardError::Storage(e.to_string()))?;
         if stored > app_schema_version {
             return Err(ShardError::SchemaTooNew {
@@ -90,8 +91,8 @@ impl ShardHandle {
         }
 
         let (changes, _) = broadcast::channel(CHANGE_STREAM_CAPACITY);
-        let log_store = ShardLogStore::new(shard, engine.clone());
-        let sm = ShardStateMachine::new(shard, engine.clone(), app, changes.clone());
+        let log_store = ShardLogStore::new(shard, stores.log.clone());
+        let sm = ShardStateMachine::new(shard, stores.state.clone(), app, changes.clone());
 
         let raft = Raft::new(node_id, config, network, log_store, sm)
             .await
@@ -105,7 +106,9 @@ impl ShardHandle {
             shard,
             node_id,
             raft,
-            engine,
+            // The handle reads applied state (schema cell, app reads):
+            // the state engine.
+            engine: stores.state,
             changes,
             app_schema_version,
         };

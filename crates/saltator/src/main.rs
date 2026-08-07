@@ -76,6 +76,20 @@ fn init_tracing() {
         .init();
 }
 
+/// Open the node's two storage roles (roadmap step 3.5): applied state
+/// in `db/` (relaxed-durability applies; replay covers a crash) and the
+/// Raft logs of every shard in `raft/` (always fsynced — the durability
+/// the protocol actually requires). Every entry point that touches shard
+/// storage must open BOTH the same way, or a shard finds its state
+/// without its log.
+fn open_stores(cfg: &Config) -> anyhow::Result<saltator_store::Stores> {
+    let state = Arc::new(saltator_store::RocksEngine::open(&cfg.data_dir.join("db"))?);
+    let log = Arc::new(saltator_store::RocksEngine::open_log(
+        &cfg.data_dir.join("raft"),
+    )?);
+    Ok(saltator_store::Stores::split(log, state))
+}
+
 fn server_name_of(cfg: &Config) -> anyhow::Result<ruma::OwnedServerName> {
     ruma::OwnedServerName::try_from(cfg.server_name.as_str())
         .map_err(|e| anyhow::anyhow!("server_name is not a valid Matrix server name: {e}"))
@@ -83,10 +97,10 @@ fn server_name_of(cfg: &Config) -> anyhow::Result<ruma::OwnedServerName> {
 
 async fn rotate(cfg: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let engine = Arc::new(saltator_store::RocksEngine::open(&cfg.data_dir.join("db"))?);
+    let stores = open_stores(&cfg)?;
     let meta = saltator_cluster::MetadataHandle::start(
         cfg.node.id,
-        engine,
+        stores,
         Some(cfg.node.advertise.clone()),
         None,
     )
@@ -110,7 +124,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let fresh_bootstrap = !cfg.data_dir.join("db").exists();
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let engine = Arc::new(saltator_store::RocksEngine::open(&cfg.data_dir.join("db"))?);
+    let stores = open_stores(&cfg)?;
 
     // A node *founds* a new cluster only on a fresh data dir with no seeds;
     // with seeds it *joins* an existing one. A restart (non-fresh) recovers
@@ -125,7 +139,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let registry = saltator_shard::ShardRegistry::new();
     let meta = saltator_cluster::MetadataHandle::start(
         cfg.node.id,
-        engine.clone(),
+        stores.clone(),
         founding.then(|| cfg.node.advertise.clone()),
         Some(&registry),
     )
@@ -207,7 +221,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let shard_bootstrap = founding.then(|| cfg.node.advertise.clone());
     let rooms = saltator_roomserver::RoomServer::start(
         cfg.node.id,
-        engine.clone(),
+        stores.clone(),
         signer.clone(),
         saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_roomserver::ROOM_SHARD),
         shard_bootstrap.clone(),
@@ -222,7 +236,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let users = saltator_userserver::UserServer::start(
         cfg.node.id,
-        engine.clone(),
+        stores.clone(),
         server_name.clone(),
         saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_userserver::USER_SHARD),
         shard_bootstrap,
