@@ -161,6 +161,10 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             saltator_store::Keyspace::User as u32,
             saltator_userserver::SCHEMA_VERSION,
         ),
+        (
+            saltator_store::Keyspace::FedOut as u32,
+            saltator_fedout::SCHEMA_VERSION,
+        ),
     ];
 
     // Serve the internal gRPC surface now (a joiner needs it to receive
@@ -219,6 +223,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // voter once the leader has caught it up. The wait therefore tolerates a
     // reconciliation round or two on a joining node.
     let shard_bootstrap = founding.then(|| cfg.node.advertise.clone());
+    let shard_bootstrap_fedout = shard_bootstrap.clone();
     let rooms = saltator_roomserver::RoomServer::start(
         cfg.node.id,
         stores.clone(),
@@ -249,6 +254,20 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         .await?;
     tracing::info!("user shard ready");
 
+    let fedout = saltator_fedout::FedOutServer::start(
+        cfg.node.id,
+        stores.clone(),
+        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_fedout::FED_OUT_SHARD),
+        shard_bootstrap_fedout,
+        Some(&registry),
+    )
+    .await?;
+    fedout
+        .shard_handle()
+        .wait_for_leader(Duration::from_secs(60))
+        .await?;
+    tracing::info!("federation-out shard ready");
+
     // Drive this node's shard groups toward the placement: as a group's
     // leader it admits new replicas; a joiner's freshly-started groups become
     // voters here. Each group is reconciled by exactly its own leader.
@@ -263,6 +282,10 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                 saltator_userserver::USER_SHARD.group(),
                 users.shard_handle().clone(),
             ),
+            saltator_cluster::LocalGroup::new(
+                saltator_fedout::FED_OUT_SHARD.group(),
+                fedout.shard_handle().clone(),
+            ),
         ],
         Duration::from_secs(2),
     );
@@ -271,7 +294,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // this binary's, the leader advances it through the log — but only
     // once every voter's binary confirms support (ClusterGate over the
     // internal Status RPC). Tasks exit once each shard is current.
-    for h in [rooms.shard_handle(), users.shard_handle()] {
+    for h in [
+        rooms.shard_handle(),
+        users.shard_handle(),
+        fedout.shard_handle(),
+    ] {
         saltator_shard::migrate::spawn_migration_supervisor(
             h.clone(),
             saltator_cluster::ClusterGate::new(h.clone(), cfg.node.id, schemas.clone()),

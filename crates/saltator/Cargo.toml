@@ -19,6 +19,7 @@ saltator-roomserver.workspace = true
 saltator-shard.workspace = true
 saltator-store.workspace = true
 saltator-userserver.workspace = true
+saltator-fedout.workspace = true
 
 ruma.workspace = true
 

@@ -15,6 +15,7 @@ saltator-shard = { path = "crates/saltator-shard" }
 saltator-store = { path = "crates/saltator-store" }
 saltator-roomserver = { path = "crates/saltator-roomserver" }
 saltator-userserver = { path = "crates/saltator-userserver" }
+saltator-fedout = { path = "crates/saltator-fedout" }
 saltator-cs-api = { path = "crates/saltator-cs-api" }
 saltator-federation = { path = "crates/saltator-federation" }
 saltator-media = { path = "crates/saltator-media" }

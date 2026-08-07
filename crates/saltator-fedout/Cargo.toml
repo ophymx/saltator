@@ -1,0 +1,20 @@
+[package]
+name = "saltator-fedout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+saltator-shard.workspace = true
+saltator-store.workspace = true
+
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+openraft.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
