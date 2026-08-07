@@ -165,7 +165,34 @@ basics. Synapse's admin API is the de-facto reference
 
 ---
 
+## Target layering (stated intention, 2026-08-06)
+
+Where the seam work converges. Not a big-bang: each PR steers by this
+map; logic moves when touched (the step-2 rule), new capability lands
+in its layer.
+
+- **Surface**: `cs-api` (client-server HTTP) and eventually
+  `federation-server` (server-server HTTP) — parse, call a service,
+  shape the response. Neither depends on the other.
+- **Domain/services**: e2ee (step 2's exemplar), delivery
+  (`saltator-fedout`, step 4), and eventually a rooms/membership
+  service. Domain crates define transport traits (`EventFetcher` is
+  the proven pattern); transport implements them; `main` wires.
+- **Transport**: `federation-client` (HTTP client, resolver, signing,
+  key fetch) — a leaf implementation, depended on via traits.
+- **State**: the shard app crates (one crate per keyspace, each
+  owning its `SCHEMA_VERSION` + migrations).
+
+Today's `saltator-federation` is server+client fused; it splits
+mechanically once cs-api's remaining direct uses thin out.
+
 ## Deferred / adjacent (not scheduled, don't lose)
+
+- **Remote-join orchestration seam**: candidate selection/failover
+  policy lives in cs-api `rooms.rs`, handshake mechanics + auth-closure
+  verification split between cs-api and federation `join_client` —
+  domain logic straddling two surface crates. The natural "step 2b"
+  when next forced into that code.
 
 - **raft-engine as the log store** (considered + parked 2026-08-06):
   the 3.5 split already captures the shared-WAL group-commit win at our

@@ -1,6 +1,6 @@
 # Design: federation-out shard (roadmap step 4)
 
-Status: DRAFT for review · 2026-08-06
+Status: ACCEPTED · 2026-08-06 (all four review calls resolved; drain mechanism refined in review)
 
 ## Problem
 
@@ -79,15 +79,28 @@ drain/ingest/drop pattern the framework was built for:
    writes go there from this binary onward.
 2. **User shard bumps to schema v2**: its migration drops
    `T_EDU_OUTBOX` (a range delete inside the migration apply).
-3. **Daemon orchestration between them**: on startup, before proposing
-   the user-shard migration, the leader drains any pre-v2 outbox rows
-   (read from user store → `EnqueueEdus` into fed-out → verify) — then
-   the v2 migration's drop is safe. The migration supervisor gains an
-   optional pre-step hook for exactly this (the design doc's
-   "daemon-level orchestration").
-4. The voter gate (already in code) holds the migration until every
-   node runs this binary — which also guarantees no old node is still
-   *writing* to the user-shard outbox when it drops.
+3. **Marker-coordinated drain** (refined in review — the original
+   pre-step sketch failed under split leadership, since the drain must
+   propose into fed-out while the migration must be proposed by the
+   user leader). Two leader-owned loops coordinate purely through
+   replicated state, exploiting that every node holds every shard's
+   applied state locally (cross-shard READS are free; writes are not):
+   - A drainer on the **fed-out leader** reads the user shard's outbox
+     from its local replica, enqueues rows into its own shard
+     (proposer == leader), and advances a durable *drained-up-to
+     marker* in fed-out state. Idempotent by marker; crash-resumable
+     anywhere; re-enqueue duplicates are absorbed by the at-least-once
+     dedupe riders.
+   - The **user-shard migration supervisor's gate** grows one local
+     read: propose v2 only when the local fed-out replica's marker
+     covers the user outbox's highest row.
+4. The freeze making this race-free: new binaries never write the
+   user-side outbox (the write path flips in the same release), and
+   the step-3 voter gate holds v2 until every voter runs the new
+   binary — so when v2 becomes proposable the old outbox is provably
+   frozen, the marker eventually covers it, and the drop loses
+   nothing. This two-loop replicated-state pattern is the reusable
+   template for future cross-shard moves.
 
 ### Testing / exit criteria
 
@@ -108,7 +121,17 @@ drain/ingest/drop pattern the framework was built for:
   test-only schema-bump knob for *timing* the kill inside the window
   stays deferred.)
 
-## Open for review (the contentious calls)
+## Decisions (resolved in review, 2026-08-06)
+
+All four calls below are AGREED, with decision 3 carrying three riders:
+to-device `message_id` dedupe on receive (bounded, time-horizoned),
+an inbound `(origin, txn_id)` response-replay cache, and a redelivery
+test asserting *exactly-once client visibility* (uniqueness, not
+presence). The receiver currently ignores both txn ids and message_id
+— at-least-once is only honest once those land, so they are in this
+step's scope.
+
+## The calls as reviewed
 
 1. **Delivery ownership consolidates on the fed-out leader** — room and
    user leaders stop sending; one worker owns all outbound. Rationale:
