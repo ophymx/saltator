@@ -167,6 +167,21 @@ basics. Synapse's admin API is the de-facto reference
 
 ## Deferred / adjacent (not scheduled, don't lose)
 
+- **raft-engine as the log store** (considered + parked 2026-08-06):
+  the 3.5 split already captures the shared-WAL group-commit win at our
+  group count; raft-engine's remaining edge is write-amp (append-once
+  vs LSM rewrite) and tombstone-free purge. Costs: rust-protobuf entry
+  envelope (no off-the-shelf openraft adapter), and a second storage
+  technology to operate forever. Adopt only on a trigger: (a) shard
+  count grows to where per-group write patterns dominate, (b) observed
+  log-scan degradation from DeleteRange tombstone debt (add a metric:
+  log-DB SST count / get_log_entries latency), or (c) real-deployment
+  write-amp/disk-wear concerns. Cheap intermediate if tombstones bite
+  first: periodic manual CompactRange over purged prefixes. Optional
+  1–2 day adapter spike would convert "believed compatible" (conflict
+  truncation as index-superseding appends) into "verified"; merge the
+  findings, not the code.
+
 - **JumpToDate leaves** (last implementable federation gap, conformance
   Group 2): federation `timestamp_to_event` fallback + topological
   equal-ts tie-break. 7 allowlisted leaves ratchet off when done.
