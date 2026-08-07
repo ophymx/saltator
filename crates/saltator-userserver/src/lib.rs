@@ -36,7 +36,12 @@ pub use types::{
 /// with clustering (M4).
 /// This binary's schema version for this shard app — bump together with
 /// a `migrate` arm (see docs/design-schema-migrations.md).
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (step 4): the outbound EDU outbox moved to the fed-out shard; the
+/// migration drops the orphaned `T_EDU_OUTBOX`. Gated in the daemon on
+/// the fed-out drain marker covering every remaining row
+/// (docs/design-federation-out.md §drain).
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 
@@ -449,6 +454,25 @@ impl UserServer {
     pub async fn record_key_change(&self, user_id: &str) -> Result<()> {
         self.expect_ok(&UserCommand::RecordKeyChange {
             user_id: user_id.to_owned(),
+        })
+        .await
+    }
+
+    /// Queue federation to-device messages with `(origin, message_id)`
+    /// dedupe: a redelivered EDU (the sender is at-least-once) drops
+    /// atomically inside apply, so clients never see duplicates — even
+    /// across our own restart, since the seen-set is replicated state.
+    pub async fn send_to_device_deduped(
+        &self,
+        origin: &str,
+        message_id: &str,
+        messages: Vec<ToDeviceMessage>,
+    ) -> Result<()> {
+        self.expect_ok(&UserCommand::SendToDeviceDeduped {
+            origin: origin.to_owned(),
+            message_id: message_id.to_owned(),
+            ts_ms: now_ms(),
+            messages,
         })
         .await
     }

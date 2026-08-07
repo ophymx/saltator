@@ -12,7 +12,7 @@ use serde_json::json;
 
 use saltator_cluster::network::GrpcRaftNetworkFactory;
 use saltator_cluster::{serve_internal, MetadataHandle};
-use saltator_federation::{spawn_sender, FederationClient};
+use saltator_federation::{spawn_delivery_worker, FederationClient};
 use saltator_roomserver::{Outcome, RoomServer, ServerSigner, ROOM_SHARD};
 use saltator_shard::ShardRegistry;
 use saltator_store::RocksEngine;
@@ -108,13 +108,13 @@ async fn only_the_shard_leader_delivers_outbound() {
         .await
         .unwrap();
     m1.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let rooms1 = start_room(1, e1, s1.clone(), &reg1, Some(addr1.to_string())).await;
+    let rooms1 = start_room(1, e1.clone(), s1.clone(), &reg1, Some(addr1.to_string())).await;
     rooms1
         .shard_handle()
         .wait_for_leader(Duration::from_secs(10))
         .await
         .unwrap();
-    spawn_serve(m1.clone(), reg1, addr1);
+    spawn_serve(m1.clone(), reg1.clone(), addr1);
 
     // --- Node 2: metadata + an uninitialized Room/0 (follower) ---
     let e2 = Arc::new(RocksEngine::open(&dir.path().join("n2")).unwrap());
@@ -123,8 +123,8 @@ async fn only_the_shard_leader_delivers_outbound() {
         .await
         .unwrap();
     m2.wait_for_leader(Duration::from_secs(10)).await.unwrap();
-    let rooms2 = start_room(2, e2, s2.clone(), &reg2, None).await;
-    spawn_serve(m2.clone(), reg2, addr2);
+    let rooms2 = start_room(2, e2.clone(), s2.clone(), &reg2, None).await;
+    spawn_serve(m2.clone(), reg2.clone(), addr2);
 
     // Fold node 2 into the room shard as a voter (what the reconciler does
     // in the real binary).
@@ -149,6 +149,53 @@ async fn only_the_shard_leader_delivers_outbound() {
     assert!(
         rooms1.shard_handle().is_leader(),
         "node 1 should lead the room"
+    );
+
+    // --- A 2-node fed-out shard mirroring the room group: delivery is
+    // gated on ITS leadership (step 4) ---
+    let fedout1 = saltator_fedout::FedOutServer::start(
+        1,
+        e1.clone(),
+        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_fedout::FED_OUT_SHARD),
+        Some(addr1.to_string()),
+        Some(&reg1),
+    )
+    .await
+    .unwrap();
+    fedout1
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    let fedout2 = saltator_fedout::FedOutServer::start(
+        2,
+        e2.clone(),
+        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_fedout::FED_OUT_SHARD),
+        None,
+        Some(&reg2),
+    )
+    .await
+    .unwrap();
+    fedout1
+        .shard_handle()
+        .add_learner(2, addr2.to_string())
+        .await
+        .unwrap();
+    fedout1
+        .shard_handle()
+        .set_voters([1, 2].into_iter().collect())
+        .await
+        .unwrap();
+    assert!(
+        eventually(Duration::from_secs(10), || fedout2
+            .shard_handle()
+            .voter_ids()
+            == [1, 2].into_iter().collect())
+        .await,
+        "node 2 never joined the fed-out shard"
+    );
+    assert!(
+        fedout1.shard_handle().is_leader(),
+        "node 1 should lead fed-out"
     );
 
     // --- A public room with a remote member ---
@@ -200,8 +247,9 @@ async fn only_the_shard_leader_delivers_outbound() {
     let base = mock_remote(count.clone()).await;
     let c1 = Arc::new(FederationClient::with_base_url(s1.clone(), base.clone()));
     let c2 = Arc::new(FederationClient::with_base_url(s2.clone(), base));
-    let send1 = spawn_sender(rooms1.clone(), c1, us.clone());
-    let send2 = spawn_sender(rooms2.clone(), c2, us.clone());
+    let bo = || Arc::new(saltator_federation::DeliveryBackoff::default());
+    let send1 = spawn_delivery_worker(fedout1.clone(), rooms1.clone(), c1, us.clone(), bo());
+    let send2 = spawn_delivery_worker(fedout2.clone(), rooms2.clone(), c2, us.clone(), bo());
 
     // Give both senders a moment to reach the current tip (they start there,
     // so the pre-existing setup events are not re-sent).
@@ -235,4 +283,5 @@ async fn only_the_shard_leader_delivers_outbound() {
 
     send1.abort();
     send2.abort();
+    let _ = (fedout1, fedout2);
 }

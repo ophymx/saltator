@@ -2956,6 +2956,7 @@ dependencies = [
  "saltator-core",
  "saltator-cs-api",
  "saltator-federation",
+ "saltator-fedout",
  "saltator-media",
  "saltator-roomserver",
  "saltator-shard",
@@ -3017,6 +3018,7 @@ dependencies = [
  "ruma",
  "saltator-core",
  "saltator-federation",
+ "saltator-fedout",
  "saltator-media",
  "saltator-roomserver",
  "saltator-shard",
@@ -3045,6 +3047,7 @@ dependencies = [
  "ruma",
  "rustls",
  "saltator-core",
+ "saltator-fedout",
  "saltator-media",
  "saltator-roomserver",
  "saltator-shard",
@@ -3053,6 +3056,21 @@ dependencies = [
  "saltator-userserver",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "saltator-fedout"
+version = "0.0.1"
+dependencies = [
+ "openraft",
+ "postcard",
+ "saltator-shard",
+ "saltator-store",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

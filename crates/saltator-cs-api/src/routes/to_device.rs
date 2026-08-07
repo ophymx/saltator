@@ -11,6 +11,7 @@ use axum::extract::State;
 use ruma::api::client::to_device::send_event_to_device;
 use ruma::to_device::DeviceIdOrAllDevices;
 
+use saltator_fedout::OutboundEdu;
 use saltator_userserver::ToDeviceMessage;
 
 use crate::error::ApiError;
@@ -75,7 +76,7 @@ pub async fn send_to_device(
     // durable outbox — awaited, so our 200 OK means the message is on
     // disk and will be retried until the destination takes it (the spec
     // gives to-device no receiver-side recovery path).
-    let entries: Vec<saltator_userserver::OutboundEdu> = remote
+    let entries: Vec<OutboundEdu> = remote
         .into_iter()
         .filter_map(|(dest, msgs)| {
             let edu = serde_json::json!({
@@ -83,17 +84,35 @@ pub async fn send_to_device(
                 "content": {
                     "sender": auth.user_id.as_str(),
                     "type": req.event_type.to_string(),
-                    "message_id": req.txn_id.as_str(),
+                    // Unique per ORIGIN SERVER (spec) — the receiver
+                    // dedupes on (origin, message_id), so a bare client
+                    // txn id would collide across senders (every client
+                    // starts its counter at the same place). Scoping by
+                    // sender keeps it deterministic: a client retry of
+                    // the same txn maps to the same message_id, and the
+                    // EDU baked into the outbox is stable across
+                    // delivery retries.
+                    "message_id": format!("{}/{}", auth.user_id, req.txn_id),
                     "messages": msgs,
                 },
             });
-            Some(saltator_userserver::OutboundEdu {
+            Some(OutboundEdu {
                 destination: dest,
                 json: serde_json::to_vec(&edu).ok()?,
             })
         })
         .collect();
-    state.users.queue_outbound_edus(entries).await?;
+    match &state.fedout {
+        Some(fedout) => fedout
+            .enqueue_edus(entries)
+            .await
+            .map_err(crate::error::ApiError::internal)?,
+        None => {
+            if !entries.is_empty() {
+                tracing::warn!("no fed-out shard wired; dropping remote to-device EDUs");
+            }
+        }
+    }
 
     state.txns.mark(
         auth.user_id.as_str(),

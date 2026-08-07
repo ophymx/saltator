@@ -60,6 +60,10 @@ pub struct CsConfig {
 pub struct CsState {
     pub users: Arc<UserServer>,
     pub rooms: Arc<RoomServer>,
+    /// The federation-out shard: durable home of outbound EDUs (step 4).
+    /// `None` in stacks without delivery (most tests): enqueues are
+    /// dropped with a warning — nothing outbound exists to deliver them.
+    pub fedout: Option<Arc<saltator_fedout::FedOutServer>>,
     pub media: MediaStore,
     pub config: CsConfig,
     /// Ephemeral typing state — shared with the federation surface, which
@@ -118,11 +122,23 @@ impl saltator_federation::EduSink for EphemeralEduSink {
 }
 
 impl CsState {
+    /// Attach the federation-out shard for durable outbound EDUs.
+    pub fn with_fedout(
+        mut self: Arc<Self>,
+        fedout: Arc<saltator_fedout::FedOutServer>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("with_fedout called on a shared CsState")
+            .fedout = Some(fedout);
+        self
+    }
+
     /// The E2EE/device-list domain service over this state's shards.
     pub(crate) fn e2ee(&self) -> services::e2ee::E2ee<'_> {
         services::e2ee::E2ee {
             users: &self.users,
             rooms: &self.rooms,
+            fedout: self.fedout.as_ref(),
             server_name: self.config.server_name.as_str(),
         }
     }
@@ -141,6 +157,7 @@ impl CsState {
             typing: Arc::new(TypingMap::new()),
             presence: Arc::new(PresenceMap::new()),
             federation: None,
+            fedout: None,
             txns: txn::TxnCache::new(),
             push_rule_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             rate_limiter: ratelimit::RateLimiter::new(),

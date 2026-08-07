@@ -136,7 +136,17 @@ log purge. Node-local format change — free pre-deployment (like the
 step-3 table shift), costly after. Lands before step 4 so the new
 delivery shard is born onto the split layout.
 
-## Step 4 ☐ — Federation-out shard (durable delivery ownership)
+## Step 4 ☑ — Federation-out shard (durable delivery ownership)
+
+DONE (fed-out-shard branch, five parts): the `saltator-fedout` crate
+(cursors/outbox/marker state machine); the unified delivery worker on
+fed-out leadership (restart-from-tip gap closed — proven by the
+resume-from-cursor exit test); the decision-3 receiver dedupe riders
+(durable to-device message_id dedupe, txn replay cache, uniqueness
+tests); and the marker-coordinated drain + user shard v2 — the schema
+framework's first shipped migration and the cross-shard-move template.
+Deferred with rationale in the design doc: the 3-node kill -9 delivery
+assertion (needs a shell-driveable mock destination).
 
 **Problem, two halves.** (a) Delivery state is scattered: the EDU outbox
 lives in the *user* shard by convenience (it had a durable store), and
@@ -165,7 +175,49 @@ basics. Synapse's admin API is the de-facto reference
 
 ---
 
+## Target layering (stated intention, 2026-08-06)
+
+Where the seam work converges. Not a big-bang: each PR steers by this
+map; logic moves when touched (the step-2 rule), new capability lands
+in its layer.
+
+- **Surface**: `cs-api` (client-server HTTP) and eventually
+  `federation-server` (server-server HTTP) — parse, call a service,
+  shape the response. Neither depends on the other.
+- **Domain/services**: e2ee (step 2's exemplar), delivery
+  (`saltator-fedout`, step 4), and eventually a rooms/membership
+  service. Domain crates define transport traits (`EventFetcher` is
+  the proven pattern); transport implements them; `main` wires.
+- **Transport**: `federation-client` (HTTP client, resolver, signing,
+  key fetch) — a leaf implementation, depended on via traits.
+- **State**: the shard app crates (one crate per keyspace, each
+  owning its `SCHEMA_VERSION` + migrations).
+
+Today's `saltator-federation` is server+client fused; it splits
+mechanically once cs-api's remaining direct uses thin out.
+
 ## Deferred / adjacent (not scheduled, don't lose)
+
+- **Remote-join orchestration seam**: candidate selection/failover
+  policy lives in cs-api `rooms.rs`, handshake mechanics + auth-closure
+  verification split between cs-api and federation `join_client` —
+  domain logic straddling two surface crates. The natural "step 2b"
+  when next forced into that code.
+
+- **raft-engine as the log store** (considered + parked 2026-08-06):
+  the 3.5 split already captures the shared-WAL group-commit win at our
+  group count; raft-engine's remaining edge is write-amp (append-once
+  vs LSM rewrite) and tombstone-free purge. Costs: rust-protobuf entry
+  envelope (no off-the-shelf openraft adapter), and a second storage
+  technology to operate forever. Adopt only on a trigger: (a) shard
+  count grows to where per-group write patterns dominate, (b) observed
+  log-scan degradation from DeleteRange tombstone debt (add a metric:
+  log-DB SST count / get_log_entries latency), or (c) real-deployment
+  write-amp/disk-wear concerns. Cheap intermediate if tombstones bite
+  first: periodic manual CompactRange over purged prefixes. Optional
+  1–2 day adapter spike would convert "believed compatible" (conflict
+  truncation as index-superseding appends) into "verified"; merge the
+  findings, not the code.
 
 - **JumpToDate leaves** (last implementable federation gap, conformance
   Group 2): federation `timestamp_to_event` fallback + topological

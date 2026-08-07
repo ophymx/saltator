@@ -161,6 +161,10 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             saltator_store::Keyspace::User as u32,
             saltator_userserver::SCHEMA_VERSION,
         ),
+        (
+            saltator_store::Keyspace::FedOut as u32,
+            saltator_fedout::SCHEMA_VERSION,
+        ),
     ];
 
     // Serve the internal gRPC surface now (a joiner needs it to receive
@@ -219,6 +223,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // voter once the leader has caught it up. The wait therefore tolerates a
     // reconciliation round or two on a joining node.
     let shard_bootstrap = founding.then(|| cfg.node.advertise.clone());
+    let shard_bootstrap_fedout = shard_bootstrap.clone();
     let rooms = saltator_roomserver::RoomServer::start(
         cfg.node.id,
         stores.clone(),
@@ -249,6 +254,20 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         .await?;
     tracing::info!("user shard ready");
 
+    let fedout = saltator_fedout::FedOutServer::start(
+        cfg.node.id,
+        stores.clone(),
+        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_fedout::FED_OUT_SHARD),
+        shard_bootstrap_fedout,
+        Some(&registry),
+    )
+    .await?;
+    fedout
+        .shard_handle()
+        .wait_for_leader(Duration::from_secs(60))
+        .await?;
+    tracing::info!("federation-out shard ready");
+
     // Drive this node's shard groups toward the placement: as a group's
     // leader it admits new replicas; a joiner's freshly-started groups become
     // voters here. Each group is reconciled by exactly its own leader.
@@ -263,20 +282,44 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                 saltator_userserver::USER_SHARD.group(),
                 users.shard_handle().clone(),
             ),
+            saltator_cluster::LocalGroup::new(
+                saltator_fedout::FED_OUT_SHARD.group(),
+                fedout.shard_handle().clone(),
+            ),
         ],
         Duration::from_secs(2),
     );
 
+    // The user-outbox drain (step 4 cross-shard move): the fed-out
+    // leader copies legacy rows into its own shard and advances the
+    // durable marker; exits once the marker covers the tail.
+    saltator_federation::spawn_user_outbox_drain(users.clone(), fedout.clone());
+
     // Schema-migration supervisors: when a shard's stored schema trails
     // this binary's, the leader advances it through the log — but only
     // once every voter's binary confirms support (ClusterGate over the
-    // internal Status RPC). Tasks exit once each shard is current.
-    for h in [rooms.shard_handle(), users.shard_handle()] {
+    // internal Status RPC). Tasks exit once each shard is current. The
+    // USER shard's v2 step carries an extra precondition: the fed-out
+    // drain marker must cover its outbox tail (the marker-coordinated
+    // cross-shard move; docs/design-federation-out.md §drain).
+    for h in [rooms.shard_handle(), fedout.shard_handle()] {
         saltator_shard::migrate::spawn_migration_supervisor(
             h.clone(),
             saltator_cluster::ClusterGate::new(h.clone(), cfg.node.id, schemas.clone()),
         );
     }
+    saltator_shard::migrate::spawn_migration_supervisor(
+        users.shard_handle().clone(),
+        UserMigrationGate {
+            cluster: saltator_cluster::ClusterGate::new(
+                users.shard_handle().clone(),
+                cfg.node.id,
+                schemas.clone(),
+            ),
+            users: users.clone(),
+            fedout: fedout.clone(),
+        },
+    );
 
     let projection = saltator_userserver::spawn_membership_projection(users.clone(), rooms.clone());
 
@@ -328,7 +371,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             allow_internal_fetch: cfg.client.allow_internal_fetch,
         },
     )
-    .with_federation(fed_client.clone(), signer.clone(), key_cache.clone());
+    .with_federation(fed_client.clone(), signer.clone(), key_cache.clone())
+    .with_fedout(fedout.clone());
     // Typing/presence maps are shared with the federation surface (inbound
     // EDUs update them).
     let cs_typing = cs_state.typing_map();
@@ -343,6 +387,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         cs_typing.clone(),
         cs_presence.clone(),
     ));
+    let delivery_backoff = Arc::new(saltator_federation::DeliveryBackoff::default());
     let fed_state = Arc::new(saltator_federation::FedState {
         server_name: server_name.clone(),
         signer: signer.clone(),
@@ -353,6 +398,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         client: Some(fed_client.clone()),
         edu_sink: Some(edu_sink),
         media: Some(fed_media),
+        delivery_backoff: Some(delivery_backoff.clone()),
+        txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let fed_router = saltator_federation::router(fed_state);
     // Federation is served over HTTPS when a cert is configured; otherwise
@@ -373,15 +420,16 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         "federation API listening",
     );
 
-    // Outbound federation: forward locally originated events to remote
-    // servers sharing each room.
-    let fed_sender =
-        saltator_federation::spawn_sender(rooms.clone(), fed_client.clone(), server_name.clone());
-    // Durable EDU outbox drainer: to-device messages and device-list
-    // updates retry until the destination takes them, resuming from disk
-    // after a restart.
-    let edu_sender =
-        saltator_federation::spawn_edu_sender(users.clone(), fed_client, server_name.clone());
+    // Outbound federation: the unified delivery worker (step 4) owns all
+    // outbound — PDUs against durable per-destination cursors, EDUs from
+    // the fed-out outbox — gated on fed-out leadership.
+    let delivery = saltator_federation::spawn_delivery_worker(
+        fedout.clone(),
+        rooms.clone(),
+        fed_client,
+        server_name.clone(),
+        delivery_backoff.clone(),
+    );
 
     let mut cs_shutdown = shutdown_rx.clone();
     let cs_task = tokio::spawn(async move {
@@ -436,8 +484,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     internal_task.await??;
     cs_task.await??;
     fed_task.await??;
-    fed_sender.abort();
-    edu_sender.abort();
+    delivery.abort();
     push_delivery.abort();
     reconciler.abort();
     projection.abort();
@@ -446,4 +493,31 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     meta.shutdown().await?;
     tracing::info!("saltator stopped");
     Ok(())
+}
+
+/// The user shard's migration gate: the cluster-wide voter check plus
+/// the v2 precondition — the fed-out drain marker (read from the LOCAL
+/// replica; cross-shard reads are free) must cover the legacy outbox's
+/// tail before the drop step may be proposed.
+struct UserMigrationGate {
+    cluster: saltator_cluster::ClusterGate,
+    users: Arc<saltator_userserver::UserServer>,
+    fedout: Arc<saltator_fedout::FedOutServer>,
+}
+
+impl saltator_shard::migrate::MigrationGate for UserMigrationGate {
+    async fn voters_ready(&self, shard: saltator_shard::ShardId, target: u32) -> bool {
+        if !self.cluster.voters_ready(shard, target).await {
+            return false;
+        }
+        if target == 2 {
+            let tail = self.users.store().edu_outbox_tail().unwrap_or(u64::MAX);
+            let marker = self.fedout.store().drain_marker().unwrap_or(0);
+            if marker < tail {
+                tracing::info!(tail, marker, "user v2 migration waiting on outbox drain");
+                return false;
+            }
+        }
+        true
+    }
 }

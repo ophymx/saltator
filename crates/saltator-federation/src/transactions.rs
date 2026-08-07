@@ -25,12 +25,23 @@ const MAX_EDUS: usize = 100;
 /// `PUT /_matrix/federation/v1/send/{txnId}`.
 pub async fn send_transaction(
     State(state): State<Arc<FedState>>,
-    Path(_txn_id): Path<String>,
+    Path(txn_id): Path<String>,
     auth: Authenticated,
 ) -> Result<axum::Json<serde_json::Value>, AuthRejection> {
     if state.rooms.is_none() {
         // No room server wired (key-only deployments/tests): nothing to do.
         return Ok(axum::Json(serde_json::json!({ "pdus": {} })));
+    }
+    // The origin just proved it is reachable: clear any delivery backoff
+    // so pending outbound to it retries immediately (Synapse parity).
+    if let Some(backoff) = &state.delivery_backoff {
+        backoff.mark_alive(&auth.origin);
+    }
+    // Transaction replay (spec "Transactions"): a repeated (origin,
+    // txn_id) — an at-least-once sender whose ack we lost — gets the
+    // stored response back without reprocessing.
+    if let Some(cached) = state.txn_replay.get(&auth.origin, &txn_id) {
+        return Ok(axum::Json(cached));
     }
 
     let body: serde_json::Value = auth.json()?;
@@ -116,7 +127,11 @@ pub async fn send_transaction(
         }
     }
 
-    Ok(axum::Json(serde_json::json!({ "pdus": results })))
+    let response = serde_json::json!({ "pdus": results });
+    state
+        .txn_replay
+        .put(&auth.origin, &txn_id, response.clone());
+    Ok(axum::Json(response))
 }
 
 /// Mark a remote user's device list changed (`m.device_list_update`).
@@ -211,7 +226,18 @@ async fn apply_to_device_edu(
             });
         }
     }
-    if let Err(e) = users.send_to_device(batch).await {
+    // Dedupe by the EDU's message_id (spec: receivers use it to drop
+    // redelivered EDUs — our sender is at-least-once, decision 3). An
+    // EDU without one falls back to the plain path.
+    let message_id = edu
+        .get("content")
+        .and_then(|c| c.get("message_id"))
+        .and_then(|v| v.as_str());
+    let result = match message_id {
+        Some(mid) => users.send_to_device_deduped(origin, mid, batch).await,
+        None => users.send_to_device(batch).await,
+    };
+    if let Err(e) = result {
         tracing::warn!(error = %e, origin, "to-device EDU apply failed");
     }
 }

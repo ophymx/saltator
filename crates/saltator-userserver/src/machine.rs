@@ -11,7 +11,8 @@ use crate::types::{
     TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS,
     T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS,
     T_DIRECTORY, T_EDU_OUTBOX, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
-    T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE,
+    T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN,
+    T_TO_DEVICE_SEEN_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -31,6 +32,26 @@ pub struct UserApp;
 impl ShardApp for UserApp {
     fn schema_version(&self) -> u32 {
         crate::SCHEMA_VERSION
+    }
+
+    fn migrate(&self, ctx: &mut ApplyCtx<'_>, to: u32) -> StoreResult<()> {
+        match to {
+            // v2: the outbound EDU outbox lives in the fed-out shard now
+            // (docs/design-federation-out.md). Every remaining row here
+            // was drained (the daemon gates this step on the fed-out
+            // marker covering the tail), so the drop loses nothing. New
+            // binaries never wrote here, and the voter gate guarantees no
+            // old binary remains.
+            2 => {
+                for (k, _) in ctx.range(T_EDU_OUTBOX, &[], &[])? {
+                    ctx.delete(T_EDU_OUTBOX, &k);
+                }
+                Ok(())
+            }
+            other => Err(StoreError::Engine(format!(
+                "no migration registered for user schema step v{other}"
+            ))),
+        }
     }
 
     fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>> {
@@ -820,38 +841,34 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             Ok(UserResponse::Ok)
         }
         UserCommand::SendToDevice { messages } => {
-            for m in messages {
-                // `"*"` fans out to every registered device; an explicit
-                // device must exist (a row nobody will ever drain is
-                // dropped, per spec).
-                let device_ids: Vec<String> = if m.device_id == "*" {
-                    let start = user_key(&m.user_id, "");
-                    ctx.range(T_DEVICE, &start, &user_end(&m.user_id))?
-                        .into_iter()
-                        .map(|(k, _)| String::from_utf8_lossy(&k[start.len()..]).into_owned())
-                        .collect()
-                } else if ctx
-                    .get(T_DEVICE, &user_key(&m.user_id, &m.device_id))?
-                    .is_some()
-                {
-                    vec![m.device_id.clone()]
-                } else {
-                    Vec::new()
-                };
-                if device_ids.is_empty() {
-                    continue;
-                }
-                // One emit per message: the seq both wakes the recipient's
-                // sync and keys the inbox rows (unique per message).
-                let seq = emit_user_change(ctx, &m.user_id)?;
-                for device_id in device_ids {
-                    ctx.put(
-                        T_TO_DEVICE,
-                        &to_device_key(&m.user_id, &device_id, seq),
-                        m.json.clone(),
-                    );
+            queue_to_device(ctx, messages)?;
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::SendToDeviceDeduped {
+            origin,
+            message_id,
+            ts_ms,
+            messages,
+        } => {
+            let seen_key = user_key(origin, message_id);
+            if ctx.get(T_TO_DEVICE_SEEN, &seen_key)?.is_some() {
+                // A redelivered EDU (at-least-once sender): drop whole.
+                return Ok(UserResponse::Ok);
+            }
+            ctx.put(T_TO_DEVICE_SEEN, &seen_key, enc("seen encode", ts_ms)?);
+            let mut idx_key = ts_ms.to_be_bytes().to_vec();
+            idx_key.extend_from_slice(&seen_key);
+            ctx.put(T_TO_DEVICE_SEEN_IDX, &idx_key, Vec::new());
+            // Horizon prune, deterministic off the command's own ts: a
+            // range scan of the time index older than the horizon.
+            let cutoff = ts_ms.saturating_sub(TO_DEVICE_SEEN_HORIZON_MS);
+            for (k, _) in ctx.range(T_TO_DEVICE_SEEN_IDX, &[], &cutoff.to_be_bytes())? {
+                ctx.delete(T_TO_DEVICE_SEEN_IDX, &k);
+                if k.len() > 8 {
+                    ctx.delete(T_TO_DEVICE_SEEN, &k[8..]);
                 }
             }
+            queue_to_device(ctx, messages)?;
             Ok(UserResponse::Ok)
         }
         UserCommand::RecordKeyChange { user_id } => {
@@ -1095,6 +1112,48 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
     }
 }
 
+/// Dedupe horizon for federation to-device `message_id`s: senders retry
+/// on second-scale backoff, so duplicates arrive promptly; an hour is
+/// generous while keeping the seen-set bounded.
+const TO_DEVICE_SEEN_HORIZON_MS: u64 = 60 * 60 * 1000;
+
+/// Queue to-device messages into recipients' durable inboxes (shared by
+/// the local and federation-deduped commands).
+fn queue_to_device(ctx: &mut ApplyCtx<'_>, messages: &[crate::ToDeviceMessage]) -> StoreResult<()> {
+    for m in messages {
+        // `"*"` fans out to every registered device; an explicit device
+        // must exist (a row nobody will ever drain is dropped, per spec).
+        let device_ids: Vec<String> = if m.device_id == "*" {
+            let start = user_key(&m.user_id, "");
+            ctx.range(T_DEVICE, &start, &user_end(&m.user_id))?
+                .into_iter()
+                .map(|(k, _)| String::from_utf8_lossy(&k[start.len()..]).into_owned())
+                .collect()
+        } else if ctx
+            .get(T_DEVICE, &user_key(&m.user_id, &m.device_id))?
+            .is_some()
+        {
+            vec![m.device_id.clone()]
+        } else {
+            Vec::new()
+        };
+        if device_ids.is_empty() {
+            continue;
+        }
+        // One emit per message: the seq both wakes the recipient's sync
+        // and keys the inbox rows (unique per message).
+        let seq = emit_user_change(ctx, &m.user_id)?;
+        for device_id in device_ids {
+            ctx.put(
+                T_TO_DEVICE,
+                &to_device_key(&m.user_id, &device_id, seq),
+                m.json.clone(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn emit_user_change(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<u64> {
     Ok(ctx.emit(enc(
         "user change encode",
@@ -1229,6 +1288,19 @@ impl UserStore {
             }
         }
         Ok(out)
+    }
+
+    /// The highest outbox row seq (0 = empty) — the drain gate's target:
+    /// the fed-out marker must cover this before the v2 drop.
+    pub fn edu_outbox_tail(&self) -> StoreResult<u64> {
+        let mut max = 0u64;
+        for (k, _) in self.read.range(T_EDU_OUTBOX, &[], &[])? {
+            if k.len() >= 8 {
+                let seq = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap_or([0; 8]));
+                max = max.max(seq);
+            }
+        }
+        Ok(max)
     }
 
     /// Pending outbox EDUs for a destination, oldest first: `(seq, EDU

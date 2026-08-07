@@ -3,8 +3,9 @@
 //! request authentication.
 
 mod backfill;
+mod delivery;
 mod directory;
-mod edu_sender;
+mod drain;
 mod fetcher;
 mod hierarchy;
 mod http_client;
@@ -16,15 +17,15 @@ mod media;
 mod outbound;
 mod query;
 mod resolver;
-mod sender;
 pub mod ssrf;
 mod transactions;
 mod user_keys;
 mod xmatrix;
 
 pub use backfill::fetch_backfill;
+pub use delivery::{spawn_delivery_worker, DeliveryBackoff};
 pub use directory::directory_body;
-pub use edu_sender::spawn_edu_sender;
+pub use drain::{drain_user_outbox_once, spawn_user_outbox_drain};
 pub use http_client::build_http_client;
 pub use inbound::{AuthRejection, Authenticated};
 pub use join_client::{
@@ -35,7 +36,6 @@ pub use keys::{trust_event_servers, KeyCache, KeyError};
 pub use media::parse_multipart_file;
 pub use outbound::{FederationClient, OutboundError};
 pub use resolver::{ResolvedServer, ServerResolver};
-pub use sender::spawn_sender;
 pub use xmatrix::{
     parse_authorization, sign_request, signing_object, verify_request, AuthError, AuthParams,
 };
@@ -102,6 +102,54 @@ pub struct FedState {
     /// Local blob store, for serving our media to other servers. `None`
     /// disables the federation media endpoint.
     pub media: Option<saltator_media::MediaStore>,
+    /// Shared delivery-backoff registry: inbound authenticated traffic
+    /// clears a destination's penalty (it is provably up). `None` when no
+    /// delivery worker runs.
+    pub delivery_backoff: Option<Arc<crate::delivery::DeliveryBackoff>>,
+    /// Replay cache for inbound transactions (spec "Transactions": a
+    /// repeated `(origin, txn_id)` gets the stored response without
+    /// reprocessing). In-memory and bounded: PDU ingest is idempotent by
+    /// event id and to-device dedupes by message_id durably, so this is
+    /// the fast-path courtesy layer, not the correctness layer.
+    pub txn_replay: TxnReplayCache,
+}
+
+/// Bounded FIFO replay cache for `(origin, txn_id) → response body`.
+#[derive(Default)]
+pub struct TxnReplayCache {
+    inner: std::sync::Mutex<TxnReplayInner>,
+}
+
+#[derive(Default)]
+struct TxnReplayInner {
+    map: std::collections::HashMap<(String, String), serde_json::Value>,
+    order: std::collections::VecDeque<(String, String)>,
+}
+
+impl TxnReplayCache {
+    const CAP: usize = 1024;
+
+    pub fn get(&self, origin: &str, txn_id: &str) -> Option<serde_json::Value> {
+        self.inner
+            .lock()
+            .expect("txn replay lock")
+            .map
+            .get(&(origin.to_owned(), txn_id.to_owned()))
+            .cloned()
+    }
+
+    pub fn put(&self, origin: &str, txn_id: &str, response: serde_json::Value) {
+        let mut inner = self.inner.lock().expect("txn replay lock");
+        let key = (origin.to_owned(), txn_id.to_owned());
+        if inner.map.insert(key.clone(), response).is_none() {
+            inner.order.push_back(key);
+            if inner.order.len() > Self::CAP {
+                if let Some(old) = inner.order.pop_front() {
+                    inner.map.remove(&old);
+                }
+            }
+        }
+    }
 }
 
 impl FedState {
@@ -121,6 +169,8 @@ impl FedState {
             client: None,
             edu_sink: None,
             media: None,
+            delivery_backoff: None,
+            txn_replay: TxnReplayCache::default(),
         }
     }
 
