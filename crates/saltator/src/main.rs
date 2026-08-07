@@ -131,6 +131,24 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     )
     .await?;
 
+    // This binary's app schema versions per keyspace: reported over the
+    // internal Status RPC (the migration gate) and used by our own
+    // supervisors below.
+    let schemas = vec![
+        (
+            saltator_store::Keyspace::Meta as u32,
+            saltator_cluster::META_SCHEMA_VERSION,
+        ),
+        (
+            saltator_store::Keyspace::Room as u32,
+            saltator_roomserver::SCHEMA_VERSION,
+        ),
+        (
+            saltator_store::Keyspace::User as u32,
+            saltator_userserver::SCHEMA_VERSION,
+        ),
+    ];
+
     // Serve the internal gRPC surface now (a joiner needs it to receive
     // replication; every node needs it for cross-node Raft traffic).
     let internal_task = {
@@ -139,6 +157,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             meta.clone(),
             registry.clone(),
             cfg.server_name.clone(),
+            schemas.clone(),
             cfg.listeners.internal,
             async move {
                 let _ = rx.wait_for(|stop| *stop).await;
@@ -233,6 +252,17 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         ],
         Duration::from_secs(2),
     );
+
+    // Schema-migration supervisors: when a shard's stored schema trails
+    // this binary's, the leader advances it through the log — but only
+    // once every voter's binary confirms support (ClusterGate over the
+    // internal Status RPC). Tasks exit once each shard is current.
+    for h in [rooms.shard_handle(), users.shard_handle()] {
+        saltator_shard::migrate::spawn_migration_supervisor(
+            h.clone(),
+            saltator_cluster::ClusterGate::new(h.clone(), cfg.node.id, schemas.clone()),
+        );
+    }
 
     let projection = saltator_userserver::spawn_membership_projection(users.clone(), rooms.clone());
 

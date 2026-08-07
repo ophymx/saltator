@@ -19,14 +19,23 @@ pub struct InternalRpc {
     handle: MetadataHandle,
     registry: ShardRegistry,
     server_name: String,
+    /// This binary's app schema versions per keyspace discriminant,
+    /// reported in Status for the migration gate.
+    schemas: Vec<(u32, u32)>,
 }
 
 impl InternalRpc {
-    pub fn new(handle: MetadataHandle, registry: ShardRegistry, server_name: String) -> Self {
+    pub fn new(
+        handle: MetadataHandle,
+        registry: ShardRegistry,
+        server_name: String,
+        schemas: Vec<(u32, u32)>,
+    ) -> Self {
         Self {
             handle,
             registry,
             server_name,
+            schemas,
         }
     }
 
@@ -112,6 +121,14 @@ impl ControlService for InternalRpc {
             initialized: metrics.membership_config.membership().voter_ids().count() > 0,
             leader: metrics.current_leader,
             last_applied: metrics.last_applied.map(|l| l.index).unwrap_or(0),
+            schemas: self
+                .schemas
+                .iter()
+                .map(|(keyspace, schema_version)| crate::proto::ShardSchema {
+                    keyspace: *keyspace,
+                    schema_version: *schema_version,
+                })
+                .collect(),
         }))
     }
 

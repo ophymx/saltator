@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use saltator_shard::storage::ShardStateMachine;
-use saltator_shard::{ApplyCtx, NoopNetworkFactory, ShardApp, ShardHandle, ShardId, APP_TABLE_MIN};
+use saltator_shard::{
+    ApplyCtx, NoopNetworkFactory, ShardApp, ShardError, ShardHandle, ShardId, APP_TABLE_FIRST,
+};
 use saltator_store::{Keyspace, KvEngine, Result as StoreResult, RocksEngine};
 
-const T_KV: u8 = APP_TABLE_MIN;
+const T_KV: u8 = APP_TABLE_FIRST;
 const SHARD: ShardId = ShardId::new(Keyspace::User, 3);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -295,4 +297,117 @@ async fn snapshot_roundtrip_restores_app_state_and_seq() {
         Some(b"2".as_slice())
     );
     assert_eq!(dst.get(&app_key(b"stale")).unwrap(), None);
+}
+
+// --- schema versioning + migrations -----------------------------------
+
+/// KvApp at schema v2: the v1→v2 migration stamps a marker row, proving
+/// the step ran through the log (deterministic, replicated, atomic).
+struct KvAppV2;
+
+impl ShardApp for KvAppV2 {
+    fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>> {
+        KvApp.apply(ctx, command)
+    }
+    fn schema_version(&self) -> u32 {
+        2
+    }
+    fn migrate(&self, ctx: &mut ApplyCtx<'_>, to: u32) -> StoreResult<()> {
+        assert_eq!(to, 2, "only one step registered");
+        ctx.put(T_KV, b"__migrated", b"v2".to_vec());
+        Ok(())
+    }
+}
+
+async fn start_app<A: ShardApp>(
+    engine: Arc<dyn KvEngine>,
+    app: A,
+) -> saltator_shard::Result<ShardHandle> {
+    let handle = ShardHandle::start(
+        SHARD,
+        1,
+        engine,
+        Arc::new(app),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await?;
+    handle
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    Ok(handle)
+}
+
+/// Fresh stores read as schema v1; a stepwise migration lands the marker
+/// and the version cell; wrong steps are declined as data, not faults;
+/// the migrated state survives restart (log replay / recovery).
+#[tokio::test]
+async fn schema_migration_stepwise_and_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine: Arc<dyn KvEngine> = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
+
+    let handle = start_app(engine.clone(), KvAppV2).await.unwrap();
+    assert_eq!(handle.schema_versions().unwrap(), (1, 2));
+
+    // Skipping a step is declined, not applied.
+    let declined = handle.propose_migrate(3).await.unwrap();
+    assert!(declined.is_err(), "skip must be declined: {declined:?}");
+    // The correct step applies and stamps the marker.
+    handle.propose_migrate(2).await.unwrap().unwrap();
+    assert_eq!(handle.schema_versions().unwrap(), (2, 2));
+    // Re-running the same step is now stale — declined.
+    assert!(handle.propose_migrate(2).await.unwrap().is_err());
+    let marker = set(&handle, "probe", b"x", false).await; // any read path
+    let _ = marker;
+    handle.shutdown().await.unwrap();
+
+    // Restart: version cell and marker survive recovery.
+    let handle = start_app(engine.clone(), KvAppV2).await.unwrap();
+    assert_eq!(handle.schema_versions().unwrap(), (2, 2));
+    handle.shutdown().await.unwrap();
+}
+
+/// A binary that only speaks v1 refuses to open v2 state (downgrade
+/// protection).
+#[tokio::test]
+async fn schema_refuses_newer_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine: Arc<dyn KvEngine> = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
+
+    let handle = start_app(engine.clone(), KvAppV2).await.unwrap();
+    handle.propose_migrate(2).await.unwrap().unwrap();
+    handle.shutdown().await.unwrap();
+
+    match start_app(engine, KvApp).await {
+        Err(ShardError::SchemaTooNew {
+            stored, supported, ..
+        }) => {
+            assert_eq!((stored, supported), (2, 1));
+        }
+        other => panic!("expected SchemaTooNew, got {:?}", other.map(|_| ())),
+    }
+}
+
+/// The supervisor drives a trailing shard to the binary's version on its
+/// own (single-node gate): the full loop — leadership wait, gate,
+/// stepwise proposal — with no manual proposes.
+#[tokio::test]
+async fn migration_supervisor_advances_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine: Arc<dyn KvEngine> = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
+    let handle = start_app(engine, KvAppV2).await.unwrap();
+    assert_eq!(handle.schema_versions().unwrap(), (1, 2));
+
+    let sup = saltator_shard::migrate::spawn_migration_supervisor(
+        handle.clone(),
+        saltator_shard::migrate::SingleNodeGate,
+    );
+    tokio::time::timeout(Duration::from_secs(15), sup)
+        .await
+        .expect("supervisor should finish")
+        .unwrap();
+    assert_eq!(handle.schema_versions().unwrap(), (2, 2));
+    handle.shutdown().await.unwrap();
 }

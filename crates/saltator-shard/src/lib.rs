@@ -15,6 +15,7 @@
 
 pub mod app;
 pub mod handle;
+pub mod migrate;
 pub mod registry;
 pub mod storage;
 
@@ -23,7 +24,7 @@ use std::io::Cursor; // used by declare_raft_types! default SnapshotData
 
 use saltator_store::Keyspace;
 
-pub use app::{ApplyCtx, ReadCtx, ShardApp, APP_TABLE_MIN};
+pub use app::{ApplyCtx, ReadCtx, ShardApp, APP_TABLE_FIRST, APP_TABLE_MIN, T_SCHEMA};
 pub use handle::{ChangeRecord, NoopNetworkFactory, ShardHandle};
 pub use registry::ShardRegistry;
 
@@ -83,6 +84,14 @@ pub enum ShardError {
     Storage(String),
     #[error("codec error: {0}")]
     Codec(String),
+    /// The on-disk state was written by a newer schema than this binary
+    /// speaks — refusing to serve it (downgrade protection).
+    #[error("shard {shard}: stored schema v{stored} is newer than supported v{supported}; upgrade the binary")]
+    SchemaTooNew {
+        shard: ShardId,
+        stored: u32,
+        supported: u32,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ShardError>;

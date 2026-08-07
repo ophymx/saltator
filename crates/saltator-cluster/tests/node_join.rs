@@ -29,6 +29,7 @@ fn spawn_serve(
         meta,
         registry,
         "example.org".into(),
+        vec![],
         addr,
         async {
             let _ = stop_rx.await;

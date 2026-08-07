@@ -94,7 +94,15 @@ when touched.*
 `join_with_body` and the routes call one-liners. Success metric over
 time: new tests land at service level instead of growing the monolith.
 
-## Step 3 ☐ — Versioned data schema + migration story
+## Step 3 ☑ — Versioned data schema + migration story
+
+DONE: design in docs/design-schema-migrations.md (accepted + built the
+same day). Per-shard version cell at T_SCHEMA=APP_TABLE_MIN (apps now
+allocate from APP_TABLE_FIRST); migrations run through the Raft log as
+runtime commands (stepwise, atomic, decline-not-wedge); refuse-newer on
+open; the all-voters-upgraded gate enforced in code over the internal
+Status RPC (ClusterGate; SingleNodeGate for no-network deployments);
+supervisors wired in the daemon per shard.
 
 **Why it jumps ahead of Step 4.** Step 4 moves durable state *between
 shards* (the EDU outbox) — exactly the operation a migration framework

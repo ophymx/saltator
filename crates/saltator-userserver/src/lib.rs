@@ -34,6 +34,10 @@ pub use types::{
 
 /// M2 runs a single user shard; the fixed shard count and placement land
 /// with clustering (M4).
+/// This binary's schema version for this shard app — bump together with
+/// a `migrate` arm (see docs/design-schema-migrations.md).
+pub const SCHEMA_VERSION: u32 = 1;
+
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 
 /// Access tokens issued alongside a refresh token expire after this long.

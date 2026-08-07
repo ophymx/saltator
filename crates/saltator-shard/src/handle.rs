@@ -43,6 +43,8 @@ pub struct ShardHandle {
     raft: Raft<TypeConfig>,
     engine: Arc<dyn KvEngine>,
     changes: broadcast::Sender<ChangeRecord>,
+    /// The app's declared schema version (the layout this binary speaks).
+    app_schema_version: u32,
 }
 
 impl ShardHandle {
@@ -73,6 +75,20 @@ impl ShardHandle {
         };
         let config = Arc::new(config.validate().map_err(raft_err)?);
 
+        // Downgrade protection: state written by a newer schema must
+        // never be reinterpreted by this binary (see
+        // docs/design-schema-migrations.md).
+        let app_schema_version = app.schema_version();
+        let stored = crate::storage::stored_schema_version(&*engine, shard)
+            .map_err(|e| ShardError::Storage(e.to_string()))?;
+        if stored > app_schema_version {
+            return Err(ShardError::SchemaTooNew {
+                shard,
+                stored,
+                supported: app_schema_version,
+            });
+        }
+
         let (changes, _) = broadcast::channel(CHANGE_STREAM_CAPACITY);
         let log_store = ShardLogStore::new(shard, engine.clone());
         let sm = ShardStateMachine::new(shard, engine.clone(), app, changes.clone());
@@ -91,6 +107,7 @@ impl ShardHandle {
             raft,
             engine,
             changes,
+            app_schema_version,
         };
 
         if !handle.is_initialized().await? {
@@ -177,6 +194,18 @@ impl ShardHandle {
     }
 
     /// Whether this node currently believes itself to be the leader.
+    /// Current voters and their advertised addresses, from the applied
+    /// membership. The migration gate probes these before proposing.
+    pub fn voters(&self) -> Vec<(NodeId, String)> {
+        let metrics = self.raft.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership().clone();
+        membership
+            .nodes()
+            .filter(|(id, _)| membership.voter_ids().any(|v| v == **id))
+            .map(|(id, node)| (*id, node.addr.clone()))
+            .collect()
+    }
+
     pub fn is_leader(&self) -> bool {
         self.current_leader() == Some(self.node_id)
     }
@@ -194,6 +223,35 @@ impl ShardHandle {
 
     /// Propose a command through the shard's Raft group and return the
     /// app's response bytes. Linearizable.
+    /// `(stored, code)` schema versions: what the applied state is in vs
+    /// what this binary speaks. `stored < code` means a migration is due.
+    pub fn schema_versions(&self) -> Result<(u32, u32)> {
+        Ok((
+            crate::storage::stored_schema_version(&*self.engine, self.shard)
+                .map_err(|e| ShardError::Storage(e.to_string()))?,
+            self.app_schema_version,
+        ))
+    }
+
+    /// Propose one schema-migration step (`to` must be stored + 1).
+    /// `Ok(Ok(()))` = migrated; `Ok(Err(reason))` = declined by the state
+    /// machine (stale step, unknown migration) — safe to re-evaluate and
+    /// retry; `Err` = Raft/storage failure.
+    pub async fn propose_migrate(&self, to: u32) -> Result<std::result::Result<(), String>> {
+        let mut cmd = vec![crate::storage::RUNTIME_CMD_PREFIX];
+        cmd.extend(
+            postcard::to_stdvec(&crate::storage::RuntimeCommand::Migrate { to })
+                .map_err(|e| ShardError::Codec(e.to_string()))?,
+        );
+        let resp = self.propose(cmd).await?;
+        match postcard::from_bytes::<crate::storage::RuntimeResponse>(&resp)
+            .map_err(|e| ShardError::Codec(e.to_string()))?
+        {
+            crate::storage::RuntimeResponse::Ok => Ok(Ok(())),
+            crate::storage::RuntimeResponse::Rejected(reason) => Ok(Err(reason)),
+        }
+    }
+
     pub async fn propose(&self, command: Vec<u8>) -> Result<Vec<u8>> {
         let resp = self.raft.client_write(command).await.map_err(raft_err)?;
         Ok(resp.data)

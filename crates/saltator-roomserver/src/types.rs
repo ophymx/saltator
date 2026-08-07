@@ -8,30 +8,30 @@
 
 use serde::{Deserialize, Serialize};
 
-use saltator_shard::APP_TABLE_MIN;
+use saltator_shard::APP_TABLE_FIRST;
 
 /// `event_id → StoredEvent`.
-pub const T_EVENT: u8 = APP_TABLE_MIN;
+pub const T_EVENT: u8 = APP_TABLE_FIRST;
 /// `seq (u64 BE) → SeqEntry` — the shard's timeline order.
-pub const T_SEQ: u8 = APP_TABLE_MIN + 1;
+pub const T_SEQ: u8 = APP_TABLE_FIRST + 1;
 /// `room_id ++ 0x00 ++ group (u64 BE) → StateGroup`.
-pub const T_GROUP: u8 = APP_TABLE_MIN + 2;
+pub const T_GROUP: u8 = APP_TABLE_FIRST + 2;
 /// `room_id → RoomMeta`.
-pub const T_ROOM: u8 = APP_TABLE_MIN + 3;
+pub const T_ROOM: u8 = APP_TABLE_FIRST + 3;
 /// `room_id ++ 0x00 ++ seq (u64 BE) → event_id (UTF-8)` — the per-room
 /// timeline order (`/messages` pagination, per-room sync windows).
-pub const T_ROOM_SEQ: u8 = APP_TABLE_MIN + 4;
+pub const T_ROOM_SEQ: u8 = APP_TABLE_FIRST + 4;
 /// `room_id ++ 0x00 ++ user_id ++ 0x00 ++ receipt_type → ReceiptRecord`.
-pub const T_RECEIPT: u8 = APP_TABLE_MIN + 5;
+pub const T_RECEIPT: u8 = APP_TABLE_FIRST + 5;
 /// `event_id → redacting event_id (UTF-8)` — set when an accepted
 /// `m.room.redaction` applies to a locally known event.
-pub const T_REDACT: u8 = APP_TABLE_MIN + 6;
+pub const T_REDACT: u8 = APP_TABLE_FIRST + 6;
 /// `room_id ++ 0x00 ++ idx (u64 BE) → event_id (UTF-8)` — backfilled
 /// history in reverse-chronological order: idx 1 is the newest event
 /// older than the local timeline, higher idx is older still. Fed by
 /// [`RoomCommand::ImportHistory`]; `/messages` pagination continues here
 /// after the local timeline floor.
-pub const T_HISTORY: u8 = APP_TABLE_MIN + 7;
+pub const T_HISTORY: u8 = APP_TABLE_FIRST + 7;
 
 /// Full state maps are stored every `MAX_GROUP_CHAIN` groups along a fork;
 /// deltas otherwise (spec.md §5.2, "state deltas with periodic full
