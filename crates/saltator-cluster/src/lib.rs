@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use saltator_shard::{ApplyCtx, ShardApp, ShardHandle, ShardId, ShardRegistry, APP_TABLE_FIRST};
-use saltator_store::{KvEngine, Result as StoreResult, StoreError};
+use saltator_store::{Result as StoreResult, StoreError};
 
 use types::{MetaCommand, MetaResponse, NodeId};
 
@@ -126,14 +126,14 @@ impl MetadataHandle {
     /// initialization is skipped.
     pub async fn start(
         node_id: NodeId,
-        engine: Arc<dyn KvEngine>,
+        stores: impl Into<saltator_store::Stores>,
         bootstrap_addr: Option<String>,
         registry: Option<&ShardRegistry>,
     ) -> Result<Self> {
         let inner = ShardHandle::start(
             ShardId::METADATA,
             node_id,
-            engine,
+            stores,
             Arc::new(MetaApp),
             network::GrpcRaftNetworkFactory::new(ShardId::METADATA),
             bootstrap_addr,

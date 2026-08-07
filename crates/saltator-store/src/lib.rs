@@ -87,6 +87,15 @@ pub trait KvEngine: Send + Sync + 'static {
     /// Apply a batch atomically, durably (fsynced WAL) once this returns.
     fn write_batch(&self, batch: WriteBatch) -> Result<()>;
 
+    /// Apply a batch atomically but WAL-buffered: ordered against other
+    /// writes, yet durable only after a later durable write or an engine
+    /// flush. For state that is reconstructible (a Raft state machine
+    /// replays from the log), where paying an fsync per apply buys
+    /// nothing. Defaults to the durable path so implementations opt in.
+    fn write_batch_relaxed(&self, batch: WriteBatch) -> Result<()> {
+        self.write_batch(batch)
+    }
+
     /// Ordered scan of `[start, end)`.
     fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
@@ -192,5 +201,44 @@ mod tests {
         assert!(key(Keyspace::Meta, 0, 5, b"") >= start);
         assert!(key(Keyspace::Meta, 0, 5, &[0xff; 32]) < end);
         assert!(key(Keyspace::Meta, 0, 6, b"") >= end);
+    }
+}
+
+/// The two storage roles of a shard, split so their durability profiles
+/// can differ: the Raft log (and vote) must fsync before the node
+/// responds; applied state may lag and replay. `From` impls let every
+/// single-engine call site (tests, embedded use) pass one engine for
+/// both roles unchanged; the daemon passes a split pair
+/// (docs/roadmap-refactors.md step 3.5).
+#[derive(Clone)]
+pub struct Stores {
+    pub log: std::sync::Arc<dyn KvEngine>,
+    pub state: std::sync::Arc<dyn KvEngine>,
+}
+
+impl Stores {
+    /// One engine serving both roles (every write durable).
+    pub fn single(engine: std::sync::Arc<dyn KvEngine>) -> Self {
+        Self {
+            log: engine.clone(),
+            state: engine,
+        }
+    }
+
+    /// Separate log and state engines.
+    pub fn split(log: std::sync::Arc<dyn KvEngine>, state: std::sync::Arc<dyn KvEngine>) -> Self {
+        Self { log, state }
+    }
+}
+
+impl<E: KvEngine> From<std::sync::Arc<E>> for Stores {
+    fn from(engine: std::sync::Arc<E>) -> Self {
+        Self::single(engine)
+    }
+}
+
+impl From<std::sync::Arc<dyn KvEngine>> for Stores {
+    fn from(engine: std::sync::Arc<dyn KvEngine>) -> Self {
+        Self::single(engine)
     }
 }

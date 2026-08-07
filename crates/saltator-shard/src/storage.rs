@@ -533,11 +533,17 @@ impl<A: ShardApp> RaftStateMachine<TypeConfig> for ShardStateMachine<A> {
             wb.put(self.sm_meta_key(K_SEQ), encode(&seq)?);
         }
         // App writes + seq + last_applied land in ONE batch: apply is
-        // atomic per call.
-        self.engine.write_batch(wb).map_err(write_err)?;
+        // atomic per call. Relaxed durability is sound here: the state
+        // machine replays from the Raft log after a crash (the log's own
+        // writes are always fsynced), and the log is never purged past a
+        // durably persisted snapshot — so nothing readable can be lost,
+        // only re-derived. (docs/roadmap-refactors.md step 3.5.)
+        self.engine.write_batch_relaxed(wb).map_err(write_err)?;
 
-        // Publish only after the batch is durable; a subscriber that sees
-        // seq N can always read it back from applied state.
+        // Publish only after the batch is applied; a subscriber that sees
+        // seq N can always read it back from applied state (post-crash,
+        // replay re-derives the identical state and re-emits — change
+        // consumers are idempotent per their cursor contract).
         for (seq, payload) in emits {
             let _ = self.changes.send(ChangeRecord { seq, payload });
         }
@@ -586,6 +592,10 @@ impl<A: ShardApp> RaftStateMachine<TypeConfig> for ShardStateMachine<A> {
                 data,
             })?,
         );
+        // DURABLE, deliberately: openraft may purge the log up to this
+        // snapshot as soon as we return, and purged-log + unsynced
+        // snapshot is the one unrecoverable ordering. The fsync here is
+        // the sync point that keeps the relaxed apply path sound.
         self.engine.write_batch(wb).map_err(write_err)
     }
 

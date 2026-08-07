@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 
 use saltator_roomserver::{RoomServer, SeqEntry};
 use saltator_shard::{ChangeRecord, NodeId, ShardHandle, ShardId, ShardRegistry, TypeConfig};
-use saltator_store::{Keyspace, KvEngine};
+use saltator_store::Keyspace;
 
 pub use machine::{UserApp, UserStore};
 pub use types::{
@@ -98,7 +98,7 @@ pub struct UserServer {
 impl UserServer {
     pub async fn start(
         node_id: NodeId,
-        engine: Arc<dyn KvEngine>,
+        stores: impl Into<saltator_store::Stores>,
         server_name: OwnedServerName,
         network: impl RaftNetworkFactory<TypeConfig>,
         bootstrap_addr: Option<String>,
@@ -107,7 +107,7 @@ impl UserServer {
         let handle = ShardHandle::start(
             USER_SHARD,
             node_id,
-            engine,
+            stores,
             Arc::new(UserApp),
             network,
             bootstrap_addr,

@@ -9,6 +9,9 @@ use crate::{BatchOp, KvEngine, Result, StoreError, WriteBatch};
 
 pub struct RocksEngine {
     db: DB,
+    /// Whether relaxed batches actually relax (WAL-buffered, no fsync).
+    /// The state role opts in; the log role never does.
+    relaxed_allowed: bool,
 }
 
 impl RocksEngine {
@@ -19,7 +22,27 @@ impl RocksEngine {
         // Prefix layout is (keyspace|shard|table); bloom filters and
         // tuning per column family can come later — one default CF for M0.
         let db = DB::open(&opts, path).map_err(rocks_err)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            relaxed_allowed: true,
+        })
+    }
+
+    /// Open a Raft-log store: every write durable (relaxed batches are
+    /// promoted to sync — the log's correctness contract), compression
+    /// off (entries are short-lived postcard; compacting them burns CPU
+    /// for nothing). Further log-shaped tuning — or replacing this with
+    /// a purpose-built store like raft-engine — slots in behind this
+    /// constructor without touching callers.
+    pub fn open_log(path: &Path) -> Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_compression_type(DBCompressionType::None);
+        let db = DB::open(&opts, path).map_err(rocks_err)?;
+        Ok(Self {
+            db,
+            relaxed_allowed: false,
+        })
     }
 
     fn sync_write_opts() -> WriteOptions {
@@ -47,6 +70,23 @@ impl KvEngine for RocksEngine {
     fn delete(&self, key: &[u8]) -> Result<()> {
         self.db
             .delete_opt(key, &Self::sync_write_opts())
+            .map_err(rocks_err)
+    }
+
+    fn write_batch_relaxed(&self, batch: WriteBatch) -> Result<()> {
+        if !self.relaxed_allowed {
+            return self.write_batch(batch);
+        }
+        let mut wb = rocksdb::WriteBatch::default();
+        for op in batch.ops {
+            match op {
+                BatchOp::Put(k, v) => wb.put(k, v),
+                BatchOp::Delete(k) => wb.delete(k),
+                BatchOp::DeleteRange(s, e) => wb.delete_range(s, e),
+            }
+        }
+        self.db
+            .write_opt(wb, &WriteOptions::default())
             .map_err(rocks_err)
     }
 
