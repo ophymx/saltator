@@ -36,7 +36,12 @@ pub use types::{
 /// with clustering (M4).
 /// This binary's schema version for this shard app — bump together with
 /// a `migrate` arm (see docs/design-schema-migrations.md).
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (step 4): the outbound EDU outbox moved to the fed-out shard; the
+/// migration drops the orphaned `T_EDU_OUTBOX`. Gated in the daemon on
+/// the fed-out drain marker covering every remaining row
+/// (docs/design-federation-out.md §drain).
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 

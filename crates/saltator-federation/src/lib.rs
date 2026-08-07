@@ -5,6 +5,7 @@
 mod backfill;
 mod delivery;
 mod directory;
+mod drain;
 mod fetcher;
 mod hierarchy;
 mod http_client;
@@ -24,6 +25,7 @@ mod xmatrix;
 pub use backfill::fetch_backfill;
 pub use delivery::spawn_delivery_worker;
 pub use directory::directory_body;
+pub use drain::{drain_user_outbox_once, spawn_user_outbox_drain};
 pub use http_client::build_http_client;
 pub use inbound::{AuthRejection, Authenticated};
 pub use join_client::{

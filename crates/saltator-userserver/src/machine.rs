@@ -34,6 +34,26 @@ impl ShardApp for UserApp {
         crate::SCHEMA_VERSION
     }
 
+    fn migrate(&self, ctx: &mut ApplyCtx<'_>, to: u32) -> StoreResult<()> {
+        match to {
+            // v2: the outbound EDU outbox lives in the fed-out shard now
+            // (docs/design-federation-out.md). Every remaining row here
+            // was drained (the daemon gates this step on the fed-out
+            // marker covering the tail), so the drop loses nothing. New
+            // binaries never wrote here, and the voter gate guarantees no
+            // old binary remains.
+            2 => {
+                for (k, _) in ctx.range(T_EDU_OUTBOX, &[], &[])? {
+                    ctx.delete(T_EDU_OUTBOX, &k);
+                }
+                Ok(())
+            }
+            other => Err(StoreError::Engine(format!(
+                "no migration registered for user schema step v{other}"
+            ))),
+        }
+    }
+
     fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>> {
         let resp = apply_command(ctx, &dec("user command decode", command)?)?;
         enc("user response encode", &resp)
@@ -1268,6 +1288,19 @@ impl UserStore {
             }
         }
         Ok(out)
+    }
+
+    /// The highest outbox row seq (0 = empty) — the drain gate's target:
+    /// the fed-out marker must cover this before the v2 drop.
+    pub fn edu_outbox_tail(&self) -> StoreResult<u64> {
+        let mut max = 0u64;
+        for (k, _) in self.read.range(T_EDU_OUTBOX, &[], &[])? {
+            if k.len() >= 8 {
+                let seq = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap_or([0; 8]));
+                max = max.max(seq);
+            }
+        }
+        Ok(max)
     }
 
     /// Pending outbox EDUs for a destination, oldest first: `(seq, EDU

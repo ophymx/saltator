@@ -290,20 +290,36 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         Duration::from_secs(2),
     );
 
+    // The user-outbox drain (step 4 cross-shard move): the fed-out
+    // leader copies legacy rows into its own shard and advances the
+    // durable marker; exits once the marker covers the tail.
+    saltator_federation::spawn_user_outbox_drain(users.clone(), fedout.clone());
+
     // Schema-migration supervisors: when a shard's stored schema trails
     // this binary's, the leader advances it through the log — but only
     // once every voter's binary confirms support (ClusterGate over the
-    // internal Status RPC). Tasks exit once each shard is current.
-    for h in [
-        rooms.shard_handle(),
-        users.shard_handle(),
-        fedout.shard_handle(),
-    ] {
+    // internal Status RPC). Tasks exit once each shard is current. The
+    // USER shard's v2 step carries an extra precondition: the fed-out
+    // drain marker must cover its outbox tail (the marker-coordinated
+    // cross-shard move; docs/design-federation-out.md §drain).
+    for h in [rooms.shard_handle(), fedout.shard_handle()] {
         saltator_shard::migrate::spawn_migration_supervisor(
             h.clone(),
             saltator_cluster::ClusterGate::new(h.clone(), cfg.node.id, schemas.clone()),
         );
     }
+    saltator_shard::migrate::spawn_migration_supervisor(
+        users.shard_handle().clone(),
+        UserMigrationGate {
+            cluster: saltator_cluster::ClusterGate::new(
+                users.shard_handle().clone(),
+                cfg.node.id,
+                schemas.clone(),
+            ),
+            users: users.clone(),
+            fedout: fedout.clone(),
+        },
+    );
 
     let projection = saltator_userserver::spawn_membership_projection(users.clone(), rooms.clone());
 
@@ -474,4 +490,31 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     meta.shutdown().await?;
     tracing::info!("saltator stopped");
     Ok(())
+}
+
+/// The user shard's migration gate: the cluster-wide voter check plus
+/// the v2 precondition — the fed-out drain marker (read from the LOCAL
+/// replica; cross-shard reads are free) must cover the legacy outbox's
+/// tail before the drop step may be proposed.
+struct UserMigrationGate {
+    cluster: saltator_cluster::ClusterGate,
+    users: Arc<saltator_userserver::UserServer>,
+    fedout: Arc<saltator_fedout::FedOutServer>,
+}
+
+impl saltator_shard::migrate::MigrationGate for UserMigrationGate {
+    async fn voters_ready(&self, shard: saltator_shard::ShardId, target: u32) -> bool {
+        if !self.cluster.voters_ready(shard, target).await {
+            return false;
+        }
+        if target == 2 {
+            let tail = self.users.store().edu_outbox_tail().unwrap_or(u64::MAX);
+            let marker = self.fedout.store().drain_marker().unwrap_or(0);
+            if marker < tail {
+                tracing::info!(tail, marker, "user v2 migration waiting on outbox drain");
+                return false;
+            }
+        }
+        true
+    }
 }
