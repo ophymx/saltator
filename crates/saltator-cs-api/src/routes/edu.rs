@@ -24,7 +24,16 @@ pub(crate) fn send_edu(state: &Arc<CsState>, destinations: Vec<String>, edu: ser
             "origin_server_ts": now_ms(),
             "edus": [edu],
         });
-        let txn_id = format!("edu{}", now_ms());
+        // Unique per transaction: receivers replay-cache on (origin,
+        // txn_id), so a timestamp alone collides when two EDUs fire in
+        // the same millisecond (back-to-back typing in two rooms) — the
+        // second would be swallowed by the cache without processing.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let txn_id = format!(
+            "edu{}-{}",
+            now_ms(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let path = format!("/_matrix/federation/v1/send/{txn_id}");
         for dest in destinations {
             if let Err(e) = client.put(&dest, &path, &txn).await {
