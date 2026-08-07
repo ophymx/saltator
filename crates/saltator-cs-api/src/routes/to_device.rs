@@ -84,7 +84,15 @@ pub async fn send_to_device(
                 "content": {
                     "sender": auth.user_id.as_str(),
                     "type": req.event_type.to_string(),
-                    "message_id": req.txn_id.as_str(),
+                    // Unique per ORIGIN SERVER (spec) — the receiver
+                    // dedupes on (origin, message_id), so a bare client
+                    // txn id would collide across senders (every client
+                    // starts its counter at the same place). Scoping by
+                    // sender keeps it deterministic: a client retry of
+                    // the same txn maps to the same message_id, and the
+                    // EDU baked into the outbox is stable across
+                    // delivery retries.
+                    "message_id": format!("{}/{}", auth.user_id, req.txn_id),
                     "messages": msgs,
                 },
             });

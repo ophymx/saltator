@@ -7518,7 +7518,9 @@ async fn to_device_over_federation_round_trip() {
         "content": {
             "sender": "@alice:a.test",
             "type": "m.room.encrypted",
-            "message_id": "fed-td-1",
+            // Must match the server's minting (user-scoped, spec:
+            // unique per origin server) for this to BE a duplicate.
+            "message_id": "@alice:a.test/fed-td-1",
             "messages": {"@bob:b.test": {"*": {"ciphertext": "remote"}}},
         },
     });

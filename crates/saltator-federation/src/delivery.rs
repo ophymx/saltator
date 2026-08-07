@@ -133,6 +133,13 @@ async fn deliver_pdus(
     // Cursor cache for this pass.
     let store = fedout.store();
     let mut cursors: BTreeMap<String, u64> = BTreeMap::new();
+    // Destinations that failed (or are backing off) THIS pass: further
+    // events for them are withheld so per-destination order holds; the
+    // floor is pulled back to their cursor so the next pass re-encounters
+    // their earliest undelivered event first. (Seq gaps between a
+    // destination's events are NOT evidence of undelivered work — they
+    // are usually just interleaved traffic for other rooms/servers.)
+    let mut blocked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // The new floor: min over destinations that still have undelivered
     // work; starts optimistic and is pulled back by laggards.
     let mut new_floor = batch.last().map(|(s, _)| *s).unwrap_or(*scan_pos);
@@ -171,15 +178,12 @@ async fn deliver_pdus(
             if *seq <= cursor {
                 continue; // already delivered
             }
-            if !backoff.ready(&dest) {
-                // This destination lags; the floor must not pass it.
-                new_floor = new_floor.min(cursor);
-                continue;
-            }
-            if cursor < seq.saturating_sub(1) {
-                // An earlier undelivered seq exists for this destination
-                // (it was backing off in a previous pass): deliver in
-                // order on a later scan that starts at its cursor.
+            if blocked.contains(&dest) || !backoff.ready(&dest) {
+                // Order guard: something earlier for this destination is
+                // undelivered (failed this pass, or backing off from a
+                // previous one) — withhold and pull the floor back so the
+                // next pass retries from its earliest undelivered event.
+                blocked.insert(dest.clone());
                 new_floor = new_floor.min(cursor);
                 continue;
             }
@@ -194,6 +198,7 @@ async fn deliver_pdus(
                 Err(e) => {
                     tracing::debug!(dest, error = %e, "delivery: PDU send failed; backing off");
                     backoff.failure(&dest);
+                    blocked.insert(dest.clone());
                     new_floor = new_floor.min(cursor);
                 }
             }
