@@ -1206,3 +1206,120 @@ async fn inbound_pdu_from_acl_denied_server_is_dropped() {
 
     our_rooms.shutdown().await.unwrap();
 }
+
+/// The restart-from-tip delivery-loss gap, closed: events committed
+/// while the delivery worker is down are delivered after "restart" (a
+/// fresh worker resuming from the durable cursors) — exactly once, with
+/// no re-delivery of what was already acked. This is step 4's headline
+/// exit assertion in-process; the 3-node kill -9 variant is tracked in
+/// the design doc.
+#[tokio::test]
+async fn delivery_resumes_from_durable_cursor_after_restart() {
+    use saltator_federation::FederationClient;
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    // Our server hosts a room with a remote member on the peer.
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
+    let (room_id, _) = our_rooms
+        .create_room(&alice, RoomVersion::V11, serde_json::Map::new())
+        .await
+        .unwrap();
+    for (ty, sk, content) in [
+        (
+            "m.room.member",
+            alice.as_str(),
+            json!({"membership": "join"}),
+        ),
+        (
+            "m.room.power_levels",
+            "",
+            json!({"users": {alice.as_str(): 100}}),
+        ),
+        ("m.room.join_rules", "", json!({"join_rule": "public"})),
+    ] {
+        our_rooms
+            .send_state(&room_id, &alice, ty, sk, content)
+            .await
+            .unwrap();
+    }
+    let peer = MockPeer::start("peer.test").await;
+    let room = ruma::RoomId::parse(&room_id).unwrap();
+    let _bob = peer_joins_our_room(&our_rooms, &room, "peer.test", "bob").await;
+
+    let (fedout, worker) = start_delivery(
+        our_rooms.clone(),
+        Arc::new(FederationClient::with_base_url(
+            hs_signer.clone(),
+            peer.base_url.clone(),
+        )),
+        hs.clone(),
+        dir.path(),
+    )
+    .await;
+
+    // msg1 delivers under the first worker; wait for its arrival.
+    let count_bodies = |peer: &MockPeer, needle: &str| {
+        peer.received()
+            .iter()
+            .flat_map(|t| t.pdus.iter())
+            .filter(|p| p["content"]["body"] == *needle)
+            .count()
+    };
+    our_rooms
+        .send_message(&room, &alice, "m.room.message", json!({"body": "msg1"}))
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if count_bodies(&peer, "msg1") >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(count_bodies(&peer, "msg1"), 1, "msg1 never delivered");
+    // Let the cursor-advance proposal land before the kill.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The worker dies; two more messages commit while nothing delivers.
+    worker.abort();
+    for body in ["msg2", "msg3"] {
+        our_rooms
+            .send_message(&room, &alice, "m.room.message", json!({"body": body}))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        count_bodies(&peer, "msg2"),
+        0,
+        "no worker should be running"
+    );
+
+    // "Restart": a fresh worker on the same durable state.
+    let worker2 = saltator_federation::spawn_delivery_worker(
+        fedout.clone(),
+        our_rooms.clone(),
+        Arc::new(FederationClient::with_base_url(
+            hs_signer.clone(),
+            peer.base_url.clone(),
+        )),
+        hs.clone(),
+    );
+    for _ in 0..300 {
+        if count_bodies(&peer, "msg3") >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(count_bodies(&peer, "msg2"), 1, "msg2 lost across restart");
+    assert_eq!(count_bodies(&peer, "msg3"), 1, "msg3 lost across restart");
+    // And the already-acked span did not re-deliver.
+    assert_eq!(count_bodies(&peer, "msg1"), 1, "msg1 re-delivered");
+
+    worker2.abort();
+    our_rooms.shutdown().await.unwrap();
+}

@@ -136,7 +136,17 @@ log purge. Node-local format change — free pre-deployment (like the
 step-3 table shift), costly after. Lands before step 4 so the new
 delivery shard is born onto the split layout.
 
-## Step 4 ☐ — Federation-out shard (durable delivery ownership)
+## Step 4 ☑ — Federation-out shard (durable delivery ownership)
+
+DONE (fed-out-shard branch, five parts): the `saltator-fedout` crate
+(cursors/outbox/marker state machine); the unified delivery worker on
+fed-out leadership (restart-from-tip gap closed — proven by the
+resume-from-cursor exit test); the decision-3 receiver dedupe riders
+(durable to-device message_id dedupe, txn replay cache, uniqueness
+tests); and the marker-coordinated drain + user shard v2 — the schema
+framework's first shipped migration and the cross-shard-move template.
+Deferred with rationale in the design doc: the 3-node kill -9 delivery
+assertion (needs a shell-driveable mock destination).
 
 **Problem, two halves.** (a) Delivery state is scattered: the EDU outbox
 lives in the *user* shard by convenience (it had a durable store), and

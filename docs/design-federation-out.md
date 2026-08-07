@@ -111,10 +111,14 @@ drain/ingest/drop pattern the framework was built for:
 - Complement: the E2EE bucket's interrupted/stopped legs re-verify EDU
   durability end-to-end on the new home; full sweep stays at the
   6-failure allowlist set.
-- Chaos: extend the 3-node job with a **delivery-loss assertion** —
-  kill -9 the fed-out leader mid-traffic; every event committed before
-  and during the failover reaches the destination (at-least-once).
-  This is the step's headline exit criterion (roadmap).
+- Chaos: the headline delivery-loss assertion landed in-process
+  (`delivery_resumes_from_durable_cursor_after_restart`): worker killed
+  with committed-undelivered events, fresh worker resumes from the
+  durable cursors, exactly-once arrival, no re-delivery of the acked
+  span. The full 3-node kill -9 variant is DEFERRED: the shell chaos
+  job would need a mock remote destination able to complete join
+  handshakes (a shell-driveable MockPeer) — tracked for the ops
+  hardening milestone alongside the mid-migration kill-timing knob.
 - The deferred kill-mid-migration chaos scenario becomes partially
   real: the user v1→v2 migration is the first shipped migration; the
   chaos job asserts it completes and no EDU is lost across it. (The
