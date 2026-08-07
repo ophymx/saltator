@@ -89,6 +89,7 @@ async fn send_transaction_routes_pdus_and_reports_results() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let base = spawn(router(state)).await;
@@ -240,6 +241,7 @@ async fn send_fills_dag_gap_via_get_missing_events() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let a_base = spawn(router(a_state)).await;
@@ -291,6 +293,7 @@ async fn send_fills_dag_gap_via_get_missing_events() {
         ))),
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_base = spawn(router(b_state)).await;
@@ -346,6 +349,7 @@ async fn unimplemented_spec_endpoints_answer_unrecognized() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let base = spawn(router(state)).await;
@@ -408,6 +412,7 @@ async fn repeated_transaction_replays_stored_response() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let base = spawn(router(state)).await;

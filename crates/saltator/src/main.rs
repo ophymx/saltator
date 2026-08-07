@@ -387,6 +387,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         cs_typing.clone(),
         cs_presence.clone(),
     ));
+    let delivery_backoff = Arc::new(saltator_federation::DeliveryBackoff::default());
     let fed_state = Arc::new(saltator_federation::FedState {
         server_name: server_name.clone(),
         signer: signer.clone(),
@@ -397,6 +398,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         client: Some(fed_client.clone()),
         edu_sink: Some(edu_sink),
         media: Some(fed_media),
+        delivery_backoff: Some(delivery_backoff.clone()),
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let fed_router = saltator_federation::router(fed_state);
@@ -426,6 +428,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         rooms.clone(),
         fed_client,
         server_name.clone(),
+        delivery_backoff.clone(),
     );
 
     let mut cs_shutdown = shutdown_rx.clone();

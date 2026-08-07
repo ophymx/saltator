@@ -23,7 +23,7 @@ mod user_keys;
 mod xmatrix;
 
 pub use backfill::fetch_backfill;
-pub use delivery::spawn_delivery_worker;
+pub use delivery::{spawn_delivery_worker, DeliveryBackoff};
 pub use directory::directory_body;
 pub use drain::{drain_user_outbox_once, spawn_user_outbox_drain};
 pub use http_client::build_http_client;
@@ -102,6 +102,10 @@ pub struct FedState {
     /// Local blob store, for serving our media to other servers. `None`
     /// disables the federation media endpoint.
     pub media: Option<saltator_media::MediaStore>,
+    /// Shared delivery-backoff registry: inbound authenticated traffic
+    /// clears a destination's penalty (it is provably up). `None` when no
+    /// delivery worker runs.
+    pub delivery_backoff: Option<Arc<crate::delivery::DeliveryBackoff>>,
     /// Replay cache for inbound transactions (spec "Transactions": a
     /// repeated `(origin, txn_id)` gets the stored response without
     /// reprocessing). In-memory and bounded: PDU ingest is idempotent by
@@ -165,6 +169,7 @@ impl FedState {
             client: None,
             edu_sink: None,
             media: None,
+            delivery_backoff: None,
             txn_replay: TxnReplayCache::default(),
         }
     }

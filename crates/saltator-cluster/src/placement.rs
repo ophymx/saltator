@@ -40,16 +40,21 @@ impl Default for ClusterConfig {
 }
 
 impl ClusterConfig {
-    /// The data shard groups this topology comprises: room groups then user
-    /// groups, by their on-the-wire group number.
+    /// The data shard groups this topology comprises: room groups, user
+    /// groups, then the federation-out group, by their on-the-wire group
+    /// number. Fed-out is a constant single shard (no config field — and
+    /// therefore no persisted-format change; a config knob arrives with
+    /// M-scale resharding behind a meta-schema migration).
     pub fn data_groups(&self) -> Vec<u64> {
-        let mut groups = Vec::with_capacity(self.room_shards as usize + self.user_shards as usize);
+        let mut groups =
+            Vec::with_capacity(self.room_shards as usize + self.user_shards as usize + 1);
         for i in 0..self.room_shards {
             groups.push(ShardId::new(Keyspace::Room, i).group());
         }
         for i in 0..self.user_shards {
             groups.push(ShardId::new(Keyspace::User, i).group());
         }
+        groups.push(ShardId::new(Keyspace::FedOut, 0).group());
         groups
     }
 }

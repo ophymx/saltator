@@ -247,8 +247,9 @@ async fn only_the_shard_leader_delivers_outbound() {
     let base = mock_remote(count.clone()).await;
     let c1 = Arc::new(FederationClient::with_base_url(s1.clone(), base.clone()));
     let c2 = Arc::new(FederationClient::with_base_url(s2.clone(), base));
-    let send1 = spawn_delivery_worker(fedout1.clone(), rooms1.clone(), c1, us.clone());
-    let send2 = spawn_delivery_worker(fedout2.clone(), rooms2.clone(), c2, us.clone());
+    let bo = || Arc::new(saltator_federation::DeliveryBackoff::default());
+    let send1 = spawn_delivery_worker(fedout1.clone(), rooms1.clone(), c1, us.clone(), bo());
+    let send2 = spawn_delivery_worker(fedout2.clone(), rooms2.clone(), c2, us.clone(), bo());
 
     // Give both senders a moment to reach the current tip (they start there,
     // so the pre-existing setup events are not re-sent).

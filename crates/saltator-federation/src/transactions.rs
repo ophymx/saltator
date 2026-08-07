@@ -32,6 +32,11 @@ pub async fn send_transaction(
         // No room server wired (key-only deployments/tests): nothing to do.
         return Ok(axum::Json(serde_json::json!({ "pdus": {} })));
     }
+    // The origin just proved it is reachable: clear any delivery backoff
+    // so pending outbound to it retries immediately (Synapse parity).
+    if let Some(backoff) = &state.delivery_backoff {
+        backoff.mark_alive(&auth.origin);
+    }
     // Transaction replay (spec "Transactions"): a repeated (origin,
     // txn_id) — an at-least-once sender whose ack we lost — gets the
     // stored response back without reprocessing.

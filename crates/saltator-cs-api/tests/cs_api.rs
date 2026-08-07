@@ -219,6 +219,7 @@ async fn start_fedout_delivery(
         rooms,
         client,
         ruma::OwnedServerName::try_from(server_name).unwrap(),
+        Arc::new(saltator_federation::DeliveryBackoff::default()),
     );
     (fedout, worker)
 }
@@ -5106,6 +5107,7 @@ async fn spawn_fed(
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     };
     if let Some(r) = rooms {
@@ -5670,6 +5672,7 @@ async fn client_joins_a_remote_room_by_remote_alias() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     };
     let a_app = saltator_federation::router(Arc::new(a_state));
@@ -6675,6 +6678,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
         ))),
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_router = saltator_federation::router(b_fed);
@@ -6835,6 +6839,7 @@ async fn inbound_federated_invite_appears_in_sync() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7097,6 +7102,7 @@ async fn outbound_federated_invite_round_trip() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7281,6 +7287,7 @@ async fn receipt_edu_over_federation_surfaces_in_sync() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7389,6 +7396,7 @@ async fn to_device_over_federation_round_trip() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7598,6 +7606,7 @@ async fn federated_key_query_claim_and_device_list_update() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7840,6 +7849,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
         client: None,
         edu_sink: Some(sink),
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -8035,6 +8045,7 @@ async fn client_downloads_remote_media_over_federation() {
         client: None,
         edu_sink: None,
         media: Some(a_media.clone()),
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
 
@@ -8270,6 +8281,7 @@ async fn client_queries_remote_profile_and_directory() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
 
@@ -9465,6 +9477,7 @@ async fn federation_public_rooms_lists_published_rooms() {
         client: None,
         edu_sink: None,
         media: None,
+        delivery_backoff: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let app = saltator_federation::router(fed);

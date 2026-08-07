@@ -32,25 +32,38 @@ const MAX_EDUS_PER_TXN: usize = 100;
 const SCAN_BATCH: usize = 256;
 
 /// Per-destination retry state (in-memory: safe to lose, the durable
-/// cursors/outbox are the source of truth).
+/// cursors/outbox are the source of truth). Shared with the inbound
+/// surface: authenticated traffic FROM a server proves it is up, so its
+/// penalty clears immediately (Synapse parity) — otherwise boot-time
+/// delivery failures escalate the backoff and fresh events (a new power
+/// levels event racing a join, say) sit out a stale penalty window.
 #[derive(Default)]
-struct Backoff(BTreeMap<String, (Instant, Duration)>);
+pub struct DeliveryBackoff(std::sync::Mutex<BTreeMap<String, (Instant, Duration)>>);
 
-impl Backoff {
+impl DeliveryBackoff {
     fn ready(&self, dest: &str) -> bool {
-        self.0.get(dest).is_none_or(|(at, _)| *at <= Instant::now())
+        self.0
+            .lock()
+            .expect("backoff lock")
+            .get(dest)
+            .is_none_or(|(at, _)| *at <= Instant::now())
     }
-    fn failure(&mut self, dest: &str) {
-        let next = self
-            .0
+    fn failure(&self, dest: &str) {
+        let mut inner = self.0.lock().expect("backoff lock");
+        let next = inner
             .get(dest)
             .map(|(_, b)| (*b * 2).min(BACKOFF_MAX))
             .unwrap_or(BACKOFF_MIN);
-        self.0
-            .insert(dest.to_owned(), (Instant::now() + next, next));
+        inner.insert(dest.to_owned(), (Instant::now() + next, next));
     }
-    fn success(&mut self, dest: &str) {
-        self.0.remove(dest);
+    fn success(&self, dest: &str) {
+        self.0.lock().expect("backoff lock").remove(dest);
+    }
+
+    /// The destination just talked to US (authenticated inbound): it is
+    /// alive — drop any penalty so pending deliveries retry now.
+    pub fn mark_alive(&self, dest: &str) {
+        self.0.lock().expect("backoff lock").remove(dest);
     }
 }
 
@@ -60,11 +73,11 @@ pub fn spawn_delivery_worker(
     rooms: Arc<RoomServer>,
     client: Arc<FederationClient>,
     server_name: ruma::OwnedServerName,
+    backoff: Arc<DeliveryBackoff>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut room_changes = rooms.subscribe();
         let mut fedout_changes = fedout.subscribe();
-        let mut backoff = Backoff::default();
         // In-memory PDU scan floor; re-derived from durable cursors (or
         // the tip) whenever we (re)gain leadership.
         let mut scan_pos: Option<u64> = None;
@@ -75,9 +88,9 @@ pub fn spawn_delivery_worker(
                     scan_pos = Some(initial_scan_pos(&fedout, &rooms));
                 }
                 if let Some(pos) = scan_pos.as_mut() {
-                    deliver_pdus(&fedout, &rooms, &client, &server_name, pos, &mut backoff).await;
+                    deliver_pdus(&fedout, &rooms, &client, &server_name, pos, &backoff).await;
                 }
-                deliver_edus(&fedout, &client, &server_name, &mut backoff).await;
+                deliver_edus(&fedout, &client, &server_name, &backoff).await;
             } else {
                 // Leadership lost: drop the scan floor so a later
                 // re-election re-derives it from the durable cursors.
@@ -117,7 +130,7 @@ async fn deliver_pdus(
     client: &Arc<FederationClient>,
     server_name: &ruma::OwnedServerName,
     scan_pos: &mut u64,
-    backoff: &mut Backoff,
+    backoff: &DeliveryBackoff,
 ) {
     let room_shard = 0u16; // single room shard (M1 layout)
     let batch = match rooms.store().timeline(*scan_pos, SCAN_BATCH) {
@@ -268,7 +281,7 @@ async fn deliver_edus(
     fedout: &FedOutServer,
     client: &Arc<FederationClient>,
     server_name: &ruma::OwnedServerName,
-    backoff: &mut Backoff,
+    backoff: &DeliveryBackoff,
 ) {
     let store = fedout.store();
     let destinations = match store.edu_destinations() {
