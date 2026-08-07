@@ -12,6 +12,17 @@ use crate::ShardId;
 /// here up; the runtime's snapshot covers exactly `APP_TABLE_MIN..`.
 pub const APP_TABLE_MIN: u8 = 8;
 
+/// The reserved schema table (`= APP_TABLE_MIN`): one
+/// `b"version" → postcard(u32)` cell per shard, written only by the
+/// runtime's `Migrate` command so it replicates, replays, and rides in
+/// snapshots like all app state. Apps allocate their tables from
+/// [`APP_TABLE_FIRST`] up. An absent cell reads as version 1 (the
+/// baseline every app starts at), which is why migrations must be total
+/// — correct on an empty store as well as a populated one.
+pub const T_SCHEMA: u8 = APP_TABLE_MIN;
+/// First table id available to apps.
+pub const APP_TABLE_FIRST: u8 = APP_TABLE_MIN + 1;
+
 /// A shard's command interpreter. Implementations MUST be deterministic:
 /// `apply` runs on every replica and again on log replay, so its outputs
 /// (writes, response, emits) may depend only on the command bytes and the
@@ -28,6 +39,27 @@ pub trait ShardApp: Send + Sync + 'static {
     /// runtime's bookkeeping. Returns the response bytes delivered to the
     /// proposer.
     fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>>;
+
+    /// The schema version this code reads and writes. Bump together with
+    /// a [`ShardApp::migrate`] arm for each step. The runtime refuses to
+    /// serve state newer than this (downgrade protection) and migrates
+    /// state older than this through the log (see
+    /// `docs/design-schema-migrations.md`).
+    fn schema_version(&self) -> u32 {
+        1
+    }
+
+    /// Migrate applied state from `to - 1` to `to`, inside one apply
+    /// (atomic, deterministic — the same contract as [`ShardApp::apply`]).
+    /// Must be total: correct on an empty store too, since a fresh store
+    /// reads as version 1 regardless of which binary created it. The
+    /// runtime invokes steps in order and writes the version cell itself.
+    fn migrate(&self, ctx: &mut ApplyCtx<'_>, to: u32) -> StoreResult<()> {
+        let _ = ctx;
+        Err(saltator_store::StoreError::Engine(format!(
+            "no migration registered for schema step v{to}"
+        )))
+    }
 }
 
 /// Context for one command application.

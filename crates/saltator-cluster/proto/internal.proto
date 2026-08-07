@@ -35,6 +35,16 @@ message StatusResponse {
   bool initialized = 4;
   optional uint64 leader = 5;
   uint64 last_applied = 6;
+  // The schema versions this node's BINARY speaks, per keyspace (the
+  // migration gate: a leader proposes a migration only once every voter
+  // reports support for the target version).
+  repeated ShardSchema schemas = 7;
+}
+
+message ShardSchema {
+  // Keyspace discriminant (matches saltator_store::Keyspace as u32).
+  uint32 keyspace = 1;
+  uint32 schema_version = 2;
 }
 
 // A node asking to join the cluster's metadata group (spec.md §4.4).

@@ -53,6 +53,7 @@ async fn internal_rpc_surface() {
         meta.clone(),
         registry,
         "example.org".into(),
+        vec![],
         addr,
         async {
             let _ = stop_rx.await;

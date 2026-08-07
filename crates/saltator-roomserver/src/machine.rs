@@ -78,6 +78,10 @@ fn receipt_key(room_id: &str, user_id: &str, receipt_type: &str, thread: &str) -
 pub struct RoomApp;
 
 impl ShardApp for RoomApp {
+    fn schema_version(&self) -> u32 {
+        crate::SCHEMA_VERSION
+    }
+
     fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>> {
         let resp = match dec::<RoomCommand>("room command decode", command)? {
             RoomCommand::Append(cmd) => apply_append(ctx, &cmd)?,

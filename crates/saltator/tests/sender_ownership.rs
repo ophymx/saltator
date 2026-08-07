@@ -51,6 +51,7 @@ fn spawn_serve(meta: MetadataHandle, registry: ShardRegistry, addr: std::net::So
         meta,
         registry,
         "us.test".into(),
+        vec![],
         addr,
         std::future::pending::<()>(),
     ));

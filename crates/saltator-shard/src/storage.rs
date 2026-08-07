@@ -28,7 +28,7 @@ use tokio::sync::broadcast;
 
 use saltator_store::{key, shard_bounds, table_bounds, KvEngine, WriteBatch};
 
-use crate::app::{ApplyCtx, ShardApp, APP_TABLE_MIN};
+use crate::app::{ApplyCtx, ShardApp, APP_TABLE_MIN, T_SCHEMA};
 use crate::handle::ChangeRecord;
 use crate::{Node, NodeId, ShardId, TypeConfig};
 
@@ -44,6 +44,52 @@ const K_MEMBERSHIP: &[u8] = b"membership";
 const K_SNAPSHOT: &[u8] = b"snapshot";
 const K_SNAPSHOT_SEQ: &[u8] = b"snapshot_seq";
 const K_SEQ: &[u8] = b"seq";
+
+/// Schema-version cell key within [`T_SCHEMA`].
+pub(crate) const K_SCHEMA_VERSION: &[u8] = b"version";
+/// First byte reserving a log entry for the runtime rather than the app.
+/// Postcard app-command enums start with a small varint variant index, so
+/// 0xFF can never begin a legitimate app command.
+pub(crate) const RUNTIME_CMD_PREFIX: u8 = 0xFF;
+
+/// Runtime-owned commands, carried in the log as
+/// `RUNTIME_CMD_PREFIX ++ postcard(RuntimeCommand)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum RuntimeCommand {
+    /// Advance the shard's schema by exactly one step (`to` must equal
+    /// stored version + 1): runs the app's `migrate(to)` inside this
+    /// apply and writes the version cell in the same atomic batch.
+    Migrate { to: u32 },
+}
+
+/// Response to a runtime command, postcard-encoded in the entry response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum RuntimeResponse {
+    Ok,
+    /// The command was declined (wrong step, unknown migration…) — data,
+    /// not a storage fault.
+    Rejected(String),
+}
+
+/// The shard's stored schema version; an absent cell reads as 1 (the
+/// baseline — see `T_SCHEMA` docs).
+pub(crate) fn stored_schema_version(
+    engine: &dyn KvEngine,
+    shard: ShardId,
+) -> saltator_store::Result<u32> {
+    Ok(
+        match engine.get(&key(
+            shard.keyspace,
+            shard.index,
+            T_SCHEMA,
+            K_SCHEMA_VERSION,
+        ))? {
+            Some(b) => postcard::from_bytes(&b)
+                .map_err(|e| saltator_store::StoreError::Engine(format!("schema cell: {e}")))?,
+            None => 1,
+        },
+    )
+}
 
 fn read_err(e: impl std::error::Error + 'static) -> StorageError<NodeId> {
     StorageIOError::read(&e).into()
@@ -333,6 +379,60 @@ impl<A: ShardApp> ShardStateMachine<A> {
     }
 }
 
+impl<A: ShardApp> ShardStateMachine<A> {
+    /// Apply a runtime-owned command (`RUNTIME_CMD_PREFIX`-tagged entry).
+    /// Failures that are *decisions* (wrong step, unknown migration)
+    /// return `RuntimeResponse::Rejected` — data to the proposer, not a
+    /// storage fault — so a stale proposal can never wedge the shard.
+    fn apply_runtime(&self, ctx: &mut ApplyCtx<'_>, cmd: &[u8]) -> saltator_store::Result<Vec<u8>> {
+        let enc_resp = |r: &RuntimeResponse| {
+            postcard::to_stdvec(r)
+                .map_err(|e| saltator_store::StoreError::Engine(format!("runtime resp: {e}")))
+        };
+        let cmd: RuntimeCommand = match postcard::from_bytes(cmd) {
+            Ok(c) => c,
+            Err(e) => {
+                return enc_resp(&RuntimeResponse::Rejected(format!("undecodable: {e}")));
+            }
+        };
+        match cmd {
+            RuntimeCommand::Migrate { to } => {
+                let current: u32 = match ctx.get(T_SCHEMA, K_SCHEMA_VERSION)? {
+                    Some(b) => postcard::from_bytes(&b).map_err(|e| {
+                        saltator_store::StoreError::Engine(format!("schema cell: {e}"))
+                    })?,
+                    None => 1,
+                };
+                if to != current + 1 {
+                    return enc_resp(&RuntimeResponse::Rejected(format!(
+                        "migration step must be v{} -> v{}, requested v{to}",
+                        current,
+                        current + 1
+                    )));
+                }
+                if to > self.app.schema_version() {
+                    return enc_resp(&RuntimeResponse::Rejected(format!(
+                        "this binary only knows schema v{}",
+                        self.app.schema_version()
+                    )));
+                }
+                // A failed migration must not half-apply; the batch is
+                // discarded with the error. Surfacing it as a storage
+                // error (not a Rejected response) is deliberate: the shard
+                // cannot serve a schema it failed to reach, and every
+                // replica fails the same way (determinism), so the
+                // operator sees it loudly.
+                self.app.migrate(ctx, to)?;
+                let enc = postcard::to_stdvec(&to)
+                    .map_err(|e| saltator_store::StoreError::Engine(format!("schema cell: {e}")))?;
+                ctx.put(T_SCHEMA, K_SCHEMA_VERSION, enc);
+                tracing::info!(shard = %ctx.shard(), to, "schema migrated");
+                enc_resp(&RuntimeResponse::Ok)
+            }
+        }
+    }
+}
+
 impl<A: ShardApp> RaftSnapshotBuilder<TypeConfig> for ShardStateMachine<A> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let last_applied = self.last_applied()?;
@@ -411,7 +511,11 @@ impl<A: ShardApp> RaftStateMachine<TypeConfig> for ShardStateMachine<A> {
                 EntryPayload::Normal(cmd) => {
                     let mut ctx =
                         ApplyCtx::new(self.shard, &*self.engine, &mut wb, &mut seq, &mut emits);
-                    let response = self.app.apply(&mut ctx, &cmd).map_err(write_err)?;
+                    let response = if cmd.first() == Some(&RUNTIME_CMD_PREFIX) {
+                        self.apply_runtime(&mut ctx, &cmd[1..]).map_err(write_err)?
+                    } else {
+                        self.app.apply(&mut ctx, &cmd).map_err(write_err)?
+                    };
                     responses.push(response);
                 }
                 EntryPayload::Membership(m) => {

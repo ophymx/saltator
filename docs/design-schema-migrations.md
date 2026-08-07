@@ -1,6 +1,6 @@
 # Design: versioned data schema + migrations (roadmap step 3)
 
-Status: DRAFT for review · 2026-08-06
+Status: ACCEPTED + IMPLEMENTED · 2026-08-06 (this branch)
 
 ## Problem
 
@@ -98,9 +98,13 @@ v1 enforcement; a proper schema-reflection test is future work.
 
 A migration is one apply = one atomic write batch. `kill -9` anywhere
 leaves either the old state (command uncommitted / unapplied) or the
-new (applied); replay re-applies deterministically. Chaos job gains a
-scenario: bump a toy schema version, kill a node mid-migration window,
-assert it rejoins and converges. Large data rewrites that exceed a
+new (applied); replay re-applies deterministically. The runtime tests
+cover stepwise application, decline-not-wedge on stale steps,
+refuse-newer, restart recovery, and the supervisor loop end-to-end.
+A chaos-job scenario (kill a node mid-migration) is deferred with a
+concrete blocker: it needs a build with a schema version ahead of the
+apps' real ones (a test-only bump knob) — tracked for the first real
+migration, which step 4's outbox move will be. Large data rewrites that exceed a
 sane single-batch size must be expressed as multiple idempotent
 `MigrateStep` commands (registry declares the step count) — not needed
 for any currently planned migration.
@@ -134,12 +138,18 @@ documented pattern, implemented first by step 4 itself.
 - **Snapshot interplay**: free — the version cell is app state, so
   snapshots carry it and installs stay coherent.
 
-## Open for review
+## Decisions (review resolved 2026-08-06)
 
-- Version-cell placement: reserved shared table id vs. per-app table.
-  (Lean: reserved runtime-adjacent table `T_SCHEMA` right at
-  `APP_TABLE_MIN`, shifting nothing existing — the cell is keyed inside
-  an existing metadata table if a free one exists.)
-- Whether the voter-binary-version gate ships in v1 or the constraint
-  stays operational documentation (lean: documentation in v1 — we run
-  single-binary deployments today).
+- **Version cell**: reserved shared table `T_SCHEMA = APP_TABLE_MIN`;
+  apps allocate their tables from `APP_TABLE_MIN + 1` up. This shifts
+  every existing app table id by one — acceptable exactly once, now,
+  while no deployment carries persistent data (CI, Complement, and dev
+  environments all start from fresh data dirs); the framework this
+  builds is what makes such shifts impossible-by-default afterwards.
+  The snapshot range (`APP_TABLE_MIN..`) covers the cell unchanged.
+- **The all-voters-upgraded gate ships in code, v1** (user call: a
+  footgun as documentation). Before proposing `Migrate`, the leader
+  queries each voter's live binary `schema_version` over the internal
+  RPC layer — transient, never persisted, so no codec impact on the
+  membership state. Any voter unreachable or behind → no proposal,
+  retry on a timer. Single-node (Noop network) trivially passes.

@@ -5,11 +5,14 @@
 //! with [`MetaApp`] as its state machine; this crate owns the typed
 //! command surface and the gRPC transport that all shard groups share.
 
+pub mod gate;
 pub mod join;
 pub mod network;
 pub mod placement;
 pub mod reconcile;
-pub mod rpc;
+mod rpc;
+
+pub use gate::ClusterGate;
 pub mod types;
 
 pub use join::join_cluster;
@@ -24,13 +27,13 @@ pub mod proto {
 use std::sync::Arc;
 use std::time::Duration;
 
-use saltator_shard::{ApplyCtx, ShardApp, ShardHandle, ShardId, ShardRegistry, APP_TABLE_MIN};
+use saltator_shard::{ApplyCtx, ShardApp, ShardHandle, ShardId, ShardRegistry, APP_TABLE_FIRST};
 use saltator_store::{KvEngine, Result as StoreResult, StoreError};
 
 use types::{MetaCommand, MetaResponse, NodeId};
 
 /// The metadata KV table (the group's only app table).
-const T_KV: u8 = APP_TABLE_MIN;
+const T_KV: u8 = APP_TABLE_FIRST;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterError {
@@ -51,6 +54,7 @@ impl From<saltator_shard::ShardError> for ClusterError {
             E::Raft(m) => ClusterError::Raft(m),
             E::Storage(m) => ClusterError::Storage(m),
             E::Codec(m) => ClusterError::Codec(m),
+            e @ E::SchemaTooNew { .. } => ClusterError::Storage(e.to_string()),
         }
     }
 }
@@ -58,7 +62,14 @@ impl From<saltator_shard::ShardError> for ClusterError {
 /// The metadata group's command interpreter: a linearizable KV store.
 pub struct MetaApp;
 
+/// The metadata group's schema version (see docs/design-schema-migrations.md).
+pub const META_SCHEMA_VERSION: u32 = 1;
+
 impl ShardApp for MetaApp {
+    fn schema_version(&self) -> u32 {
+        META_SCHEMA_VERSION
+    }
+
     fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>> {
         // A committed command that fails to decode means log corruption or
         // a broken upgrade — fatal, not skippable.
@@ -301,10 +312,11 @@ pub async fn serve_internal(
     handle: MetadataHandle,
     registry: ShardRegistry,
     server_name: String,
+    schemas: Vec<(u32, u32)>,
     listen: std::net::SocketAddr,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let svc = rpc::InternalRpc::new(handle, registry, server_name);
+    let svc = rpc::InternalRpc::new(handle, registry, server_name, schemas);
     let svc = Arc::new(svc);
 
     tonic::transport::Server::builder()

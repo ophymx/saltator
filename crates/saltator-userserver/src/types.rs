@@ -7,84 +7,84 @@
 
 use serde::{Deserialize, Serialize};
 
-use saltator_shard::APP_TABLE_MIN;
+use saltator_shard::APP_TABLE_FIRST;
 
 /// `user_id → Account`.
-pub const T_ACCOUNT: u8 = APP_TABLE_MIN;
+pub const T_ACCOUNT: u8 = APP_TABLE_FIRST;
 /// `token_hash (32 bytes) → TokenEntry` — access and refresh tokens.
-pub const T_TOKEN: u8 = APP_TABLE_MIN + 1;
+pub const T_TOKEN: u8 = APP_TABLE_FIRST + 1;
 /// `user_id ++ 0x00 ++ device_id → Device`.
-pub const T_DEVICE: u8 = APP_TABLE_MIN + 2;
+pub const T_DEVICE: u8 = APP_TABLE_FIRST + 2;
 /// `user_id → Profile`.
-pub const T_PROFILE: u8 = APP_TABLE_MIN + 3;
+pub const T_PROFILE: u8 = APP_TABLE_FIRST + 3;
 /// `user_id ++ 0x00 ++ room_id ++ 0x00 ++ type → AccountDataEntry`
 /// (`room_id` empty = global account data).
-pub const T_ACCOUNT_DATA: u8 = APP_TABLE_MIN + 4;
+pub const T_ACCOUNT_DATA: u8 = APP_TABLE_FIRST + 4;
 /// `user_id ++ 0x00 ++ filter_id → filter JSON`.
-pub const T_FILTER: u8 = APP_TABLE_MIN + 5;
+pub const T_FILTER: u8 = APP_TABLE_FIRST + 5;
 /// `user_id ++ 0x00 ++ room_id → MembershipEntry` — the membership
 /// projection over the room keyspace (spec.md §4.1, §9: eventually
 /// consistent, monotonic per source shard).
-pub const T_MEMBERSHIP: u8 = APP_TABLE_MIN + 6;
+pub const T_MEMBERSHIP: u8 = APP_TABLE_FIRST + 6;
 /// `source (e.g. "room/0") → u64 BE` — projection cursors.
-pub const T_CURSOR: u8 = APP_TABLE_MIN + 7;
+pub const T_CURSOR: u8 = APP_TABLE_FIRST + 7;
 /// `alias → AliasEntry`.
-pub const T_ALIAS: u8 = APP_TABLE_MIN + 8;
+pub const T_ALIAS: u8 = APP_TABLE_FIRST + 8;
 /// `media_id → MediaMeta`.
-pub const T_MEDIA: u8 = APP_TABLE_MIN + 9;
+pub const T_MEDIA: u8 = APP_TABLE_FIRST + 9;
 /// `room_id → [1]` — rooms published to the public directory. Presence in
 /// the table is the fact; the value is a placeholder.
-pub const T_DIRECTORY: u8 = APP_TABLE_MIN + 10;
+pub const T_DIRECTORY: u8 = APP_TABLE_FIRST + 10;
 /// `user_id ++ 0x00 ++ room_id → Vec<Vec<u8>>` — stripped-state events for
 /// a pending invite to a room we don't host (received over federation).
 /// `/sync` renders these as the invite's `invite_state`.
-pub const T_INVITE_STATE: u8 = APP_TABLE_MIN + 11;
+pub const T_INVITE_STATE: u8 = APP_TABLE_FIRST + 11;
 /// `user_id ++ 0x00 ++ device_id → device_keys JSON` — a device's published
 /// identity keys for E2EE (`/keys/upload`, spec.md §5.5).
-pub const T_DEVICE_KEYS: u8 = APP_TABLE_MIN + 12;
+pub const T_DEVICE_KEYS: u8 = APP_TABLE_FIRST + 12;
 /// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ key_id → one-time-key JSON`.
 /// Claiming one is a Raft-serialized delete, so an OTK is never handed out
 /// twice (spec.md §5.5, §9).
-pub const T_ONE_TIME_KEY: u8 = APP_TABLE_MIN + 13;
+pub const T_ONE_TIME_KEY: u8 = APP_TABLE_FIRST + 13;
 /// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ seq (u64 BE) → to-device event
 /// JSON` — the durable per-device to-device inbox, drained by `/sync`
 /// (spec.md §5.5). `seq` is the user-shard seq at which the message was
 /// queued; sync windows on it like account data.
-pub const T_TO_DEVICE: u8 = APP_TABLE_MIN + 14;
+pub const T_TO_DEVICE: u8 = APP_TABLE_FIRST + 14;
 /// `seq (u64 BE) → KeyChangeEntry` — the device-list change log: one row
 /// whenever a user's E2EE device list changes (identity keys published,
 /// device deleted) or their room-sharing visibility changes (join/leave).
 /// `/sync` and `/keys/changes` window it to compute `changed`/`left`.
 /// Tiny rows, unbounded growth; pruning is a hardening brick.
-pub const T_KEY_CHANGE: u8 = APP_TABLE_MIN + 15;
+pub const T_KEY_CHANGE: u8 = APP_TABLE_FIRST + 15;
 /// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ app_id ++ 0x00 ++ pushkey →
 /// pusher JSON` — push notification targets (`/pushers`). Device-scoped:
 /// a pusher dies with the session that created it (which is what makes
 /// password-change logout drop other sessions' pushers).
-pub const T_PUSHER: u8 = APP_TABLE_MIN + 16;
+pub const T_PUSHER: u8 = APP_TABLE_FIRST + 16;
 /// `user_id ++ 0x00 ++ version (u64 BE) → BackupVersionMeta` — E2EE
 /// key-backup versions (`/room_keys/version`). Versions count up per
 /// user; deleted ones keep a tombstoned row so the counter never reuses
 /// a version.
-pub const T_BACKUP_VERSION: u8 = APP_TABLE_MIN + 17;
+pub const T_BACKUP_VERSION: u8 = APP_TABLE_FIRST + 17;
 /// `user_id ++ 0x00 ++ version (u64 BE) ++ 0x00 ++ room_id ++ 0x00 ++
 /// session_id → KeyBackupData JSON` — the backed-up room keys.
-pub const T_BACKUP_KEY: u8 = APP_TABLE_MIN + 18;
+pub const T_BACKUP_KEY: u8 = APP_TABLE_FIRST + 18;
 /// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ algorithm → FallbackEntry` —
 /// one fallback key per device+algorithm, served by `/keys/claim` when
 /// the one-time keys run dry (spec 1.2 / MSC2732). Never deleted by a
 /// claim, only replaced by upload.
-pub const T_FALLBACK_KEY: u8 = APP_TABLE_MIN + 19;
+pub const T_FALLBACK_KEY: u8 = APP_TABLE_FIRST + 19;
 /// `user_id ++ 0x00 ++ kind → raw key JSON` — cross-signing keys, kind ∈
 /// `master` | `self_signing` | `user_signing`.
-pub const T_CROSS_SIGNING: u8 = APP_TABLE_MIN + 20;
+pub const T_CROSS_SIGNING: u8 = APP_TABLE_FIRST + 20;
 /// `destination ++ 0x00 ++ seq (u64 BE) → EDU JSON` — the durable outbound
 /// EDU outbox. To-device messages and device-list updates queue here (the
 /// spec gives them no receiver-side recovery, so the *sender* owns
 /// delivery); the federation EDU sender drains per destination with
 /// retry/backoff, acking on success. Survives restarts — unlike typing/
 /// presence, which stay fire-and-forget. `seq` is the user-shard seq.
-pub const T_EDU_OUTBOX: u8 = APP_TABLE_MIN + 21;
+pub const T_EDU_OUTBOX: u8 = APP_TABLE_FIRST + 21;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {

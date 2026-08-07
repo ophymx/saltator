@@ -29,6 +29,10 @@ fn dec<T: for<'de> serde::Deserialize<'de>>(what: &str, b: &[u8]) -> StoreResult
 pub struct UserApp;
 
 impl ShardApp for UserApp {
+    fn schema_version(&self) -> u32 {
+        crate::SCHEMA_VERSION
+    }
+
     fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>> {
         let resp = apply_command(ctx, &dec("user command decode", command)?)?;
         enc("user response encode", &resp)
