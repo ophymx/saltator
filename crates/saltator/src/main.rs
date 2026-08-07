@@ -355,7 +355,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             allow_internal_fetch: cfg.client.allow_internal_fetch,
         },
     )
-    .with_federation(fed_client.clone(), signer.clone(), key_cache.clone());
+    .with_federation(fed_client.clone(), signer.clone(), key_cache.clone())
+    .with_fedout(fedout.clone());
     // Typing/presence maps are shared with the federation surface (inbound
     // EDUs update them).
     let cs_typing = cs_state.typing_map();
@@ -400,15 +401,15 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         "federation API listening",
     );
 
-    // Outbound federation: forward locally originated events to remote
-    // servers sharing each room.
-    let fed_sender =
-        saltator_federation::spawn_sender(rooms.clone(), fed_client.clone(), server_name.clone());
-    // Durable EDU outbox drainer: to-device messages and device-list
-    // updates retry until the destination takes them, resuming from disk
-    // after a restart.
-    let edu_sender =
-        saltator_federation::spawn_edu_sender(users.clone(), fed_client, server_name.clone());
+    // Outbound federation: the unified delivery worker (step 4) owns all
+    // outbound — PDUs against durable per-destination cursors, EDUs from
+    // the fed-out outbox — gated on fed-out leadership.
+    let delivery = saltator_federation::spawn_delivery_worker(
+        fedout.clone(),
+        rooms.clone(),
+        fed_client,
+        server_name.clone(),
+    );
 
     let mut cs_shutdown = shutdown_rx.clone();
     let cs_task = tokio::spawn(async move {
@@ -463,8 +464,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     internal_task.await??;
     cs_task.await??;
     fed_task.await??;
-    fed_sender.abort();
-    edu_sender.abort();
+    delivery.abort();
     push_delivery.abort();
     reconciler.abort();
     projection.abort();

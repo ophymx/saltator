@@ -3,8 +3,8 @@
 //! request authentication.
 
 mod backfill;
+mod delivery;
 mod directory;
-mod edu_sender;
 mod fetcher;
 mod hierarchy;
 mod http_client;
@@ -16,15 +16,14 @@ mod media;
 mod outbound;
 mod query;
 mod resolver;
-mod sender;
 pub mod ssrf;
 mod transactions;
 mod user_keys;
 mod xmatrix;
 
 pub use backfill::fetch_backfill;
+pub use delivery::spawn_delivery_worker;
 pub use directory::directory_body;
-pub use edu_sender::spawn_edu_sender;
 pub use http_client::build_http_client;
 pub use inbound::{AuthRejection, Authenticated};
 pub use join_client::{
@@ -35,7 +34,6 @@ pub use keys::{trust_event_servers, KeyCache, KeyError};
 pub use media::parse_multipart_file;
 pub use outbound::{FederationClient, OutboundError};
 pub use resolver::{ResolvedServer, ServerResolver};
-pub use sender::spawn_sender;
 pub use xmatrix::{
     parse_authorization, sign_request, signing_object, verify_request, AuthError, AuthParams,
 };

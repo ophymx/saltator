@@ -50,6 +50,36 @@ async fn start_rooms(
     rooms
 }
 
+/// Single-node fed-out shard + the unified delivery worker (step 4's
+/// replacement for the old spawn_sender in these tests).
+async fn start_delivery(
+    rooms: Arc<saltator_roomserver::RoomServer>,
+    client: Arc<saltator_federation::FederationClient>,
+    hs: OwnedServerName,
+    dir: &std::path::Path,
+) -> (
+    Arc<saltator_fedout::FedOutServer>,
+    tokio::task::JoinHandle<()>,
+) {
+    let engine: Arc<dyn saltator_store::KvEngine> =
+        Arc::new(saltator_store::RocksEngine::open(&dir.join("fedout")).unwrap());
+    let fedout = saltator_fedout::FedOutServer::start(
+        1,
+        engine,
+        saltator_shard::NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    fedout
+        .wait_for_leader(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    let worker = saltator_federation::spawn_delivery_worker(fedout.clone(), rooms, client, hs);
+    (fedout, worker)
+}
+
 /// The peer hosts a public room; our server drives the make_join/send_join
 /// handshake against it and imports the returned state — proving the peer
 /// builds a room + join response our pipeline accepts.
@@ -594,7 +624,7 @@ async fn event_citing_rejected_auth_event_is_rejected() {
 /// half of Complement's TestOutboundFederationSend.
 #[tokio::test]
 async fn outbound_send_reaches_remote_members() {
-    use saltator_federation::{join_remote_room, spawn_sender, FederationClient};
+    use saltator_federation::{join_remote_room, FederationClient};
 
     let dir = tempfile::tempdir().unwrap();
     let hs: OwnedServerName = "hs.test".try_into().unwrap();
@@ -609,14 +639,16 @@ async fn outbound_send_reaches_remote_members() {
     // Start the outbound sender *before* the join, as a real server would
     // (it runs continuously). This puts the imported join within the
     // sender's window, so the co-signer-skip is actually exercised.
-    let sender = spawn_sender(
+    let (_fedout, sender) = start_delivery(
         our_rooms.clone(),
         Arc::new(FederationClient::with_base_url(
             hs_signer.clone(),
             peer.base_url.clone(),
         )),
         hs.clone(),
-    );
+        dir.path(),
+    )
+    .await;
 
     let client = FederationClient::with_base_url(hs_signer.clone(), peer.base_url.clone());
     let resp = join_remote_room(&client, &hs_signer, "peer.test", &room_id, "@alice:hs.test")
@@ -831,7 +863,7 @@ async fn peer_joins_our_room(
 /// TestACLs / TestACLsForEDUs.
 #[tokio::test]
 async fn resident_fans_out_send_join_membership_to_other_members() {
-    use saltator_federation::{spawn_sender, FederationClient};
+    use saltator_federation::FederationClient;
 
     let dir = tempfile::tempdir().unwrap();
     let hs: OwnedServerName = "hs.test".try_into().unwrap();
@@ -869,14 +901,16 @@ async fn resident_fans_out_send_join_membership_to_other_members() {
     // client ignores the destination name and posts everything here, so this
     // stands in for every remote member server.
     let peer = MockPeer::start("capture.test").await;
-    let sender = spawn_sender(
+    let (_fedout, sender) = start_delivery(
         our_rooms.clone(),
         Arc::new(FederationClient::with_base_url(
             hs_signer.clone(),
             peer.base_url.clone(),
         )),
         hs.clone(),
-    );
+        dir.path(),
+    )
+    .await;
 
     // b.test joins first: at that point only alice (local) is a member, so
     // there is no other server to fan bob's join out to.
@@ -948,7 +982,7 @@ async fn resident_fans_out_send_join_membership_to_other_members() {
 /// see her ban in a room hosted elsewhere).
 #[tokio::test]
 async fn ban_of_remote_user_reaches_their_server() {
-    use saltator_federation::{spawn_sender, FederationClient};
+    use saltator_federation::FederationClient;
 
     let dir = tempfile::tempdir().unwrap();
     let hs: OwnedServerName = "hs.test".try_into().unwrap();
@@ -984,14 +1018,16 @@ async fn ban_of_remote_user_reaches_their_server() {
 
     // Capture our outbound at a single mock endpoint (destination name ignored).
     let peer = MockPeer::start("capture.test").await;
-    let sender = spawn_sender(
+    let (_fedout, sender) = start_delivery(
         our_rooms.clone(),
         Arc::new(FederationClient::with_base_url(
             hs_signer.clone(),
             peer.base_url.clone(),
         )),
         hs.clone(),
-    );
+        dir.path(),
+    )
+    .await;
 
     // bob (on b.test) joins, then alice bans him — bob's server is now the only
     // *remote* server and the ban removes it from current membership.

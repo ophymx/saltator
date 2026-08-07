@@ -7,9 +7,21 @@ use saltator_store::{key, table_bounds, KvEngine, Result as StoreResult, WriteBa
 
 use crate::ShardId;
 
-/// Tables below this are owned by the shard runtime (Raft log, Raft
-/// metadata, state-machine metadata). Apps allocate their tables from
-/// here up; the runtime's snapshot covers exactly `APP_TABLE_MIN..`.
+/// Tables below this are owned by the shard runtime. One shared table-id
+/// namespace spans BOTH storage roles (step 3.5's log/state split), with
+/// each id living in exactly one of the two DBs:
+///   - log DB (`Stores::log`, always-fsynced): `T_LOG = 0` (entries),
+///     `T_RAFT = 1` (vote/committed/purge bookkeeping — atomic with log
+///     deletion);
+///   - state DB (`Stores::state`, relaxed applies): `T_SM_META = 2`
+///     (last-applied/membership/seq/snapshot — atomic with app writes),
+///     [`T_SCHEMA`]` = 8`, and app tables from [`APP_TABLE_FIRST`] up;
+///   - 3–7: spare.
+///
+/// The split line runs through the reserved range on purpose — it IS the
+/// durability/atomicity boundary. Apps allocate from [`APP_TABLE_FIRST`];
+/// the runtime's snapshot covers exactly `APP_TABLE_MIN..` of the state
+/// DB (sm-meta rides in the snapshot struct's own fields instead).
 pub const APP_TABLE_MIN: u8 = 8;
 
 /// The reserved schema table (`= APP_TABLE_MIN`): one

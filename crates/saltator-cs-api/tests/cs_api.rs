@@ -188,6 +188,41 @@ impl Env {
     }
 }
 
+/// Single-node fed-out shard + the unified delivery worker (step 4).
+async fn start_fedout_delivery(
+    dir: &std::path::Path,
+    rooms: Arc<RoomServer>,
+    client: Arc<FederationClient>,
+    server_name: &str,
+) -> (
+    Arc<saltator_fedout::FedOutServer>,
+    tokio::task::JoinHandle<()>,
+) {
+    let engine: Arc<dyn saltator_store::KvEngine> = Arc::new(
+        saltator_store::RocksEngine::open(&dir.join(format!("fedout-{server_name}"))).unwrap(),
+    );
+    let fedout = saltator_fedout::FedOutServer::start(
+        1,
+        engine,
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    fedout
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    let worker = saltator_federation::spawn_delivery_worker(
+        fedout.clone(),
+        rooms,
+        client,
+        ruma::OwnedServerName::try_from(server_name).unwrap(),
+    );
+    (fedout, worker)
+}
+
 #[tokio::test]
 async fn two_users_chat_end_to_end() {
     let env = start_env().await;
@@ -5453,15 +5488,17 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
     );
     let since = sync0["next_batch"].as_str().unwrap().to_owned();
 
-    // hs2's real outbound sender, aimed at hs1.
-    let hs2_sender = saltator_federation::spawn_sender(
+    // hs2's real outbound delivery worker, aimed at hs1.
+    let (_hs2_fedout, hs2_sender) = start_fedout_delivery(
+        dir.path(),
         hs2_rooms.clone(),
         Arc::new(FederationClient::with_base_url(
             hs2_signer.clone(),
             hs1_fed_base.clone(),
         )),
-        ruma::OwnedServerName::try_from("hs2").unwrap(),
-    );
+        "hs2",
+    )
+    .await;
 
     // bob bans alice; the sender delivers the ban to hs1.
     let alice_uid = "@alice:hs1";
@@ -7405,17 +7442,20 @@ async fn to_device_over_federation_round_trip() {
         a_signer.clone(),
         Arc::new(KeyCache::with_base_url(b_fed_base.clone())),
     );
-    let a_router = saltator_cs_api::router(a_cs);
-    // Remote to-device goes through the durable outbox; drain it like the
-    // daemon does.
-    let a_edu_sender = saltator_federation::spawn_edu_sender(
-        a_users.clone(),
+    // Remote to-device goes through the fed-out outbox (step 4); run the
+    // shard + delivery worker like the daemon does.
+    let (a_fedout, a_edu_sender) = start_fedout_delivery(
+        dir.path(),
+        a_rooms.clone(),
         Arc::new(FederationClient::with_base_url(
             a_signer.clone(),
             b_fed_base,
         )),
-        ruma::OwnedServerName::try_from("a.test").unwrap(),
-    );
+        "a.test",
+    )
+    .await;
+    let a_cs = a_cs.with_fedout(a_fedout.clone());
+    let a_router = saltator_cs_api::router(a_cs);
 
     let bob = reg(&b_router, "bob").await;
     let alice = reg(&a_router, "alice").await;

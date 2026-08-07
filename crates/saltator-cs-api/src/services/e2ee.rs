@@ -7,8 +7,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use saltator_fedout::{FedOutServer, OutboundEdu};
 use saltator_roomserver::RoomServer;
-use saltator_userserver::{OutboundEdu, UserServer};
+use saltator_userserver::UserServer;
 
 use crate::error::ApiError;
 
@@ -19,6 +20,9 @@ type Result<T> = std::result::Result<T, ApiError>;
 pub(crate) struct E2ee<'a> {
     pub users: &'a Arc<UserServer>,
     pub rooms: &'a Arc<RoomServer>,
+    /// Durable outbound home (step 4). `None` in delivery-less stacks:
+    /// enqueues drop with a warning.
+    pub fedout: Option<&'a Arc<FedOutServer>>,
     pub server_name: &'a str,
 }
 
@@ -173,9 +177,12 @@ impl E2ee<'_> {
             .collect();
         // Spawned so route handlers don't block on the shard write; the
         // outbox makes delivery itself durable once queued.
-        let users = self.users.clone();
+        let Some(fedout) = self.fedout.cloned() else {
+            tracing::warn!("no fed-out shard wired; dropping device-list EDUs");
+            return;
+        };
         tokio::spawn(async move {
-            if let Err(e) = users.queue_outbound_edus(entries).await {
+            if let Err(e) = fedout.enqueue_edus(entries).await {
                 tracing::warn!(error = %e, "queueing device-list EDUs failed");
             }
         });
@@ -246,6 +253,7 @@ mod tests {
         tempfile::TempDir,
         Arc<RoomServer>,
         Arc<UserServer>,
+        Arc<saltator_fedout::FedOutServer>,
         tokio::task::JoinHandle<()>,
     ) {
         let dir = tempfile::tempdir().unwrap();
@@ -278,8 +286,22 @@ mod tests {
         for h in [rooms.shard_handle(), users.shard_handle()] {
             h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
         }
+        let fedout = saltator_fedout::FedOutServer::start(
+            1,
+            Arc::new(RocksEngine::open(&dir.path().join("fedout")).unwrap())
+                as Arc<dyn saltator_store::KvEngine>,
+            NoopNetworkFactory,
+            Some("127.0.0.1:0".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        fedout
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
         let proj = spawn_membership_projection(users.clone(), rooms.clone());
-        (dir, rooms, users, proj)
+        (dir, rooms, users, fedout, proj)
     }
 
     /// The joiner's own user id appears in their `device_lists.changed`
@@ -287,7 +309,7 @@ mod tests {
     /// the service, no router.
     #[tokio::test]
     async fn deltas_include_self_and_members_on_join() {
-        let (_dir, rooms, users, proj) = stack().await;
+        let (_dir, rooms, users, fedout, proj) = stack().await;
         let alice = ruma::OwnedUserId::try_from(format!("@alice:{SERVER}")).unwrap();
         let bob = ruma::OwnedUserId::try_from(format!("@bob:{SERVER}")).unwrap();
 
@@ -341,6 +363,7 @@ mod tests {
         let svc = E2ee {
             users: &users,
             rooms: &rooms,
+            fedout: Some(&fedout),
             server_name: SERVER,
         };
         let my_rooms: std::collections::BTreeSet<String> =
@@ -355,6 +378,7 @@ mod tests {
         );
 
         proj.abort();
+        fedout.shutdown().await.unwrap();
         rooms.shutdown().await.unwrap();
         users.shutdown().await.unwrap();
     }
@@ -363,10 +387,11 @@ mod tests {
     /// each destination — the announce path minus the room-audience glue.
     #[tokio::test]
     async fn queue_update_reaches_outbox_with_replay_marker() {
-        let (_dir, rooms, users, proj) = stack().await;
+        let (_dir, rooms, users, fedout, proj) = stack().await;
         let svc = E2ee {
             users: &users,
             rooms: &rooms,
+            fedout: Some(&fedout),
             server_name: SERVER,
         };
         svc.queue_update(
@@ -379,7 +404,7 @@ mod tests {
         // The queue write is spawned; poll the outbox briefly.
         let mut rows = Vec::new();
         for _ in 0..100 {
-            rows = users.store().edu_outbox("remote.test", 10).unwrap();
+            rows = fedout.store().edu_outbox("remote.test", 10).unwrap();
             if !rows.is_empty() {
                 break;
             }
@@ -391,6 +416,7 @@ mod tests {
         assert_eq!(edu["content"]["org.saltator.replay"], true);
 
         proj.abort();
+        fedout.shutdown().await.unwrap();
         rooms.shutdown().await.unwrap();
         users.shutdown().await.unwrap();
     }
