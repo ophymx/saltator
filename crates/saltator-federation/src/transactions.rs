@@ -71,12 +71,25 @@ pub async fn send_transaction(
         crate::keys::trust_event_servers(&state.key_cache, rooms, &pdu_objs).await;
     }
 
+    let ingest_start = crate::now_ms();
+    let pdu_count = pdus.len();
     let mut results = serde_json::Map::new();
     for pdu in pdus.into_iter().take(MAX_PDUS) {
         let (event_id, result) = process_pdu(&state, &auth.origin, pdu).await;
         if let Some(event_id) = event_id {
             results.insert(event_id, result);
         }
+    }
+    if pdu_count > 0 {
+        // Receiver leg of the delivery-latency decomposition (pairs with
+        // the sender's queue_ms/put_ms log in delivery.rs).
+        tracing::debug!(
+            origin = %auth.origin,
+            txn_id,
+            count = pdu_count,
+            ingest_ms = crate::now_ms().saturating_sub(ingest_start),
+            "send_transaction: PDUs ingested"
+        );
     }
 
     // EDUs: applied best-effort, no per-EDU result. To-device messages go
