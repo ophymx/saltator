@@ -129,6 +129,9 @@ where
 pub struct Auth {
     pub user_id: OwnedUserId,
     pub device_id: String,
+    /// Authenticated with an application service's `as_token` — unlocks
+    /// AS-only abilities (`?ts` timestamp massaging).
+    pub appservice: bool,
 }
 
 impl FromRequestParts<Arc<CsState>> for Auth {
@@ -139,12 +142,32 @@ impl FromRequestParts<Arc<CsState>> for Auth {
         state: &Arc<CsState>,
     ) -> Result<Self, Self::Rejection> {
         let token = token_from_parts(parts).ok_or_else(ApiError::missing_token)?;
+        // An appservice token authenticates as the AS's sender user (its
+        // devices are virtual — a stable synthetic id keeps txn scoping
+        // working). Checked first: AS tokens live in config, not the user
+        // shard.
+        if let Some(reg) = state.appservices.iter().find(|a| a.as_token == token) {
+            let user_id = OwnedUserId::try_from(format!(
+                "@{}:{}",
+                reg.sender_localpart, state.config.server_name
+            ))
+            .map_err(|_| ApiError::unknown_token())?;
+            return Ok(Auth {
+                user_id,
+                device_id: format!("appservice_{}", reg.sender_localpart),
+                appservice: true,
+            });
+        }
         let (user_id, device_id) = state
             .users
             .authenticate(&token)
             .map_err(ApiError::from)?
             .ok_or_else(ApiError::unknown_token)?;
-        Ok(Auth { user_id, device_id })
+        Ok(Auth {
+            user_id,
+            device_id,
+            appservice: false,
+        })
     }
 }
 

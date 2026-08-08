@@ -1736,15 +1736,37 @@ pub async fn send_message_event(
     state.rate_limit(crate::ratelimit::Kind::Message, auth.user_id.as_str())?;
     let content: serde_json::Value = serde_json::from_str(req.body.json().get())
         .map_err(|e| ApiError::bad_json(e.to_string()))?;
-    let outcome = state
-        .rooms
-        .send_message(
-            &req.room_id,
-            &auth.user_id,
-            &req.event_type.to_string(),
-            content,
-        )
-        .await?;
+    // `?ts` timestamp massaging is an appservice-only ability (MSC3316);
+    // for everyone else the parameter is ignored, as Synapse does.
+    let ts_override = match req.timestamp {
+        Some(ts) if auth.appservice => Some(u64::from(ts.0)),
+        _ => None,
+    };
+    let outcome = match ts_override {
+        Some(ts) => {
+            state
+                .rooms
+                .send_message_at(
+                    &req.room_id,
+                    &auth.user_id,
+                    &req.event_type.to_string(),
+                    content,
+                    ts,
+                )
+                .await?
+        }
+        None => {
+            state
+                .rooms
+                .send_message(
+                    &req.room_id,
+                    &auth.user_id,
+                    &req.event_type.to_string(),
+                    content,
+                )
+                .await?
+        }
+    };
     let (event_id, _) = accepted_event_id(outcome)?;
     state.txns.put(
         auth.user_id.as_str(),
@@ -2039,9 +2061,11 @@ pub async fn get_state_event_empty_key(
 /// `GET /rooms/{roomId}/timestamp_to_event?ts=&dir=`: the event closest to
 /// `ts` in direction `dir` (MSC3030 "jump to date"). `f` returns the first
 /// event at or after `ts`, `b` the last at or before; ties break by
-/// timeline order (earliest for `f`, latest for `b`). 404 when none. This
-/// serves from the local timeline only; querying past the local history
-/// (the federated backfill fallback) is future work.
+/// timeline order (earliest for `f`, latest for `b`). 404 when none.
+/// Serves locally (timeline + backfilled history); while unfetched
+/// history remains below our floor, a closer event may exist that we have
+/// never seen, so the room's resident servers are consulted and the
+/// winning event backfilled (Synapse's gap fallback, MSC3030).
 pub async fn timestamp_to_event(
     State(state): State<Arc<CsState>>,
     auth: Auth,
@@ -2056,11 +2080,37 @@ pub async fn timestamp_to_event(
         .ok_or_else(|| ApiError::invalid_param("ts: required integer (ms)"))?;
     let backward = matches!(q.get("dir").map(String::as_str), Some("b"));
 
-    match state
+    let history_ok = history_readable(&state, &room_id)?;
+    let local = state
         .rooms
-        .timestamp_to_event(&room_id, ts, backward)
-        .map_err(internal)?
-    {
+        .timestamp_to_event(&room_id, ts, backward, history_ok)
+        .map_err(internal)?;
+
+    // Unfetched history below our floor means the true closest event may
+    // be one we have never seen — ask the servers that hold it. Gated on
+    // the same visibility rule as serving history.
+    let frontier = state.rooms.history_frontier(&room_id).map_err(internal)?;
+    if history_ok && !frontier.is_empty() {
+        if let Some((remote_id, remote_ts)) =
+            remote_timestamp_to_event(&state, &room_id, ts, backward).await
+        {
+            let remote_better = match &local {
+                None => true,
+                Some((_, local_ts)) => remote_ts.abs_diff(ts) < local_ts.abs_diff(ts),
+            };
+            if remote_better {
+                // Backfill so /context can mint a pagination token for it
+                // (the spec's "should try to backfill this event").
+                backfill_until_present(&state, &room_id, &remote_id).await;
+                return Ok(axum::Json(serde_json::json!({
+                    "event_id": remote_id,
+                    "origin_server_ts": remote_ts,
+                })));
+            }
+        }
+    }
+
+    match local {
         Some((id, ots)) => Ok(axum::Json(serde_json::json!({
             "event_id": id,
             "origin_server_ts": ots,
@@ -2068,6 +2118,67 @@ pub async fn timestamp_to_event(
         None => Err(ApiError::not_found(
             "No event found for the given timestamp",
         )),
+    }
+}
+
+/// Ask the room's resident servers `GET /timestamp_to_event`; the first
+/// server with an answer wins (they hold the history we lack).
+async fn remote_timestamp_to_event(
+    state: &CsState,
+    room_id: &str,
+    ts: u64,
+    backward: bool,
+) -> Option<(String, u64)> {
+    let fed = state.federation.as_ref()?;
+    let our_name = state.config.server_name.as_str();
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(resident) = saltator_federation::resident_of_room(room_id) {
+        if resident != our_name {
+            candidates.push(resident);
+        }
+    }
+    for server in state.rooms.remote_servers_in_room(room_id, our_name).ok()? {
+        if !candidates.contains(&server) {
+            candidates.push(server);
+        }
+    }
+    for dest in candidates {
+        match saltator_federation::fetch_timestamp_to_event(
+            &fed.client,
+            &dest,
+            room_id,
+            ts,
+            backward,
+        )
+        .await
+        {
+            Ok(Some(found)) => return Some(found),
+            Ok(None) | Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// Pull backfill batches until `event_id` is stored locally (or the
+/// frontier closes / stops progressing). Best-effort: the answer is
+/// returned to the client either way; this only anchors `/context`.
+async fn backfill_until_present(state: &CsState, room_id: &str, event_id: &str) {
+    for _ in 0..5 {
+        match state.rooms.store().event(event_id) {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => return,
+        }
+        let Ok(frontier) = state.rooms.history_frontier(room_id) else {
+            return;
+        };
+        if frontier.is_empty() {
+            return;
+        }
+        match fetch_history(state, room_id, &frontier).await {
+            Ok(n) if n > 0 => {}
+            _ => return,
+        }
     }
 }
 
@@ -2087,10 +2198,7 @@ pub async fn get_context(
     let meta = room_meta(&state.rooms, room_id)?;
     let version = room_version(&meta)?;
 
-    // The target must exist, belong to this room, and be visible.
-    if !crate::room_util::user_can_see_event(&state.rooms, room_id, req.event_id.as_str(), user)? {
-        return Err(ApiError::not_found("Event not found"));
-    }
+    // The target must exist and belong to this room.
     let Some(target) = state
         .rooms
         .store()
@@ -2102,6 +2210,24 @@ pub async fn get_context(
     let event = client_event(&state.rooms, version, room_id, req.event_id.as_str(), user)?
         .filter(|ev| ev.get("room_id").and_then(|r| r.as_str()) == Some(room_id))
         .ok_or_else(|| ApiError::not_found("Event not found"))?;
+    // A backfilled-history target sits below the timeline floor: it has no
+    // state group for a per-event visibility check, so gate on the room's
+    // current history visibility, exactly as /messages does when serving
+    // history rows.
+    if target.seq == 0 {
+        let Some(hidx) = target.history_idx else {
+            return Err(ApiError::not_found("Event not found"));
+        };
+        if !history_readable(&state, room_id)? {
+            return Err(ApiError::not_found("Event not found"));
+        }
+        let limit = (u64::from(req.limit) as usize).min(100);
+        return context_in_history(&state, room_id, user, event, hidx, ceiling, limit);
+    }
+    // Timeline targets: per-event visibility.
+    if !crate::room_util::user_can_see_event(&state.rooms, room_id, req.event_id.as_str(), user)? {
+        return Err(ApiError::not_found("Event not found"));
+    }
     let target_seq = target.seq;
 
     let total = (u64::from(req.limit) as usize).min(100);
@@ -2150,6 +2276,98 @@ pub async fn get_context(
     Ok(axum::Json(serde_json::json!({
         "start": format!("t{}", oldest.saturating_sub(1)),
         "end": format!("t{newest}"),
+        "events_before": events_before,
+        "event": event,
+        "events_after": events_after,
+        "state": state_events,
+    })))
+}
+
+/// `/context` for a target in backfilled history (below the timeline
+/// floor): neighbours come from the history order — history indexes grow
+/// *older* — continuing up onto the timeline on the newer side. Tokens
+/// are the `h{idx}` positions `/messages` paginates with. The state block
+/// reflects the newest timeline event returned; a response that never
+/// reaches the timeline has none (backfilled events predate every
+/// locally-known state snapshot).
+fn context_in_history(
+    state: &CsState,
+    room_id: &str,
+    user: &str,
+    event: serde_json::Value,
+    hidx: u64,
+    ceiling: Option<u64>,
+    limit: usize,
+) -> Result<axum::Json<serde_json::Value>> {
+    let version = room_version(&room_meta(&state.rooms, room_id)?)?;
+    let store = state.rooms.store();
+    let before_limit = limit / 2 + limit % 2;
+    let after_limit = limit - before_limit;
+
+    // Older side: ascending idx = newer→older = reverse chronological.
+    let mut events_before = Vec::new();
+    let mut oldest = hidx;
+    for (idx, id) in store
+        .room_history(room_id, hidx, None, before_limit, false)
+        .map_err(internal)?
+    {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+            oldest = idx;
+            events_before.push(ev);
+        }
+    }
+
+    // Newer side: the rest of history (descending idx = older→newer),
+    // then the timeline from its floor.
+    let mut events_after = Vec::new();
+    let mut newest_hist = hidx;
+    let mut newest_seq: Option<u64> = None;
+    if hidx > 1 {
+        for (idx, id) in store
+            .room_history(room_id, 0, Some(hidx - 1), after_limit, true)
+            .map_err(internal)?
+        {
+            if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+                newest_hist = idx;
+                events_after.push(ev);
+            }
+        }
+    }
+    let remaining = after_limit.saturating_sub(events_after.len());
+    if remaining > 0 {
+        for (seq, id) in store
+            .room_timeline(room_id, 0, ceiling, remaining, false)
+            .map_err(internal)?
+        {
+            if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+                newest_seq = Some(seq);
+                events_after.push(ev);
+            }
+        }
+    }
+
+    let mut state_events = Vec::new();
+    if let Some(seq) = newest_seq {
+        let state_map = crate::room_util::state_at_seq(&state.rooms, room_id, seq)?;
+        for id in state_map.values() {
+            if let Some(ev) = client_event(&state.rooms, version, room_id, id, user)? {
+                state_events.push(ev);
+            }
+        }
+    }
+
+    // `h{idx}` anchors: paginating /messages backwards from `h{x}` yields
+    // strictly older rows (idx > x), so `start` names the oldest returned
+    // row and `end` sits one step newer than the newest returned history
+    // row — unless the response reached the timeline, where native
+    // `t{seq}` tokens take over.
+    let end = match newest_seq {
+        Some(seq) => format!("t{seq}"),
+        None => format!("h{}", newest_hist.saturating_sub(1)),
+    };
+    Ok(axum::Json(serde_json::json!({
+        "start": format!("h{oldest}"),
+        "end": end,
         "events_before": events_before,
         "event": event,
         "events_after": events_after,

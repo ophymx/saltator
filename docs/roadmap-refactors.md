@@ -219,10 +219,22 @@ mechanically once cs-api's remaining direct uses thin out.
   truncation as index-superseding appends) into "verified"; merge the
   findings, not the code.
 
-- **JumpToDate leaves** (last implementable federation gap, conformance
-  Group 2): federation `timestamp_to_event` fallback + topological
-  equal-ts tie-break. 7 allowlisted leaves ratchet off when done.
-- **Application services** — unblocks the 1 AS-blocked allowlist leaf.
+- ~~**JumpToDate leaves**~~ DONE (jump-to-date branch, 2026-08-07):
+  remote fallback + backfill + history-aware `/context`; the
+  "topological" leaves actually needed minimal appservice support, not
+  tie-break work. All 7 leaves plus the AS-bridge leaf ratcheted off —
+  allowlist is down to the 4 by-design v6/v7 entries (92/96).
+- **Application services, full** — minimal support landed with
+  jump-to-date (as_token auth as sender user, `?ts` massaging,
+  registration-file loading). Still missing: namespaces, `?user_id=`
+  impersonation, outbound event push (`hs_token`), `/register` with
+  `m.login.application_service`.
+- **Federation delivery latency** (task #17, blocking-ish): the
+  restricted-join "uses power levels" family loses a ~40-100ms
+  eventual-consistency race in CI (~every run since #43 merged; V11 then
+  V12 variants). Instrument deliver_pdus latency, then attack the
+  dominant term (batch queued PDUs per txn — spec allows 50; parallel
+  per-dest sends; PDU-before-EDU priority).
 - Security-review follow-ups (see memory: resolver private-IP M2,
   cross-signing sig L1, L6/L8).
 - PDU sender: `deliver_to` gives up after 3 attempts per pass —

@@ -22,7 +22,7 @@ mod transactions;
 mod user_keys;
 mod xmatrix;
 
-pub use backfill::fetch_backfill;
+pub use backfill::{fetch_backfill, fetch_timestamp_to_event};
 pub use delivery::{spawn_delivery_worker, DeliveryBackoff};
 pub use directory::directory_body;
 pub use drain::{drain_user_outbox_once, spawn_user_outbox_drain};
