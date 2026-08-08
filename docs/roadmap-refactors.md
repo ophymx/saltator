@@ -171,7 +171,37 @@ copying route logic. Scope to be broken down when it starts; likely
 slices: account admin (deactivate/reset/erase), room admin
 (shutdown/purge), server notices, registration tokens, moderation
 basics. Synapse's admin API is the de-facto reference
-(`~/src/synapse` for ground truth).
+(`~/src/synapse` for ground truth). Now also owed from the cluster
+hardening pass: **graceful voter removal** — `NodeStatus::Draining`
+exists in the roster model but nothing sets it, so the only node-removal
+path today is crash-and-forget.
+
+## Interlude ☑ — Cluster hardening (2026-08-08, user-directed, pre-Step-5)
+
+Complement compliance against real 3-node clusters, with and without
+node churn — local-only by design (never CI; multi-node failover timing
+under suite load is inherently noisy; the goal is finding bugs, not a
+badge). Three landings (cluster-hardening branch):
+
+1. **Leader forwarding + read-your-writes barrier** (`ShardHandle::
+   propose`): a follower forwards to the leader over a new ControlService
+   Propose RPC, rides out elections, and does not ack until its OWN
+   applied state reaches the committed index. The prerequisite for any
+   single-URL (load-balanced) cluster deployment.
+2. **3-node Complement harness**: `CLUSTER_NODES=3` turns the Complement
+   image into an in-container cluster behind haproxy (first-healthy
+   affinity, redispatch on death; TLS passthrough on 8448; shared media
+   dir). `scripts/complement_cluster.sh` runs any suite against it.
+   Result: full csapi (371 tests) and federation suites match
+   single-node exactly.
+3. **Churn**: `scripts/cluster_churn_soak.sh` (kill -9/restart cycles of
+   random nodes incl. leaders under pinned single-node writes; converge
+   audits per cycle; late-added 4th node must fold in and serve) — found
+   and fixed the placement boot wedge (RF-capped placement vs. the
+   every-node-hosts-everything serving assumption; placement now floors
+   RF at the node count until data-plane routing for unhosted shards
+   exists). Full csapi suite under `CHURN_INTERVAL=20` kill -9 churn:
+   zero churn-induced failures (verified kills do fire mid-test).
 
 ---
 
