@@ -82,6 +82,21 @@ pub struct CsState {
     pub(crate) push_rule_locks:
         tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) rate_limiter: ratelimit::RateLimiter,
+    /// Registered application services (minimal support: `as_token` →
+    /// sender identity plus `?ts` timestamp massaging; namespaces,
+    /// impersonation, and outbound event push are not implemented).
+    pub(crate) appservices: Vec<AppServiceRegistration>,
+}
+
+/// One application service registration (the subset of the registration
+/// file this server understands).
+#[derive(Debug, Clone)]
+pub struct AppServiceRegistration {
+    /// The token the AS authenticates to us with (`hs_token`, the reverse
+    /// direction, is unused until outbound push exists).
+    pub as_token: String,
+    /// Localpart of the AS's own user (`@{sender_localpart}:{server}`).
+    pub sender_localpart: String,
 }
 
 /// The bits of the federation surface the CS API drives directly: a signed
@@ -133,6 +148,18 @@ impl CsState {
         self
     }
 
+    /// Attach application service registrations (loaded from registration
+    /// files at startup).
+    pub fn with_appservices(
+        mut self: Arc<Self>,
+        appservices: Vec<AppServiceRegistration>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("with_appservices called on a shared CsState")
+            .appservices = appservices;
+        self
+    }
+
     /// The E2EE/device-list domain service over this state's shards.
     pub(crate) fn e2ee(&self) -> services::e2ee::E2ee<'_> {
         services::e2ee::E2ee {
@@ -161,6 +188,7 @@ impl CsState {
             txns: txn::TxnCache::new(),
             push_rule_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             rate_limiter: ratelimit::RateLimiter::new(),
+            appservices: Vec::new(),
         })
     }
 

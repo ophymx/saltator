@@ -73,6 +73,12 @@ pub struct ClientConfig {
     /// servers live on private IPs.
     #[serde(default)]
     pub allow_internal_fetch: bool,
+    /// Directory of application service registration files (`*.yaml`);
+    /// each is loaded at startup. Registrations grant their `as_token`
+    /// authentication as the AS's sender user plus `?ts` timestamp
+    /// massaging.
+    #[serde(default)]
+    pub appservice_registration_dir: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -84,6 +90,7 @@ impl Default for ClientConfig {
             well_known_client: None,
             rate_limits_enabled: true,
             allow_internal_fetch: false,
+            appservice_registration_dir: None,
         }
     }
 }

@@ -33,6 +33,13 @@ TLS
 )"
 fi
 
+# Complement copies appservice registration files here for blueprints
+# that declare one (e.g. the jump-to-date `?ts` massaging tests).
+AS_DIR=""
+if [ -d /complement/appservice ]; then
+    AS_DIR='appservice_registration_dir = "/complement/appservice"'
+fi
+
 cat > /data/saltator.toml <<EOF
 server_name = "$SERVER_NAME"
 data_dir = "/data"
@@ -48,6 +55,7 @@ rate_limits_enabled = false
 # Complement's URL-preview/pusher targets live on the isolated test network
 # (private IPs); allow the server to fetch them.
 allow_internal_fetch = true
+$AS_DIR
 
 [node]
 id = 1

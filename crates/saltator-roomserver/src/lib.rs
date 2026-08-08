@@ -452,7 +452,7 @@ impl RoomServer {
         state_key: &str,
         content: serde_json::Value,
     ) -> Result<Outcome> {
-        self.send_local(room_id, sender, event_type, Some(state_key), content)
+        self.send_local(room_id, sender, event_type, Some(state_key), content, None)
             .await
     }
 
@@ -464,7 +464,22 @@ impl RoomServer {
         event_type: &str,
         content: serde_json::Value,
     ) -> Result<Outcome> {
-        self.send_local(room_id, sender, event_type, None, content)
+        self.send_local(room_id, sender, event_type, None, content, None)
+            .await
+    }
+
+    /// [`Self::send_message`] with an explicit `origin_server_ts` —
+    /// appservice timestamp massaging (`?ts=`, MSC3316). The event still
+    /// lands at the timeline tip; only its claimed time changes.
+    pub async fn send_message_at(
+        &self,
+        room_id: &ruma::RoomId,
+        sender: &UserId,
+        event_type: &str,
+        content: serde_json::Value,
+        ts: u64,
+    ) -> Result<Outcome> {
+        self.send_local(room_id, sender, event_type, None, content, Some(ts))
             .await
     }
 
@@ -562,6 +577,7 @@ impl RoomServer {
             "m.room.member",
             Some(target.as_str()),
             serde_json::Value::Object(content),
+            None,
         )?;
         Ok((version, raw))
     }
@@ -877,25 +893,41 @@ impl RoomServer {
             .unwrap_or_default())
     }
 
-    /// The timeline event closest to `ts` (MSC3030 "jump to date"), shared
-    /// by the CS and federation `timestamp_to_event` endpoints. Forwards
+    /// The event closest to `ts` (MSC3030 "jump to date"), shared by the
+    /// CS and federation `timestamp_to_event` endpoints. Forwards
     /// (`backward == false`) returns the first event at or after `ts`,
-    /// backwards the last at or before; ties break by timeline order
+    /// backwards the last at or before; ties break by room order
     /// (earliest forwards, latest backwards). `None` when no event
-    /// qualifies. Serves from the local timeline only; chasing history we
-    /// don't hold (the federated fallback) is the caller's concern.
+    /// qualifies. Searches the local timeline, plus already-backfilled
+    /// history when `include_history` (the CS route gates that on the
+    /// room's history visibility, like `/messages`); chasing history we
+    /// don't hold yet (the federated fallback) is the caller's concern.
     pub fn timestamp_to_event(
         &self,
         room_id: &str,
         ts: u64,
         backward: bool,
+        include_history: bool,
     ) -> Result<Option<(String, u64)>> {
         let store = self.store();
-        let mut best: Option<(u64, u64, String)> = None;
-        for (seq, id) in store
+        // One chronological position across both orders: history sits
+        // below the whole timeline, and its indexes grow *older*.
+        let timeline = store
             .room_timeline(room_id, 0, None, usize::MAX, false)
             .map_err(storage_err)?
-        {
+            .into_iter()
+            .map(|(seq, id)| ((1u64, seq), id));
+        let history = if include_history {
+            store
+                .room_history(room_id, 0, None, usize::MAX, false)
+                .map_err(storage_err)?
+        } else {
+            Vec::new()
+        }
+        .into_iter()
+        .map(|(idx, id)| ((0u64, u64::MAX - idx), id));
+        let mut best: Option<(u64, (u64, u64), String)> = None;
+        for (pos, id) in timeline.chain(history) {
             let Some(stored) = store.event(&id).map_err(storage_err)? else {
                 continue;
             };
@@ -912,11 +944,11 @@ impl RoomServer {
             }
             let better = match &best {
                 None => true,
-                Some((bts, bseq, _)) if backward => (ots, seq) > (*bts, *bseq),
-                Some((bts, bseq, _)) => (ots, seq) < (*bts, *bseq),
+                Some((bts, bpos, _)) if backward => (ots, pos) > (*bts, *bpos),
+                Some((bts, bpos, _)) => (ots, pos) < (*bts, *bpos),
             };
             if better {
-                best = Some((ots, seq, id));
+                best = Some((ots, pos, id));
             }
         }
         Ok(best.map(|(ots, _, id)| (id, ots)))
@@ -1749,11 +1781,13 @@ impl RoomServer {
         event_type: &str,
         state_key: Option<&str>,
         content: serde_json::Value,
+        ts_override: Option<u64>,
     ) -> Result<Outcome> {
         // The lock spans build + process: prev_events/auth_events read
         // here must still be the room's tip when the proposal lands.
         let _guard = self.lock_room(room_id.as_str()).await;
-        let (raw, version) = self.build_local(room_id, sender, event_type, state_key, content)?;
+        let (raw, version) =
+            self.build_local(room_id, sender, event_type, state_key, content, ts_override)?;
         // Locally authored: the sender's `is_local` check fans it out already.
         self.process(raw, version, &room_id.to_owned(), false, false)
             .await
@@ -1791,6 +1825,8 @@ impl RoomServer {
     }
 
     /// Build and sign a local event on the room's current tip.
+    /// `ts_override` replaces the `origin_server_ts` stamp (appservice
+    /// timestamp massaging).
     fn build_local(
         &self,
         room_id: &ruma::RoomId,
@@ -1798,6 +1834,7 @@ impl RoomServer {
         event_type: &str,
         state_key: Option<&str>,
         content: serde_json::Value,
+        ts_override: Option<u64>,
     ) -> Result<(CanonicalJsonObject, RoomVersion)> {
         let store = self.store();
         let meta = store
@@ -1834,7 +1871,7 @@ impl RoomServer {
         let mut obj = serde_json::json!({
             "room_id": room_id.as_str(),
             "sender": sender.as_str(),
-            "origin_server_ts": now_ms(),
+            "origin_server_ts": ts_override.unwrap_or_else(now_ms),
             "type": event_type,
             "content": CanonicalJsonValue::Object(content_obj),
             "auth_events": auth_events,

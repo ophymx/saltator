@@ -57,21 +57,31 @@ join-rule filtering, and `allowed_room_ids` on a restricted child.
 
 ## Group 2 — Jump to date (`/timestamp_to_event`)  ·  S  ·  CS-local
 Tests: `TestJumpToDateEndpoint`.
-Status (2026-08-02): PARTIAL. The CS endpoint is live and passes the
-direction + permission leaves (find after/before, nothing past the
-ends, non-member 403 on private/public). Two leaves remain:
-  1. `parallel/federation` — needs the **federation**
-     `GET /_matrix/federation/v1/timestamp_to_event/{roomId}` fallback: when
-     the local timeline has no event on the requested side of `ts`, query
-     the resident/other server and backfill, then answer.
-  2. `should_find_next_event_topologically_{after,before}...when all message
-     timestamps are the same` — the tie-break must be **topological** (DAG
-     depth / stream order), not `(origin_server_ts, seq)`. When many events
-     share a ts, return the one closest in topological order.
-Build: add the fed endpoint + client fallback; change the equal-ts tie-break
-to topological order.
-Local test: extend `timestamp_to_event_endpoint` with an all-equal-ts batch
-and assert topological selection; fed leaf needs the peer harness.
+Status (2026-08-07): DONE — whole test green 3× locally, all leaves removed
+from the allowlist. What it took (jump-to-date branch):
+  1. The CS route's federated fallback: an un-fetched `history_frontier`
+     means the true answer may be an event we've never seen, so consult
+     the room's resident servers (`fetch_timestamp_to_event`), prefer the
+     remote answer when strictly closer (Synapse's comparison), and
+     backfill until the winning event is stored so `/context` can anchor
+     on it. The local query now also searches already-backfilled history
+     (`room_history`), gated on the room's history visibility.
+  2. `/context` for history-resident targets: neighbours from the history
+     order, `h{idx}` start/end tokens compatible with `/messages`
+     pagination, empty state block (backfilled events predate all local
+     state).
+  3. The "topological" and "imported event" leaves needed **minimal
+     appservice support**, not tie-break work — Complement sends their
+     fixture events through an AS with `?ts=` massaging, and our
+     `(origin_server_ts, seq)` tie-break was already topological for
+     same-sender sequential sends. Landed: registration-file loading
+     (`client.appservice_registration_dir`, hand-parsed flat scalars),
+     `as_token` auth as the AS's sender user, `?ts` on `/send` (AS-only,
+     silently ignored otherwise, Synapse parity). Namespaces,
+     impersonation (`?user_id=`), and outbound AS event push remain
+     unimplemented.
+This also turned `TestJoinFederatedRoomFromApplicationServiceBridgeUser`
+green (Group 12) — its bridge user only needed as_token auth + join.
 
 ## Group 3 — Unknown endpoint / method handling  ·  S  ·  CS-local
 Tests: `TestUnknownEndpoints`.
@@ -333,7 +343,10 @@ path (shard readiness / put_media). Low confidence until root-caused.
 
 ## Group 12 — Application service bridge user  ·  L  ·  out of scope now
 Tests: `TestJoinFederatedRoomFromApplicationServiceBridgeUser`.
-Cause: no application-service support yet. Out of scope until AS lands.
+Status (2026-08-07): DONE — green 3× with the minimal AS support from
+Group 2 (as_token auth as the sender user; the bridge user then joins
+over ordinary federation). Full AS (namespaces, impersonation, event
+push) remains future work.
 
 ---
 
@@ -356,8 +369,9 @@ same shape as csapi) instead of the old positive must-pass list. Landing
 a feature now means *removing* its tests from the allowlist (the gate
 warns when an allowlisted test starts passing); any unlisted failure —
 including a brand-new upstream test — fails CI by default. Remaining
-allowlist: 4 by-design (v6/v7, below the v8 floor), 1 AS-blocked leaf,
-7 JumpToDate leaves (Group 2's two remaining features).
+allowlist (2026-08-07, after the jump-to-date branch closed Group 2 and
+Group 12): 4 by-design entries (v6/v7, below the v8 floor) — nothing
+else. 92/96 top-level.
 
 ---
 

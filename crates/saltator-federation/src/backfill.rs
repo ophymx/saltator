@@ -266,7 +266,7 @@ pub async fn timestamp_to_event(
         ));
     };
     match rooms
-        .timestamp_to_event(&room_id, ts, backward)
+        .timestamp_to_event(&room_id, ts, backward, true)
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -368,6 +368,31 @@ pub async fn fetch_backfill(
         }
     }
     Ok(pdus)
+}
+
+/// `GET /timestamp_to_event` on a remote server (the MSC3030 fallback for
+/// history we don't hold): the event closest to `ts` in the remote's copy
+/// of the room. `Ok(None)` when the remote has nothing on that side (404).
+pub async fn fetch_timestamp_to_event(
+    client: &crate::outbound::FederationClient,
+    destination: &str,
+    room_id: &str,
+    ts: u64,
+    backward: bool,
+) -> Result<Option<(String, u64)>, crate::outbound::OutboundError> {
+    let dir = if backward { "b" } else { "f" };
+    let path = format!(
+        "/_matrix/federation/v1/timestamp_to_event/{}?ts={ts}&dir={dir}",
+        query_encode(room_id)
+    );
+    let resp = match client.get(destination, &path).await {
+        Ok(resp) => resp,
+        Err(crate::outbound::OutboundError::Status(404, _)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let event_id = resp.get("event_id").and_then(|v| v.as_str());
+    let ots = resp.get("origin_server_ts").and_then(|v| v.as_u64());
+    Ok(event_id.zip(ots).map(|(id, ts)| (id.to_owned(), ts)))
 }
 
 /// Percent-encode the characters that would break a query value; event
