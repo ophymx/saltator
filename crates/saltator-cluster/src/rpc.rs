@@ -11,7 +11,10 @@ use saltator_shard::{ShardRegistry, TypeConfig};
 
 use crate::proto::control_service_server::ControlService;
 use crate::proto::raft_service_server::RaftService;
-use crate::proto::{JoinRequest, JoinResponse, RaftPayload, StatusRequest, StatusResponse};
+use crate::proto::{
+    JoinRequest, JoinResponse, ProposeRequest, ProposeResponse, RaftPayload, StatusRequest,
+    StatusResponse,
+};
 use crate::types::CODEC_VERSION;
 use crate::MetadataHandle;
 
@@ -157,6 +160,38 @@ impl ControlService for InternalRpc {
                 leader_id,
                 leader_addr,
             }))
+        }
+    }
+
+    /// A proposal forwarded from a non-leader node: apply it through the
+    /// addressed group's Raft if we lead it, else hand back a leader hint.
+    async fn propose(
+        &self,
+        request: Request<ProposeRequest>,
+    ) -> Result<Response<ProposeResponse>, Status> {
+        use openraft::error::{ClientWriteError, RaftError};
+        let req = request.into_inner();
+        let raft = self.registry.get(req.group).ok_or_else(|| {
+            Status::not_found(format!("no shard group {} on this node", req.group))
+        })?;
+        match raft.client_write(req.command).await {
+            Ok(resp) => Ok(Response::new(ProposeResponse {
+                applied: true,
+                response: resp.data,
+                log_index: resp.log_id.index,
+                leader_id: None,
+                leader_addr: None,
+            })),
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
+                Ok(Response::new(ProposeResponse {
+                    applied: false,
+                    response: Vec::new(),
+                    log_index: 0,
+                    leader_id: f.leader_id,
+                    leader_addr: f.leader_node.map(|n| n.addr),
+                }))
+            }
+            Err(e) => Err(Status::internal(format!("propose: {e}"))),
         }
     }
 }

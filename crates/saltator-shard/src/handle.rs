@@ -35,6 +35,41 @@ pub struct ChangeRecord {
 /// lagging out.
 const CHANGE_STREAM_CAPACITY: usize = 1024;
 
+/// How long a non-leader [`ShardHandle::propose`] keeps retrying to reach
+/// a leader (its own group re-electing, or forwarding to the current
+/// leader) before giving up. Covers an election (timeout ceiling 3s) with
+/// slack.
+const FORWARD_DEADLINE: Duration = Duration::from_secs(10);
+/// Pause between forward/re-election attempts.
+const FORWARD_RETRY_PAUSE: Duration = Duration::from_millis(150);
+/// How long the read-your-writes barrier waits for the forwarded write to
+/// appear in LOCAL applied state. Expiry is not an error — the write is
+/// committed either way — but is logged: local reads may briefly not see
+/// it.
+const FORWARD_APPLY_BARRIER: Duration = Duration::from_secs(5);
+
+/// Outcome of forwarding one proposal to another node.
+pub enum ForwardOutcome {
+    /// The remote node led the group and applied the command.
+    Applied { response: Vec<u8>, log_index: u64 },
+    /// The remote node is not the leader; its best hint of who is.
+    Redirect { leader_addr: Option<String> },
+}
+
+/// Cross-node proposal transport, implemented by the cluster crate over
+/// the internal ControlService. Lets a follower serve writes by handing
+/// them to the leader (spec.md §9) — the piece that makes ANY node able
+/// to serve a client's request, so a load balancer needs no leader
+/// awareness.
+pub trait ProposeForwarder: Send + Sync {
+    fn forward(
+        &self,
+        addr: String,
+        group: u64,
+        command: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ForwardOutcome>> + Send>>;
+}
+
 /// Handle to one running shard Raft group on this node.
 #[derive(Clone)]
 pub struct ShardHandle {
@@ -45,6 +80,10 @@ pub struct ShardHandle {
     changes: broadcast::Sender<ChangeRecord>,
     /// The app's declared schema version (the layout this binary speaks).
     app_schema_version: u32,
+    /// Set once at startup (shared across clones); absent in single-node
+    /// deployments and tests, where a non-leader propose keeps its old
+    /// fail-fast behavior.
+    forwarder: Arc<std::sync::OnceLock<Arc<dyn ProposeForwarder>>>,
 }
 
 impl ShardHandle {
@@ -111,6 +150,7 @@ impl ShardHandle {
             engine: stores.state,
             changes,
             app_schema_version,
+            forwarder: Arc::new(std::sync::OnceLock::new()),
         };
 
         if !handle.is_initialized().await? {
@@ -256,8 +296,73 @@ impl ShardHandle {
     }
 
     pub async fn propose(&self, command: Vec<u8>) -> Result<Vec<u8>> {
-        let resp = self.raft.client_write(command).await.map_err(raft_err)?;
-        Ok(resp.data)
+        use openraft::error::ClientWriteError;
+        let deadline = tokio::time::Instant::now() + FORWARD_DEADLINE;
+        // Standing leader hint from the last redirect, used when our own
+        // Raft doesn't know the leader yet (mid-election).
+        let mut hint: Option<String> = None;
+        loop {
+            // Leadership may have arrived here since the last attempt, so
+            // the local write is always tried first.
+            let forward = match self.raft.client_write(command.clone()).await {
+                Ok(resp) => return Ok(resp.data),
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => f,
+                Err(e) => return Err(raft_err(e)),
+            };
+            if let Some(fwd) = self.forwarder.get() {
+                let addr = forward.leader_node.map(|n| n.addr).or_else(|| hint.take());
+                if let Some(addr) = addr {
+                    match fwd.forward(addr, self.shard.group(), command.clone()).await {
+                        Ok(ForwardOutcome::Applied {
+                            response,
+                            log_index,
+                        }) => {
+                            // Read-your-writes: the client's next read may
+                            // hit THIS node, so don't ack until our applied
+                            // state contains the write. Expiry only warns —
+                            // the write is committed regardless.
+                            if self
+                                .raft
+                                .wait(Some(FORWARD_APPLY_BARRIER))
+                                .applied_index_at_least(
+                                    Some(log_index),
+                                    "forwarded write applied locally",
+                                )
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    shard = %self.shard,
+                                    log_index,
+                                    "forwarded write acked before local apply caught up"
+                                );
+                            }
+                            return Ok(response);
+                        }
+                        Ok(ForwardOutcome::Redirect { leader_addr }) => hint = leader_addr,
+                        // Transport failure (leader died, election under
+                        // way): retry the loop.
+                        Err(e) => {
+                            tracing::debug!(shard = %self.shard, error = %e, "proposal forward failed; retrying");
+                        }
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ShardError::Raft(format!(
+                    "{}: no leader reachable to accept the proposal",
+                    self.shard
+                )));
+            }
+            tokio::time::sleep(FORWARD_RETRY_PAUSE).await;
+        }
+    }
+
+    /// Install the cross-node proposal transport (once, at startup, before
+    /// the handle is cloned into servers). Without it a non-leader propose
+    /// fails after the retry deadline instead of forwarding.
+    pub fn set_forwarder(&self, forwarder: Arc<dyn ProposeForwarder>) {
+        let _ = self.forwarder.set(forwarder);
     }
 
     /// Confirm leadership/lease so that a subsequent [`read_ctx`]

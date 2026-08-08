@@ -25,7 +25,7 @@ use std::io::Cursor; // used by declare_raft_types! default SnapshotData
 use saltator_store::Keyspace;
 
 pub use app::{ApplyCtx, ReadCtx, ShardApp, APP_TABLE_FIRST, APP_TABLE_MIN, T_SCHEMA};
-pub use handle::{ChangeRecord, NoopNetworkFactory, ShardHandle};
+pub use handle::{ChangeRecord, ForwardOutcome, NoopNetworkFactory, ProposeForwarder, ShardHandle};
 pub use registry::ShardRegistry;
 
 /// Version tag for postcard-encoded internal payloads (spec.md §8).

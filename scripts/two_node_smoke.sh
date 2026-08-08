@@ -82,9 +82,48 @@ for marker in "metadata group ready" "room shard ready" "user shard ready"; do
   fi
 done
 
+# Leader forwarding + read-your-writes: node 1 founded every group so it
+# leads them — node 2 is a follower for everything. Every write below goes
+# ONLY to node 2 (no cross-node retries) and each write's effect must be
+# readable from node 2 immediately after its ack.
+if [ "$pass" = 1 ]; then
+  echo "=== leader forwarding via node 2 (follower) ==="
+  C2=http://127.0.0.1:18009
+  TOKEN=$(curl -fsS -X POST "$C2/_matrix/client/v3/register" \
+    -H 'Content-Type: application/json' \
+    -d '{"auth":{"type":"m.login.dummy"},"username":"fwd","password":"p"}' | jq -r .access_token 2>/dev/null)
+  if [ -z "$TOKEN" ] || [ "$TOKEN" = null ]; then
+    echo "FORWARDING FAIL: register via follower did not succeed"; pass=0
+  else
+    ROOM=$(curl -fsS -X POST "$C2/_matrix/client/v3/createRoom" \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{"preset":"public_chat"}' | jq -r .room_id 2>/dev/null)
+    if [ -z "$ROOM" ] || [ "$ROOM" = null ]; then
+      echo "FORWARDING FAIL: createRoom via follower did not succeed"; pass=0
+    else
+      ROOM_ENC=$(printf %s "$ROOM" | jq -sRr @uri)
+      CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+        "$C2/_matrix/client/v3/rooms/$ROOM_ENC/send/m.room.message/fwd-1" \
+        -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+        -d '{"msgtype":"m.text","body":"forwarded-write"}')
+      if [ "$CODE" != 200 ]; then
+        echo "FORWARDING FAIL: send via follower returned $CODE"; pass=0
+      else
+        # Read-your-writes: no retry loop — the ack must imply local
+        # visibility on the node that served the write.
+        BODY=$(curl -fsS "$C2/_matrix/client/v3/rooms/$ROOM_ENC/messages?dir=b&limit=10" \
+          -H "Authorization: Bearer $TOKEN" | jq -r '.chunk[]?.content.body // empty')
+        if ! printf '%s\n' "$BODY" | grep -qxF "forwarded-write"; then
+          echo "READ-YOUR-WRITES FAIL: acked write not readable from the serving follower"; pass=0
+        fi
+      fi
+    fi
+  fi
+fi
+
 if [ "$pass" = 1 ]; then
   echo "reconcile on node 1:"; grep "reconciled group membership" "$WORK/n1.log" || true
-  echo "RESULT: PASS — node 2 joined and hosts both shard groups"
+  echo "RESULT: PASS — node 2 joined, hosts both shard groups, and serves forwarded writes with read-your-writes"
   exit 0
 fi
 echo "RESULT: FAIL"

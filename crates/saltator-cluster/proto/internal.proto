@@ -63,7 +63,29 @@ message JoinResponse {
   optional string leader_addr = 3;
 }
 
+// A proposal forwarded from a non-leader node (spec.md §9 "writes go
+// through the leader"): the receiver applies it through the addressed
+// group's Raft if it leads, else answers with a leader hint.
+message ProposeRequest {
+  uint64 group = 1;
+  // Opaque app command bytes (the ShardApp owns their meaning).
+  bytes command = 2;
+}
+
+message ProposeResponse {
+  bool applied = 1;
+  // Set when applied: the app's response bytes and the committed log
+  // index — the forwarding node's read-your-writes barrier waits for its
+  // local apply to reach that index before acking its client.
+  bytes response = 2;
+  uint64 log_index = 3;
+  // Set when not applied: where the leader is believed to be.
+  optional uint64 leader_id = 4;
+  optional string leader_addr = 5;
+}
+
 service ControlService {
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc Join(JoinRequest) returns (JoinResponse);
+  rpc Propose(ProposeRequest) returns (ProposeResponse);
 }
