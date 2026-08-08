@@ -28,6 +28,8 @@ const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(8);
 /// Spec cap on EDUs per transaction.
 const MAX_EDUS_PER_TXN: usize = 100;
+/// Spec cap on PDUs per transaction.
+const MAX_PDUS_PER_TXN: usize = 50;
 /// Room-timeline entries examined per scan pass.
 const SCAN_BATCH: usize = 256;
 
@@ -120,10 +122,18 @@ fn initial_scan_pos(fedout: &FedOutServer, rooms: &RoomServer) -> u64 {
 
 /// One PDU delivery pass: scan the room timeline from the floor, resolve
 /// each event's destinations (the old sender's rules, moved verbatim via
-/// [`event_destinations`]), send strictly in order per destination, and
-/// advance the durable cursor on ack. A failing destination backs off
-/// without holding others back; the floor advances only past seqs that
-/// every *relevant* destination has either acked or is skipping.
+/// [`event_destinations`]), and send each destination its queued events
+/// as ONE transaction (chunked at the spec's 50-PDU cap) — batching is
+/// the latency lever: an event burst costs one HTTPS round trip and one
+/// cursor proposal per destination instead of one per event, so a fresh
+/// event (a power-levels grant racing a join, say) is not serialized
+/// behind its predecessors' round trips. Per-destination order holds
+/// within and across chunks; the durable cursor advances to each acked
+/// chunk's last seq. A failing destination backs off without holding
+/// others back; the floor advances only past seqs that every *relevant*
+/// destination has either acked or is skipping. (Seq gaps between a
+/// destination's events are NOT evidence of undelivered work — they are
+/// usually just interleaved traffic for other rooms/servers.)
 async fn deliver_pdus(
     fedout: &FedOutServer,
     rooms: &RoomServer,
@@ -143,16 +153,10 @@ async fn deliver_pdus(
     if batch.is_empty() {
         return;
     }
-    // Cursor cache for this pass.
     let store = fedout.store();
+    // Cursor cache and per-destination send queues for this pass.
     let mut cursors: BTreeMap<String, u64> = BTreeMap::new();
-    // Destinations that failed (or are backing off) THIS pass: further
-    // events for them are withheld so per-destination order holds; the
-    // floor is pulled back to their cursor so the next pass re-encounters
-    // their earliest undelivered event first. (Seq gaps between a
-    // destination's events are NOT evidence of undelivered work — they
-    // are usually just interleaved traffic for other rooms/servers.)
-    let mut blocked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut queues: BTreeMap<String, Vec<(u64, serde_json::Value)>> = BTreeMap::new();
     // The new floor: min over destinations that still have undelivered
     // work; starts optimistic and is pulled back by laggards.
     let mut new_floor = batch.last().map(|(s, _)| *s).unwrap_or(*scan_pos);
@@ -164,17 +168,6 @@ async fn deliver_pdus(
         let Some((raw, dests)) = event_destinations(rooms, server_name, room_id, event_id) else {
             continue;
         };
-        if dests.is_empty() {
-            continue;
-        }
-        let body = json!({
-            "origin": server_name.as_str(),
-            "origin_server_ts": raw.get("origin_server_ts").and_then(|t| t.as_u64()).unwrap_or(0),
-            "pdus": [raw],
-        });
-        // Stable per-event transaction id (seq-derived, as the old
-        // sender): a redelivered event carries the identical id.
-        let txn_path = format!("/_matrix/federation/v1/send/{seq}");
         for dest in dests {
             let cursor = match cursors.get(&dest) {
                 Some(c) => *c,
@@ -191,30 +184,65 @@ async fn deliver_pdus(
             if *seq <= cursor {
                 continue; // already delivered
             }
-            if blocked.contains(&dest) || !backoff.ready(&dest) {
-                // Order guard: something earlier for this destination is
-                // undelivered (failed this pass, or backing off from a
-                // previous one) — withhold and pull the floor back so the
-                // next pass retries from its earliest undelivered event.
-                blocked.insert(dest.clone());
-                new_floor = new_floor.min(cursor);
-                continue;
-            }
+            queues.entry(dest).or_default().push((*seq, raw.clone()));
+        }
+    }
+
+    for (dest, queued) in queues {
+        // `acked`: the last seq durably confirmed for this destination —
+        // where the next pass must resume if we stop short.
+        let mut acked = cursors.get(&dest).copied().unwrap_or(0);
+        if !backoff.ready(&dest) {
+            new_floor = new_floor.min(acked);
+            continue;
+        }
+        let mut stopped = false;
+        for chunk in queued.chunks(MAX_PDUS_PER_TXN) {
+            let first = chunk.first().expect("non-empty chunk").0;
+            let last = chunk.last().expect("non-empty chunk").0;
+            let body = json!({
+                "origin": server_name.as_str(),
+                "origin_server_ts": crate::now_ms(),
+                "pdus": chunk.iter().map(|(_, raw)| raw).collect::<Vec<_>>(),
+            });
+            // Stable seq-range transaction id: a straight retry of the
+            // same chunk dedupes at the receiver's replay cache, while a
+            // retry that grew (new events queued behind a failure) gets a
+            // fresh id — its replay of already-ingested PDUs is idempotent
+            // by event id.
+            let txn_path = format!("/_matrix/federation/v1/send/{first}_{last}");
             match client.put(&dest, &txn_path, &body).await {
                 Ok(_) => {
                     backoff.success(&dest);
-                    cursors.insert(dest.clone(), *seq);
-                    if let Err(e) = fedout.advance_pdu_cursor(room_shard, &dest, *seq).await {
+                    acked = last;
+                    if let Err(e) = fedout.advance_pdu_cursor(room_shard, &dest, last).await {
                         tracing::warn!(error = %e, dest, "delivery: cursor advance failed");
+                    }
+                    if let Some(ots) = chunk
+                        .last()
+                        .and_then(|(_, raw)| raw.get("origin_server_ts"))
+                        .and_then(|t| t.as_u64())
+                    {
+                        tracing::debug!(
+                            dest,
+                            first,
+                            last,
+                            count = chunk.len(),
+                            lag_ms = crate::now_ms().saturating_sub(ots),
+                            "delivery: PDU transaction acked"
+                        );
                     }
                 }
                 Err(e) => {
                     tracing::debug!(dest, error = %e, "delivery: PDU send failed; backing off");
                     backoff.failure(&dest);
-                    blocked.insert(dest.clone());
-                    new_floor = new_floor.min(cursor);
+                    stopped = true;
+                    break;
                 }
             }
+        }
+        if stopped {
+            new_floor = new_floor.min(acked);
         }
     }
     *scan_pos = new_floor.max(*scan_pos);
