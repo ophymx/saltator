@@ -211,6 +211,14 @@ async fn deliver_pdus(
             // fresh id — its replay of already-ingested PDUs is idempotent
             // by event id.
             let txn_path = format!("/_matrix/federation/v1/send/{first}_{last}");
+            // Latency decomposition: queue_ms ≈ event creation → this PUT
+            // starting (origin apply + worker wake + any pass-in-flight
+            // wait); put_ms = the round trip (network + receiver ingest).
+            let newest_ots = chunk
+                .last()
+                .and_then(|(_, raw)| raw.get("origin_server_ts"))
+                .and_then(|t| t.as_u64());
+            let put_start = crate::now_ms();
             match client.put(&dest, &txn_path, &body).await {
                 Ok(_) => {
                     backoff.success(&dest);
@@ -218,17 +226,14 @@ async fn deliver_pdus(
                     if let Err(e) = fedout.advance_pdu_cursor(room_shard, &dest, last).await {
                         tracing::warn!(error = %e, dest, "delivery: cursor advance failed");
                     }
-                    if let Some(ots) = chunk
-                        .last()
-                        .and_then(|(_, raw)| raw.get("origin_server_ts"))
-                        .and_then(|t| t.as_u64())
-                    {
+                    if let Some(ots) = newest_ots {
                         tracing::debug!(
                             dest,
                             first,
                             last,
                             count = chunk.len(),
-                            lag_ms = crate::now_ms().saturating_sub(ots),
+                            queue_ms = put_start.saturating_sub(ots),
+                            put_ms = crate::now_ms().saturating_sub(put_start),
                             "delivery: PDU transaction acked"
                         );
                     }

@@ -33,6 +33,13 @@ use crate::CsState;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
+/// How long a restricted join waits for in-flight room state (e.g. a
+/// power-levels grant crossing federation) before conceding that no local
+/// member can authorise it and falling back to a remote join. Long enough
+/// to cover a delivery retry cycle (backoff floor 500ms), short against
+/// client join timeouts.
+const RESTRICTED_AUTH_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::internal(e)
 }
@@ -584,11 +591,41 @@ async fn join_with_body(
         // user stamped on the join. If we hold the room but can't authorise
         // (no eligible local member, or we can't verify the allow
         // conditions), another resident might — fall back to a remote join.
-        match state
+        let mut verdict = state
             .rooms
             .restricted_join_authoriser(room_id, &auth.user_id)
-            .map_err(internal)?
-        {
+            .map_err(internal)?;
+        if matches!(verdict, saltator_roomserver::RestrictedAuth::CannotGrant) {
+            // "No local member has invite power" is often only TRANSIENTLY
+            // true mid-churn: the power-levels grant that empowers one may
+            // be in flight from the room's origin (created milliseconds
+            // ago on another server). Falling back to a remote join here
+            // is not just slower — it changes semantics (the join gets
+            // authorised by a remote user instead of the intended local
+            // one). Wait briefly, re-evaluating as room state lands,
+            // before conceding; a genuine CannotGrant pays this window
+            // once and then fails over exactly as before.
+            let mut changes = state.rooms.subscribe();
+            let deadline = tokio::time::Instant::now() + RESTRICTED_AUTH_RECHECK;
+            loop {
+                match tokio::time::timeout_at(deadline, changes.recv()).await {
+                    Err(_) => break, // window closed; concede
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                    // A room-shard change (or a lagged stream — state moved
+                    // even faster): re-evaluate.
+                    Ok(_) => {
+                        verdict = state
+                            .rooms
+                            .restricted_join_authoriser(room_id, &auth.user_id)
+                            .map_err(internal)?;
+                        if !matches!(verdict, saltator_roomserver::RestrictedAuth::CannotGrant) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        match verdict {
             saltator_roomserver::RestrictedAuth::NotNeeded => {
                 local_pipeline_join(state, auth, room_id, reason, body, None).await?;
             }
