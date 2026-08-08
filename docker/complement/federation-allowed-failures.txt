@@ -22,3 +22,15 @@ TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6
 TestKnocking
 TestKnockRoomsInPublicRoomsDirectory
 TestCannotSendNonKnockViaSendKnock
+
+# --- Upstream test-design race (our answer is spec-correct) ---
+# The test samples eventB.AfterTimestamp and immediately has the remote
+# user join; the 1ms tsBoundaryGuard protects the sample against eventB
+# but NOT against the join that follows it. Our join handshake stamps the
+# membership's origin_server_ts ~1.5ms after the sample, so ~20% of runs
+# they share a millisecond and the backward search correctly returns the
+# join (distance 0, ots <= ts) instead of eventB (MSC3030 says closest
+# wins; Synapse can't lose this race only because its join path takes
+# ≥10ms). Root-caused 2026-08-08; upstream fix = a tsBoundaryGuard sleep
+# before the federation joins in room_timestamp_to_event_test.go.
+TestJumpToDateEndpoint/parallel/federation/looking_backwards,_should_be_able_to_find_event_that_was_sent_before_we_joined
