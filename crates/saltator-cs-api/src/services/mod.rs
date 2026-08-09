@@ -4,4 +4,5 @@
 //! rule is that route files gain no *new* domain logic, and existing
 //! logic moves here when touched).
 
+pub(crate) mod admin;
 pub(crate) mod e2ee;

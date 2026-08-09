@@ -171,6 +171,59 @@ impl FromRequestParts<Arc<CsState>> for Auth {
     }
 }
 
+/// An authenticated caller who is also a server administrator.
+///
+/// Wraps [`Auth`] rather than replacing it, so admin routes get the same
+/// token handling as everything else and the privilege check stays in one
+/// place ([`CsState::is_admin`]).
+///
+/// One deliberate difference: the admin surface accepts the bearer header
+/// only, never the deprecated `?access_token=` query form. The Matrix API
+/// has to keep that fallback for old clients; a *new* surface does not,
+/// and an administrator's token in a URL is the worst thing to leak
+/// through `Referer`, proxy logs or shell history.
+#[derive(Debug, Clone)]
+pub struct AdminAuth(pub Auth);
+
+impl AdminAuth {
+    /// The acting administrator — for audit logging, and for the
+    /// self-targeting guards the lifecycle slice will need (an admin
+    /// should not be able to lock themselves out).
+    pub fn user_id(&self) -> &ruma::UserId {
+        &self.0.user_id
+    }
+}
+
+impl FromRequestParts<Arc<CsState>> for AdminAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<CsState>,
+    ) -> Result<Self, Self::Rejection> {
+        if !bearer_header(parts) {
+            return Err(ApiError::missing_token());
+        }
+        let auth = Auth::from_request_parts(parts, state).await?;
+        if !state.is_admin(&auth)? {
+            // Deliberately the same message whether the account lacks the
+            // flag or does not exist: a 403 here should not be an oracle
+            // for who is an administrator.
+            return Err(ApiError::forbidden("You are not a server administrator"));
+        }
+        Ok(Self(auth))
+    }
+}
+
+/// Whether the request carries an `Authorization: Bearer` header at all.
+fn bearer_header(parts: &Parts) -> bool {
+    parts
+        .headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.starts_with("Bearer "))
+}
+
 /// Bearer header, falling back to the (deprecated, pre-1.11) query param.
 fn token_from_parts(parts: &Parts) -> Option<String> {
     if let Some(v) = parts.headers.get(axum::http::header::AUTHORIZATION) {

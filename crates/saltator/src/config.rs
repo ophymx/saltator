@@ -79,6 +79,11 @@ pub struct ClientConfig {
     /// massaging.
     #[serde(default)]
     pub appservice_registration_dir: Option<String>,
+    /// Full user IDs granted server-administrator rights, unioned with
+    /// the per-account admin flag. This is the bootstrap: a fresh server
+    /// has no admin account and no way to grant one from inside.
+    #[serde(default)]
+    pub admin_users: Vec<String>,
 }
 
 impl Default for ClientConfig {
@@ -91,6 +96,7 @@ impl Default for ClientConfig {
             rate_limits_enabled: true,
             allow_internal_fetch: false,
             appservice_registration_dir: None,
+            admin_users: Vec::new(),
         }
     }
 }
@@ -185,6 +191,10 @@ rate_limits_enabled = true
 # Keep false in production (SSRF protection); true only in isolated tests.
 allow_internal_fetch = false
 # well_known_client = "https://matrix.example.org"
+# Server administrators, in addition to accounts carrying the admin flag.
+# A fresh server has no admin account and no way to grant one from inside,
+# so the first administrator has to be named here.
+# admin_users = ["@root:example.org"]
 
 [federation]
 # Serve the federation port over HTTPS. Real federation requires TLS;

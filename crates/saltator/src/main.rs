@@ -415,6 +415,17 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         Some(ca) => saltator_federation::KeyCache::with_ca(ca),
         None => saltator_federation::KeyCache::new(),
     });
+    // Parsed here rather than at the use site so a malformed admin user id
+    // fails the daemon at startup instead of silently never matching.
+    let admin_users = cfg
+        .client
+        .admin_users
+        .iter()
+        .map(|u| {
+            ruma::OwnedUserId::try_from(u.as_str())
+                .map_err(|e| anyhow::anyhow!("client.admin_users: {u:?} is not a user id: {e}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let cs_state = saltator_cs_api::CsState::new(
         users.clone(),
         rooms.clone(),
@@ -431,6 +442,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                 saltator_cs_api::RateLimitConfig::disabled()
             },
             allow_internal_fetch: cfg.client.allow_internal_fetch,
+            admin_users,
         },
     )
     .with_federation(fed_client.clone(), signer.clone(), key_cache.clone())

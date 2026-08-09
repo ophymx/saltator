@@ -6,10 +6,10 @@ use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
     account_data_key, device_scoped_key, prefix_end, to_device_key, user_key, Account,
-    AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimedKey, Device, FallbackEntry,
-    KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, SessionCmd, TokenEntry,
-    TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS,
-    T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS,
+    AccountDataEntry, AccountState, AccountV2, AliasEntry, BackupVersionMeta, ClaimedKey, Device,
+    FallbackEntry, KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, SessionCmd,
+    TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA,
+    T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS,
     T_DIRECTORY, T_EDU_OUTBOX, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
     T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN,
     T_TO_DEVICE_SEEN_IDX,
@@ -25,6 +25,29 @@ fn enc<T: serde::Serialize>(what: &str, v: &T) -> StoreResult<Vec<u8>> {
 
 fn dec<T: for<'de> serde::Deserialize<'de>>(what: &str, b: &[u8]) -> StoreResult<T> {
     postcard::from_bytes(b).map_err(|e| codec_err(what, e))
+}
+
+/// One page of [`UserStore::accounts`]: the rows, and the start key of
+/// the page after this one (`None` on the last page).
+pub type AccountPage = (Vec<(String, Account)>, Option<String>);
+
+/// The v2 → v3 account mapping (schema step 3). Pure, so the encoding
+/// contract can be tested without a shard: existing accounts keep their
+/// credential and creation time, a `deactivated` bool becomes the
+/// corresponding lifecycle state, and nobody is grandfathered into being
+/// an administrator.
+fn account_v2_to_v3(old: AccountV2) -> Account {
+    Account {
+        password_hash: old.password_hash,
+        created_ts: old.created_ts,
+        state: if old.deactivated {
+            AccountState::Deactivated
+        } else {
+            AccountState::Active
+        },
+        admin: false,
+        erased: false,
+    }
 }
 
 pub struct UserApp;
@@ -45,6 +68,21 @@ impl ShardApp for UserApp {
             2 => {
                 for (k, _) in ctx.range(T_EDU_OUTBOX, &[], &[])? {
                     ctx.delete(T_EDU_OUTBOX, &k);
+                }
+                Ok(())
+            }
+            // v3: `Account` gains state/admin/erased in place of the
+            // `deactivated` bool (docs/design-admin-identity.md). Rewrite
+            // every row: the two encodings are not compatible, so this
+            // must be total. Correct on an empty store.
+            3 => {
+                for (k, v) in ctx.range(T_ACCOUNT, &[], &[])? {
+                    let old: AccountV2 = dec("account v2 decode", &v)?;
+                    ctx.put(
+                        T_ACCOUNT,
+                        &k,
+                        enc("account encode", &account_v2_to_v3(old))?,
+                    );
                 }
                 Ok(())
             }
@@ -308,7 +346,9 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                     &Account {
                         password_hash: password_hash.clone(),
                         created_ts: *ts,
-                        deactivated: false,
+                        state: AccountState::Active,
+                        admin: false,
+                        erased: false,
                     },
                 )?,
             );
@@ -929,7 +969,7 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             else {
                 return Ok(UserResponse::NotFound);
             };
-            account.deactivated = true;
+            account.state = AccountState::Deactivated;
             account.password_hash = None;
             ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
             if delete_devices_except(ctx, user_id, None)? {
@@ -1200,6 +1240,37 @@ impl UserStore {
 
     pub fn account(&self, user_id: &str) -> StoreResult<Option<Account>> {
         self.get_typed("account decode", T_ACCOUNT, user_id.as_bytes())
+    }
+
+    /// One page of accounts in user-id order, starting at `from`
+    /// (inclusive) — for the admin user list. Bounded by construction:
+    /// there is no unpaginated variant, because an operator listing every
+    /// account should not be a whole-table materialization.
+    ///
+    /// Returns at most `limit` entries plus the next start key, which is
+    /// `None` on the last page.
+    pub fn accounts(&self, from: Option<&str>, limit: usize) -> StoreResult<AccountPage> {
+        // One extra row tells us whether a further page exists without a
+        // second query; it is the next page's start key, not a result.
+        let rows = self.read.scan(
+            T_ACCOUNT,
+            from.unwrap_or("").as_bytes(),
+            &[],
+            limit.saturating_add(1),
+            false,
+        )?;
+        let mut out = Vec::with_capacity(rows.len().min(limit));
+        let mut next = None;
+        for (i, (k, v)) in rows.into_iter().enumerate() {
+            let user_id = String::from_utf8(k)
+                .map_err(|_| StoreError::Engine("account key not UTF-8".into()))?;
+            if i == limit {
+                next = Some(user_id);
+                break;
+            }
+            out.push((user_id, dec("account decode", &v)?));
+        }
+        Ok((out, next))
     }
 
     pub fn profile(&self, user_id: &str) -> StoreResult<Option<Profile>> {
@@ -1571,5 +1642,73 @@ impl UserStore {
 
     pub fn media(&self, media_id: &str) -> StoreResult<Option<MediaMeta>> {
         self.get_typed("media decode", T_MEDIA, media_id.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A v2 account row must not silently decode as v3. Postcard encodes
+    /// fields positionally, so a v2 blob read as v3 lands the `deactivated`
+    /// bool on the state discriminant and then runs out of bytes. That
+    /// failure is what makes the migration load-bearing rather than
+    /// cosmetic — if this ever starts succeeding, old rows would be
+    /// misread as `Active` with garbage flags.
+    #[test]
+    fn v2_account_does_not_decode_as_v3() {
+        let v2 = AccountV2 {
+            password_hash: Some("$argon2id$v=19$dummy".into()),
+            created_ts: 1_700_000_000_000,
+            deactivated: false,
+        };
+        let blob = postcard::to_stdvec(&v2).unwrap();
+        assert!(
+            postcard::from_bytes::<Account>(&blob).is_err(),
+            "v2 blob must not be readable as a v3 Account"
+        );
+    }
+
+    #[test]
+    fn v3_migration_maps_deactivation_to_state() {
+        let live = account_v2_to_v3(AccountV2 {
+            password_hash: Some("hash".into()),
+            created_ts: 7,
+            deactivated: false,
+        });
+        assert_eq!(live.state, AccountState::Active);
+        assert_eq!(live.password_hash.as_deref(), Some("hash"));
+        assert_eq!(live.created_ts, 7);
+
+        let gone = account_v2_to_v3(AccountV2 {
+            password_hash: None,
+            created_ts: 7,
+            deactivated: true,
+        });
+        assert_eq!(gone.state, AccountState::Deactivated);
+    }
+
+    /// Nobody is grandfathered into privilege by the migration — the
+    /// bootstrap admin comes from config, never from existing data.
+    #[test]
+    fn v3_migration_grants_no_admin() {
+        for deactivated in [false, true] {
+            let a = account_v2_to_v3(AccountV2 {
+                password_hash: None,
+                created_ts: 0,
+                deactivated,
+            });
+            assert!(!a.admin);
+            assert!(!a.erased);
+        }
+    }
+
+    /// Only `Active` may authenticate, so a state added later is refused
+    /// until something deliberately allows it.
+    #[test]
+    fn only_active_authenticates() {
+        assert!(AccountState::Active.can_authenticate());
+        assert!(!AccountState::Locked.can_authenticate());
+        assert!(!AccountState::Deactivated.can_authenticate());
     }
 }

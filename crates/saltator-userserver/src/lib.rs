@@ -27,9 +27,10 @@ use saltator_store::Keyspace;
 
 pub use machine::{UserApp, UserStore};
 pub use types::{
-    Account, AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimRequest, ClaimedKey, Device,
-    KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry, OutboundEdu, Profile, SessionCmd,
-    ToDeviceMessage, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse,
+    Account, AccountDataEntry, AccountState, AliasEntry, BackupVersionMeta, ClaimRequest,
+    ClaimedKey, Device, KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry, OutboundEdu,
+    Profile, SessionCmd, ToDeviceMessage, TokenEntry, TokenKind, UserChangePayload, UserCommand,
+    UserResponse,
 };
 
 /// M2 runs a single user shard; the fixed shard count and placement land
@@ -41,7 +42,12 @@ pub use types::{
 /// migration drops the orphaned `T_EDU_OUTBOX`. Gated in the daemon on
 /// the fed-out drain marker covering every remaining row
 /// (docs/design-federation-out.md §drain).
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// v3 (step 5, slice 1): `Account` gains an explicit lifecycle state, an
+/// admin flag and an erasure marker, replacing the `deactivated` bool
+/// (docs/design-admin-identity.md). The migration rewrites every
+/// `T_ACCOUNT` row in place; no cross-shard coordination, so no gate.
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 
@@ -207,7 +213,7 @@ impl UserServer {
             .store()
             .account(user_id.as_str())
             .map_err(storage_err)?
-            .filter(|a| !a.deactivated);
+            .filter(|a| a.state.can_authenticate());
         let Some(hash) = account.and_then(|a| a.password_hash) else {
             // No such account (or no password): still spend an Argon2 verify
             // so latency doesn't disclose account existence.
@@ -231,7 +237,7 @@ impl UserServer {
             .store()
             .account(user_id.as_str())
             .map_err(storage_err)?
-            .filter(|a| !a.deactivated);
+            .filter(|a| a.state.can_authenticate());
         let Some(hash) = account.and_then(|a| a.password_hash) else {
             dummy_verify().await;
             return Ok(false);
@@ -282,14 +288,15 @@ impl UserServer {
         let user_id = OwnedUserId::try_from(entry.user_id)
             .map_err(|e| UserError::Internal(format!("stored user id: {e}")))?;
         // Defence in depth: deactivation already deletes a user's tokens,
-        // but never honour a token for a deactivated account even if one
+        // but never honour a token for a non-active account even if one
         // survived (a missed deletion path, projection lag, a future
-        // session command that skips the check).
+        // session command that skips the check). `Locked` has no teardown
+        // at all, so this check is the whole kill-switch.
         if self
             .store()
             .account(user_id.as_str())
             .map_err(storage_err)?
-            .is_none_or(|a| a.deactivated)
+            .is_none_or(|a| !a.state.can_authenticate())
         {
             return Ok(None);
         }

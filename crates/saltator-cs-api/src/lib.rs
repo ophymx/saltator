@@ -18,7 +18,7 @@ mod typing;
 use std::sync::Arc;
 
 use axum::routing::{get, post, put};
-use ruma::OwnedServerName;
+use ruma::{OwnedServerName, OwnedUserId};
 
 use saltator_core::RoomVersion;
 use saltator_federation::FederationClient;
@@ -54,6 +54,11 @@ pub struct CsConfig {
     /// enable only in trusted, network-isolated test harnesses whose
     /// mock servers live on loopback/private IPs.
     pub allow_internal_fetch: bool,
+    /// Server administrators named in config, unioned with the account
+    /// flag by [`CsState::is_admin`]. This is the bootstrap: a fresh
+    /// server has no admin account and no way to grant one, so the first
+    /// administrator has to come from outside the database.
+    pub admin_users: Vec<OwnedUserId>,
 }
 
 /// Shared state of every CS route.
@@ -160,6 +165,35 @@ impl CsState {
         self
     }
 
+    /// Whether the caller is a server administrator.
+    ///
+    /// The single resolution point, deliberately: no route reads the
+    /// account's `admin` flag directly, so a later token-scope or
+    /// external-IdP arm lands here and nowhere else
+    /// (docs/design-admin-identity.md).
+    pub(crate) fn is_admin(&self, auth: &extract::Auth) -> Result<bool, ApiError> {
+        // Appservices are never administrators: an AS identity is
+        // synthesized from config and has no account row at all, so there
+        // is nothing to carry the flag.
+        if auth.appservice {
+            return Ok(false);
+        }
+        if self.config.admin_users.contains(&auth.user_id) {
+            return Ok(true);
+        }
+        Ok(self
+            .users
+            .store()
+            .account(auth.user_id.as_str())
+            .map_err(ApiError::internal)?
+            .is_some_and(|a| a.admin))
+    }
+
+    /// The admin/user-management domain service over this state's shards.
+    pub(crate) fn admin(&self) -> services::admin::Admin<'_> {
+        services::admin::Admin { users: &self.users }
+    }
+
     /// The E2EE/device-list domain service over this state's shards.
     pub(crate) fn e2ee(&self) -> services::e2ee::E2ee<'_> {
         services::e2ee::E2ee {
@@ -231,7 +265,7 @@ impl CsState {
 /// Build the client-server router. Serve this on the client listener.
 pub fn router(state: Arc<CsState>) -> axum::Router {
     use routes::{
-        account, backup, keys, media, push, relations, rooms, search, session, spaces, sync,
+        account, admin, backup, keys, media, push, relations, rooms, search, session, spaces, sync,
         to_device,
     };
 
@@ -519,6 +553,20 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route("/_matrix/federation/v1/version", get(federation_version))
         .route("/_matrix/key/v2/query", post(notary_query))
         .route("/_matrix/key/v2/query/{server_name}", get(notary_query));
+
+    // -- admin API (docs/design-admin-identity.md). Our own namespace: no
+    // `_synapse`-prefixed paths and no aliases for other servers' admin
+    // tooling. Registered before the CORS layer deliberately — the admin
+    // console may be served from a separate listener, and cross-origin
+    // bearer-token calls need the same permissive treatment as the rest
+    // of the API (there are no cookies anywhere, so this grants a browser
+    // nothing it did not already hold a token for).
+    app = app
+        .route("/_saltator/admin/v1/users", get(admin::list_users))
+        .route(
+            "/_saltator/admin/v1/users/{user_id}",
+            get(admin::user_detail),
+        );
 
     app.fallback(unrecognized)
         .method_not_allowed_fallback(method_not_allowed)

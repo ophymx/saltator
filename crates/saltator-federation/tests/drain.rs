@@ -84,15 +84,17 @@ async fn drain_moves_rows_once_then_v2_drops_the_table() {
     );
 
     // The gate condition now holds (marker >= tail); the v2 migration
-    // drops the drained table.
-    assert_eq!(users.shard_handle().schema_versions().unwrap(), (1, 2));
+    // drops the drained table. Only the *stored* version is asserted: the
+    // code version moves with every later schema step and is not what
+    // this test is about.
+    assert_eq!(users.shard_handle().schema_versions().unwrap().0, 1);
     users
         .shard_handle()
         .propose_migrate(2)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(users.shard_handle().schema_versions().unwrap(), (2, 2));
+    assert_eq!(users.shard_handle().schema_versions().unwrap().0, 2);
     assert_eq!(users.store().edu_outbox_tail().unwrap(), 0);
     // Fed-out rows are untouched by the user-shard drop.
     assert_eq!(fedout.store().edu_outbox("a.test", 10).unwrap().len(), 2);

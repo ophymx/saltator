@@ -149,10 +149,50 @@ pub(crate) fn account_data_key(user_id: &str, room_id: &str, data_type: &str) ->
     k
 }
 
+/// Account lifecycle (docs/design-admin-identity.md). Postcard encodes
+/// the variant index, so this is append-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountState {
+    Active,
+    /// Reversible auth kill-switch: tokens rejected, data and rooms
+    /// untouched. Nothing sets this until the lifecycle slice; the
+    /// authentication check already honours it.
+    Locked,
+    /// Irreversible teardown: password cleared, every device deleted.
+    Deactivated,
+}
+
+impl AccountState {
+    /// Whether an account in this state may authenticate. Anything but
+    /// `Active` is refused, so new states are closed by default.
+    pub fn can_authenticate(self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     /// Argon2 PHC string; `None` for passwordless accounts (appservices,
-    /// later login types).
+    /// later login types). Means "no local credential" and nothing else —
+    /// never infer the account's kind or state from it.
+    pub password_hash: Option<String>,
+    pub created_ts: u64,
+    pub state: AccountState,
+    /// Server administrator. Never read this at a call site: authorization
+    /// resolves through one function (`CsState::is_admin`) so it can grow
+    /// a token-scope arm later.
+    pub admin: bool,
+    /// GDPR erasure — a modifier on `Deactivated`, not a state of its own.
+    pub erased: bool,
+}
+
+/// The v2 shape of [`Account`], read only by the v3 migration.
+///
+/// `Serialize` is derived purely so tests can mint a genuine v2 blob and
+/// assert the encoding contract; nothing in the server ever writes one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AccountV2 {
     pub password_hash: Option<String>,
     pub created_ts: u64,
     pub deactivated: bool,

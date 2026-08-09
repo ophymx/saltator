@@ -118,13 +118,20 @@ impl FromRequestParts<Arc<CsState>> for AdminAuth { ... }
 backed by exactly one function on `CsState`:
 
 ```rust
-pub(crate) async fn is_admin(&self, auth: &Auth) -> Result<bool, ApiError>
+pub(crate) fn is_admin(&self, auth: &Auth) -> Result<bool, ApiError>
 ```
 
 which today unions the account's `admin` bit with a config allowlist,
 and later grows an "or: the presented token carries an admin scope" arm.
 No route ever reads `account.admin`. This is the `internal.py` /
 `mas.py` lesson, applied before we need it.
+
+`AdminAuth` also narrows how the token may arrive: **bearer header only,
+never the deprecated `?access_token=` query form**. The Matrix API has to
+keep that fallback for old clients (`extract.rs:183`), but a new surface
+does not, and an administrator's credential in a URL is the worst thing
+to leak through `Referer`, proxy logs or shell history — especially once
+a console is served from the same origin.
 
 The extractor doc comment at `extract.rs:27` already reserves the
 pattern ("handlers state their own requirements"); `AdminAuth` fills the

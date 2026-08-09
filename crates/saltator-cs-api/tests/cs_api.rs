@@ -10,7 +10,7 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use saltator_cs_api::{CsConfig, CsState};
+use saltator_cs_api::{AppServiceRegistration, CsConfig, CsState};
 use saltator_media::MediaStore;
 use saltator_roomserver::RoomServer;
 use saltator_shard::NoopNetworkFactory;
@@ -40,6 +40,32 @@ async fn start_env_with(rate_limits: saltator_cs_api::RateLimitConfig) -> Env {
 async fn start_env_cfg(
     rate_limits: saltator_cs_api::RateLimitConfig,
     allow_internal_fetch: bool,
+) -> Env {
+    start_env_full(rate_limits, allow_internal_fetch, Vec::new(), Vec::new()).await
+}
+
+/// An env whose config names bootstrap administrators, and optionally
+/// registers an appservice — the two identity sources `is_admin` has to
+/// tell apart.
+async fn start_env_admin(admins: &[&str], appservices: Vec<AppServiceRegistration>) -> Env {
+    let admins = admins
+        .iter()
+        .map(|u| ruma::OwnedUserId::try_from(*u).unwrap())
+        .collect();
+    start_env_full(
+        saltator_cs_api::RateLimitConfig::disabled(),
+        true,
+        admins,
+        appservices,
+    )
+    .await
+}
+
+async fn start_env_full(
+    rate_limits: saltator_cs_api::RateLimitConfig,
+    allow_internal_fetch: bool,
+    admin_users: Vec<ruma::OwnedUserId>,
+    appservices: Vec<AppServiceRegistration>,
 ) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
@@ -83,8 +109,14 @@ async fn start_env_cfg(
             well_known_client: Some("https://hs.test".into()),
             rate_limits,
             allow_internal_fetch,
+            admin_users,
         },
     );
+    let state = if appservices.is_empty() {
+        state
+    } else {
+        state.with_appservices(appservices)
+    };
     Env {
         _dir: dir,
         router: saltator_cs_api::router(state.clone()),
@@ -5239,6 +5271,7 @@ async fn client_joins_a_remote_room_via_federation() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -5450,6 +5483,7 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -5697,6 +5731,7 @@ async fn client_joins_a_remote_room_by_remote_alias() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -5862,6 +5897,7 @@ async fn remote_join_drops_unverifiable_noncritical_state() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -6018,6 +6054,7 @@ async fn send_message_in_remote_ported_room() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -6224,6 +6261,7 @@ async fn remote_join_backfills_full_history() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -6507,6 +6545,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -6824,6 +6863,7 @@ async fn inbound_federated_invite_appears_in_sync() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     );
     let cs_router = saltator_cs_api::router(cs_state);
@@ -7015,6 +7055,7 @@ async fn cs_stack(
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     );
     if let Some(base) = fed_client_base {
@@ -7155,6 +7196,7 @@ async fn outbound_federated_invite_round_trip() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -7447,6 +7489,7 @@ async fn to_device_over_federation_round_trip() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -7657,6 +7700,7 @@ async fn federated_key_query_claim_and_device_list_update() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -7830,6 +7874,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     );
     let cs_router = saltator_cs_api::router(cs_state.clone());
@@ -8110,6 +8155,7 @@ async fn client_downloads_remote_media_over_federation() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -8345,6 +8391,7 @@ async fn client_queries_remote_profile_and_directory() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -9155,6 +9202,7 @@ async fn spaces_hierarchy_spans_federation() {
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
+            admin_users: Vec::new(),
         },
     )
     .with_federation(
@@ -9499,4 +9547,214 @@ async fn federation_public_rooms_lists_published_rooms() {
     assert_eq!(body["total_room_count_estimate"], 1, "{body}");
 
     env.shutdown().await;
+}
+
+// -- admin API authorization (docs/design-admin-identity.md slice 1) ------
+
+const ADMIN_USERS: &str = "/_saltator/admin/v1/users";
+
+/// The admin surface is not part of the Matrix API and must not answer an
+/// anonymous caller.
+#[tokio::test]
+async fn admin_api_requires_a_token() {
+    let env = start_env().await;
+    let (status, body) = env.req("GET", ADMIN_USERS, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["errcode"], "M_MISSING_TOKEN");
+}
+
+/// An ordinary account authenticates fine and is still refused: the
+/// account exists, so this proves the privilege check runs rather than
+/// the token check failing.
+#[tokio::test]
+async fn admin_api_refuses_a_non_admin() {
+    let env = start_env().await;
+    let token = env.register("mallory", "pw-12345678").await;
+    let (status, body) = env.req("GET", ADMIN_USERS, Some(&token), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+}
+
+/// The config allowlist is the bootstrap: it grants admin to an account
+/// whose stored `admin` flag is false, because nothing can set that flag
+/// on a fresh server.
+#[tokio::test]
+async fn config_named_admin_may_list_users() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let token = env.register("root", "pw-12345678").await;
+    env.register("alice", "pw-12345678").await;
+
+    let (status, body) = env.req("GET", ADMIN_USERS, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<&str> = body["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["user_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["@alice:hs.test", "@root:hs.test"]);
+    // Bootstrap admin-ness comes from config, so the stored flag is still
+    // false — the two sources are unioned, not conflated.
+    let root = body["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["user_id"] == "@root:hs.test")
+        .unwrap();
+    assert_eq!(root["admin"], false);
+    assert_eq!(root["state"], "active");
+}
+
+/// An appservice token authenticates as its sender user but has no account
+/// row at all, so it can never be an administrator — even when that user
+/// id is named in the admin allowlist.
+#[tokio::test]
+async fn appservice_token_is_never_admin() {
+    let env = start_env_admin(
+        &["@bridge:hs.test"],
+        vec![AppServiceRegistration {
+            as_token: "as-secret-token".to_owned(),
+            sender_localpart: "bridge".to_owned(),
+        }],
+    )
+    .await;
+    let (status, body) = env
+        .req("GET", ADMIN_USERS, Some("as-secret-token"), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn admin_user_detail_reports_devices_and_404s_for_strangers() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let token = env.register("root", "pw-12345678").await;
+    env.register("alice", "pw-12345678").await;
+
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_saltator/admin/v1/users/@alice:hs.test",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@alice:hs.test");
+    assert_eq!(body["displayname"], "alice");
+    assert_eq!(body["has_password"], true);
+    assert_eq!(body["devices"].as_array().unwrap().len(), 1);
+    // The hash is never exposed, only whether one exists.
+    assert!(body.get("password_hash").is_none());
+
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_saltator/admin/v1/users/@nobody:hs.test",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["errcode"], "M_NOT_FOUND");
+}
+
+/// Paging through the admin list is driven by `next_from`, which is the
+/// next page's first key.
+#[tokio::test]
+async fn admin_user_list_pages() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let token = env.register("root", "pw-12345678").await;
+    for lp in ["alice", "bob"] {
+        env.register(lp, "pw-12345678").await;
+    }
+
+    let (status, first) = env
+        .req("GET", &format!("{ADMIN_USERS}?limit=2"), Some(&token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["users"].as_array().unwrap().len(), 2);
+    let next = first["next_from"].as_str().unwrap().to_owned();
+    assert_eq!(next, "@root:hs.test");
+
+    let (status, last) = env
+        .req(
+            "GET",
+            &format!("{ADMIN_USERS}?limit=2&from={next}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{last}");
+    assert_eq!(last["users"][0]["user_id"], "@root:hs.test");
+    assert!(last.get("next_from").is_none(), "{last}");
+}
+
+/// A deactivated account's token stops working, and the admin view says
+/// why — the state is the operator-visible reason, not a missing row.
+#[tokio::test]
+async fn deactivated_account_is_visible_and_cannot_authenticate() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let admin_token = env.register("root", "pw-12345678").await;
+    let victim_token = env.register("alice", "pw-12345678").await;
+
+    let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
+    env.users.deactivate(&alice).await.unwrap();
+
+    let (status, _) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(&victim_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_saltator/admin/v1/users/@alice:hs.test",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "deactivated");
+}
+
+/// The admin surface refuses a token passed the deprecated query way, even
+/// though the same token works on the Matrix API. Keeps administrator
+/// credentials out of URLs, where `Referer` and access logs would spread
+/// them once a console is served from this origin.
+#[tokio::test]
+async fn admin_api_refuses_query_param_tokens() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let token = env.register("root", "pw-12345678").await;
+
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("{ADMIN_USERS}?access_token={token}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["errcode"], "M_MISSING_TOKEN");
+
+    // The same token in the header is accepted, so this is about the
+    // transport and not the credential.
+    let (status, _) = env.req("GET", ADMIN_USERS, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The Matrix API keeps the fallback for old clients.
+    let (status, _) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/account/whoami?access_token={token}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
 }
