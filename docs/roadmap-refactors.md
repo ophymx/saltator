@@ -167,14 +167,31 @@ outbox migration proven on a store carrying pending entries.
 ## Step 5 ☐ — Admin API + user management (operational surface)
 
 Deliberately after Steps 1–2 so admin endpoints call services instead of
-copying route logic. Scope to be broken down when it starts; likely
-slices: account admin (deactivate/reset/erase), room admin
-(shutdown/purge), server notices, registration tokens, moderation
-basics. Synapse's admin API is the de-facto reference
-(`~/src/synapse` for ground truth). Now also owed from the cluster
-hardening pass: **graceful voter removal** — `NodeStatus::Draining`
-exists in the roster model but nothing sets it, so the only node-removal
-path today is crash-and-forget.
+copying route logic. **Scoped and ACCEPTED 2026-08-09 in
+docs/design-admin-identity.md.** User's constraint: no MAS, user
+management stays internal, but the design must let OIDC/Keycloak drop in
+later without re-cutting the account model. Admin surface is
+`/_saltator/admin/v1`.
+
+Organising idea: split the three things Synapse conflates in one `users`
+row — the **account record** (identity + lifecycle), the **credential**
+(pluggable; local password now, an IdP later), and **authorization**
+(resolved from the requester through one function, never read off the
+account at a call site — Synapse changed exactly one function to move
+admin from a DB column to an OAuth scope, and that is the lesson).
+
+Six slices, one PR each: (1) account model v3 + `AdminAuth` spine +
+read-only endpoints; (2) lifecycle — lock/deactivate/erase/reset;
+(3) real UIA sessions + registration tokens (today's UIA session token
+is random and never validated); (4) the identity link table +
+`services/auth.rs` indirection, no OIDC code; (5) room admin
+(shutdown/block, **not** purge) + server notices; (6) **graceful voter
+removal** — owed from the cluster hardening pass, where
+`NodeStatus::Draining` exists in the roster model but nothing sets it,
+so crash-and-forget is the only node-removal path.
+
+Deferred by the scoping: 3PID/identity server, guest access, room purge,
+Synapse's read-only "suspend" state, and the SSO browser flow itself.
 
 ## Interlude ☑ — Cluster hardening (2026-08-08, user-directed, pre-Step-5)
 
