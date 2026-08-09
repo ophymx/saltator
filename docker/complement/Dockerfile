@@ -9,8 +9,10 @@
 # glibc requirement is satisfied.
 FROM ubuntu:24.04
 
+# haproxy + procps serve only CLUSTER_NODES>1 (the local hardening
+# harness); they are small and keep this a single image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates openssl \
+    && apt-get install -y --no-install-recommends curl ca-certificates openssl haproxy procps \
     && rm -rf /var/lib/apt/lists/*
 
 COPY saltator /usr/local/bin/saltator
@@ -18,6 +20,12 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /usr/local/bin/saltator /entrypoint.sh
 
 ENV SERVER_NAME=localhost
+# 1 = single node (CI). Build a local hardening image with
+#   docker build --build-arg CLUSTER_NODES=3 [--build-arg CHURN_INTERVAL=20] ...
+ARG CLUSTER_NODES=1
+ARG CHURN_INTERVAL=0
+ENV CLUSTER_NODES=$CLUSTER_NODES
+ENV CHURN_INTERVAL=$CHURN_INTERVAL
 EXPOSE 8008 8448
 
 HEALTHCHECK --interval=1s --timeout=2s --start-period=2s --retries=60 \

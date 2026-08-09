@@ -322,6 +322,14 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         .await?;
     tracing::info!("federation-out shard ready");
 
+    // Proposal forwarding: any node serves any write by handing it to the
+    // shard's leader over the internal RPC (a load balancer needs no
+    // leader awareness).
+    let forwarder = saltator_cluster::forward::RpcProposeForwarder::new();
+    rooms.shard_handle().set_forwarder(forwarder.clone());
+    users.shard_handle().set_forwarder(forwarder.clone());
+    fedout.shard_handle().set_forwarder(forwarder.clone());
+
     // Drive this node's shard groups toward the placement: as a group's
     // leader it admits new replicas; a joiner's freshly-started groups become
     // voters here. Each group is reconciled by exactly its own leader.

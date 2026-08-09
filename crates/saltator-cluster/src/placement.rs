@@ -114,10 +114,20 @@ impl Placement {
     }
 }
 
-/// Assign `min(RF, |nodes|)` replicas to each data group by rendezvous
-/// hashing over the active nodes.
+/// Assign replicas to each data group by rendezvous hashing over the
+/// active nodes.
+///
+/// INTERIM POLICY: every group goes to EVERY active node (RF is floored
+/// at the node count). The whole serving surface currently assumes local
+/// applied state for every shard — startup waits for each group's
+/// leadership, and CS/federation reads hit the local store directly — so
+/// a node outside a group's replica set could neither boot nor serve
+/// (found by the churn soak: a 4th node wedged at "awaiting join").
+/// `replication_factor` becomes a real cap once data-plane routing for
+/// unhosted shards exists; the rendezvous ranking already yields the
+/// stable per-group orderings that cap will truncate to.
 pub fn assign(config: &ClusterConfig, nodes: &BTreeSet<NodeId>) -> Placement {
-    let rf = (config.replication_factor as usize).min(nodes.len());
+    let rf = (config.replication_factor as usize).max(nodes.len());
     let mut groups = BTreeMap::new();
     for g in config.data_groups() {
         let mut ranked: Vec<NodeId> = nodes.iter().copied().collect();
@@ -164,35 +174,19 @@ mod tests {
     }
 
     #[test]
-    fn replication_factor_respected_and_capped() {
+    fn interim_policy_places_every_group_on_every_node() {
+        // Until data-plane routing for unhosted shards exists, every
+        // active node must host every group (see `assign`); a node
+        // outside a replica set could neither boot nor serve.
         let cfg = big_config();
-        // Plenty of nodes → exactly RF replicas per group, all distinct.
-        for (_g, r) in assign(&cfg, &nodes(&[1, 2, 3, 4, 5])).iter() {
-            assert_eq!(r.len(), 3);
+        let ns = nodes(&[1, 2, 3, 4, 5]);
+        for (_g, r) in assign(&cfg, &ns).iter() {
+            assert_eq!(r.len(), 5, "every node hosts every group");
             let uniq: BTreeSet<_> = r.iter().copied().collect();
             assert_eq!(uniq.len(), r.len(), "replicas must be distinct nodes");
         }
-        // Fewer nodes than RF → capped at the node count.
         for (_g, r) in assign(&cfg, &nodes(&[1, 2])).iter() {
             assert_eq!(r.len(), 2);
-        }
-    }
-
-    #[test]
-    fn load_is_roughly_balanced() {
-        let cfg = big_config();
-        let ns = nodes(&[1, 2, 3, 4, 5]);
-        let placement = assign(&cfg, &ns);
-        let total_slots = (cfg.room_shards as usize + cfg.user_shards as usize) * 3;
-        let ideal = total_slots / 5;
-        for id in [1, 2, 3, 4, 5] {
-            let count = placement.groups_for(id).len();
-            // Within 40% of the ideal share — rendezvous is balanced in
-            // expectation, loose bound guards against a pathological hash.
-            assert!(
-                count >= ideal * 6 / 10 && count <= ideal * 14 / 10,
-                "node {id} hosts {count}, ideal ~{ideal}"
-            );
         }
     }
 

@@ -5,6 +5,7 @@
 //! with [`MetaApp`] as its state machine; this crate owns the typed
 //! command surface and the gRPC transport that all shard groups share.
 
+pub mod forward;
 pub mod gate;
 pub mod join;
 pub mod network;
