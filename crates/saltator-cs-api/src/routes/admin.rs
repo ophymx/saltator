@@ -1,5 +1,5 @@
-//! The admin API (`/_saltator/admin/v1`) — read-only surface for now
-//! (docs/design-admin-identity.md slice 1).
+//! The admin API (`/_saltator/admin/v1`) — account inspection and
+//! lifecycle (docs/design-admin-identity.md slices 1 and 2).
 //!
 //! These are not Matrix endpoints and carry no ruma types: the request
 //! and response shapes are ours, hand-rolled like `/capabilities`. Errors
@@ -51,4 +51,163 @@ pub async fn user_detail(
     Ok(axum::Json(
         serde_json::to_value(detail).map_err(ApiError::internal)?,
     ))
+}
+
+// -- lifecycle (slice 2) --------------------------------------------------
+
+/// Path user ids are parsed rather than passed through: a malformed one
+/// should be a 400 here, not a miss against the account table that looks
+/// like "no such user".
+fn target(user_id: &str) -> Result<ruma::OwnedUserId> {
+    ruma::OwnedUserId::try_from(user_id)
+        .map_err(|e| ApiError::invalid_param(format!("{user_id:?} is not a user id: {e}")))
+}
+
+/// Every mutation answers with the account's new state, so a console does
+/// not have to re-read to find out what it just did.
+fn detail_response(detail: impl serde::Serialize) -> Result<axum::Json<serde_json::Value>> {
+    Ok(axum::Json(
+        serde_json::to_value(detail).map_err(ApiError::internal)?,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DeactivateBody {
+    /// Also mark the account erased and clear its profile. Does **not**
+    /// redact the user's messages — that is not implemented.
+    #[serde(default)]
+    erase: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ResetPasswordBody {
+    new_password: String,
+    /// Revoke every existing session. Defaults to true: an admin reset is
+    /// usually a response to compromise, so leaving the old sessions alive
+    /// is the wrong default.
+    #[serde(default = "default_true")]
+    logout_devices: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SetAdminBody {
+    admin: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `POST /_saltator/admin/v1/users/{user_id}/lock`
+pub async fn lock_user(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(user_id): Path<String>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    tracing::info!(admin = %auth.user_id(), %target, "admin: lock account");
+    detail_response(
+        state
+            .admin()
+            .set_locked(auth.user_id(), &target, true)
+            .await?,
+    )
+}
+
+/// `POST /_saltator/admin/v1/users/{user_id}/unlock`
+pub async fn unlock_user(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(user_id): Path<String>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    tracing::info!(admin = %auth.user_id(), %target, "admin: unlock account");
+    detail_response(
+        state
+            .admin()
+            .set_locked(auth.user_id(), &target, false)
+            .await?,
+    )
+}
+
+/// `POST /_saltator/admin/v1/users/{user_id}/deactivate`
+pub async fn deactivate_user(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(user_id): Path<String>,
+    body: Option<axum::Json<DeactivateBody>>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    let erase = body.map(|b| b.erase).unwrap_or(false);
+    tracing::info!(admin = %auth.user_id(), %target, erase, "admin: deactivate account");
+    detail_response(
+        state
+            .admin()
+            .deactivate(auth.user_id(), &target, erase)
+            .await?,
+    )
+}
+
+/// `POST /_saltator/admin/v1/users/{user_id}/reset_password`
+pub async fn reset_password(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(user_id): Path<String>,
+    axum::Json(body): axum::Json<ResetPasswordBody>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    tracing::info!(
+        admin = %auth.user_id(), %target, logout = body.logout_devices,
+        "admin: reset password"
+    );
+    detail_response(
+        state
+            .admin()
+            .reset_password(&target, &body.new_password, body.logout_devices)
+            .await?,
+    )
+}
+
+/// `PUT /_saltator/admin/v1/users/{user_id}/admin`
+pub async fn set_admin(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(user_id): Path<String>,
+    axum::Json(body): axum::Json<SetAdminBody>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    tracing::info!(admin = %auth.user_id(), %target, grant = body.admin, "admin: set admin flag");
+    detail_response(
+        state
+            .admin()
+            .set_admin(auth.user_id(), &target, body.admin)
+            .await?,
+    )
+}
+
+/// `DELETE /_saltator/admin/v1/users/{user_id}/devices`
+pub async fn delete_all_devices(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(user_id): Path<String>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    tracing::info!(admin = %auth.user_id(), %target, "admin: revoke all sessions");
+    detail_response(state.admin().delete_devices(&target, None).await?)
+}
+
+/// `DELETE /_saltator/admin/v1/users/{user_id}/devices/{device_id}`
+pub async fn delete_device(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path((user_id, device_id)): Path<(String, String)>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    tracing::info!(admin = %auth.user_id(), %target, device = %device_id, "admin: revoke session");
+    detail_response(
+        state
+            .admin()
+            .delete_devices(&target, Some(&device_id))
+            .await?,
+    )
 }

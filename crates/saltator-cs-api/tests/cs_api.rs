@@ -9758,3 +9758,228 @@ async fn admin_api_refuses_query_param_tokens() {
         .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// -- admin lifecycle (docs/design-admin-identity.md slice 2) --------------
+
+/// The headline property of `Locked`: an existing token stops working
+/// immediately and works again after unlock, with no re-login. Only
+/// provable through the real authentication path, which is why this lives
+/// at the router rather than the service.
+#[tokio::test]
+async fn lock_revokes_live_tokens_and_unlock_restores_them() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    let alice = env.register("alice", "pw-12345678").await;
+    let whoami = "/_matrix/client/v3/account/whoami";
+
+    let (status, _) = env.req("GET", whoami, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_saltator/admin/v1/users/@alice:hs.test/lock",
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "locked");
+
+    let (status, body) = env.req("GET", whoami, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_saltator/admin/v1/users/@alice:hs.test/unlock",
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "active");
+
+    // Same token, no re-login: the lock never destroyed the session.
+    let (status, _) = env.req("GET", whoami, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A locked account cannot log in afresh either — the refusal is in the
+/// account check, not only in token validation.
+#[tokio::test]
+async fn locked_account_cannot_log_in() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    env.register("alice", "pw-12345678").await;
+    env.req(
+        "POST",
+        "/_saltator/admin/v1/users/@alice:hs.test/lock",
+        Some(&root),
+        None,
+    )
+    .await;
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/login",
+            None,
+            Some(json!({
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": "alice"},
+                "password": "pw-12345678"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// An admin password reset kills the old sessions and the old password.
+#[tokio::test]
+async fn admin_password_reset_replaces_credential_and_sessions() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    let alice = env.register("alice", "pw-12345678").await;
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_saltator/admin/v1/users/@alice:hs.test/reset_password",
+            Some(&root),
+            Some(json!({"new_password": "fresh-password-1"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["devices"].as_array().unwrap().len(), 0);
+
+    let (status, _) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "old session survived");
+
+    let login = |password: &'static str| {
+        env.req(
+            "POST",
+            "/_matrix/client/v3/login",
+            None,
+            Some(json!({
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": "alice"},
+                "password": password
+            })),
+        )
+    };
+    assert_eq!(login("pw-12345678").await.0, StatusCode::FORBIDDEN);
+    assert_eq!(login("fresh-password-1").await.0, StatusCode::OK);
+}
+
+/// The stored admin flag is a real grant, not only a config mirror: a
+/// promoted account reaches the admin API, and demotion closes it again.
+#[tokio::test]
+async fn granting_the_admin_flag_opens_the_api() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    let alice = env.register("alice", "pw-12345678").await;
+
+    let (status, _) = env.req("GET", ADMIN_USERS, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            "/_saltator/admin/v1/users/@alice:hs.test/admin",
+            Some(&root),
+            Some(json!({"admin": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["admin"], true);
+
+    let (status, _) = env.req("GET", ADMIN_USERS, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    env.req(
+        "PUT",
+        "/_saltator/admin/v1/users/@alice:hs.test/admin",
+        Some(&root),
+        Some(json!({"admin": false})),
+    )
+    .await;
+    let (status, _) = env.req("GET", ADMIN_USERS, Some(&alice), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The self-lockout guard, over HTTP: an administrator cannot remove their
+/// own access, because nothing in this API could give it back.
+#[tokio::test]
+async fn admin_cannot_lock_out_themselves() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+
+    for (method, path, body) in [
+        ("POST", "/_saltator/admin/v1/users/@root:hs.test/lock", None),
+        (
+            "POST",
+            "/_saltator/admin/v1/users/@root:hs.test/deactivate",
+            None,
+        ),
+        (
+            "PUT",
+            "/_saltator/admin/v1/users/@root:hs.test/admin",
+            Some(json!({"admin": false})),
+        ),
+    ] {
+        let (status, resp) = env.req(method, path, Some(&root), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {resp}");
+        assert_eq!(resp["errcode"], "M_INVALID_PARAM");
+    }
+
+    let (status, _) = env.req("GET", ADMIN_USERS, Some(&root), None).await;
+    assert_eq!(status, StatusCode::OK, "admin locked themselves out anyway");
+}
+
+/// A malformed user id in the path is a 400, not a 404 that reads as
+/// "no such account".
+#[tokio::test]
+async fn malformed_target_user_id_is_a_bad_request() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_saltator/admin/v1/users/not-a-user-id/lock",
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_PARAM");
+}
+
+/// Deactivate with `erase` clears the profile, and the erasure shows in
+/// the admin view.
+#[tokio::test]
+async fn admin_deactivate_with_erase() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    env.register("alice", "pw-12345678").await;
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_saltator/admin/v1/users/@alice:hs.test/deactivate",
+            Some(&root),
+            Some(json!({"erase": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "deactivated");
+    assert_eq!(body["erased"], true);
+    assert!(body["displayname"].is_null(), "{body}");
+}

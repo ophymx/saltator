@@ -562,6 +562,34 @@ pub enum UserCommand {
         ts_ms: u64,
         messages: Vec<ToDeviceMessage>,
     },
+    /// Admin: lock or unlock an account (docs/design-admin-identity.md).
+    /// Reversible and non-destructive — sessions stay on disk and start
+    /// working again on unlock, because the refusal lives in the
+    /// authentication check rather than in a teardown. Refuses to touch a
+    /// `Deactivated` account: that state is terminal.
+    SetLocked {
+        user_id: String,
+        locked: bool,
+    },
+    /// Admin: grant or revoke the server-administrator flag.
+    SetAdmin {
+        user_id: String,
+        admin: bool,
+    },
+    /// Admin password reset. Distinct from [`UserCommand::ChangePassword`]
+    /// because there is no device to keep: the administrator is not on one
+    /// of the target's sessions.
+    AdminSetPassword {
+        user_id: String,
+        password_hash: String,
+        logout_devices: bool,
+    },
+    /// Admin: mark an account erased and clear its profile. Only the
+    /// marker and the profile — message redaction is not implemented, so
+    /// this is not yet a complete erasure.
+    SetErased {
+        user_id: String,
+    },
 }
 
 /// A stored one-time key ([`T_ONE_TIME_KEY`]) with its upload slot:
@@ -672,6 +700,15 @@ pub enum UserResponse {
         count: u64,
         etag: u64,
     },
+    /// The account exists but its lifecycle state forbids the operation
+    /// (unlocking a deactivated account, say). Distinct from `NotFound`,
+    /// which would tell an operator the wrong thing.
+    ///
+    /// Appended, like every variant here: responses cross nodes via the
+    /// leader-forwarding `Propose` RPC, and postcard encodes the variant
+    /// index — inserting one mid-enum would make a rolling upgrade decode
+    /// every later variant as its neighbour.
+    InvalidState,
 }
 
 /// Change-stream payload of the user shard: something about `user_id`

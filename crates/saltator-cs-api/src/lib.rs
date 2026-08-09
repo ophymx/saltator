@@ -17,7 +17,7 @@ mod typing;
 
 use std::sync::Arc;
 
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use ruma::{OwnedServerName, OwnedUserId};
 
 use saltator_core::RoomVersion;
@@ -191,7 +191,10 @@ impl CsState {
 
     /// The admin/user-management domain service over this state's shards.
     pub(crate) fn admin(&self) -> services::admin::Admin<'_> {
-        services::admin::Admin { users: &self.users }
+        services::admin::Admin {
+            users: &self.users,
+            admin_users: &self.config.admin_users,
+        }
     }
 
     /// The E2EE/device-list domain service over this state's shards.
@@ -566,6 +569,34 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_saltator/admin/v1/users/{user_id}",
             get(admin::user_detail),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/lock",
+            post(admin::lock_user),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/unlock",
+            post(admin::unlock_user),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/deactivate",
+            post(admin::deactivate_user),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/reset_password",
+            post(admin::reset_password),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/admin",
+            put(admin::set_admin),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/devices",
+            delete(admin::delete_all_devices),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/devices/{device_id}",
+            delete(admin::delete_device),
         );
 
     app.fallback(unrecognized)

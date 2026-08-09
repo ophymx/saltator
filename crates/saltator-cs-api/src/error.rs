@@ -164,6 +164,10 @@ impl From<UserError> for ApiError {
             UserError::Forbidden => Self::forbidden(e.to_string()),
             UserError::InvalidGrant => Self::unknown_token(),
             UserError::NotFound => Self::not_found(e.to_string()),
+            // A caller error with a precise cause, so say which: an
+            // operator retrying blindly against a deactivated account
+            // should not be told "not found".
+            UserError::InvalidState => Self::invalid_param(e.to_string()),
             UserError::AliasExists => {
                 Self::new(StatusCode::CONFLICT, "M_UNKNOWN", "Alias already exists")
             }

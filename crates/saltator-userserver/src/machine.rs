@@ -301,6 +301,28 @@ fn delete_devices_except(
 
 /// Log a device-list change for `user_id` so peers' `/sync` and
 /// `/keys/changes` tell them to re-query the user's keys.
+/// Tear an account down: mark it `Deactivated`, drop the local credential
+/// and invalidate every session.
+///
+/// Shared by the client's own `/account/deactivate` and the admin API, so
+/// there is exactly one definition of what deactivation *means*. A second
+/// implementation that forgot the device sweep would leave live tokens on
+/// a "deactivated" account.
+fn apply_deactivate(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<UserResponse> {
+    let ukey = user_id.as_bytes();
+    let Some(mut account): Option<Account> = get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+    else {
+        return Ok(UserResponse::NotFound);
+    };
+    account.state = AccountState::Deactivated;
+    account.password_hash = None;
+    ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+    if delete_devices_except(ctx, user_id, None)? {
+        log_key_change(ctx, user_id)?;
+    }
+    Ok(UserResponse::Ok)
+}
+
 fn log_key_change(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<()> {
     let seq = emit_user_change(ctx, user_id)?;
     put_key_change(ctx, seq, user_id, None)
@@ -962,19 +984,79 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
             Ok(UserResponse::Ok)
         }
-        UserCommand::Deactivate { user_id } => {
+        UserCommand::Deactivate { user_id } => apply_deactivate(ctx, user_id),
+        UserCommand::SetLocked { user_id, locked } => {
             let ukey = user_id.as_bytes();
             let Some(mut account): Option<Account> =
                 get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
             else {
                 return Ok(UserResponse::NotFound);
             };
-            account.state = AccountState::Deactivated;
-            account.password_hash = None;
+            // Deactivation is terminal: locking or unlocking past it would
+            // either be a no-op dressed as success or a resurrection.
+            if account.state == AccountState::Deactivated {
+                return Ok(UserResponse::InvalidState);
+            }
+            account.state = if *locked {
+                AccountState::Locked
+            } else {
+                AccountState::Active
+            };
             ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
-            if delete_devices_except(ctx, user_id, None)? {
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::SetAdmin { user_id, admin } => {
+            let ukey = user_id.as_bytes();
+            let Some(mut account): Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            account.admin = *admin;
+            ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::AdminSetPassword {
+            user_id,
+            password_hash,
+            logout_devices,
+        } => {
+            let ukey = user_id.as_bytes();
+            let Some(mut account): Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            // A deactivated account has had its credential deliberately
+            // cleared; handing it a new one would partially undo that.
+            if account.state == AccountState::Deactivated {
+                return Ok(UserResponse::InvalidState);
+            }
+            account.password_hash = Some(password_hash.clone());
+            ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+            // No device is kept: the administrator is not on one of them.
+            if *logout_devices && delete_devices_except(ctx, user_id, None)? {
                 log_key_change(ctx, user_id)?;
             }
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::SetErased { user_id } => {
+            let ukey = user_id.as_bytes();
+            let Some(mut account): Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            // Erasure is a modifier on deactivation, not an alternative to
+            // it: erasing a live account would leave it able to log in.
+            if account.state != AccountState::Deactivated {
+                return Ok(UserResponse::InvalidState);
+            }
+            account.erased = true;
+            ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+            // The profile is the PII this server can actually remove
+            // today. Message redaction is not implemented.
+            ctx.delete(T_PROFILE, ukey);
             Ok(UserResponse::Ok)
         }
         UserCommand::CreateBackupVersion {

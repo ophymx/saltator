@@ -71,6 +71,8 @@ pub enum UserError {
     InvalidGrant,
     #[error("not found")]
     NotFound,
+    #[error("the account's state does not allow this")]
+    InvalidState,
     #[error("alias already exists")]
     AliasExists,
     #[error("shard: {0}")]
@@ -666,6 +668,64 @@ impl UserServer {
         {
             UserResponse::Ok => Ok(()),
             UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    // -- admin lifecycle (docs/design-admin-identity.md) ------------------
+
+    /// Lock or unlock an account. Reversible: no session is destroyed, so
+    /// unlocking restores the user's existing devices.
+    pub async fn set_locked(&self, user_id: &UserId, locked: bool) -> Result<()> {
+        self.lifecycle(&UserCommand::SetLocked {
+            user_id: user_id.to_string(),
+            locked,
+        })
+        .await
+    }
+
+    /// Grant or revoke the server-administrator flag.
+    pub async fn set_admin(&self, user_id: &UserId, admin: bool) -> Result<()> {
+        self.lifecycle(&UserCommand::SetAdmin {
+            user_id: user_id.to_string(),
+            admin,
+        })
+        .await
+    }
+
+    /// Administratively set a password. Unlike `change_password` this
+    /// keeps no device, because the caller is not on one of the target's
+    /// sessions.
+    pub async fn admin_set_password(
+        &self,
+        user_id: &UserId,
+        new_password: &str,
+        logout_devices: bool,
+    ) -> Result<()> {
+        let password_hash = hash_password(new_password).await?;
+        self.lifecycle(&UserCommand::AdminSetPassword {
+            user_id: user_id.to_string(),
+            password_hash,
+            logout_devices,
+        })
+        .await
+    }
+
+    /// Mark a (already deactivated) account erased and drop its profile.
+    /// Message redaction is not implemented — see the command's docs.
+    pub async fn set_erased(&self, user_id: &UserId) -> Result<()> {
+        self.lifecycle(&UserCommand::SetErased {
+            user_id: user_id.to_string(),
+        })
+        .await
+    }
+
+    /// Propose a lifecycle command, mapping the two ways it can decline.
+    async fn lifecycle(&self, cmd: &UserCommand) -> Result<()> {
+        match self.propose(cmd).await? {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            UserResponse::InvalidState => Err(UserError::InvalidState),
             other => Err(unexpected(other)),
         }
     }

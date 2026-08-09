@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use ruma::{OwnedUserId, UserId};
 use saltator_userserver::{AccountState, UserServer};
 use serde::Serialize;
 
@@ -24,6 +25,10 @@ const MAX_LIMIT: usize = 1000;
 /// [`crate::CsState::admin`].
 pub(crate) struct Admin<'a> {
     pub users: &'a Arc<UserServer>,
+    /// Administrators granted by config. Needed here so a revoke that
+    /// could not possibly take effect is refused rather than silently
+    /// succeeding.
+    pub admin_users: &'a [OwnedUserId],
 }
 
 /// One row of the user list. Deliberately small — the list is for
@@ -126,6 +131,110 @@ impl Admin<'_> {
             devices,
         })
     }
+
+    /// Refuse an action that would strip the caller's own access.
+    ///
+    /// An administrator who locks, deactivates or demotes themselves has
+    /// no way back through this API — the only recovery is editing config
+    /// and restarting. Cheap to prevent, expensive to undo.
+    fn not_self(actor: &UserId, target: &UserId, what: &str) -> Result<()> {
+        if actor == target {
+            return Err(ApiError::invalid_param(format!(
+                "refusing to {what} your own account"
+            )));
+        }
+        Ok(())
+    }
+
+    fn is_config_admin(&self, user: &UserId) -> bool {
+        self.admin_users.iter().any(|u| u == user)
+    }
+
+    pub async fn set_locked(
+        &self,
+        actor: &UserId,
+        target: &UserId,
+        locked: bool,
+    ) -> Result<UserDetail> {
+        if locked {
+            Self::not_self(actor, target, "lock")?;
+        }
+        self.users.set_locked(target, locked).await?;
+        self.user_detail(target.as_str())
+    }
+
+    /// Deactivate, optionally marking the account erased.
+    ///
+    /// `erase` sets the marker and clears the profile. It does **not**
+    /// redact the user's messages — that is not implemented, and calling
+    /// this a complete erasure would be a lie to whoever is answering the
+    /// data-subject request.
+    pub async fn deactivate(
+        &self,
+        actor: &UserId,
+        target: &UserId,
+        erase: bool,
+    ) -> Result<UserDetail> {
+        Self::not_self(actor, target, "deactivate")?;
+        self.users.deactivate(target).await?;
+        if erase {
+            self.users.set_erased(target).await?;
+        }
+        self.user_detail(target.as_str())
+    }
+
+    pub async fn set_admin(
+        &self,
+        actor: &UserId,
+        target: &UserId,
+        admin: bool,
+    ) -> Result<UserDetail> {
+        if !admin {
+            Self::not_self(actor, target, "revoke administrator rights from")?;
+            // The stored flag is only half the grant; clearing it while
+            // config still names the user would report success and change
+            // nothing an operator can observe.
+            if self.is_config_admin(target) {
+                return Err(ApiError::invalid_param(format!(
+                    "{target} is an administrator via server config; \
+                     remove them from client.admin_users instead"
+                )));
+            }
+        }
+        self.users.set_admin(target, admin).await?;
+        self.user_detail(target.as_str())
+    }
+
+    pub async fn reset_password(
+        &self,
+        target: &UserId,
+        new_password: &str,
+        logout_devices: bool,
+    ) -> Result<UserDetail> {
+        if new_password.is_empty() {
+            return Err(ApiError::invalid_param("password must not be empty"));
+        }
+        self.users
+            .admin_set_password(target, new_password, logout_devices)
+            .await?;
+        self.user_detail(target.as_str())
+    }
+
+    /// Revoke one session, or every session when `device_id` is `None`.
+    pub async fn delete_devices(
+        &self,
+        target: &UserId,
+        device_id: Option<&str>,
+    ) -> Result<UserDetail> {
+        // The account has to exist first: deleting devices of an unknown
+        // user otherwise reports success against nothing.
+        self.user_detail(target.as_str())?;
+        match device_id {
+            Some(id) => self.users.delete_device(target, id).await?,
+            None => self.users.delete_all_devices(target).await?,
+        }
+        self.user_detail(target.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +273,19 @@ mod tests {
         (dir, users)
     }
 
+    /// A service with no config-named administrators — the default for
+    /// tests that are not about the bootstrap allowlist.
+    fn admin(users: &Arc<UserServer>) -> Admin<'_> {
+        Admin {
+            users,
+            admin_users: &[],
+        }
+    }
+
+    fn uid(localpart: &str) -> ruma::OwnedUserId {
+        ruma::OwnedUserId::try_from(format!("@{localpart}:{SERVER}")).unwrap()
+    }
+
     async fn register(users: &Arc<UserServer>, localpart: &str, password: Option<&str>) {
         users
             .register(localpart, password, None, None, false, false)
@@ -179,7 +301,7 @@ mod tests {
         for lp in ["carol", "alice", "bob", "dave", "erin"] {
             register(&users, lp, Some("pw")).await;
         }
-        let admin = Admin { users: &users };
+        let admin = admin(&users);
 
         let first = admin.list_users(None, Some(2)).unwrap();
         let ids: Vec<&str> = first.users.iter().map(|u| u.user_id.as_str()).collect();
@@ -210,7 +332,7 @@ mod tests {
         let (_dir, users) = stack().await;
         register(&users, "alice", Some("pw")).await;
         register(&users, "bob", Some("pw")).await;
-        let page = Admin { users: &users }.list_users(None, Some(2)).unwrap();
+        let page = admin(&users).list_users(None, Some(2)).unwrap();
         assert_eq!(page.users.len(), 2);
         assert!(page.next_from.is_none());
     }
@@ -219,9 +341,7 @@ mod tests {
     async fn detail_reports_profile_devices_and_credential() {
         let (_dir, users) = stack().await;
         register(&users, "alice", Some("pw")).await;
-        let detail = Admin { users: &users }
-            .user_detail("@alice:hs.test")
-            .unwrap();
+        let detail = admin(&users).user_detail("@alice:hs.test").unwrap();
 
         assert_eq!(detail.summary.state, AccountState::Active);
         assert!(!detail.summary.admin);
@@ -237,9 +357,7 @@ mod tests {
     async fn passwordless_account_is_active_without_credential() {
         let (_dir, users) = stack().await;
         register(&users, "bridge", None).await;
-        let detail = Admin { users: &users }
-            .user_detail("@bridge:hs.test")
-            .unwrap();
+        let detail = admin(&users).user_detail("@bridge:hs.test").unwrap();
         assert!(!detail.has_password);
         assert_eq!(detail.summary.state, AccountState::Active);
     }
@@ -251,7 +369,7 @@ mod tests {
         let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
         users.deactivate(&alice).await.unwrap();
 
-        let admin = Admin { users: &users };
+        let admin = admin(&users);
         assert_eq!(
             admin.user_detail("@alice:hs.test").unwrap().summary.state,
             AccountState::Deactivated
@@ -263,9 +381,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_user_is_not_found() {
         let (_dir, users) = stack().await;
-        let err = Admin { users: &users }
-            .user_detail("@nobody:hs.test")
-            .unwrap_err();
+        let err = admin(&users).user_detail("@nobody:hs.test").unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
     }
 
@@ -275,9 +391,253 @@ mod tests {
     async fn limit_is_clamped() {
         let (_dir, users) = stack().await;
         register(&users, "alice", Some("pw")).await;
-        let page = Admin { users: &users }
-            .list_users(None, Some(usize::MAX))
-            .unwrap();
+        let page = admin(&users).list_users(None, Some(usize::MAX)).unwrap();
         assert_eq!(page.users.len(), 1);
+    }
+
+    // -- lifecycle (slice 2) ---------------------------------------------
+
+    /// Locking is reversible and non-destructive: the device survives, so
+    /// unlocking restores the session rather than requiring a fresh login.
+    #[tokio::test]
+    async fn lock_is_reversible_and_keeps_devices() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let (root, alice) = (uid("root"), uid("alice"));
+
+        let locked = admin(&users).set_locked(&root, &alice, true).await.unwrap();
+        assert_eq!(locked.summary.state, AccountState::Locked);
+        assert_eq!(locked.devices.len(), 1, "lock must not tear down sessions");
+
+        let unlocked = admin(&users)
+            .set_locked(&root, &alice, false)
+            .await
+            .unwrap();
+        assert_eq!(unlocked.summary.state, AccountState::Active);
+        assert_eq!(unlocked.devices.len(), 1);
+    }
+
+    /// Deactivation is terminal — unlocking must not resurrect an account.
+    #[tokio::test]
+    async fn deactivated_cannot_be_unlocked() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let (root, alice) = (uid("root"), uid("alice"));
+        admin(&users)
+            .deactivate(&root, &alice, false)
+            .await
+            .unwrap();
+
+        let err = admin(&users)
+            .set_locked(&root, &alice, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            admin(&users)
+                .user_detail(alice.as_str())
+                .unwrap()
+                .summary
+                .state,
+            AccountState::Deactivated
+        );
+    }
+
+    /// Deactivation clears the credential and every session.
+    #[tokio::test]
+    async fn deactivate_tears_down_credential_and_sessions() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let detail = admin(&users)
+            .deactivate(&uid("root"), &uid("alice"), false)
+            .await
+            .unwrap();
+        assert_eq!(detail.summary.state, AccountState::Deactivated);
+        assert!(!detail.has_password);
+        assert!(detail.devices.is_empty());
+        assert!(!detail.summary.erased, "erase is opt-in");
+    }
+
+    /// Erasure sets the marker and drops the profile. It does not redact
+    /// messages — that is unimplemented, and this test documents the
+    /// boundary rather than pretending otherwise.
+    #[tokio::test]
+    async fn erase_marks_and_clears_profile() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let detail = admin(&users)
+            .deactivate(&uid("root"), &uid("alice"), true)
+            .await
+            .unwrap();
+        assert!(detail.summary.erased);
+        assert_eq!(detail.summary.displayname, None);
+        assert_eq!(detail.avatar_url, None);
+    }
+
+    /// Erasing a live account would leave it able to log in, so the state
+    /// machine refuses it outright.
+    #[tokio::test]
+    async fn erase_requires_deactivation() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let err = users.set_erased(&uid("alice")).await.unwrap_err();
+        assert!(matches!(err, saltator_userserver::UserError::InvalidState));
+    }
+
+    #[tokio::test]
+    async fn reset_password_revokes_sessions_when_asked() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let alice = uid("alice");
+
+        let kept = admin(&users)
+            .reset_password(&alice, "new-password", false)
+            .await
+            .unwrap();
+        assert!(kept.has_password);
+        assert_eq!(kept.devices.len(), 1, "logout_devices=false keeps them");
+
+        let cleared = admin(&users)
+            .reset_password(&alice, "newer-password", true)
+            .await
+            .unwrap();
+        assert!(cleared.devices.is_empty());
+        // The new password works.
+        assert!(users
+            .login_password("alice", "newer-password", None, None, false)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn reset_password_refuses_deactivated_and_empty() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let alice = uid("alice");
+
+        let err = admin(&users)
+            .reset_password(&alice, "", true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+
+        admin(&users)
+            .deactivate(&uid("root"), &alice, false)
+            .await
+            .unwrap();
+        let err = admin(&users)
+            .reset_password(&alice, "anything", true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// A locked account still accepts an admin password reset: the usual
+    /// order is reset, then unlock.
+    #[tokio::test]
+    async fn reset_password_works_while_locked() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let (root, alice) = (uid("root"), uid("alice"));
+        admin(&users).set_locked(&root, &alice, true).await.unwrap();
+        assert!(admin(&users)
+            .reset_password(&alice, "new-password", true)
+            .await
+            .is_ok());
+    }
+
+    /// The three self-targeting actions that would strip the caller's own
+    /// access are refused; the recoverable one (unlock) is not.
+    #[tokio::test]
+    async fn refuses_to_strip_the_callers_own_access() {
+        let (_dir, users) = stack().await;
+        register(&users, "root", Some("pw")).await;
+        let root = uid("root");
+        let svc = admin(&users);
+
+        for err in [
+            svc.set_locked(&root, &root, true).await.unwrap_err(),
+            svc.deactivate(&root, &root, false).await.unwrap_err(),
+            svc.set_admin(&root, &root, false).await.unwrap_err(),
+        ] {
+            assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        }
+        // Still active: none of the refusals half-applied.
+        assert_eq!(
+            svc.user_detail(root.as_str()).unwrap().summary.state,
+            AccountState::Active
+        );
+        // Granting to self is harmless and allowed.
+        assert!(svc.set_admin(&root, &root, true).await.is_ok());
+    }
+
+    /// Revoking the stored flag from a config-named admin would report
+    /// success and change nothing observable, so it is refused instead.
+    #[tokio::test]
+    async fn refuses_to_revoke_a_config_granted_admin() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let alice = uid("alice");
+        let svc = Admin {
+            users: &users,
+            admin_users: std::slice::from_ref(&alice),
+        };
+        let err = svc
+            .set_admin(&uid("root"), &alice, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("admin_users"));
+    }
+
+    #[tokio::test]
+    async fn admin_flag_round_trips() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let (root, alice) = (uid("root"), uid("alice"));
+        let svc = admin(&users);
+        assert!(
+            svc.set_admin(&root, &alice, true)
+                .await
+                .unwrap()
+                .summary
+                .admin
+        );
+        assert!(
+            !svc.set_admin(&root, &alice, false)
+                .await
+                .unwrap()
+                .summary
+                .admin
+        );
+    }
+
+    /// Device revocation against an unknown account is a 404, not a
+    /// success against nothing.
+    #[tokio::test]
+    async fn device_revocation_needs_a_real_account() {
+        let (_dir, users) = stack().await;
+        let err = admin(&users)
+            .delete_devices(&uid("nobody"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn device_revocation_removes_sessions() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let alice = uid("alice");
+        let before = admin(&users).user_detail(alice.as_str()).unwrap();
+        let device = before.devices[0].device_id.clone();
+
+        let after = admin(&users)
+            .delete_devices(&alice, Some(&device))
+            .await
+            .unwrap();
+        assert!(after.devices.is_empty());
+        // The account itself is untouched — revoking a session is not a lock.
+        assert_eq!(after.summary.state, AccountState::Active);
     }
 }

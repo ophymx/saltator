@@ -235,12 +235,26 @@ inventory to what a small operator actually uses:
 |---|---|
 | `GET /users` | needs a new `T_ACCOUNT` range reader on `UserStore` |
 | `GET /users/{id}` | state, admin, created_ts, devices, external ids |
-| `PUT /users/{id}` | create-or-update: displayname, admin, state, password, external_ids |
 | `POST /users/{id}/lock` · `/unlock` | reversible kill-switch |
 | `POST /users/{id}/deactivate` | `{erase: bool}` |
-| `POST /users/{id}/reset_password` | `{logout_devices: bool}` |
-| `GET/DELETE /users/{id}/devices[/{device_id}]` | admin session revocation |
+| `POST /users/{id}/reset_password` | `{new_password, logout_devices}` |
+| `PUT /users/{id}/admin` | grant/revoke the stored flag |
+| `DELETE /users/{id}/devices[/{device_id}]` | admin session revocation |
 | `GET /auth_providers/{provider}/users/{external_id}` | reverse link lookup |
+
+Two notes from building slice 2. A composite **`PUT /users/{id}`**
+(create-or-update in one call) was dropped in favour of the explicit
+action endpoints above: each of those maps to exactly one shard command
+with one meaning, whereas the composite would also have introduced
+admin-side *account creation*, which bypasses `registration_enabled` and
+UIA and deserves its own decision. Registration tokens (slice 3) are the
+designed answer to closed-deployment onboarding, so nothing is blocked.
+
+And **`erase` is partial and says so**: it sets the marker and clears the
+profile, which is the PII this server can actually remove today. It does
+not redact the user's messages. That work is real and unscheduled;
+calling the current behaviour a complete erasure would misinform whoever
+is answering a data-subject request.
 
 **Registration tokens** — `T_REG_TOKEN = APP_TABLE_FIRST + 27`
 (`{token, uses_allowed, pending, completed, expiry_ts}`), CRUD under
@@ -352,6 +366,8 @@ Slices 1–4 are the ones the user's constraint is really about. 5, 6 and
   unimplemented.
 - **Guest access.** Still 403 (`routes/session.rs:74`).
 - **Room purge** (decision 4).
+- **Message redaction on erasure** — see the erase note above.
+- **Admin-side account creation** — see the `PUT /users/{id}` note above.
 - **The SSO browser flow itself** — templates, IdP picker, localpart
   picker, callback. That is the OIDC slice, below.
 
