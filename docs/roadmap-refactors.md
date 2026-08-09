@@ -188,7 +188,9 @@ is random and never validated); (4) the identity link table +
 (shutdown/block, **not** purge) + server notices; (6) **graceful voter
 removal** — owed from the cluster hardening pass, where
 `NodeStatus::Draining` exists in the roster model but nothing sets it,
-so crash-and-forget is the only node-removal path.
+so crash-and-forget is the only node-removal path; (7) an **admin web
+UI** served by the binary — TypeScript/Vite sub-project under `web/admin`,
+scoped separately in docs/design-admin-ui.md.
 
 Deferred by the scoping: 3PID/identity server, guest access, room purge,
 Synapse's read-only "suspend" state, and the SSO browser flow itself.

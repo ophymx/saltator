@@ -319,9 +319,13 @@ One concern per PR, in dependency order.
 5. **Room admin + server notices.** Room list/detail, shutdown/block,
    notices room.
 6. **Cluster drain.** `Draining` wired end to end; the interlude's debt.
+7. **Admin web UI** — a TypeScript/Vite sub-project served by the
+   binary. Its own design: `docs/design-admin-ui.md`. Startable as soon
+   as slice 1 lands, and it needs no admin-specific auth mechanism,
+   which is a dividend of admin being a property of an ordinary account.
 
-Slices 1–4 are the ones the user's constraint is really about. 5 and 6
-are independent and can reorder.
+Slices 1–4 are the ones the user's constraint is really about. 5, 6 and
+7 are independent and can reorder.
 
 ## Explicitly out of scope
 
