@@ -291,7 +291,8 @@ pub async fn device_signing_upload(
             ),
             None => None,
         };
-        crate::routes::account::require_password_uia(&state, &auth, &req_auth).await?;
+        let request_id = format!("cross_signing_upload:{}", auth.user_id);
+        crate::routes::account::require_password_uia(&state, &auth, &request_id, &req_auth).await?;
     }
     let key_of = |field: &str| -> Result<Option<Vec<u8>>> {
         match body.get(field) {

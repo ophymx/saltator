@@ -64,6 +64,21 @@ pub(crate) struct UserDetail {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct RegTokenSummary {
+    pub token: String,
+    /// `None` = unlimited uses.
+    pub uses_allowed: Option<u64>,
+    pub used: u64,
+    /// `None` = never expires.
+    pub expiry_ts: Option<u64>,
+    pub created_ts: u64,
+    /// Whether the token would authorise a registration right now —
+    /// computed, so an operator does not have to compare clocks and
+    /// counters themselves.
+    pub valid: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct DeviceSummary {
     pub device_id: String,
     pub display_name: Option<String>,
@@ -218,6 +233,76 @@ impl Admin<'_> {
             .admin_set_password(target, new_password, logout_devices)
             .await?;
         self.user_detail(target.as_str())
+    }
+
+    // -- registration tokens ---------------------------------------------
+
+    pub fn list_registration_tokens(&self) -> Result<Vec<RegTokenSummary>> {
+        let now = crate::now_ms();
+        let mut out: Vec<RegTokenSummary> = self
+            .users
+            .store()
+            .registration_tokens()
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .map(|(token, t)| RegTokenSummary {
+                valid: t.usable(now),
+                token,
+                uses_allowed: t.uses_allowed,
+                used: t.used,
+                expiry_ts: t.expiry_ts,
+                created_ts: t.created_ts,
+            })
+            .collect();
+        out.sort_by(|a, b| a.token.cmp(&b.token));
+        Ok(out)
+    }
+
+    pub async fn create_registration_token(
+        &self,
+        token: Option<String>,
+        uses_allowed: Option<u64>,
+        expiry_ts: Option<u64>,
+    ) -> Result<RegTokenSummary> {
+        // A server-minted token is the safer default: an operator picking
+        // one by hand tends to pick a guessable one.
+        let token = match token {
+            Some(t) if t.is_empty() => {
+                return Err(ApiError::invalid_param("token must not be empty"))
+            }
+            Some(t) => t,
+            None => saltator_userserver::generate_token(),
+        };
+        if let Some(expiry) = expiry_ts {
+            if expiry <= crate::now_ms() {
+                return Err(ApiError::invalid_param("expiry_ts is already in the past"));
+            }
+        }
+        self.users
+            .create_registration_token(&token, uses_allowed, expiry_ts)
+            .await?;
+        self.registration_token(&token)
+    }
+
+    pub fn registration_token(&self, token: &str) -> Result<RegTokenSummary> {
+        let entry = self
+            .users
+            .store()
+            .registration_token(token)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("Unknown registration token"))?;
+        Ok(RegTokenSummary {
+            valid: entry.usable(crate::now_ms()),
+            token: token.to_owned(),
+            uses_allowed: entry.uses_allowed,
+            used: entry.used,
+            expiry_ts: entry.expiry_ts,
+            created_ts: entry.created_ts,
+        })
+    }
+
+    pub async fn delete_registration_token(&self, token: &str) -> Result<()> {
+        Ok(self.users.delete_registration_token(token).await?)
     }
 
     /// Revoke one session, or every session when `device_id` is `None`.

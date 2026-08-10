@@ -6,3 +6,4 @@
 
 pub(crate) mod admin;
 pub(crate) mod e2ee;
+pub(crate) mod uia;

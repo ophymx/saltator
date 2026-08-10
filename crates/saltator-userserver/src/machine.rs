@@ -7,12 +7,12 @@ use saltator_store::{Result as StoreResult, StoreError};
 use crate::types::{
     account_data_key, device_scoped_key, prefix_end, to_device_key, user_key, Account,
     AccountDataEntry, AccountState, AccountV2, AliasEntry, BackupVersionMeta, ClaimedKey, Device,
-    FallbackEntry, KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, SessionCmd,
-    TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA,
-    T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS,
-    T_DIRECTORY, T_EDU_OUTBOX, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
-    T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN,
-    T_TO_DEVICE_SEEN_IDX,
+    FallbackEntry, KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, RegToken,
+    SessionCmd, TokenEntry, TokenKind, UiaSession, UserChangePayload, UserCommand, UserResponse,
+    T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR,
+    T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_EDU_OUTBOX, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE,
+    T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_REG_TOKEN, T_TOKEN,
+    T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -323,6 +323,80 @@ fn apply_deactivate(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<UserRe
     Ok(UserResponse::Ok)
 }
 
+/// Reserve a username, create the account, and consume a registration
+/// token if one was presented — all in one apply batch.
+///
+/// The token is re-checked *here* rather than trusted from the UIA stage:
+/// the stage runs against a read of the applied state, so two concurrent
+/// registrations can both see a one-use token as valid. Only the ordering
+/// the log gives us makes "one use" true.
+fn apply_register(
+    ctx: &mut ApplyCtx<'_>,
+    user_id: &str,
+    password_hash: &Option<String>,
+    ts: u64,
+    session: Option<&SessionCmd>,
+    registration_token: Option<&str>,
+) -> StoreResult<UserResponse> {
+    let ukey = user_id.as_bytes();
+    if ctx.get(T_ACCOUNT, ukey)?.is_some() {
+        return Ok(UserResponse::UserExists);
+    }
+    if let Some(token) = registration_token {
+        let Some(mut entry): Option<RegToken> =
+            get_typed(ctx, "reg token decode", T_REG_TOKEN, token.as_bytes())?
+        else {
+            return Ok(UserResponse::InvalidToken);
+        };
+        if !entry.usable(ts) {
+            return Ok(UserResponse::InvalidToken);
+        }
+        entry.used += 1;
+        ctx.put(
+            T_REG_TOKEN,
+            token.as_bytes(),
+            enc("reg token encode", &entry)?,
+        );
+    }
+    ctx.put(
+        T_ACCOUNT,
+        ukey,
+        enc(
+            "account encode",
+            &Account {
+                password_hash: password_hash.clone(),
+                created_ts: ts,
+                state: AccountState::Active,
+                admin: false,
+                erased: false,
+            },
+        )?,
+    );
+    if let Some(session) = session {
+        write_session(ctx, session)?;
+    }
+    Ok(UserResponse::Ok)
+}
+
+/// `T_UIA_SESSION_IDX` key: `created_ts (BE) ++ session_id`.
+fn uia_idx_key(created_ts: u64, session_id: &str) -> Vec<u8> {
+    let mut k = created_ts.to_be_bytes().to_vec();
+    k.extend_from_slice(session_id.as_bytes());
+    k
+}
+
+/// Drop UIA sessions created before `expire_before_ts`. Deterministic:
+/// the horizon is carried in the command, never read from a clock.
+fn sweep_uia_sessions(ctx: &mut ApplyCtx<'_>, expire_before_ts: u64) -> StoreResult<()> {
+    let end = expire_before_ts.to_be_bytes().to_vec();
+    for (k, _) in ctx.range(T_UIA_SESSION_IDX, &[], &end)? {
+        let session_id = &k[8..];
+        ctx.delete(T_UIA_SESSION, session_id);
+        ctx.delete(T_UIA_SESSION_IDX, &k);
+    }
+    Ok(())
+}
+
 fn log_key_change(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<()> {
     let seq = emit_user_change(ctx, user_id)?;
     put_key_change(ctx, seq, user_id, None)
@@ -355,30 +429,21 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             password_hash,
             ts,
             session,
-        } => {
-            let ukey = user_id.as_bytes();
-            if ctx.get(T_ACCOUNT, ukey)?.is_some() {
-                return Ok(UserResponse::UserExists);
-            }
-            ctx.put(
-                T_ACCOUNT,
-                ukey,
-                enc(
-                    "account encode",
-                    &Account {
-                        password_hash: password_hash.clone(),
-                        created_ts: *ts,
-                        state: AccountState::Active,
-                        admin: false,
-                        erased: false,
-                    },
-                )?,
-            );
-            if let Some(session) = session {
-                write_session(ctx, session)?;
-            }
-            Ok(UserResponse::Ok)
-        }
+        } => apply_register(ctx, user_id, password_hash, *ts, session.as_ref(), None),
+        UserCommand::RegisterWithToken {
+            user_id,
+            password_hash,
+            ts,
+            session,
+            registration_token,
+        } => apply_register(
+            ctx,
+            user_id,
+            password_hash,
+            *ts,
+            session.as_ref(),
+            registration_token.as_deref(),
+        ),
         UserCommand::CreateSession(session) => {
             if ctx.get(T_ACCOUNT, session.user_id.as_bytes())?.is_none() {
                 return Ok(UserResponse::NotFound);
@@ -1040,6 +1105,90 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
             Ok(UserResponse::Ok)
         }
+        UserCommand::CompleteUiaStage {
+            session_id,
+            request_hash,
+            stage,
+            registration_token,
+            now_ts,
+            expire_before_ts,
+        } => {
+            sweep_uia_sessions(ctx, *expire_before_ts)?;
+            let skey = session_id.as_bytes();
+            let existing: Option<UiaSession> =
+                get_typed(ctx, "uia session decode", T_UIA_SESSION, skey)?;
+            let mut session = match existing {
+                Some(s) => {
+                    // A session carries privilege — the stages already
+                    // satisfied. Honouring it for a different request would
+                    // let a client complete a password stage for something
+                    // harmless and spend it on something destructive.
+                    if s.request_hash != *request_hash {
+                        return Ok(UserResponse::UiaRequestMismatch);
+                    }
+                    s
+                }
+                // Absent means "first stage of this flow": a single-stage
+                // flow completes in one request, with no session id from
+                // the client, and the spec allows exactly that.
+                None => {
+                    ctx.put(
+                        T_UIA_SESSION_IDX,
+                        &uia_idx_key(*now_ts, session_id),
+                        Vec::new(),
+                    );
+                    UiaSession {
+                        request_hash: *request_hash,
+                        completed: Vec::new(),
+                        registration_token: None,
+                        created_ts: *now_ts,
+                    }
+                }
+            };
+            if !session.completed.iter().any(|s| s == stage) {
+                session.completed.push(stage.clone());
+            }
+            if registration_token.is_some() {
+                session.registration_token = registration_token.clone();
+            }
+            ctx.put(T_UIA_SESSION, skey, enc("uia session encode", &session)?);
+            Ok(UserResponse::UiaCompleted {
+                completed: session.completed,
+                registration_token: session.registration_token,
+            })
+        }
+        UserCommand::CreateRegistrationToken {
+            token,
+            uses_allowed,
+            expiry_ts,
+            ts,
+        } => {
+            let key = token.as_bytes();
+            if ctx.get(T_REG_TOKEN, key)?.is_some() {
+                return Ok(UserResponse::TokenExists);
+            }
+            ctx.put(
+                T_REG_TOKEN,
+                key,
+                enc(
+                    "reg token encode",
+                    &RegToken {
+                        uses_allowed: *uses_allowed,
+                        used: 0,
+                        expiry_ts: *expiry_ts,
+                        created_ts: *ts,
+                    },
+                )?,
+            );
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::DeleteRegistrationToken { token } => {
+            if ctx.get(T_REG_TOKEN, token.as_bytes())?.is_none() {
+                return Ok(UserResponse::NotFound);
+            }
+            ctx.delete(T_REG_TOKEN, token.as_bytes());
+            Ok(UserResponse::Ok)
+        }
         UserCommand::SetErased { user_id } => {
             let ukey = user_id.as_bytes();
             let Some(mut account): Option<Account> =
@@ -1353,6 +1502,27 @@ impl UserStore {
             out.push((user_id, dec("account decode", &v)?));
         }
         Ok((out, next))
+    }
+
+    pub fn uia_session(&self, session_id: &str) -> StoreResult<Option<UiaSession>> {
+        self.get_typed("uia session decode", T_UIA_SESSION, session_id.as_bytes())
+    }
+
+    pub fn registration_token(&self, token: &str) -> StoreResult<Option<RegToken>> {
+        self.get_typed("reg token decode", T_REG_TOKEN, token.as_bytes())
+    }
+
+    /// Every registration token. Unpaginated on purpose: this is an
+    /// operator-managed set of invite codes, not user data, and a
+    /// deployment with enough of them to matter has a different problem.
+    pub fn registration_tokens(&self) -> StoreResult<Vec<(String, RegToken)>> {
+        let mut out = Vec::new();
+        for (k, v) in self.read.range(T_REG_TOKEN, &[], &[])? {
+            let token = String::from_utf8(k)
+                .map_err(|_| StoreError::Engine("registration token not UTF-8".into()))?;
+            out.push((token, dec("reg token decode", &v)?));
+        }
+        Ok(out)
     }
 
     pub fn profile(&self, user_id: &str) -> StoreResult<Option<Profile>> {

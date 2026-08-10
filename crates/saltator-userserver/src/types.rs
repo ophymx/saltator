@@ -94,6 +94,15 @@ pub const T_TO_DEVICE_SEEN: u8 = APP_TABLE_FIRST + 22;
 /// `ts_ms (u64 BE) ++ origin ++ 0x00 ++ message_id → ()` — time index
 /// over [`T_TO_DEVICE_SEEN`] so the horizon prune is a range delete.
 pub const T_TO_DEVICE_SEEN_IDX: u8 = APP_TABLE_FIRST + 23;
+/// `session_id → UiaSession` — user-interactive auth sessions
+/// (docs/design-admin-identity.md slice 3).
+pub const T_UIA_SESSION: u8 = APP_TABLE_FIRST + 24;
+/// `created_ts (u64 BE) ++ session_id → ()` — time index over
+/// [`T_UIA_SESSION`] so the expiry sweep is a bounded range scan rather
+/// than a full table walk on every stage completion.
+pub const T_UIA_SESSION_IDX: u8 = APP_TABLE_FIRST + 25;
+/// `token → RegToken` — registration tokens.
+pub const T_REG_TOKEN: u8 = APP_TABLE_FIRST + 26;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -196,6 +205,48 @@ pub(crate) struct AccountV2 {
     pub password_hash: Option<String>,
     pub created_ts: u64,
     pub deactivated: bool,
+}
+
+/// An in-progress user-interactive authentication.
+///
+/// The session is bound to the request that started it: `request_hash`
+/// covers the body with `auth` removed. Without that, a client could
+/// satisfy a password stage for a harmless request and replay the
+/// completed session against a destructive one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiaSession {
+    pub request_hash: [u8; 32],
+    /// Stage types completed so far, in completion order.
+    pub completed: Vec<String>,
+    /// The registration token presented to the token stage, remembered
+    /// because a later stage in the same flow arrives in a different
+    /// request that no longer carries it.
+    pub registration_token: Option<String>,
+    pub created_ts: u64,
+}
+
+/// A registration token: an invite code that authorises `/register` when
+/// the server is otherwise closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegToken {
+    /// `None` = unlimited.
+    pub uses_allowed: Option<u64>,
+    /// Registrations actually completed with this token. There is no
+    /// separate "pending" count: the token is consumed inside the
+    /// register command itself, so a claim cannot be stranded by an
+    /// abandoned session.
+    pub used: u64,
+    /// `None` = never expires (ms since epoch).
+    pub expiry_ts: Option<u64>,
+    pub created_ts: u64,
+}
+
+impl RegToken {
+    /// Whether the token may still authorise a registration at `now`.
+    pub fn usable(&self, now: u64) -> bool {
+        self.expiry_ts.is_none_or(|e| now < e)
+            && self.uses_allowed.is_none_or(|allowed| self.used < allowed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +641,44 @@ pub enum UserCommand {
     SetErased {
         user_id: String,
     },
+    /// Record one completed UIA stage, creating the session if this is the
+    /// first (a single-stage flow legitimately completes in one request,
+    /// with no session id from the client).
+    ///
+    /// `now_ts` also drives the expiry sweep: apply must not read a clock,
+    /// so the gateway stamps the time and the prune happens here.
+    CompleteUiaStage {
+        session_id: String,
+        request_hash: [u8; 32],
+        stage: String,
+        /// Set when the stage being completed is the registration-token
+        /// one; remembered on the session for the eventual register.
+        registration_token: Option<String>,
+        now_ts: u64,
+        /// Sessions created before this are swept in the same batch.
+        expire_before_ts: u64,
+    },
+    /// Register, atomically consuming a registration token when one is
+    /// given. Supersedes [`UserCommand::Register`], which stays for log
+    /// replay: consuming the token in the same batch as the username
+    /// reservation is what makes a one-use token actually one-use under
+    /// concurrent registrations.
+    RegisterWithToken {
+        user_id: String,
+        password_hash: Option<String>,
+        ts: u64,
+        session: Option<SessionCmd>,
+        registration_token: Option<String>,
+    },
+    CreateRegistrationToken {
+        token: String,
+        uses_allowed: Option<u64>,
+        expiry_ts: Option<u64>,
+        ts: u64,
+    },
+    DeleteRegistrationToken {
+        token: String,
+    },
 }
 
 /// A stored one-time key ([`T_ONE_TIME_KEY`]) with its upload slot:
@@ -709,6 +798,19 @@ pub enum UserResponse {
     /// index — inserting one mid-enum would make a rolling upgrade decode
     /// every later variant as its neighbour.
     InvalidState,
+    /// A UIA session exists but was started for a different request, so
+    /// its completed stages must not be honoured here.
+    UiaRequestMismatch,
+    /// The stages completed so far on this session, and the registration
+    /// token it remembers (if any).
+    UiaCompleted {
+        completed: Vec<String>,
+        registration_token: Option<String>,
+    },
+    /// The registration token is unknown, expired, or exhausted.
+    InvalidToken,
+    /// A registration token with this value already exists.
+    TokenExists,
 }
 
 /// Change-stream payload of the user shard: something about `user_id`

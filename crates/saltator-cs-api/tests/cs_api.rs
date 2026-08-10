@@ -41,13 +41,28 @@ async fn start_env_cfg(
     rate_limits: saltator_cs_api::RateLimitConfig,
     allow_internal_fetch: bool,
 ) -> Env {
-    start_env_full(rate_limits, allow_internal_fetch, Vec::new(), Vec::new()).await
+    start_env_full(
+        rate_limits,
+        allow_internal_fetch,
+        Vec::new(),
+        Vec::new(),
+        false,
+    )
+    .await
 }
 
 /// An env whose config names bootstrap administrators, and optionally
 /// registers an appservice — the two identity sources `is_admin` has to
 /// tell apart.
 async fn start_env_admin(admins: &[&str], appservices: Vec<AppServiceRegistration>) -> Env {
+    start_env_admin_cfg(admins, appservices, false).await
+}
+
+async fn start_env_admin_cfg(
+    admins: &[&str],
+    appservices: Vec<AppServiceRegistration>,
+    registration_requires_token: bool,
+) -> Env {
     let admins = admins
         .iter()
         .map(|u| ruma::OwnedUserId::try_from(*u).unwrap())
@@ -57,6 +72,7 @@ async fn start_env_admin(admins: &[&str], appservices: Vec<AppServiceRegistratio
         true,
         admins,
         appservices,
+        registration_requires_token,
     )
     .await
 }
@@ -66,6 +82,7 @@ async fn start_env_full(
     allow_internal_fetch: bool,
     admin_users: Vec<ruma::OwnedUserId>,
     appservices: Vec<AppServiceRegistration>,
+    registration_requires_token: bool,
 ) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
@@ -105,6 +122,7 @@ async fn start_env_full(
             server_name,
             default_room_version: saltator_core::RoomVersion::V12,
             registration_enabled: true,
+            registration_requires_token,
             max_upload_size: 1024 * 1024,
             well_known_client: Some("https://hs.test".into()),
             rate_limits,
@@ -5267,6 +5285,7 @@ async fn client_joins_a_remote_room_via_federation() {
             server_name: b_name,
             default_room_version: saltator_core::RoomVersion::V12,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -5479,6 +5498,7 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
             server_name: hs1_name,
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -5727,6 +5747,7 @@ async fn client_joins_a_remote_room_by_remote_alias() {
             server_name: b_name,
             default_room_version: saltator_core::RoomVersion::V12,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -5893,6 +5914,7 @@ async fn remote_join_drops_unverifiable_noncritical_state() {
             server_name: b_name,
             default_room_version: saltator_core::RoomVersion::V12,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -6050,6 +6072,7 @@ async fn send_message_in_remote_ported_room() {
             server_name: b_name,
             default_room_version: saltator_core::RoomVersion::V12,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -6257,6 +6280,7 @@ async fn remote_join_backfills_full_history() {
             server_name: b_name,
             default_room_version: saltator_core::RoomVersion::V12,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -6541,6 +6565,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
             server_name: b_name.clone(),
             default_room_version: saltator_core::RoomVersion::V12,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -6859,6 +6884,7 @@ async fn inbound_federated_invite_appears_in_sync() {
             server_name: b_name.clone(),
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -7051,6 +7077,7 @@ async fn cs_stack(
             server_name: name,
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -7192,6 +7219,7 @@ async fn outbound_federated_invite_round_trip() {
             server_name: a_name,
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -7485,6 +7513,7 @@ async fn to_device_over_federation_round_trip() {
             server_name: a_name,
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -7696,6 +7725,7 @@ async fn federated_key_query_claim_and_device_list_update() {
             server_name: a_name,
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -7870,6 +7900,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
             server_name: b_name.clone(),
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -8151,6 +8182,7 @@ async fn client_downloads_remote_media_over_federation() {
             server_name: b_name.clone(),
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -8387,6 +8419,7 @@ async fn client_queries_remote_profile_and_directory() {
             server_name: b_name.clone(),
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -9198,6 +9231,7 @@ async fn spaces_hierarchy_spans_federation() {
             server_name: hs1_name,
             default_room_version: saltator_core::RoomVersion::V11,
             registration_enabled: true,
+            registration_requires_token: false,
             max_upload_size: 1024 * 1024,
             well_known_client: None,
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
@@ -9982,4 +10016,269 @@ async fn admin_deactivate_with_erase() {
     assert_eq!(body["state"], "deactivated");
     assert_eq!(body["erased"], true);
     assert!(body["displayname"].is_null(), "{body}");
+}
+
+// -- UIA sessions + registration tokens (slice 3) -------------------------
+
+const REG_TOKENS: &str = "/_saltator/admin/v1/registration_tokens";
+const REGISTER: &str = "/_matrix/client/v3/register";
+
+/// The gated two-stage registration flow, end to end: the challenge names
+/// both stages, the interim 401 reports progress, and only the second
+/// request creates the account.
+#[tokio::test]
+async fn gated_registration_walks_both_stages() {
+    // The gate applies to everyone, including the bootstrap admin — see
+    // the ordering note in docs/design-admin-identity.md.
+    let env = start_env_admin_cfg(&["@root:hs.test"], Vec::new(), true).await;
+    let (status, body) = env
+        .req(
+            "POST",
+            REGISTER,
+            None,
+            Some(json!({"username": "root", "password": "pw-12345678"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    let stages: Vec<&str> = body["flows"][0]["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        stages,
+        ["m.login.registration_token", "m.login.dummy"],
+        "{body}"
+    );
+}
+
+/// With tokens required, a token minted by an admin lets exactly one
+/// registration through, and the second attempt is refused.
+#[tokio::test]
+async fn one_use_token_admits_exactly_one_registration() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+
+    let (status, token_body) = env
+        .req(
+            "POST",
+            REG_TOKENS,
+            Some(&root),
+            Some(json!({"uses_allowed": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{token_body}");
+    let token = token_body["token"].as_str().unwrap().to_owned();
+    assert_eq!(token_body["used"], 0);
+    assert_eq!(token_body["valid"], true);
+
+    // Registering with the token twice: the second must lose, because the
+    // token is consumed atomically inside the register command rather than
+    // at the UIA stage (which is only a read).
+    let register_with = |user: &'static str, token: String| {
+        env.req(
+            "POST",
+            REGISTER,
+            None,
+            Some(json!({
+                "username": user,
+                "password": "pw-12345678",
+                "auth": {"type": "m.login.registration_token", "token": token}
+            })),
+        )
+    };
+
+    // First: the token stage completes but the flow still wants dummy.
+    let (status, body) = register_with("alice", token.clone()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    let session = body["session"].as_str().unwrap().to_owned();
+    assert_eq!(body["completed"][0], "m.login.registration_token");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            REGISTER,
+            None,
+            Some(json!({
+                "username": "alice",
+                "password": "pw-12345678",
+                "auth": {"type": "m.login.dummy", "session": session}
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The token is now spent.
+    let (status, body) = env
+        .req("GET", &format!("{REG_TOKENS}/{token}"), Some(&root), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["used"], 1);
+    assert_eq!(body["valid"], false);
+
+    let (status, body) = register_with("bob", token).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+}
+
+/// The unauthenticated validity probe, so a client can reject a bad invite
+/// code before collecting a password.
+#[tokio::test]
+async fn registration_token_validity_probe() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    let (_, created) = env
+        .req(
+            "POST",
+            REG_TOKENS,
+            Some(&root),
+            Some(json!({"token": "open-sesame", "uses_allowed": 2})),
+        )
+        .await;
+    assert_eq!(created["token"], "open-sesame");
+
+    let path = "/_matrix/client/v1/register/m.login.registration_token/validity";
+    let (status, body) = env
+        .req("GET", &format!("{path}?token=open-sesame"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["valid"], true);
+
+    let (status, body) = env
+        .req("GET", &format!("{path}?token=nonsense"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["valid"], false, "must not leak which tokens exist");
+}
+
+#[tokio::test]
+async fn registration_token_admin_crud() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+
+    let (_, a) = env
+        .req(
+            "POST",
+            REG_TOKENS,
+            Some(&root),
+            Some(json!({"token": "aaa"})),
+        )
+        .await;
+    assert_eq!(a["uses_allowed"], serde_json::Value::Null, "{a}");
+    env.req(
+        "POST",
+        REG_TOKENS,
+        Some(&root),
+        Some(json!({"token": "bbb"})),
+    )
+    .await;
+
+    let (status, list) = env.req("GET", REG_TOKENS, Some(&root), None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let names: Vec<&str> = list["registration_tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["token"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["aaa", "bbb"]);
+
+    // Duplicates are refused rather than silently resetting the counter.
+    let (status, body) = env
+        .req(
+            "POST",
+            REG_TOKENS,
+            Some(&root),
+            Some(json!({"token": "aaa"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let (status, _) = env
+        .req("DELETE", &format!("{REG_TOKENS}/aaa"), Some(&root), None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = env
+        .req("GET", &format!("{REG_TOKENS}/aaa"), Some(&root), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Only administrators may see or mint invite codes.
+    let mallory = env.register("mallory", "pw-12345678").await;
+    let (status, _) = env.req("GET", REG_TOKENS, Some(&mallory), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// A UIA session that has actually completed a stage is bound to the
+/// request it completed for, and cannot be spent on another endpoint.
+///
+/// Note the setup deliberately completes a stage first: an id from an
+/// opening challenge is never stored, so presenting one elsewhere is not
+/// a replay — the client still has to do that endpoint's auth work in the
+/// same request. What must not work is carrying *earned* progress across.
+#[tokio::test]
+async fn uia_session_does_not_cross_endpoints() {
+    let env = start_env().await;
+    let token = env.register("alice", "pw-12345678").await;
+    let session = "client-chosen-session";
+    let password_auth = |session: &str| {
+        json!({"auth": {
+            "type": "m.login.password",
+            "session": session,
+            "identifier": {"type": "m.id.user", "user": "alice"},
+            "password": "pw-12345678"
+        }})
+    };
+
+    // A second session to delete, so the deletion does not revoke the
+    // token driving this test.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/login",
+            None,
+            Some(json!({
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": "alice"},
+                "password": "pw-12345678"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let device = body["device_id"].as_str().unwrap().to_owned();
+
+    // Earn a completed password stage against the device deletion.
+    let (status, body) = env
+        .req(
+            "DELETE",
+            &format!("/_matrix/client/v3/devices/{device}"),
+            Some(&token),
+            Some(password_auth(session)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The same session, now carrying that progress, against deactivation.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/deactivate",
+            Some(&token),
+            Some(password_auth(session)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // A fresh session for the same call is fine — it is the carried-over
+    // progress that was refused, not the operation.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/deactivate",
+            Some(&token),
+            Some(password_auth("a-different-session")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

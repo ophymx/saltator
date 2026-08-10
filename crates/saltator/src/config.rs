@@ -53,6 +53,15 @@ pub struct ClientConfig {
     /// Whether `POST /register` is open.
     #[serde(default = "default_true")]
     pub registration_enabled: bool,
+    /// Require a registration token on `/register`. Independent of
+    /// `registration_enabled` — closed still means closed. Mint tokens
+    /// through the admin API.
+    ///
+    /// Turn this on only once an administrator exists: the gate applies to
+    /// everyone, and only an admin can mint a token, so enabling it on an
+    /// empty server locks it with nobody inside.
+    #[serde(default)]
+    pub registration_requires_token: bool,
     /// Room version for `/createRoom` when the client names none.
     #[serde(default = "default_room_version")]
     pub default_room_version: String,
@@ -90,6 +99,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             registration_enabled: true,
+            registration_requires_token: false,
             default_room_version: default_room_version(),
             max_upload_size: default_max_upload(),
             well_known_client: None,
@@ -183,6 +193,10 @@ federation = "127.0.0.1:8448"
 
 [client]
 registration_enabled = true
+# Require an invite code from the admin API's registration_tokens surface.
+# Turn on only AFTER an administrator has registered: the gate applies to
+# everyone and only an admin can mint tokens.
+registration_requires_token = false
 default_room_version = "12"
 max_upload_size = 52428800
 # Login/registration/message rate limiting (429 M_LIMIT_EXCEEDED).

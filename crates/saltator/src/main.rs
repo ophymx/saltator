@@ -434,6 +434,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             server_name: server_name.clone(),
             default_room_version,
             registration_enabled: cfg.client.registration_enabled,
+            registration_requires_token: cfg.client.registration_requires_token,
             max_upload_size: cfg.client.max_upload_size,
             well_known_client: cfg.client.well_known_client.clone(),
             rate_limits: if cfg.client.rate_limits_enabled {

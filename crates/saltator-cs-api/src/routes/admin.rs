@@ -211,3 +211,73 @@ pub async fn delete_device(
             .await?,
     )
 }
+
+// -- registration tokens (slice 3) ---------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateTokenBody {
+    /// Omit to have the server mint one.
+    #[serde(default)]
+    token: Option<String>,
+    /// Omit for unlimited uses.
+    #[serde(default)]
+    uses_allowed: Option<u64>,
+    /// Omit for no expiry (ms since epoch).
+    #[serde(default)]
+    expiry_ts: Option<u64>,
+}
+
+/// `GET /_saltator/admin/v1/registration_tokens`
+pub async fn list_registration_tokens(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+) -> Result<axum::Json<serde_json::Value>> {
+    tracing::info!(admin = %auth.user_id(), "admin: list registration tokens");
+    let tokens = state.admin().list_registration_tokens()?;
+    Ok(axum::Json(
+        serde_json::json!({ "registration_tokens": tokens }),
+    ))
+}
+
+/// `POST /_saltator/admin/v1/registration_tokens`
+pub async fn create_registration_token(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    body: Option<axum::Json<CreateTokenBody>>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let body = body.map(|b| b.0).unwrap_or(CreateTokenBody {
+        token: None,
+        uses_allowed: None,
+        expiry_ts: None,
+    });
+    tracing::info!(
+        admin = %auth.user_id(), uses = ?body.uses_allowed,
+        "admin: create registration token"
+    );
+    detail_response(
+        state
+            .admin()
+            .create_registration_token(body.token, body.uses_allowed, body.expiry_ts)
+            .await?,
+    )
+}
+
+/// `GET /_saltator/admin/v1/registration_tokens/{token}`
+pub async fn get_registration_token(
+    State(state): State<Arc<CsState>>,
+    _auth: AdminAuth,
+    Path(token): Path<String>,
+) -> Result<axum::Json<serde_json::Value>> {
+    detail_response(state.admin().registration_token(&token)?)
+}
+
+/// `DELETE /_saltator/admin/v1/registration_tokens/{token}`
+pub async fn delete_registration_token(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(token): Path<String>,
+) -> Result<axum::Json<serde_json::Value>> {
+    tracing::info!(admin = %auth.user_id(), "admin: delete registration token");
+    state.admin().delete_registration_token(&token).await?;
+    Ok(axum::Json(serde_json::json!({})))
+}

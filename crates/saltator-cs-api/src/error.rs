@@ -123,6 +123,17 @@ impl ApiError {
         e.extra.insert("session".into(), session.into());
         e
     }
+
+    /// Add the `completed` list to a UIA challenge. Omitted when empty:
+    /// the spec allows either, and clients read "no key" and "empty list"
+    /// the same way.
+    pub fn with_completed(mut self, completed: &[String]) -> Self {
+        if !completed.is_empty() {
+            self.extra
+                .insert("completed".into(), serde_json::json!(completed));
+        }
+        self
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -168,6 +179,15 @@ impl From<UserError> for ApiError {
             // operator retrying blindly against a deactivated account
             // should not be told "not found".
             UserError::InvalidState => Self::invalid_param(e.to_string()),
+            // Replaying a session against another request is a client
+            // misuse, not a re-challengeable failure.
+            UserError::UiaRequestMismatch => Self::forbidden(e.to_string()),
+            // The token passed the UIA stage but lost the atomic re-check
+            // at registration — exhausted or deleted in between.
+            UserError::InvalidToken => Self::forbidden(e.to_string()),
+            UserError::TokenExists => {
+                Self::new(StatusCode::CONFLICT, "M_INVALID_PARAM", e.to_string())
+            }
             UserError::AliasExists => {
                 Self::new(StatusCode::CONFLICT, "M_UNKNOWN", "Alias already exists")
             }

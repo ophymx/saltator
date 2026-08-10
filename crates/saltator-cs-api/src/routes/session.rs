@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use ruma::api::client::account::{get_username_availability, register, whoami};
 use ruma::api::client::discovery::get_capabilities;
 use ruma::api::client::discovery::get_supported_versions;
 use ruma::api::client::session::{get_login_types, login, logout, logout_all, refresh_token};
-use ruma::api::client::uiaa::{AuthData, UserIdentifier};
+use ruma::api::client::uiaa::UserIdentifier;
 
 use saltator_core::RoomVersion;
 use saltator_userserver::Session;
@@ -81,33 +81,37 @@ pub async fn register(
     if !state.config.registration_enabled {
         return Err(ApiError::forbidden("Registration is disabled"));
     }
-    // Single-stage UIA: m.login.dummy.
-    match &req.auth {
-        Some(AuthData::Dummy(_)) | Some(AuthData::FallbackAcknowledgement(_)) => {}
-        _ => {
-            return Err(ApiError::uiaa(
-                &[&["m.login.dummy"]],
-                saltator_userserver::generate_token(),
-            ))
-        }
-    }
-
     let localpart = match &req.username {
         Some(u) => u.clone(),
         None => random_localpart(),
     };
+    // The UIA session is bound to the account being created, so a flow
+    // completed for one username cannot be spent on another.
+    let request_id = format!("register:{localpart}");
+    let outcome = state
+        .uia()
+        .check(
+            &crate::services::uia::Purpose::Register {
+                requires_token: state.config.registration_requires_token,
+            },
+            &request_id,
+            req.auth.as_ref(),
+        )
+        .await?;
+
     // Registration is unauthenticated, so the budget is server-global.
     state.rate_limit(crate::ratelimit::Kind::Registration, "")?;
     let (user_id, session) = state
         .users
-        .register(
-            &localpart,
-            req.password.as_deref(),
-            req.device_id.as_ref().map(|d| d.to_string()),
-            req.initial_device_display_name.clone(),
-            req.refresh_token,
-            req.inhibit_login,
-        )
+        .register_with_token(saltator_userserver::RegisterRequest {
+            localpart: &localpart,
+            password: req.password.as_deref(),
+            device_id: req.device_id.as_ref().map(|d| d.to_string()),
+            display_name: req.initial_device_display_name.clone(),
+            want_refresh: req.refresh_token,
+            inhibit_login: req.inhibit_login,
+            registration_token: outcome.registration_token.as_deref(),
+        })
         .await?;
 
     let mut resp = register::v3::Response::new(user_id);
@@ -118,6 +122,32 @@ pub async fn register(
         resp.expires_in = s.expires_in_ms.map(Duration::from_millis);
     }
     Ok(Ra(resp))
+}
+
+/// `GET /_matrix/client/v1/register/m.login.registration_token/validity`
+///
+/// Lets a client tell the user their invite code is bad *before* they
+/// fill in a username and password. Unauthenticated by spec, and answers
+/// only yes/no — never why, or anything about other tokens.
+pub async fn registration_token_validity(
+    State(state): State<Arc<CsState>>,
+    Query(q): Query<TokenValidityQuery>,
+) -> Result<axum::Json<serde_json::Value>> {
+    // Unauthenticated and token-guessable, so it shares registration's
+    // server-global budget rather than having none.
+    state.rate_limit(crate::ratelimit::Kind::Registration, "")?;
+    let valid = state
+        .users
+        .store()
+        .registration_token(&q.token)
+        .map_err(ApiError::internal)?
+        .is_some_and(|t| t.usable(crate::now_ms()));
+    Ok(axum::Json(serde_json::json!({ "valid": valid })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TokenValidityQuery {
+    token: String,
 }
 
 pub async fn register_available(

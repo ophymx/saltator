@@ -156,13 +156,14 @@ add today. Synapse's entire "account is linked to an IdP" state is a
 three-column table (`storage/schema/main/delta/56/user_external_ids.sql`):
 
 ```
-T_EXTERNAL_ID      = APP_TABLE_FIRST + 24   auth_provider \0 external_id -> user_id
-T_EXTERNAL_ID_USER = APP_TABLE_FIRST + 25   user_id \0 auth_provider     -> external_id
+T_EXTERNAL_ID      = APP_TABLE_FIRST + 27   auth_provider \0 external_id -> user_id
+T_EXTERNAL_ID_USER = APP_TABLE_FIRST + 28   user_id \0 auth_provider     -> external_id
 ```
 
-(next free ids; the user shard currently tops out at `+23`,
-`types.rs:96`. The reverse index is ours — Synapse bolted one on later
-as a background update, `registration.py:2619`.)
+(next free ids after slice 3's tables; ids are allocated as slices land
+rather than reserved ahead, so a hole never invites a mistake. The
+reverse index is ours — Synapse bolted one on later as a background
+update, `registration.py:2619`.)
 
 Uniqueness is on `(auth_provider, external_id)`: one subject at one
 provider maps to exactly one MXID, and one MXID may carry links to
@@ -209,19 +210,28 @@ first.
 
 ### Real UIA sessions
 
-`T_UIA_SESSION = APP_TABLE_FIRST + 26`: session id → `{user_id?,
-request_hash, completed_stages, params, created_ts}`, with new
-append-only `UserCommand` variants to create a session and mark a stage
-complete. Expiry by `created_ts` sweep.
+`T_UIA_SESSION = APP_TABLE_FIRST + 24`: session id → `{request_hash,
+completed, registration_token?, created_ts}`, with a `+25` time index so
+the expiry sweep is a bounded range scan. Sessions are created by the
+`CompleteUiaStage` command, which also carries the horizon for the sweep
+— `apply` must not read a clock.
 
-This is required by step 5 on its own merits (registration tokens are a
-multi-stage flow), and it is *also* the OIDC prerequisite: `m.login.sso`
-as a re-authentication stage is only offerable because the link table
-exists, and only completable because a session persists
-(`handlers/auth.py:398-425`, `handlers/sso.py:857-923`). Synapse's
-equivalent first-login session is in-memory and single-process
-(`handlers/sso.py:161`) — a known scaling wart we get to skip by putting
-it in the shard from the start.
+Three things fell out of building it that the sketch above did not say:
+
+- **The session binds to an explicit operation id, not a body hash.**
+  Each route passes a string naming what it is doing
+  (`deactivate:@alice:hs.test`, `delete_device:@alice:hs.test:ABC`), and
+  that is what gets hashed. Hashing the raw body instead would mean
+  canonicalising JSON and stripping `auth`, and would still not say
+  *which endpoint* the body was for — which is the property that matters.
+- **An absent session id means "create one", never "reject".** A
+  single-stage flow legitimately completes in one request, and
+  conformance tests register with a bare `m.login.dummy` and no session.
+- **The opening challenge stores nothing.** A session row appears only
+  once a stage actually completes, so abandoned challenges cost nothing
+  and an unknown session id is simply a fresh one. The security property
+  is about carrying *earned* progress across requests, and unearned
+  progress does not exist.
 
 ### Admin surface
 
@@ -256,13 +266,30 @@ not redact the user's messages. That work is real and unscheduled;
 calling the current behaviour a complete erasure would misinform whoever
 is answering a data-subject request.
 
-**Registration tokens** — `T_REG_TOKEN = APP_TABLE_FIRST + 27`
-(`{token, uses_allowed, pending, completed, expiry_ts}`), CRUD under
+**Registration tokens** — `T_REG_TOKEN = APP_TABLE_FIRST + 26`
+(`{uses_allowed?, used, expiry_ts?, created_ts}`), CRUD under
 `/registration_tokens`, plus the `m.login.registration_token` stage in
-`/register`. This is how a closed deployment onboards without email, and
-it is why we need real UIA. It is also strictly better than what we have
-now, where `registration_enabled` is a single boolean
-(`config.rs:53`).
+`/register` and the spec's unauthenticated `.../validity` probe. This is
+how a closed deployment onboards without email, and it is why we need
+real UIA. It is also strictly better than the single `registration_enabled`
+boolean we had.
+
+Note the counter is a plain `used`, not Synapse's `pending`/`completed`
+pair. Synapse needs two because its token is claimed when the UIA stage
+completes and confirmed when registration finishes, which leaves a claim
+stranded whenever a session is abandoned. We avoid the split entirely by
+consuming the token *inside the register command*, in the same batch as
+the username reservation: the UIA stage only reads, so it can be wrong
+under concurrency, and the log ordering is what actually makes a one-use
+token one-use.
+
+**Operator ordering trap.** The gate applies to everyone, and only an
+administrator can mint a token — so turning `registration_requires_token`
+on before any admin account exists locks the server closed with no way
+in. The sequence is: start open, register the bootstrap admin named in
+`client.admin_users`, then turn the gate on. Admin-side account creation
+would remove the trap and is deferred (see the `PUT /users/{id}` note
+above); until then this is documentation, not code.
 
 **Rooms** — `GET /rooms`, `GET /rooms/{id}`, and `DELETE /rooms/{id}` as
 *shutdown* (kick local members, block re-join), **not purge**. Purge

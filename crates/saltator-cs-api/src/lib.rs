@@ -40,6 +40,9 @@ pub struct CsConfig {
     pub default_room_version: RoomVersion,
     /// Whether `POST /register` is open.
     pub registration_enabled: bool,
+    /// Require a registration token to register. Independent of
+    /// `registration_enabled`: closed still means closed.
+    pub registration_requires_token: bool,
     /// Media upload cap in bytes.
     pub max_upload_size: u64,
     /// Base URL advertised in `/.well-known/matrix/client`
@@ -195,6 +198,11 @@ impl CsState {
             users: &self.users,
             admin_users: &self.config.admin_users,
         }
+    }
+
+    /// The user-interactive-auth service.
+    pub(crate) fn uia(&self) -> services::uia::Uia<'_> {
+        services::uia::Uia { users: &self.users }
     }
 
     /// The E2EE/device-list domain service over this state's shards.
@@ -503,6 +511,10 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_matrix/client/v1/room_summary/{room_id_or_alias}",
             get(spaces::get_room_summary),
+        )
+        .route(
+            "/_matrix/client/v1/register/m.login.registration_token/validity",
+            get(session::registration_token_validity),
         );
 
     // -- media (authenticated endpoints only, Matrix 1.11+)
@@ -597,6 +609,14 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_saltator/admin/v1/users/{user_id}/devices/{device_id}",
             delete(admin::delete_device),
+        )
+        .route(
+            "/_saltator/admin/v1/registration_tokens",
+            get(admin::list_registration_tokens).post(admin::create_registration_token),
+        )
+        .route(
+            "/_saltator/admin/v1/registration_tokens/{token}",
+            get(admin::get_registration_token).delete(admin::delete_registration_token),
         );
 
     app.fallback(unrecognized)

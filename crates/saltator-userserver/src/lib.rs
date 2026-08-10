@@ -29,8 +29,8 @@ pub use machine::{UserApp, UserStore};
 pub use types::{
     Account, AccountDataEntry, AccountState, AliasEntry, BackupVersionMeta, ClaimRequest,
     ClaimedKey, Device, KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry, OutboundEdu,
-    Profile, SessionCmd, ToDeviceMessage, TokenEntry, TokenKind, UserChangePayload, UserCommand,
-    UserResponse,
+    Profile, RegToken, SessionCmd, ToDeviceMessage, TokenEntry, TokenKind, UiaSession,
+    UserChangePayload, UserCommand, UserResponse,
 };
 
 /// M2 runs a single user shard; the fixed shard count and placement land
@@ -54,6 +54,11 @@ pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 /// Access tokens issued alongside a refresh token expire after this long.
 pub const ACCESS_TOKEN_LIFETIME_MS: u64 = 60 * 60 * 1000;
 
+/// How long a user-interactive auth session stays valid. Long enough for
+/// a human to work through a multi-stage flow, short enough that a
+/// half-completed session is not a standing credential.
+pub const UIA_SESSION_TTL_MS: u64 = 15 * 60 * 1000;
+
 /// Cursor key of the room/0 → user/0 membership projection.
 const ROOM_SOURCE: &str = "room/0";
 
@@ -73,6 +78,12 @@ pub enum UserError {
     NotFound,
     #[error("the account's state does not allow this")]
     InvalidState,
+    #[error("this authentication session was started for a different request")]
+    UiaRequestMismatch,
+    #[error("unknown, expired, or exhausted registration token")]
+    InvalidToken,
+    #[error("registration token already exists")]
+    TokenExists,
     #[error("alias already exists")]
     AliasExists,
     #[error("shard: {0}")]
@@ -89,6 +100,20 @@ type Result<T> = std::result::Result<T, UserError>;
 
 fn storage_err(e: impl std::fmt::Display) -> UserError {
     UserError::Storage(e.to_string())
+}
+
+/// Everything `/register` needs. A struct rather than a parameter list:
+/// six of the seven fields are `Option`s and bools, which positionally is
+/// a bug waiting to happen.
+pub struct RegisterRequest<'a> {
+    pub localpart: &'a str,
+    pub password: Option<&'a str>,
+    pub device_id: Option<String>,
+    pub display_name: Option<String>,
+    pub want_refresh: bool,
+    pub inhibit_login: bool,
+    /// Consumed atomically with the username reservation when set.
+    pub registration_token: Option<&'a str>,
 }
 
 /// A freshly created session's credentials (the only moment the raw
@@ -170,35 +195,16 @@ impl UserServer {
         want_refresh: bool,
         inhibit_login: bool,
     ) -> Result<(OwnedUserId, Option<Session>)> {
-        let user_id = self.user_id_for(localpart)?;
-        let password_hash = match password {
-            Some(p) => Some(hash_password(p).await?),
-            None => None,
-        };
-        let (session, cmd) = if inhibit_login {
-            (None, None)
-        } else {
-            let (s, c) = new_session(user_id.clone(), device_id, display_name, want_refresh);
-            (Some(s), Some(c))
-        };
-        match self
-            .propose(&UserCommand::Register {
-                user_id: user_id.to_string(),
-                password_hash,
-                ts: now_ms(),
-                session: cmd,
-            })
-            .await?
-        {
-            UserResponse::Ok => {}
-            UserResponse::UserExists => return Err(UserError::UserExists),
-            other => return Err(unexpected(other)),
-        }
-        // Default displayname = localpart (what Synapse does; clients and
-        // member events expect a name from the start).
-        self.set_profile(&user_id, Some(Some(user_id.localpart().to_owned())), None)
-            .await?;
-        Ok((user_id, session))
+        self.register_with_token(RegisterRequest {
+            localpart,
+            password,
+            device_id,
+            display_name,
+            want_refresh,
+            inhibit_login,
+            registration_token: None,
+        })
+        .await
     }
 
     /// Password login. `user` may be a full user ID or a localpart.
@@ -663,6 +669,119 @@ impl UserServer {
         match self
             .propose(&UserCommand::Deactivate {
                 user_id: user_id.to_string(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    // -- user-interactive auth + registration tokens ----------------------
+
+    /// Record a completed UIA stage, returning every stage completed on
+    /// the session so far. Creates the session when the client sent no id.
+    ///
+    /// Returns the completed stages and the registration token the session
+    /// remembers. `Err(UserError::UiaRequestMismatch)` means the session was
+    /// started for a different request — see [`UiaSession`].
+    pub async fn complete_uia_stage(
+        &self,
+        session_id: &str,
+        request_hash: [u8; 32],
+        stage: &str,
+        registration_token: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>)> {
+        let now = now_ms();
+        match self
+            .propose(&UserCommand::CompleteUiaStage {
+                session_id: session_id.to_owned(),
+                request_hash,
+                stage: stage.to_owned(),
+                registration_token: registration_token.map(str::to_owned),
+                now_ts: now,
+                expire_before_ts: now.saturating_sub(UIA_SESSION_TTL_MS),
+            })
+            .await?
+        {
+            UserResponse::UiaCompleted {
+                completed,
+                registration_token,
+            } => Ok((completed, registration_token)),
+            UserResponse::UiaRequestMismatch => Err(UserError::UiaRequestMismatch),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Register, consuming `registration_token` atomically when given.
+    pub async fn register_with_token(
+        &self,
+        req: RegisterRequest<'_>,
+    ) -> Result<(OwnedUserId, Option<Session>)> {
+        let user_id = self.user_id_for(req.localpart)?;
+        let password_hash = match req.password {
+            Some(p) => Some(hash_password(p).await?),
+            None => None,
+        };
+        let (session, cmd) = if req.inhibit_login {
+            (None, None)
+        } else {
+            let (s, c) = new_session(
+                user_id.clone(),
+                req.device_id,
+                req.display_name,
+                req.want_refresh,
+            );
+            (Some(s), Some(c))
+        };
+        match self
+            .propose(&UserCommand::RegisterWithToken {
+                user_id: user_id.to_string(),
+                password_hash,
+                ts: now_ms(),
+                session: cmd,
+                registration_token: req.registration_token.map(str::to_owned),
+            })
+            .await?
+        {
+            UserResponse::Ok => {}
+            UserResponse::UserExists => return Err(UserError::UserExists),
+            UserResponse::InvalidToken => return Err(UserError::InvalidToken),
+            other => return Err(unexpected(other)),
+        }
+        // Default displayname = localpart (what Synapse does; clients and
+        // member events expect a name from the start).
+        self.set_profile(&user_id, Some(Some(user_id.localpart().to_owned())), None)
+            .await?;
+        Ok((user_id, session))
+    }
+
+    pub async fn create_registration_token(
+        &self,
+        token: &str,
+        uses_allowed: Option<u64>,
+        expiry_ts: Option<u64>,
+    ) -> Result<()> {
+        match self
+            .propose(&UserCommand::CreateRegistrationToken {
+                token: token.to_owned(),
+                uses_allowed,
+                expiry_ts,
+                ts: now_ms(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::TokenExists => Err(UserError::TokenExists),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub async fn delete_registration_token(&self, token: &str) -> Result<()> {
+        match self
+            .propose(&UserCommand::DeleteRegistrationToken {
+                token: token.to_owned(),
             })
             .await?
         {
