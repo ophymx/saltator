@@ -11069,3 +11069,94 @@ async fn cluster_node_list_and_drain_guards() {
     }
     env.shutdown().await;
 }
+
+// -- admin console (docs/design-admin-ui.md slice 7) ----------------------
+//
+// Feature-gated: the console is default-off, so these run in the same CI
+// job that builds with `--features admin-ui`.
+
+#[cfg(feature = "admin-ui")]
+mod admin_ui {
+    use super::*;
+
+    const UI: &str = "/_saltator/admin/ui";
+
+    /// A raw request that keeps the response headers, which `Env::req`
+    /// discards.
+    async fn head(env: &Env, path: &str, origin: Option<&str>) -> (StatusCode, http::HeaderMap) {
+        let mut builder = Request::builder().method("GET").uri(path);
+        if let Some(origin) = origin {
+            builder = builder.header("Origin", origin);
+        }
+        let resp = env
+            .router
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        (resp.status(), resp.headers().clone())
+    }
+
+    /// The shell is served at the mount point and for client-side routes —
+    /// including one carrying a user id, whose dots must not be mistaken
+    /// for a file extension.
+    #[tokio::test]
+    async fn the_console_serves_its_shell_for_client_routes() {
+        let env = start_env().await;
+        for path in [
+            UI,
+            &format!("{UI}/"),
+            &format!("{UI}/users"),
+            &format!("{UI}/users/@alice:hs.test"),
+        ] {
+            let (status, headers) = head(&env, path, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(
+                headers["content-type"], "text/html; charset=utf-8",
+                "{path}"
+            );
+        }
+        // A missing bundle file is a bundle bug, not a route.
+        let (status, _) = head(&env, &format!("{UI}/assets/nope.js"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        env.shutdown().await;
+    }
+
+    /// The console mounts after the CORS layer, and that placement is the
+    /// whole opt-out: the permissive header exists for Matrix clients and
+    /// must not land on an admin console.
+    #[tokio::test]
+    async fn the_console_is_not_readable_cross_origin() {
+        let env = start_env().await;
+        let (_, matrix) = head(&env, "/_matrix/client/versions", Some("https://evil.test")).await;
+        assert_eq!(
+            matrix
+                .get("access-control-allow-origin")
+                .map(|v| v.to_str().unwrap()),
+            Some("*"),
+            "the Matrix surface keeps its permissive CORS"
+        );
+
+        let (_, console) = head(&env, UI, Some("https://evil.test")).await;
+        assert!(
+            console.get("access-control-allow-origin").is_none(),
+            "console answered with CORS headers: {console:?}"
+        );
+        env.shutdown().await;
+    }
+
+    /// This is the only HTML this server emits, so the policy that makes
+    /// that safe is asserted at the router, not just in the embed crate.
+    #[tokio::test]
+    async fn the_console_carries_its_security_headers() {
+        let env = start_env().await;
+        let (_, headers) = head(&env, UI, None).await;
+        let csp = headers["content-security-policy"].to_str().unwrap();
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert_eq!(headers["referrer-policy"], "no-referrer");
+        assert_eq!(headers["x-frame-options"], "DENY");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        env.shutdown().await;
+    }
+}

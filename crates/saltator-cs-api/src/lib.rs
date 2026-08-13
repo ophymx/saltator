@@ -732,7 +732,8 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             get(admin::get_registration_token).delete(admin::delete_registration_token),
         );
 
-    app.fallback(unrecognized)
+    let app = app
+        .fallback(unrecognized)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(
             tower_http::cors::CorsLayer::new()
@@ -740,8 +741,40 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
                 .allow_methods(tower_http::cors::Any)
                 .allow_headers(tower_http::cors::Any),
         )
-        .with_state(state)
+        .with_state(state);
+
+    // The console mounts AFTER the CORS layer, and that placement is the
+    // whole opt-out: `Router::layer` applies only to routes registered
+    // before it, so `Access-Control-Allow-Origin: *` never lands on the
+    // console's responses. The permissive layer exists for Matrix
+    // clients; an admin console has no reason to be readable
+    // cross-origin.
+    //
+    // `nest`, not `merge`: axum panics when merging two routers that both
+    // carry a fallback, and the root has one (`unrecognized`). Nesting
+    // gives the SPA its own inner fallback for client-side routes without
+    // disturbing `M_UNRECOGNIZED` on `/_matrix/*`.
+    #[cfg(feature = "admin-ui")]
+    let app = app
+        .nest(ADMIN_UI_PREFIX, saltator_admin_ui::router())
+        // `nest` covers the bare prefix and `/{*rest}`, and a wildcard
+        // needs at least one character — so the trailing-slash form, which
+        // is exactly what the bundle's own asset URLs are relative to,
+        // needs its own route.
+        .route(
+            &format!("{ADMIN_UI_PREFIX}/"),
+            get(saltator_admin_ui::index),
+        );
+
+    app
 }
+
+/// Where the console is served. Under our own prefix, beside the API it
+/// drives — the UI rides wherever the admin API rides, so same-origin
+/// holds on the shared client listener and on the optional separate admin
+/// listener alike.
+#[cfg(feature = "admin-ui")]
+pub const ADMIN_UI_PREFIX: &str = "/_saltator/admin/ui";
 
 async fn unrecognized() -> ApiError {
     ApiError::unrecognized()

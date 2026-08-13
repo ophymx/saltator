@@ -164,7 +164,7 @@ one retry/backoff policy for both.
 deliveries — extend the chaos job with a delivery-loss assertion; EDU
 outbox migration proven on a store carrying pending entries.
 
-## Step 5 ☐ — Admin API + user management (operational surface)
+## Step 5 ☑ — Admin API + user management (operational surface)
 
 Deliberately after Steps 1–2 so admin endpoints call services instead of
 copying route logic. **Scoped and ACCEPTED 2026-08-09 in
@@ -195,12 +195,16 @@ scoped separately in docs/design-admin-ui.md.
 Deferred by the scoping: 3PID/identity server, guest access, room purge,
 Synapse's read-only "suspend" state, and the SSO browser flow itself.
 
-**Status:** slices 1–6 landed. Slice 7 (the admin web UI,
-docs/design-admin-ui.md) is all that remains of the step. Notes from
-building each slice are recorded in docs/design-admin-identity.md beside
-the design they revise — including slice 6's finding that the interim
-RF-floor placement policy does *not* block graceful drain, which had been
-the open risk.
+**DONE** (2026-08-13): all seven slices landed. Notes from building each
+are recorded beside the design they revise — in
+docs/design-admin-identity.md for slices 1–6, docs/design-admin-ui.md for
+slice 7 — including slice 6's finding that the interim RF-floor placement
+policy does *not* block graceful drain, which had been the open risk.
+
+The console is the workspace's first cargo feature (`admin-ui`,
+default-off) and its first non-Rust sub-project (`web/admin`, Svelte 5 +
+Vite). `cargo build` still needs only a Rust toolchain: the bundle is
+staged out of band and the embed crate's build.rs never invokes npm.
 
 ## Interlude ☑ — Cluster hardening (2026-08-08, user-directed, pre-Step-5)
 

@@ -1,0 +1,13 @@
+[package]
+name = "saltator-admin-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# The bundle is staged into dist/ out of band (npm, or CI's frontend job),
+# so it must not be swept into the crate by cargo's include heuristics.
+exclude = ["dist"]
+
+[dependencies]
+axum.workspace = true
+include_dir.workspace = true

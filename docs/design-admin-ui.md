@@ -1,7 +1,8 @@
 # Design: admin web UI (roadmap step 5, slice 7)
 
-Status: PROPOSED · 2026-08-09. Companion to `docs/design-admin-identity.md`,
-which defines the API this consumes.
+Status: ACCEPTED + IMPLEMENTED · 2026-08-13. Companion to
+`docs/design-admin-identity.md`, which defines the API this consumes.
+Framework confirmed in review: **Svelte 5**.
 
 A web console for the step-5 admin API, shipped as a sub-project in this
 repo and served by the saltator binary itself. Toolchain decided in
@@ -219,6 +220,40 @@ Slice 7 of step 5, startable as soon as API slice 1 lands.
 - **7b — account operations.** Everything from API slices 2 and 3:
   lifecycle actions, registration tokens.
 - **7c — rooms and cluster.** API slices 5 and 6.
+
+## Notes from building it
+
+- **The three properties survived, measured rather than assumed.** A
+  touch-rebuild of `saltator-roomserver` followed by
+  `cargo build -p saltator` takes 5.4s on the default configuration and
+  5.7s with `--features admin-ui`. A changed bundle recompiles three
+  crates (the embed crate plus its two dependents) in ~9s. Switching
+  *between* feature sets costs a one-off ~34s rebuild, which is inherent
+  to cargo's feature resolution and only affects someone alternating.
+- **`nest` does not match the mount point's trailing slash.** It expands
+  to the bare prefix plus `/{*rest}`, and a wildcard needs at least one
+  character, so `/_saltator/admin/ui/` fell through to the *outer*
+  router's `M_UNRECOGNIZED` fallback. Since Vite's `base` ends in a
+  slash, that is the form every asset URL is relative to — the console
+  was broken in exactly the configuration it ships in. The fix is one
+  extra route on the outer router.
+- **"Looks like a filename" is the wrong test for "is an asset."** A
+  Matrix user id contains dots, so `/users/@alice:hs.test` — the
+  console's most-used deep link — 404ed instead of loading the shell.
+  The rule is `assets/` prefix only, which is exactly what Vite emits.
+  A unit test caught this before the browser did.
+- **TypeScript is pinned to 6, not 7.** `svelte-check@4` declares a peer
+  of `^5 || ^6`, and npm refuses to resolve 7. Worth revisiting whenever
+  svelte-check catches up.
+- **Bundle size:** 64 KB of JS (23 KB gzipped) plus 4 KB of CSS for the
+  whole console, embedded. The framework choice is most of why.
+- **Verified in a real browser**, not just by unit test: signed in
+  against a running server, paged the user list, opened a user by deep
+  link, locked an account, wrote an identity link, sent a server notice,
+  blocked a remote room, minted a registration token, and confirmed the
+  cluster page refuses to drain the last active node with the server's
+  own message. Zero console errors; every mutation was checked
+  server-side through the API afterwards.
 
 ## Out of scope
 

@@ -13,3 +13,9 @@
 /docker/interop/synapse-data/
 __pycache__/
 /.cargo/
+
+# Admin console: node_modules, and the bundle staged into the embed crate.
+# The bundle is built out of band (npm run build in web/admin, or CI's
+# frontend job) exactly like the Complement image's prebuilt binary above.
+/web/admin/node_modules/
+/crates/saltator-admin-ui/dist/
