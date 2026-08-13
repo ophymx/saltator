@@ -448,7 +448,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         },
     )
     .with_federation(fed_client.clone(), signer.clone(), key_cache.clone())
-    .with_fedout(fedout.clone());
+    .with_fedout(fedout.clone())
+    .with_cluster(meta.clone());
     let cs_state = match &cfg.client.appservice_registration_dir {
         Some(dir) => cs_state.with_appservices(load_appservice_registrations(dir)),
         None => cs_state,

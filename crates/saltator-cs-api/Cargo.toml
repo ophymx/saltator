@@ -12,6 +12,10 @@ saltator-userserver.workspace = true
 saltator-fedout.workspace = true
 saltator-media.workspace = true
 saltator-federation.workspace = true
+# The cluster control plane, for the admin node/drain endpoints. A handle,
+# like the shard servers above — not a new layer.
+saltator-cluster.workspace = true
+saltator-shard.workspace = true
 
 blake3.workspace = true
 ruma.workspace = true
@@ -31,7 +35,6 @@ bytes.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
-saltator-shard.workspace = true
 saltator-store.workspace = true
 saltator-testsupport.workspace = true
 tempfile.workspace = true

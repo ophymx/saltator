@@ -279,6 +279,52 @@ pub async fn lookup_external_id(
     )
 }
 
+// -- cluster (slice 6) ----------------------------------------------------
+
+/// `GET /_saltator/admin/v1/cluster/nodes`
+///
+/// The roster as the answering node sees it. A node with no `groups` has
+/// finished draining and can be stopped.
+pub async fn list_cluster_nodes(
+    State(state): State<Arc<CsState>>,
+    _auth: AdminAuth,
+) -> Result<axum::Json<serde_json::Value>> {
+    detail_response(state.cluster_admin().list_nodes()?)
+}
+
+/// `POST /_saltator/admin/v1/cluster/nodes/{node_id}/drain`
+pub async fn drain_node(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(node_id): Path<u64>,
+) -> Result<axum::Json<serde_json::Value>> {
+    tracing::info!(admin = %auth.user_id(), node_id, "admin: drain node");
+    detail_response(state.cluster_admin().drain(node_id).await?)
+}
+
+/// `POST /_saltator/admin/v1/cluster/nodes/{node_id}/undrain`
+pub async fn undrain_node(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(node_id): Path<u64>,
+) -> Result<axum::Json<serde_json::Value>> {
+    tracing::info!(admin = %auth.user_id(), node_id, "admin: return node to service");
+    detail_response(state.cluster_admin().undrain(node_id).await?)
+}
+
+/// `DELETE /_saltator/admin/v1/cluster/nodes/{node_id}`
+///
+/// Forget a drained node. Bookkeeping after the node has been stopped —
+/// it does not stop anything itself.
+pub async fn remove_cluster_node(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(node_id): Path<u64>,
+) -> Result<axum::Json<serde_json::Value>> {
+    tracing::info!(admin = %auth.user_id(), node_id, "admin: remove node");
+    detail_response(state.cluster_admin().remove(node_id).await?)
+}
+
 // -- server notices (slice 5) ---------------------------------------------
 
 #[derive(Debug, serde::Deserialize)]

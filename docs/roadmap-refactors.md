@@ -195,6 +195,13 @@ scoped separately in docs/design-admin-ui.md.
 Deferred by the scoping: 3PID/identity server, guest access, room purge,
 Synapse's read-only "suspend" state, and the SSO browser flow itself.
 
+**Status:** slices 1–6 landed. Slice 7 (the admin web UI,
+docs/design-admin-ui.md) is all that remains of the step. Notes from
+building each slice are recorded in docs/design-admin-identity.md beside
+the design they revise — including slice 6's finding that the interim
+RF-floor placement policy does *not* block graceful drain, which had been
+the open risk.
+
 ## Interlude ☑ — Cluster hardening (2026-08-08, user-directed, pre-Step-5)
 
 Complement compliance against real 3-node clusters, with and without

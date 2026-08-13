@@ -44,6 +44,11 @@ pub enum ClusterError {
     Storage(String),
     #[error("codec error: {0}")]
     Codec(String),
+    /// A roster transition the cluster refused. Kept as the typed error so
+    /// callers can map each cause to its own status code rather than
+    /// matching on a message.
+    #[error("{0}")]
+    Roster(#[from] placement::RosterError),
 }
 
 type Result<T> = std::result::Result<T, ClusterError>;
@@ -188,7 +193,6 @@ impl MetadataHandle {
         voters.insert(node_id);
         self.inner.set_voters(voters).await?;
 
-        let config = self.cluster_config().await?.unwrap_or_default();
         let mut roster = self.roster().await?;
         roster.insert(
             node_id,
@@ -197,8 +201,83 @@ impl MetadataHandle {
                 status: NodeStatus::Active,
             },
         );
-        let placement = placement::assign(&config, &placement::active_nodes(&roster));
-        self.set_blob(K_ROSTER, &roster).await?;
+        self.write_roster(&roster).await?;
+        Ok(())
+    }
+
+    // -- node removal (docs/design-admin-identity.md slice 6) -------------
+    //
+    // Two steps on purpose, mirroring how a node arrives. `admit_node` is
+    // one call because a joiner has no state to release; leaving does.
+    //
+    //   1. drain  — stop being a placement target. Each data group's
+    //      leader reconciles the node out of its voter set on the next
+    //      tick. The node stays a metadata voter throughout, which is what
+    //      lets it *receive* the placement update: a group it leads can
+    //      only be reconciled by itself.
+    //   2. remove — once it holds nothing, take it out of the metadata
+    //      group and forget it.
+    //
+    // Collapsing these into one call would cut the node off from the
+    // metadata group while it still led groups, leaving it unable to learn
+    // it should step down.
+
+    /// Mark `node_id` draining and recompute placement without it. Must be
+    /// called on the leader.
+    pub async fn drain_node(&self, node_id: NodeId) -> Result<Roster> {
+        self.update_roster(|roster| placement::plan_drain(roster, node_id))
+            .await
+    }
+
+    /// Return `node_id` to service and recompute placement with it. Must
+    /// be called on the leader.
+    pub async fn undrain_node(&self, node_id: NodeId) -> Result<Roster> {
+        self.update_roster(|roster| placement::plan_undrain(roster, node_id))
+            .await
+    }
+
+    /// Remove a drained `node_id` from the metadata group and the roster.
+    /// Must be called on the leader.
+    ///
+    /// The metadata membership change comes first: if the process dies
+    /// between the two writes, a node that is out of the group but still
+    /// in the roster is visible and can be removed again, whereas the
+    /// reverse leaves an invisible voter holding a quorum share.
+    pub async fn remove_node(&self, node_id: NodeId) -> Result<Roster> {
+        let _guard = self.updates.lock().await;
+        let roster = self.roster().await?;
+        let next = placement::plan_removal(&roster, node_id)?;
+
+        let mut voters = self.inner.voter_ids();
+        if voters.remove(&node_id) {
+            // `retain = false`: the node is dropped as a learner too, not
+            // demoted into one. A removed node must stop receiving the log.
+            self.inner.set_voters(voters).await?;
+        }
+        self.write_roster(&next).await?;
+        Ok(next)
+    }
+
+    /// Apply a roster transition and republish the placement derived from
+    /// it, under the same lock that serializes joins.
+    async fn update_roster(
+        &self,
+        plan: impl FnOnce(&Roster) -> std::result::Result<Roster, placement::RosterError>,
+    ) -> Result<Roster> {
+        let _guard = self.updates.lock().await;
+        let roster = self.roster().await?;
+        let next = plan(&roster)?;
+        self.write_roster(&next).await?;
+        Ok(next)
+    }
+
+    /// Persist a roster and the placement it implies. Placement second:
+    /// it is derived, so a crash between the two leaves a placement that
+    /// is merely stale, and the next roster change recomputes it.
+    async fn write_roster(&self, roster: &Roster) -> Result<()> {
+        let config = self.cluster_config().await?.unwrap_or_default();
+        let placement = placement::assign(&config, &placement::active_nodes(roster));
+        self.set_blob(K_ROSTER, roster).await?;
         self.set_blob(K_PLACEMENT, &placement).await?;
         Ok(())
     }
@@ -216,10 +295,10 @@ impl MetadataHandle {
                 status: NodeStatus::Active,
             },
         );
-        let placement = placement::assign(&config, &placement::active_nodes(&roster));
+        // Config first: the placement `write_roster` derives is read back
+        // from it.
         self.set_blob(K_CONFIG, &config).await?;
-        self.set_blob(K_ROSTER, &roster).await?;
-        self.set_blob(K_PLACEMENT, &placement).await?;
+        self.write_roster(&roster).await?;
         Ok(())
     }
 

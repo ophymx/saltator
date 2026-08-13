@@ -108,6 +108,10 @@ pub struct CsState {
     pub(crate) push_rule_locks:
         tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) rate_limiter: ratelimit::RateLimiter,
+    /// The cluster control plane, for the admin node/drain endpoints.
+    /// `None` in stacks that run the shard servers without a metadata
+    /// group (most tests): the cluster endpoints then say so.
+    pub(crate) cluster: Option<saltator_cluster::MetadataHandle>,
     /// Registered application services (minimal support: `as_token` →
     /// sender identity plus `?ts` timestamp massaging; namespaces,
     /// impersonation, and outbound event push are not implemented).
@@ -171,6 +175,18 @@ impl CsState {
         Arc::get_mut(&mut self)
             .expect("with_fedout called on a shared CsState")
             .fedout = Some(fedout);
+        self
+    }
+
+    /// Attach the cluster control plane, enabling the admin node/drain
+    /// endpoints (docs/design-admin-identity.md slice 6).
+    pub fn with_cluster(
+        mut self: Arc<Self>,
+        cluster: saltator_cluster::MetadataHandle,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("with_cluster called on a shared CsState")
+            .cluster = Some(cluster);
         self
     }
 
@@ -239,6 +255,13 @@ impl CsState {
         }
     }
 
+    /// The cluster-administration service.
+    pub(crate) fn cluster_admin(&self) -> services::cluster_admin::ClusterAdmin<'_> {
+        services::cluster_admin::ClusterAdmin {
+            meta: self.cluster.as_ref(),
+        }
+    }
+
     /// The user-interactive-auth service.
     pub(crate) fn uia(&self) -> services::uia::Uia<'_> {
         services::uia::Uia { users: &self.users }
@@ -282,6 +305,7 @@ impl CsState {
             push_rule_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             rate_limiter: ratelimit::RateLimiter::new(),
             appservices: Vec::new(),
+            cluster: None,
         })
     }
 
@@ -669,6 +693,22 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_saltator/admin/v1/users/{user_id}/notice",
             post(admin::send_notice),
+        )
+        .route(
+            "/_saltator/admin/v1/cluster/nodes",
+            get(admin::list_cluster_nodes),
+        )
+        .route(
+            "/_saltator/admin/v1/cluster/nodes/{node_id}",
+            delete(admin::remove_cluster_node),
+        )
+        .route(
+            "/_saltator/admin/v1/cluster/nodes/{node_id}/drain",
+            post(admin::drain_node),
+        )
+        .route(
+            "/_saltator/admin/v1/cluster/nodes/{node_id}/undrain",
+            post(admin::undrain_node),
         )
         .route("/_saltator/admin/v1/rooms", get(admin::list_rooms))
         .route(

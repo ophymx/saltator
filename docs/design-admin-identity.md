@@ -403,15 +403,61 @@ room. Four decisions worth recording:
 - **The room is recorded last.** A room id stored before the room is
   habitable would be reused in that state by every later notice.
 
-**Cluster** — `POST /cluster/nodes/{id}/drain` and the matching
-`GET /cluster/nodes`, which is where the interlude's owed work lands:
-set `NodeStatus::Draining` in the roster via a new `MetadataHandle`
-method beside `admit_node` (`crates/saltator-cluster/src/lib.rs:181`),
-then let the reconciler (`reconcile.rs:37`) act. Note the interim
-placement policy floors RF at the node count
-(`placement.rs:117-129`), so `assign()` and the reconciler have to agree
-that a draining node stops being a placement target before removal can
-mean anything.
+**Cluster** — `GET /cluster/nodes`, `POST /cluster/nodes/{id}/drain`,
+`POST /cluster/nodes/{id}/undrain`, `DELETE /cluster/nodes/{id}`. This is
+where the interlude's owed work lands: `NodeStatus::Draining` existed in
+the roster model and nothing set it, so crash-and-forget was the only
+node-removal path.
+
+**The interim placement policy turned out not to block this.** The worry
+was that flooring RF at the node count (`placement.rs`) would mean a node
+could never stop hosting a group without data-plane routing for unhosted
+shards. It does not: the floor is over the *active* set, so draining
+shrinks that set and every remaining node still hosts everything. Drain
+needs no routing work, and `replication_factor` stays capped as before.
+
+**Leaving is two operations, and that is the design.** `admit_node` is
+one call because a joiner has no state to release; a leaver does.
+
+1. **Drain** — the node stops being a placement target. Each data group's
+   leader then reconciles it out of the voter set through the *ordinary*
+   mechanism (`reconcile.rs`); there is no drain-specific path, which is
+   what makes it work for groups the draining node itself leads. It stays
+   a metadata voter the whole time, and that is the point: a node can
+   only act on a placement it can still receive.
+2. **Remove** — once it holds nothing, it leaves the metadata group and
+   the roster.
+
+Collapsing them would cut the node off from the metadata group while it
+still led groups, leaving it unable to learn it should release them.
+`plan_drain` / `plan_undrain` / `plan_removal` are pure functions over
+the roster so the guards are testable without a cluster: the last active
+node cannot be drained (there is no "shut the cluster down" operation and
+this is not it), only a drained node can be removed, and the node
+answering the request will not remove itself.
+
+Two limits worth naming rather than hiding:
+
+- **Roster changes are leader-only.** They read-modify-write the
+  control-plane records and change metadata membership, so a request to a
+  follower is refused with a message naming the leader —
+  `GET /cluster/nodes` reports it too. Node join solved the same problem
+  with a redirect the joiner retries; an equivalent forwarding RPC for
+  the admin path is a reasonable follow-up, not a prerequisite.
+- **A drained node must be taken out of service by the operator.** It
+  keeps its old local state but stops receiving updates, so reads go
+  stale and writes hang (they forward to the leader, then wait for
+  *local* applied state that will never advance). There is no readiness
+  endpoint for a load balancer to poll — the server has no health
+  endpoint at all today — so the sequence is manual:
+
+  1. `POST /cluster/nodes/{id}/drain`
+  2. poll `GET /cluster/nodes` until that node's `groups` is empty
+  3. stop the process and take it out of the load balancer
+  4. `DELETE /cluster/nodes/{id}`
+
+  A readiness endpoint that fails while draining is the obvious next
+  brick, and would make step 3 automatic.
 
 ### The read path, and the SQLite ops-projection idea
 

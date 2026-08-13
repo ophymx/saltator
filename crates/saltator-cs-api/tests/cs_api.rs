@@ -26,6 +26,8 @@ struct Env {
     users: Arc<UserServer>,
     state: Arc<CsState>,
     projection: tokio::task::JoinHandle<()>,
+    /// The metadata group, when the env runs one (slice 6).
+    cluster: Option<saltator_cluster::MetadataHandle>,
 }
 
 async fn start_env() -> Env {
@@ -48,6 +50,7 @@ async fn start_env_cfg(
         Vec::new(),
         false,
         None,
+        false,
     )
     .await
 }
@@ -73,6 +76,25 @@ async fn start_env_notices(admins: &[&str], localpart: &str) -> Env {
     start_env_admin_notices(admins, Vec::new(), false, Some(localpart.to_owned())).await
 }
 
+/// An admin env that also runs a single-node metadata group, so the
+/// cluster endpoints have a control plane to talk to (slice 6).
+async fn start_env_cluster(admins: &[&str]) -> Env {
+    let admins = admins
+        .iter()
+        .map(|u| ruma::OwnedUserId::try_from(*u).unwrap())
+        .collect();
+    start_env_full(
+        saltator_cs_api::RateLimitConfig::disabled(),
+        true,
+        admins,
+        Vec::new(),
+        false,
+        None,
+        true,
+    )
+    .await
+}
+
 async fn start_env_admin_notices(
     admins: &[&str],
     appservices: Vec<AppServiceRegistration>,
@@ -90,6 +112,7 @@ async fn start_env_admin_notices(
         appservices,
         registration_requires_token,
         server_notices_localpart,
+        false,
     )
     .await
 }
@@ -101,6 +124,7 @@ async fn start_env_full(
     appservices: Vec<AppServiceRegistration>,
     registration_requires_token: bool,
     server_notices_localpart: Option<String>,
+    with_cluster: bool,
 ) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
@@ -119,7 +143,7 @@ async fn start_env_full(
     .unwrap();
     let users = UserServer::start(
         1,
-        engine,
+        engine.clone(),
         server_name.clone(),
         NoopNetworkFactory,
         Some("127.0.0.1:0".into()),
@@ -130,6 +154,24 @@ async fn start_env_full(
     for h in [rooms.shard_handle(), users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
+    // A single-node metadata group over the same engine: a real control
+    // plane for the cluster endpoints to read and mutate.
+    const META_ADDR: &str = "127.0.0.1:7100";
+    let cluster = if with_cluster {
+        let meta = saltator_cluster::MetadataHandle::start(1, engine, Some(META_ADDR.into()), None)
+            .await
+            .unwrap();
+        meta.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+        meta.bootstrap_cluster(
+            saltator_cluster::ClusterConfig::default(),
+            META_ADDR.to_owned(),
+        )
+        .await
+        .unwrap();
+        Some(meta)
+    } else {
+        None
+    };
     let projection = spawn_membership_projection(users.clone(), rooms.clone());
     let media = MediaStore::open(dir.path().join("media")).unwrap();
     let state = CsState::new(
@@ -154,6 +196,10 @@ async fn start_env_full(
     } else {
         state.with_appservices(appservices)
     };
+    let state = match &cluster {
+        Some(meta) => state.with_cluster(meta.clone()),
+        None => state,
+    };
     Env {
         _dir: dir,
         router: saltator_cs_api::router(state.clone()),
@@ -161,6 +207,7 @@ async fn start_env_full(
         users,
         state,
         projection,
+        cluster,
     }
 }
 
@@ -252,6 +299,9 @@ impl Env {
 
     async fn shutdown(self) {
         self.projection.abort();
+        if let Some(meta) = &self.cluster {
+            meta.shutdown().await.unwrap();
+        }
         self.rooms.shutdown().await.unwrap();
         self.users.shutdown().await.unwrap();
     }
@@ -10921,5 +10971,101 @@ async fn a_notice_needs_a_real_recipient() {
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    env.shutdown().await;
+}
+
+// -- cluster admin (docs/design-admin-identity.md slice 6) ----------------
+
+const CLUSTER_NODES: &str = "/_saltator/admin/v1/cluster/nodes";
+
+/// Admin-only, like the rest of the surface — and the check runs before
+/// anything looks at whether a control plane exists.
+#[tokio::test]
+async fn cluster_endpoints_are_admin_only() {
+    let env = start_env_cluster(&["@root:hs.test"]).await;
+    let mallory = env.register("mallory", "pw-12345678").await;
+    for (method, path) in [
+        ("GET", CLUSTER_NODES.to_owned()),
+        ("POST", format!("{CLUSTER_NODES}/1/drain")),
+        ("POST", format!("{CLUSTER_NODES}/1/undrain")),
+        ("DELETE", format!("{CLUSTER_NODES}/1")),
+    ] {
+        let (status, body) = env.req(method, &path, Some(&mallory), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+    }
+    env.shutdown().await;
+}
+
+/// A server with no control plane says so rather than 500ing or
+/// pretending the cluster is empty.
+#[tokio::test]
+async fn cluster_endpoints_report_a_missing_control_plane() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    let (status, body) = env.req("GET", CLUSTER_NODES, Some(&root), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("control plane"),
+        "{body}"
+    );
+    env.shutdown().await;
+}
+
+/// The roster read, and the two refusals that keep an operator from
+/// dismantling the cluster they are standing on.
+#[tokio::test]
+async fn cluster_node_list_and_drain_guards() {
+    let env = start_env_cluster(&["@root:hs.test"]).await;
+    let root = env.register("root", "pw-12345678").await;
+
+    let (status, body) = env.req("GET", CLUSTER_NODES, Some(&root), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["view_from"], 1);
+    assert_eq!(body["leader"], 1);
+    let nodes = body["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1, "{body}");
+    assert_eq!(nodes[0]["node_id"], 1);
+    assert_eq!(nodes[0]["status"], "active");
+    assert_eq!(nodes[0]["metadata_voter"], true);
+    // The founder hosts every group; the labels are readable, not raw
+    // group numbers.
+    let groups: Vec<&str> = nodes[0]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g.as_str().unwrap())
+        .collect();
+    assert_eq!(groups, ["Room/0", "User/0", "FedOut/0"], "{body}");
+
+    // Draining the only node would leave the cluster nowhere to put data.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("{CLUSTER_NODES}/1/drain"),
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("last active"),
+        "{body}"
+    );
+
+    // Removing the node answering the request is refused too.
+    let (status, body) = env
+        .req("DELETE", &format!("{CLUSTER_NODES}/1"), Some(&root), None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // And a node that was never in the roster is a 404, not a silent no-op.
+    for (method, path) in [
+        ("POST", format!("{CLUSTER_NODES}/99/drain")),
+        ("POST", format!("{CLUSTER_NODES}/99/undrain")),
+        ("DELETE", format!("{CLUSTER_NODES}/99")),
+    ] {
+        let (status, body) = env.req(method, &path, Some(&root), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {body}");
+    }
     env.shutdown().await;
 }

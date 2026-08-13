@@ -3017,6 +3017,7 @@ dependencies = [
  "rand 0.8.7",
  "reqwest",
  "ruma",
+ "saltator-cluster",
  "saltator-core",
  "saltator-federation",
  "saltator-fedout",
