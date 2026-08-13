@@ -47,6 +47,7 @@ async fn start_env_cfg(
         Vec::new(),
         Vec::new(),
         false,
+        None,
     )
     .await
 }
@@ -63,6 +64,21 @@ async fn start_env_admin_cfg(
     appservices: Vec<AppServiceRegistration>,
     registration_requires_token: bool,
 ) -> Env {
+    start_env_admin_notices(admins, appservices, registration_requires_token, None).await
+}
+
+/// An admin env with server notices configured (slice 5): the notices
+/// localpart is what turns the feature on.
+async fn start_env_notices(admins: &[&str], localpart: &str) -> Env {
+    start_env_admin_notices(admins, Vec::new(), false, Some(localpart.to_owned())).await
+}
+
+async fn start_env_admin_notices(
+    admins: &[&str],
+    appservices: Vec<AppServiceRegistration>,
+    registration_requires_token: bool,
+    server_notices_localpart: Option<String>,
+) -> Env {
     let admins = admins
         .iter()
         .map(|u| ruma::OwnedUserId::try_from(*u).unwrap())
@@ -73,6 +89,7 @@ async fn start_env_admin_cfg(
         admins,
         appservices,
         registration_requires_token,
+        server_notices_localpart,
     )
     .await
 }
@@ -83,6 +100,7 @@ async fn start_env_full(
     admin_users: Vec<ruma::OwnedUserId>,
     appservices: Vec<AppServiceRegistration>,
     registration_requires_token: bool,
+    server_notices_localpart: Option<String>,
 ) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
@@ -128,6 +146,7 @@ async fn start_env_full(
             rate_limits,
             allow_internal_fetch,
             admin_users,
+            server_notices_localpart,
         },
     );
     let state = if appservices.is_empty() {
@@ -5291,6 +5310,7 @@ async fn client_joins_a_remote_room_via_federation() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -5504,6 +5524,7 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -5753,6 +5774,7 @@ async fn client_joins_a_remote_room_by_remote_alias() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -5920,6 +5942,7 @@ async fn remote_join_drops_unverifiable_noncritical_state() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -6078,6 +6101,7 @@ async fn send_message_in_remote_ported_room() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -6286,6 +6310,7 @@ async fn remote_join_backfills_full_history() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -6571,6 +6596,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -6890,6 +6916,7 @@ async fn inbound_federated_invite_appears_in_sync() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     );
     let cs_router = saltator_cs_api::router(cs_state);
@@ -7083,6 +7110,7 @@ async fn cs_stack(
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     );
     if let Some(base) = fed_client_base {
@@ -7225,6 +7253,7 @@ async fn outbound_federated_invite_round_trip() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -7519,6 +7548,7 @@ async fn to_device_over_federation_round_trip() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -7731,6 +7761,7 @@ async fn federated_key_query_claim_and_device_list_update() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -7906,6 +7937,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     );
     let cs_router = saltator_cs_api::router(cs_state.clone());
@@ -8188,6 +8220,7 @@ async fn client_downloads_remote_media_over_federation() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -8425,6 +8458,7 @@ async fn client_queries_remote_profile_and_directory() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -9237,6 +9271,7 @@ async fn spaces_hierarchy_spans_federation() {
             rate_limits: saltator_cs_api::RateLimitConfig::disabled(),
             allow_internal_fetch: true,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         },
     )
     .with_federation(
@@ -10406,5 +10441,485 @@ async fn login_flows_advertise_password() {
     let flows = body["flows"].as_array().unwrap();
     assert_eq!(flows.len(), 1, "{body}");
     assert_eq!(flows[0]["type"], "m.login.password");
+    env.shutdown().await;
+}
+
+// -- room admin (docs/design-admin-identity.md slice 5) -------------------
+
+const ADMIN_ROOMS: &str = "/_saltator/admin/v1/rooms";
+
+async fn make_room(env: &Env, token: &str, name: &str) -> String {
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(token),
+            Some(json!({"preset": "public_chat", "name": name})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["room_id"].as_str().unwrap().to_owned()
+}
+
+/// The room surface is admin-only, like the rest of `/_saltator/admin`.
+#[tokio::test]
+async fn room_admin_endpoints_are_admin_only() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let mallory = env.register("mallory", "pw-12345678").await;
+    let room = make_room(&env, &mallory, "Mallory's room").await;
+
+    for (method, path, body) in [
+        ("GET", ADMIN_ROOMS.to_owned(), None),
+        ("GET", format!("{ADMIN_ROOMS}/{room}"), None),
+        ("DELETE", format!("{ADMIN_ROOMS}/{room}"), None),
+        (
+            "PUT",
+            format!("{ADMIN_ROOMS}/{room}/block"),
+            Some(json!({"blocked": true})),
+        ),
+        ("GET", "/_saltator/admin/v1/blocked_rooms".to_owned(), None),
+    ] {
+        let (status, resp) = env.req(method, &path, Some(&mallory), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {resp}");
+    }
+    env.shutdown().await;
+}
+
+/// A hosted room lists with its name and member counts; the detail adds
+/// the creator and the local members.
+#[tokio::test]
+async fn admin_room_list_and_detail() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    let alice = env.register("alice", "pw-12345678").await;
+    let room = make_room(&env, &alice, "Ops").await;
+
+    let (status, body) = env.req("GET", ADMIN_ROOMS, Some(&root), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rooms = body["rooms"].as_array().unwrap();
+    assert_eq!(rooms.len(), 1, "{body}");
+    assert_eq!(rooms[0]["room_id"], room.as_str());
+    assert_eq!(rooms[0]["name"], "Ops");
+    assert_eq!(rooms[0]["joined_members"], 1);
+    assert_eq!(rooms[0]["local_joined_members"], 1);
+    assert_eq!(rooms[0]["join_rule"], "public");
+    assert!(rooms[0].get("blocked").is_none(), "open room: {body}");
+
+    let (status, body) = env
+        .req("GET", &format!("{ADMIN_ROOMS}/{room}"), Some(&root), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["local_members"][0], "@alice:hs.test");
+    assert_eq!(body["local_members_truncated"], false);
+
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("{ADMIN_ROOMS}/!nope:hs.test"),
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    env.shutdown().await;
+}
+
+/// Shutdown makes every local member leave and closes the room: the
+/// rejoin is refused, and the room is still readable afterwards, because
+/// this is a shutdown and not a purge.
+#[tokio::test]
+async fn shutdown_evicts_members_and_blocks_rejoin() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    let alice = env.register("alice", "pw-12345678").await;
+    let bob = env.register("bob", "pw-12345678").await;
+    let room = make_room(&env, &alice, "Spam").await;
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/join/{room}"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = env
+        .req(
+            "DELETE",
+            &format!("{ADMIN_ROOMS}/{room}"),
+            Some(&root),
+            Some(json!({"reason": "abuse"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut kicked: Vec<&str> = body["kicked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u.as_str().unwrap())
+        .collect();
+    kicked.sort();
+    assert_eq!(kicked, ["@alice:hs.test", "@bob:hs.test"], "{body}");
+    assert_eq!(body["failed"].as_array().unwrap().len(), 0, "{body}");
+    assert_eq!(body["blocked"], true);
+
+    // Closed to both of them, and to anyone else.
+    for token in [&alice, &bob] {
+        let (status, body) = env
+            .req(
+                "POST",
+                &format!("/_matrix/client/v3/join/{room}"),
+                Some(token),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["errcode"], "M_FORBIDDEN");
+    }
+    // A knock is a request to join, so it is refused by the same block.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/knock/{room}"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // The room itself survives: emptied and blocked, not deleted.
+    let (status, body) = env
+        .req("GET", &format!("{ADMIN_ROOMS}/{room}"), Some(&root), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["local_joined_members"], 0, "{body}");
+    assert_eq!(body["blocked"]["by"], "@root:hs.test");
+    assert!(body["local_members"].as_array().unwrap().is_empty());
+    env.shutdown().await;
+}
+
+/// A block can name a room this server has never heard of — the only way
+/// to keep local users out of somewhere else — and unblocking lifts it.
+#[tokio::test]
+async fn a_room_we_do_not_host_can_be_blocked() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    const REMOTE: &str = "!abuse:remote.test";
+    const BLOCKED: &str = "/_saltator/admin/v1/blocked_rooms";
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("{ADMIN_ROOMS}/{REMOTE}/block"),
+            Some(&root),
+            Some(json!({"blocked": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = env.req("GET", BLOCKED, Some(&root), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["blocked_rooms"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(rows[0]["room_id"], REMOTE);
+    assert_eq!(rows[0]["hosted"], false, "we do not host it: {body}");
+
+    // It is invisible to the room list, which only knows hosted rooms —
+    // which is exactly why the blocked list is its own endpoint.
+    let (_, body) = env.req("GET", ADMIN_ROOMS, Some(&root), None).await;
+    assert_eq!(body["rooms"].as_array().unwrap().len(), 0, "{body}");
+
+    // Shutdown is not available for a room we do not host.
+    let (status, body) = env
+        .req(
+            "DELETE",
+            &format!("{ADMIN_ROOMS}/{REMOTE}"),
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("{ADMIN_ROOMS}/{REMOTE}/block"),
+            Some(&root),
+            Some(json!({"blocked": false})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("blocked").is_none(), "{body}");
+    let (_, body) = env.req("GET", BLOCKED, Some(&root), None).await;
+    assert_eq!(body["blocked_rooms"].as_array().unwrap().len(), 0, "{body}");
+    env.shutdown().await;
+}
+
+/// The block is enforced on the resident side too. A block that only
+/// stopped our own clients would leave the room reachable through us by
+/// every other server on the federation.
+#[tokio::test]
+async fn federated_join_into_a_blocked_room_is_refused() {
+    use saltator_testsupport::MockPeer;
+
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    let alice = env.register("alice", "pw-12345678").await;
+    let room = make_room(&env, &alice, "Spam").await;
+
+    let peer = MockPeer::start("peer.test").await;
+    let name = ruma::OwnedServerName::try_from(SERVER).unwrap();
+    let (fed_signer, _) = saltator_roomserver::ServerSigner::generate(name.clone(), "9".to_owned());
+    let fed = Arc::new(FedState {
+        server_name: name,
+        signer: Arc::new(fed_signer),
+        old_keys: Vec::<OldVerifyKey>::new(),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(peer.base_url.clone())),
+        rooms: Some(env.rooms.clone()),
+        users: Some(env.users.clone()),
+        client: None,
+        edu_sink: None,
+        media: None,
+        delivery_backoff: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
+    });
+    let app = saltator_federation::router(fed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+    let make_join = format!("/_matrix/federation/v1/make_join/{room}/@remote:peer.test");
+
+    // Open: the resident hands out a template.
+    let (status, body) = peer.signed_get(&base, SERVER, &make_join).await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("{ADMIN_ROOMS}/{room}/block"),
+            Some(&root),
+            Some(json!({"blocked": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = peer.signed_get(&base, SERVER, &make_join).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN", "{body}");
+    env.shutdown().await;
+}
+
+// -- server notices (docs/design-admin-identity.md slice 5) ---------------
+
+fn notice(body: &str) -> Value {
+    json!({"content": {"msgtype": "m.text", "body": body}})
+}
+
+/// The first notice builds the room and invites the user; the second
+/// reuses it. A second room per notice would be the obvious bug.
+#[tokio::test]
+async fn server_notices_create_a_room_once_and_reuse_it() {
+    let env = start_env_notices(&["@root:hs.test"], "notices").await;
+    let root = env.register("root", "pw-12345678").await;
+    let alice = env.register("alice", "pw-12345678").await;
+    const NOTICE: &str = "/_saltator/admin/v1/users/@alice:hs.test/notice";
+
+    let (status, first) = env
+        .req("POST", NOTICE, Some(&root), Some(notice("disk is full")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let room_id = first["room_id"].as_str().unwrap().to_owned();
+
+    let (status, second) = env
+        .req("POST", NOTICE, Some(&root), Some(notice("still full")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["room_id"], room_id.as_str(), "one room per user");
+    assert_ne!(second["event_id"], first["event_id"]);
+
+    // Alice sees an invite to it, from the server's own account.
+    let (status, sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sync}");
+    let invite = &sync["rooms"]["invite"][room_id.as_str()];
+    assert!(!invite.is_null(), "no invite in sync: {sync}");
+    let name = invite["invite_state"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["type"] == "m.room.name")
+        .map(|e| e["content"]["name"].clone());
+    assert_eq!(name, Some(json!("Server Notices")), "{invite}");
+
+    // The sending account exists and is passwordless — there is no
+    // credential, so nobody can log in as the server.
+    let (status, detail) = env
+        .req(
+            "GET",
+            "/_saltator/admin/v1/users/@notices:hs.test",
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["has_password"], false);
+    env.shutdown().await;
+}
+
+/// The notices room is a notice board, not an inbox: the recipient can
+/// read it and cannot post in it.
+#[tokio::test]
+async fn a_user_cannot_post_in_their_notices_room() {
+    let env = start_env_notices(&["@root:hs.test"], "notices").await;
+    let root = env.register("root", "pw-12345678").await;
+    let alice = env.register("alice", "pw-12345678").await;
+
+    let (_, sent) = env
+        .req(
+            "POST",
+            "/_saltator/admin/v1/users/@alice:hs.test/notice",
+            Some(&root),
+            Some(notice("read only")),
+        )
+        .await;
+    let room_id = sent["room_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/join/{room_id}"),
+            Some(&alice),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_id}/send/m.room.message/txn1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "please stop"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    env.shutdown().await;
+}
+
+/// Leaving is always allowed, so the next notice has to put the user back
+/// — otherwise it would land in a room they are not in.
+#[tokio::test]
+async fn leaving_a_notices_room_does_not_stop_the_next_notice() {
+    let env = start_env_notices(&["@root:hs.test"], "notices").await;
+    let root = env.register("root", "pw-12345678").await;
+    let alice = env.register("alice", "pw-12345678").await;
+    const NOTICE: &str = "/_saltator/admin/v1/users/@alice:hs.test/notice";
+
+    let (_, sent) = env
+        .req("POST", NOTICE, Some(&root), Some(notice("first")))
+        .await;
+    let room_id = sent["room_id"].as_str().unwrap().to_owned();
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_id}/leave"),
+            Some(&alice),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = env
+        .req("POST", NOTICE, Some(&root), Some(notice("second")))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["room_id"], room_id.as_str(), "same room, re-invited");
+
+    let (_, sync) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    assert!(
+        !sync["rooms"]["invite"][room_id.as_str()].is_null(),
+        "expected a fresh invite: {sync}"
+    );
+    env.shutdown().await;
+}
+
+/// Unconfigured is a 400 that says so, not a mystery. And the reserved
+/// localpart cannot be registered by a user: it is the server's voice.
+#[tokio::test]
+async fn notices_need_configuring_and_reserve_their_localpart() {
+    let off = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = off.register("root", "pw-12345678").await;
+    off.register("alice", "pw-12345678").await;
+    let (status, body) = off
+        .req(
+            "POST",
+            "/_saltator/admin/v1/users/@alice:hs.test/notice",
+            Some(&root),
+            Some(notice("nobody home")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("server_notices_localpart"),
+        "{body}"
+    );
+    // With notices off nothing reserves the name, so it is registrable.
+    assert!(!off.register("notices", "pw-12345678").await.is_empty());
+    off.shutdown().await;
+
+    let on = start_env_notices(&["@root:hs.test"], "notices").await;
+    let (status, body) = on
+        .req(
+            "POST",
+            "/_matrix/client/v3/register",
+            None,
+            Some(json!({
+                "username": "notices",
+                "password": "pw-12345678",
+                "auth": {"type": "m.login.dummy"}
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_USER_IN_USE");
+
+    let (status, body) = on
+        .req(
+            "GET",
+            "/_matrix/client/v3/register/available?username=notices",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_USER_IN_USE");
+    on.shutdown().await;
+}
+
+/// A notice to an account that does not exist is a 404, not a room
+/// created for nobody.
+#[tokio::test]
+async fn a_notice_needs_a_real_recipient() {
+    let env = start_env_notices(&["@root:hs.test"], "notices").await;
+    let root = env.register("root", "pw-12345678").await;
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_saltator/admin/v1/users/@nobody:hs.test/notice",
+            Some(&root),
+            Some(notice("hello?")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     env.shutdown().await;
 }

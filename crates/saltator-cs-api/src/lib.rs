@@ -62,6 +62,15 @@ pub struct CsConfig {
     /// server has no admin account and no way to grant one, so the first
     /// administrator has to come from outside the database.
     pub admin_users: Vec<OwnedUserId>,
+    /// Localpart of the account that delivers server notices, e.g.
+    /// `notices` → `@notices:example.org`. `None` disables the feature.
+    ///
+    /// Off by default because turning it on creates and reserves an
+    /// account: an operator should choose that name, not inherit it. Once
+    /// set, the localpart is refused to `/register` — otherwise a user
+    /// could take the name and receive, or send, what looks like server
+    /// mail.
+    pub server_notices_localpart: Option<String>,
 }
 
 /// The credential providers this server offers, and the single place the
@@ -206,6 +215,27 @@ impl CsState {
         services::admin::Admin {
             users: &self.users,
             admin_users: &self.config.admin_users,
+        }
+    }
+
+    /// The room-administration service: room inspection, shutdown and the
+    /// join block (docs/design-admin-identity.md slice 5).
+    pub(crate) fn room_admin(&self) -> services::room_admin::RoomAdmin<'_> {
+        services::room_admin::RoomAdmin {
+            users: &self.users,
+            rooms: &self.rooms,
+            server_name: self.config.server_name.as_str(),
+        }
+    }
+
+    /// The server-notices service (docs/design-admin-identity.md slice 5).
+    pub(crate) fn notices(&self) -> services::notices::Notices<'_> {
+        services::notices::Notices {
+            users: &self.users,
+            rooms: &self.rooms,
+            server_name: self.config.server_name.as_str(),
+            localpart: self.config.server_notices_localpart.as_deref(),
+            room_version: self.config.default_room_version,
         }
     }
 
@@ -635,6 +665,23 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_saltator/admin/v1/auth_providers/{auth_provider}/users/{external_id}",
             get(admin::lookup_external_id),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/notice",
+            post(admin::send_notice),
+        )
+        .route("/_saltator/admin/v1/rooms", get(admin::list_rooms))
+        .route(
+            "/_saltator/admin/v1/rooms/{room_id}",
+            get(admin::room_detail).delete(admin::shutdown_room),
+        )
+        .route(
+            "/_saltator/admin/v1/rooms/{room_id}/block",
+            put(admin::set_room_blocked),
+        )
+        .route(
+            "/_saltator/admin/v1/blocked_rooms",
+            get(admin::list_blocked_rooms),
         )
         .route(
             "/_saltator/admin/v1/registration_tokens",

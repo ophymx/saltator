@@ -279,6 +279,145 @@ pub async fn lookup_external_id(
     )
 }
 
+// -- server notices (slice 5) ---------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct NoticeBody {
+    /// The message event content, e.g.
+    /// `{"msgtype": "m.text", "body": "..."}`. Passed through rather than
+    /// assembled here, so an operator can send any message type their
+    /// users' clients render.
+    content: serde_json::Value,
+}
+
+/// `POST /_saltator/admin/v1/users/{user_id}/notice`
+pub async fn send_notice(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(user_id): Path<String>,
+    axum::Json(body): axum::Json<NoticeBody>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    if !body.content.is_object() {
+        return Err(ApiError::invalid_param("content must be an object"));
+    }
+    tracing::info!(admin = %auth.user_id(), %target, "admin: send server notice");
+    detail_response(state.notices().send(&target, body.content).await?)
+}
+
+// -- rooms (slice 5) ------------------------------------------------------
+
+/// Room ids, like user ids, are parsed rather than passed through — and
+/// here it matters twice over, because the block endpoint accepts rooms
+/// this server has never heard of, so a typo has nothing to bounce off.
+fn room_target(room_id: &str) -> Result<ruma::OwnedRoomId> {
+    ruma::OwnedRoomId::try_from(room_id)
+        .map_err(|e| ApiError::invalid_param(format!("{room_id:?} is not a room id: {e}")))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListRoomsQuery {
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ShutdownBody {
+    /// Also close the room to further joins. Defaults to true: a shutdown
+    /// that leaves the door open is not one.
+    #[serde(default = "default_true")]
+    block: bool,
+    /// Recorded on each member's leave event.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SetBlockedBody {
+    blocked: bool,
+}
+
+/// `GET /_saltator/admin/v1/rooms`
+pub async fn list_rooms(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Query(q): Query<ListRoomsQuery>,
+) -> Result<axum::Json<serde_json::Value>> {
+    tracing::info!(admin = %auth.user_id(), from = ?q.from, "admin: list rooms");
+    detail_response(state.room_admin().list_rooms(q.from.as_deref(), q.limit)?)
+}
+
+/// `GET /_saltator/admin/v1/rooms/{room_id}`
+pub async fn room_detail(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(room_id): Path<String>,
+) -> Result<axum::Json<serde_json::Value>> {
+    tracing::info!(admin = %auth.user_id(), room = %room_id, "admin: read room");
+    detail_response(state.room_admin().room_detail(&room_id)?)
+}
+
+/// `DELETE /_saltator/admin/v1/rooms/{room_id}` — shutdown, **not** purge:
+/// every local member leaves and the room is closed to joins. The events
+/// stay on disk.
+pub async fn shutdown_room(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(room_id): Path<String>,
+    body: Option<axum::Json<ShutdownBody>>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = room_target(&room_id)?;
+    let (block, reason) = match body {
+        Some(axum::Json(b)) => (b.block, b.reason),
+        None => (true, None),
+    };
+    tracing::info!(admin = %auth.user_id(), room = %target, block, "admin: shut down room");
+    detail_response(
+        state
+            .room_admin()
+            .shutdown(auth.user_id(), &target, block, reason.as_deref())
+            .await?,
+    )
+}
+
+/// `PUT /_saltator/admin/v1/rooms/{room_id}/block`
+///
+/// Separate from shutdown because unblocking exists, and because blocking
+/// a room this server does not host is a legitimate act on its own.
+pub async fn set_room_blocked(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path(room_id): Path<String>,
+    axum::Json(body): axum::Json<SetBlockedBody>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = room_target(&room_id)?;
+    tracing::info!(
+        admin = %auth.user_id(), room = %target, blocked = body.blocked,
+        "admin: set room block"
+    );
+    detail_response(
+        state
+            .room_admin()
+            .set_blocked(auth.user_id(), &target, body.blocked)
+            .await?,
+    )
+}
+
+/// `GET /_saltator/admin/v1/blocked_rooms`
+///
+/// Its own path rather than a filter on the room list: a block can name a
+/// room this server does not host, which has no row in the room shard and
+/// so can never appear there.
+pub async fn list_blocked_rooms(
+    State(state): State<Arc<CsState>>,
+    _auth: AdminAuth,
+) -> Result<axum::Json<serde_json::Value>> {
+    let rooms = state.room_admin().list_blocked()?;
+    Ok(axum::Json(serde_json::json!({ "blocked_rooms": rooms })))
+}
+
 // -- registration tokens (slice 3) ---------------------------------------
 
 #[derive(Debug, serde::Deserialize)]

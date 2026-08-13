@@ -6,14 +6,14 @@ use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
     account_data_key, device_scoped_key, external_key, prefix_end, to_device_key, user_key,
-    Account, AccountDataEntry, AccountState, AccountV2, AliasEntry, BackupVersionMeta, ClaimedKey,
-    Device, FallbackEntry, KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, RegToken,
-    SessionCmd, TokenEntry, TokenKind, UiaSession, UserChangePayload, UserCommand, UserResponse,
-    T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR,
-    T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_EDU_OUTBOX, T_EXTERNAL_ID, T_EXTERNAL_ID_USER,
-    T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY,
-    T_PROFILE, T_PUSHER, T_REG_TOKEN, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX,
-    T_UIA_SESSION, T_UIA_SESSION_IDX,
+    Account, AccountDataEntry, AccountState, AccountV2, AliasEntry, BackupVersionMeta, BlockedRoom,
+    ClaimedKey, Device, FallbackEntry, KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry,
+    Profile, RegToken, SessionCmd, TokenEntry, TokenKind, UiaSession, UserChangePayload,
+    UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION,
+    T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_EDU_OUTBOX, T_EXTERNAL_ID,
+    T_EXTERNAL_ID_USER, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
+    T_MEMBERSHIP, T_NOTICES_ROOM, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_REG_TOKEN, T_ROOM_BLOCKED,
+    T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -1248,6 +1248,41 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             ctx.delete(T_EXTERNAL_ID_USER, &rev);
             Ok(UserResponse::Ok)
         }
+        UserCommand::SetNoticesRoom { user_id, room_id } => {
+            ctx.put(
+                T_NOTICES_ROOM,
+                user_id.as_bytes(),
+                enc("notices room encode", room_id)?,
+            );
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::SetRoomBlocked {
+            room_id,
+            blocked,
+            by,
+            ts,
+        } => {
+            let key = room_id.as_bytes();
+            if *blocked {
+                ctx.put(
+                    T_ROOM_BLOCKED,
+                    key,
+                    enc(
+                        "blocked room encode",
+                        &BlockedRoom {
+                            by: by.clone(),
+                            ts: *ts,
+                        },
+                    )?,
+                );
+            } else {
+                // Unblocking an unblocked room is a no-op, not an error:
+                // the operator's intent ("this room is open") holds either
+                // way, and a 404 here would only invite a retry loop.
+                ctx.delete(T_ROOM_BLOCKED, key);
+            }
+            Ok(UserResponse::Ok)
+        }
         UserCommand::SetErased { user_id } => {
             let ukey = user_id.as_bytes();
             let Some(mut account): Option<Account> =
@@ -1580,6 +1615,33 @@ impl UserStore {
             let token = String::from_utf8(k)
                 .map_err(|_| StoreError::Engine("registration token not UTF-8".into()))?;
             out.push((token, dec("reg token decode", &v)?));
+        }
+        Ok(out)
+    }
+
+    /// The room carrying this user's server notices, if one has been
+    /// created.
+    pub fn notices_room(&self, user_id: &str) -> StoreResult<Option<String>> {
+        self.get_typed("notices room decode", T_NOTICES_ROOM, user_id.as_bytes())
+    }
+
+    /// Why a room is closed to joins, or `None` if it is open. On the
+    /// latency path of every join, local and federated, so it is a point
+    /// lookup and nothing more.
+    pub fn blocked_room(&self, room_id: &str) -> StoreResult<Option<BlockedRoom>> {
+        self.get_typed("blocked room decode", T_ROOM_BLOCKED, room_id.as_bytes())
+    }
+
+    /// Every blocked room, id-ordered. Unpaginated: this is an
+    /// operator-curated set, and one large enough to matter is its own
+    /// problem. It is also the only way to see blocks on rooms this server
+    /// does not host, which have no row in the room shard to list.
+    pub fn blocked_rooms(&self) -> StoreResult<Vec<(String, BlockedRoom)>> {
+        let mut out = Vec::new();
+        for (k, v) in self.read.range(T_ROOM_BLOCKED, &[], &[])? {
+            let room_id = String::from_utf8(k)
+                .map_err(|_| StoreError::Engine("blocked room id not UTF-8".into()))?;
+            out.push((room_id, dec("blocked room decode", &v)?));
         }
         Ok(out)
     }

@@ -19,6 +19,10 @@ fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
     StoreError::Engine(format!("{what}: {e}"))
 }
 
+/// One page of [`RoomStore::rooms`]: the rows, and the start key of the
+/// page after this one (`None` on the last page).
+pub type RoomPage = (Vec<(String, RoomMeta)>, Option<String>);
+
 fn enc<T: serde::Serialize>(what: &str, v: &T) -> StoreResult<Vec<u8>> {
     postcard::to_stdvec(v).map_err(|e| codec_err(what, e))
 }
@@ -678,6 +682,35 @@ impl RoomStore {
             Some(b) => Ok(Some(dec("room meta decode", &b)?)),
             None => Ok(None),
         }
+    }
+
+    /// One page of hosted rooms in room-id order, starting at `from`
+    /// (inclusive) — for the admin room list. Bounded by construction, for
+    /// the same reason [`UserStore::accounts`] is: enumeration is not a
+    /// whole-table materialization.
+    ///
+    /// [`UserStore::accounts`]: saltator_userserver::UserStore::accounts
+    pub fn rooms(&self, from: Option<&str>, limit: usize) -> StoreResult<RoomPage> {
+        // The extra row is the next page's start key, not a result.
+        let rows = self.read.scan(
+            T_ROOM,
+            from.unwrap_or("").as_bytes(),
+            &[],
+            limit.saturating_add(1),
+            false,
+        )?;
+        let mut out = Vec::with_capacity(rows.len().min(limit));
+        let mut next = None;
+        for (i, (k, v)) in rows.into_iter().enumerate() {
+            let room_id =
+                String::from_utf8(k).map_err(|_| StoreError::Engine("room id not UTF-8".into()))?;
+            if i == limit {
+                next = Some(room_id);
+                break;
+            }
+            out.push((room_id, dec("room meta decode", &v)?));
+        }
+        Ok((out, next))
     }
 
     pub fn group(&self, room_id: &str, group: u64) -> StoreResult<Option<StateGroup>> {

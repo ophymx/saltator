@@ -341,11 +341,67 @@ above); until then this is documentation, not code.
 *shutdown* (kick local members, block re-join), **not purge**. Purge
 fights the append-only event log and the snapshot path, and
 `RoomCommand` (`crates/saltator-roomserver/src/types.rs:141`) has no
-deletion primitive at all. Deferred (decision 4).
+deletion primitive at all. Deferred (decision 4). Plus
+`PUT /rooms/{id}/block` (the block is reversible, and worth having
+without a shutdown) and `GET /blocked_rooms`.
+
+Five things settled while building slice 5:
+
+- **The block is user-shard state (`T_ROOM_BLOCKED`), not room-shard.**
+  It has to apply to rooms this server does *not* host — there is no room
+  row to hang it on, and a remote room the local users keep rejoining is
+  exactly what an operator blocks. It also puts the flag somewhere both
+  surfaces can read: `FedState` already holds a `UserServer`, and the
+  user shard is already where server-global room metadata lives (the
+  public directory, the alias table).
+- **Enforced on six entry points**, because a block enforced on one side
+  is not a block: CS join and knock, and federated `make_join`,
+  `send_join`, `send_knock` and inbound `/invite`. Refusing our own
+  clients while still serving the room to every other server would be
+  theatre. Invite is included deliberately — it is the other way in.
+- **Block first, then kick.** Kicking first leaves a window in which the
+  user just removed walks straight back in.
+- **Members leave as themselves; the admin does not kick them.** An
+  administrator holds no power level in a room they are not in, so a kick
+  would have to either fail auth or bypass it. Leaving is the one
+  membership change every member may always make. The response reports
+  the outcome per member: a partial shutdown is a real outcome, and the
+  operator needs to know who is still in there.
+- **Blocking a remote room contains, it does not evict.** Local members
+  of a room we do not host stay in it: evicting them means a
+  `make_leave`/`send_leave` each, and *finding* them means a room → users
+  index the user shard does not have (memberships are keyed user-first,
+  `T_MEMBERSHIP`). Shutdown therefore refuses non-hosted rooms outright
+  and says so, rather than half-working. The index is the prerequisite if
+  this is ever wanted.
 
 **Server notices** — a server-owned room per user, created on demand and
-reused, for delivering operator messages. Small, and the natural
+reused, for delivering operator messages
+(`POST /users/{id}/notice`, body `{content}`). Small, and the natural
 delivery channel for everything above.
+
+The mechanism is deliberately ordinary: a server-owned account creates a
+normal room, invites the user, and sends a normal message, so every
+existing client renders it and nothing about federation, push or sync
+needs a special case. The only new state is `T_NOTICES_ROOM`
+(`user_id → room_id`) — without it the second notice would open a second
+room. Four decisions worth recording:
+
+- **The room is one-way.** `events_default` sits above `users_default`,
+  so the recipient reads and cannot post. A support channel nobody is
+  reading is worse than no channel; this is a notice board.
+- **Leaving is allowed, and the next notice re-invites.** Membership is
+  checked before each send, because a notice delivered into a room the
+  user has left is not a notice.
+- **Off by default, and the localpart is reserved when on.** Enabling it
+  creates an account, which an operator should name rather than inherit.
+  Once named, `/register` and `/register/available` refuse that
+  localpart: a user holding `@notices:…` would receive other people's
+  notices and could send what looks like server mail. The account is
+  created lazily on the first notice and is passwordless, so there is no
+  credential to log in with.
+- **The room is recorded last.** A room id stored before the room is
+  habitable would be reused in that state by every later notice.
 
 **Cluster** — `POST /cluster/nodes/{id}/drain` and the matching
 `GET /cluster/nodes`, which is where the interlude's owed work lands:

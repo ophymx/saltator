@@ -25,6 +25,42 @@ fn err(
 
 type FedResult = Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)>;
 
+/// Refuse an inbound membership handshake into a room an administrator has
+/// closed (docs/design-admin-identity.md slice 5).
+///
+/// The resident side has to enforce this, not just the client API: a block
+/// that only stopped our own users would leave the room reachable through
+/// us by every other server on the federation. The state lives in the user
+/// shard so both surfaces can read it without either owning the other.
+///
+/// No user shard wired (key-only deployments) means no blocks exist to
+/// enforce.
+fn refuse_if_blocked(
+    state: &FedState,
+    room_id: &str,
+) -> Result<(), (StatusCode, axum::Json<serde_json::Value>)> {
+    let blocked = state
+        .users
+        .as_ref()
+        .is_some_and(|users| users.store().blocked_room(room_id).ok().flatten().is_some());
+    if blocked {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "This room has been blocked by a server administrator",
+        ));
+    }
+    Ok(())
+}
+
+/// The `room_id` of a membership event body, for the block check.
+fn event_room_id(raw: &CanonicalJsonObject) -> Option<&str> {
+    match raw.get("room_id") {
+        Some(CanonicalJsonValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 /// A `send_join`/`send_leave` body must be an `m.room.member` event with
 /// the expected membership and `state_key == sender`; anything else is
 /// rejected with 400 (spec: these endpoints only accept the corresponding
@@ -79,6 +115,7 @@ pub async fn make_knock(
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad room id"))?;
     let user = ruma::UserId::parse(&user_id)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad user id"))?;
+    refuse_if_blocked(&state, room.as_str())?;
 
     match rooms.make_knock_template(&room, &user) {
         Ok((version, template)) => Ok(axum::Json(serde_json::json!({
@@ -135,6 +172,9 @@ pub async fn send_knock(
     // spec: /send_knock accepts only an m.room.member knock with
     // state_key == sender; anything else is a 400.
     require_membership_event(&raw, "knock")?;
+    if let Some(room_id) = event_room_id(&raw) {
+        refuse_if_blocked(&state, room_id)?;
+    }
 
     match rooms.send_knock(raw).await {
         Ok(result) => Ok(axum::Json(serde_json::json!({
@@ -160,6 +200,7 @@ pub async fn make_join(
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad room id"))?;
     let user = ruma::UserId::parse(&user_id)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad user id"))?;
+    refuse_if_blocked(&state, room.as_str())?;
 
     match rooms.make_join_template(&room, &user) {
         Ok((version, template)) => Ok(axum::Json(serde_json::json!({
@@ -266,6 +307,11 @@ async fn send_join_apply(
         }
     };
     require_membership_event(&raw, "join")?;
+    // From the event, not the path: the event is what gets applied, and
+    // the two are not checked against each other here.
+    if let Some(room_id) = event_room_id(&raw) {
+        refuse_if_blocked(&state, room_id)?;
+    }
 
     match rooms.send_join(raw).await {
         Ok(result) => Ok(serde_json::json!({
@@ -489,6 +535,11 @@ pub async fn invite(
         .map_err(|_| invalid("state_key is not a user id"))?;
     if invitee.server_name() != state.server_name {
         return Err(invalid("invited user is not on this server"));
+    }
+    // An invite is the other way into a room. Refusing joins but signing
+    // invites would leave the block one click from useless.
+    if let Some(room_id) = event_room_id(&event) {
+        refuse_if_blocked(&state, room_id)?;
     }
 
     // Verify the origin's signature on the event.

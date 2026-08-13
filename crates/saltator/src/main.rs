@@ -444,6 +444,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             },
             allow_internal_fetch: cfg.client.allow_internal_fetch,
             admin_users,
+            server_notices_localpart: cfg.client.server_notices_localpart.clone(),
         },
     )
     .with_federation(fed_client.clone(), signer.clone(), key_cache.clone())

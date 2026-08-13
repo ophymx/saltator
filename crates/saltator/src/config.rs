@@ -93,6 +93,14 @@ pub struct ClientConfig {
     /// has no admin account and no way to grant one from inside.
     #[serde(default)]
     pub admin_users: Vec<String>,
+    /// Localpart of the account that delivers server notices (e.g.
+    /// `notices`). Unset disables the feature.
+    ///
+    /// Setting it creates and reserves that account on first use: the
+    /// localpart is refused to `/register` from then on, so nobody can
+    /// take the name and send what looks like server mail.
+    #[serde(default)]
+    pub server_notices_localpart: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -107,6 +115,7 @@ impl Default for ClientConfig {
             allow_internal_fetch: false,
             appservice_registration_dir: None,
             admin_users: Vec::new(),
+            server_notices_localpart: None,
         }
     }
 }

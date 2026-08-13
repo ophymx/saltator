@@ -7,4 +7,6 @@
 pub(crate) mod admin;
 pub(crate) mod auth;
 pub(crate) mod e2ee;
+pub(crate) mod notices;
+pub(crate) mod room_admin;
 pub(crate) mod uia;

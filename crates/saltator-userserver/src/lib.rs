@@ -27,9 +27,9 @@ use saltator_store::Keyspace;
 
 pub use machine::{UserApp, UserStore};
 pub use types::{
-    Account, AccountDataEntry, AccountState, AliasEntry, BackupVersionMeta, ClaimRequest,
-    ClaimedKey, Device, KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry, OutboundEdu,
-    Profile, RegToken, SessionCmd, ToDeviceMessage, TokenEntry, TokenKind, UiaSession,
+    Account, AccountDataEntry, AccountState, AliasEntry, BackupVersionMeta, BlockedRoom,
+    ClaimRequest, ClaimedKey, Device, KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry,
+    OutboundEdu, Profile, RegToken, SessionCmd, ToDeviceMessage, TokenEntry, TokenKind, UiaSession,
     UserChangePayload, UserCommand, UserResponse,
 };
 
@@ -48,10 +48,11 @@ pub use types::{
 /// (docs/design-admin-identity.md). The migration rewrites every
 /// `T_ACCOUNT` row in place; no cross-shard coordination, so no gate.
 ///
-/// Still v3 after slices 3 and 4: both only *added* tables (UIA sessions,
-/// registration tokens, identity links). A new table starts empty and no
-/// existing row changes shape, so there is nothing for a migration to do
-/// — the version tracks layout changes to data that already exists.
+/// Still v3 after slices 3, 4 and 5: each only *added* tables (UIA
+/// sessions, registration tokens, identity links, blocked rooms, notices
+/// rooms). A new table starts empty and no existing row changes shape, so
+/// there is nothing for a migration to do — the version tracks layout
+/// changes to data that already exists.
 pub const SCHEMA_VERSION: u32 = 3;
 
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
@@ -842,6 +843,27 @@ impl UserServer {
     pub async fn set_erased(&self, user_id: &UserId) -> Result<()> {
         self.lifecycle(&UserCommand::SetErased {
             user_id: user_id.to_string(),
+        })
+        .await
+    }
+
+    /// Remember the room carrying a user's server notices.
+    pub async fn set_notices_room(&self, user_id: &UserId, room_id: &str) -> Result<()> {
+        self.expect_ok(&UserCommand::SetNoticesRoom {
+            user_id: user_id.to_string(),
+            room_id: room_id.to_owned(),
+        })
+        .await
+    }
+
+    /// Close a room to joins, or reopen it. `by` is the acting
+    /// administrator, kept for the audit trail.
+    pub async fn set_room_blocked(&self, room_id: &str, blocked: bool, by: &UserId) -> Result<()> {
+        self.expect_ok(&UserCommand::SetRoomBlocked {
+            room_id: room_id.to_owned(),
+            blocked,
+            by: by.to_string(),
+            ts: now_ms(),
         })
         .await
     }

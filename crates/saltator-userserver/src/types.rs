@@ -117,6 +117,22 @@ pub const T_EXTERNAL_ID: u8 = APP_TABLE_FIRST + 27;
 /// bolted its equivalent on later as a background update; ours is written
 /// in the same batch as the forward row, so the two cannot drift.
 pub const T_EXTERNAL_ID_USER: u8 = APP_TABLE_FIRST + 28;
+/// `room_id → BlockedRoom` — rooms an administrator has closed to joins
+/// (docs/design-admin-identity.md slice 5).
+///
+/// Server-global room metadata, so it lives here beside the public
+/// directory ([`T_DIRECTORY`]) and the alias table rather than in the room
+/// shard. Two reasons: a block must apply to rooms this server does *not*
+/// host (there is no room row to hang it on, and a remote room the local
+/// users keep rejoining is exactly what an operator blocks), and the
+/// federation surface holds a `UserServer` but reaches room state only
+/// through the pipeline it is trying to refuse.
+pub const T_ROOM_BLOCKED: u8 = APP_TABLE_FIRST + 29;
+/// `user_id → room_id` — the server-notices room for a user
+/// (docs/design-admin-identity.md slice 5). One per user, created on the
+/// first notice and reused forever: remembering it is what stops the
+/// second notice opening a second room.
+pub const T_NOTICES_ROOM: u8 = APP_TABLE_FIRST + 30;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -270,6 +286,18 @@ impl RegToken {
         self.expiry_ts.is_none_or(|e| now < e)
             && self.uses_allowed.is_none_or(|allowed| self.used < allowed)
     }
+}
+
+/// A room closed to joins by an administrator ([`T_ROOM_BLOCKED`]).
+///
+/// Presence in the table is the fact; the fields are the audit trail an
+/// operator needs six months later, when the only question is who did
+/// this and when.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockedRoom {
+    /// The administrator who blocked it.
+    pub by: String,
+    pub ts: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,6 +751,24 @@ pub enum UserCommand {
     UnlinkExternalId {
         user_id: String,
         auth_provider: String,
+    },
+    /// Remember which room carries a user's server notices. Written once,
+    /// just after the room is created; the room itself is ordinary state
+    /// in the room shard.
+    SetNoticesRoom {
+        user_id: String,
+        room_id: String,
+    },
+    /// Admin: close a room to joins, or reopen it
+    /// (docs/design-admin-identity.md slice 5). Takes a room id rather
+    /// than requiring the room to exist locally — blocking a room this
+    /// server does not host is the point.
+    SetRoomBlocked {
+        room_id: String,
+        blocked: bool,
+        /// The acting administrator, recorded for the audit trail.
+        by: String,
+        ts: u64,
     },
 }
 

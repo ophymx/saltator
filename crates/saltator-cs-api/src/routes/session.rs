@@ -84,6 +84,21 @@ pub async fn register(
         Some(u) => u.clone(),
         None => random_localpart(),
     };
+    // The server-notices account is the server's own voice. If a user
+    // could register that localpart they would receive other people's
+    // notices and be able to send what looks like server mail.
+    if state
+        .config
+        .server_notices_localpart
+        .as_deref()
+        .is_some_and(|reserved| reserved == localpart)
+    {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "M_USER_IN_USE",
+            "Desired user ID is already taken",
+        ));
+    }
     // The UIA session is bound to the account being created, so a flow
     // completed for one username cannot be spent on another.
     let request_id = format!("register:{localpart}");
@@ -158,10 +173,16 @@ pub async fn register_available(
     }
     let user_id = state.users.canonical_user_id(&req.username)?;
     let store = state.users.store();
-    if store
-        .account(user_id.as_str())
-        .map_err(ApiError::internal)?
-        .is_some()
+    let reserved = state
+        .config
+        .server_notices_localpart
+        .as_deref()
+        .is_some_and(|reserved| reserved == user_id.localpart());
+    if reserved
+        || store
+            .account(user_id.as_str())
+            .map_err(ApiError::internal)?
+            .is_some()
     {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
