@@ -47,6 +47,11 @@ pub use types::{
 /// admin flag and an erasure marker, replacing the `deactivated` bool
 /// (docs/design-admin-identity.md). The migration rewrites every
 /// `T_ACCOUNT` row in place; no cross-shard coordination, so no gate.
+///
+/// Still v3 after slices 3 and 4: both only *added* tables (UIA sessions,
+/// registration tokens, identity links). A new table starts empty and no
+/// existing row changes shape, so there is nothing for a migration to do
+/// — the version tracks layout changes to data that already exists.
 pub const SCHEMA_VERSION: u32 = 3;
 
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
@@ -84,6 +89,8 @@ pub enum UserError {
     InvalidToken,
     #[error("registration token already exists")]
     TokenExists,
+    #[error("that external identity is already linked to {0}")]
+    ExternalIdInUse(String),
     #[error("alias already exists")]
     AliasExists,
     #[error("shard: {0}")]
@@ -837,6 +844,50 @@ impl UserServer {
             user_id: user_id.to_string(),
         })
         .await
+    }
+
+    // -- identity links (docs/design-admin-identity.md slice 4) -----------
+
+    /// Link an account to its subject at an external identity provider.
+    ///
+    /// Writable before any provider is configured — pre-linking accounts
+    /// and *then* enabling the IdP is the migration path that avoids a
+    /// flag day, and it is why this lands before any OIDC code exists.
+    pub async fn link_external_id(
+        &self,
+        user_id: &UserId,
+        auth_provider: &str,
+        external_id: &str,
+    ) -> Result<()> {
+        match self
+            .propose(&UserCommand::LinkExternalId {
+                user_id: user_id.to_string(),
+                auth_provider: auth_provider.to_owned(),
+                external_id: external_id.to_owned(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            UserResponse::InvalidState => Err(UserError::InvalidState),
+            UserResponse::ExternalIdInUse(owner) => Err(UserError::ExternalIdInUse(owner)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Drop an account's link to one provider.
+    pub async fn unlink_external_id(&self, user_id: &UserId, auth_provider: &str) -> Result<()> {
+        match self
+            .propose(&UserCommand::UnlinkExternalId {
+                user_id: user_id.to_string(),
+                auth_provider: auth_provider.to_owned(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
     }
 
     /// Propose a lifecycle command, mapping the two ways it can decline.

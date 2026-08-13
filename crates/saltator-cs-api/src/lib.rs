@@ -64,6 +64,15 @@ pub struct CsConfig {
     pub admin_users: Vec<OwnedUserId>,
 }
 
+/// The credential providers this server offers, and the single place the
+/// list is built. A constant rather than a config field because local
+/// passwords are the only credential the server can verify today — the
+/// OIDC slice replaces this with a list derived from its config block,
+/// and everything downstream (`GET /login`, the login path) already reads
+/// from here (docs/design-admin-identity.md slice 4).
+const AUTH_PROVIDERS: &[services::auth::AuthProvider] =
+    &[services::auth::AuthProvider::LocalPassword];
+
 /// Shared state of every CS route.
 pub struct CsState {
     pub users: Arc<UserServer>,
@@ -203,6 +212,15 @@ impl CsState {
     /// The user-interactive-auth service.
     pub(crate) fn uia(&self) -> services::uia::Uia<'_> {
         services::uia::Uia { users: &self.users }
+    }
+
+    /// The authentication service: login flows and credential
+    /// verification (docs/design-admin-identity.md slice 4).
+    pub(crate) fn authn(&self) -> services::auth::Authn<'_> {
+        services::auth::Authn {
+            users: &self.users,
+            providers: AUTH_PROVIDERS,
+        }
     }
 
     /// The E2EE/device-list domain service over this state's shards.
@@ -609,6 +627,14 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_saltator/admin/v1/users/{user_id}/devices/{device_id}",
             delete(admin::delete_device),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/external_ids/{auth_provider}",
+            put(admin::link_external_id).delete(admin::unlink_external_id),
+        )
+        .route(
+            "/_saltator/admin/v1/auth_providers/{auth_provider}/users/{external_id}",
+            get(admin::lookup_external_id),
         )
         .route(
             "/_saltator/admin/v1/registration_tokens",

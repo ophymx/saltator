@@ -5,5 +5,6 @@
 //! logic moves here when touched).
 
 pub(crate) mod admin;
+pub(crate) mod auth;
 pub(crate) mod e2ee;
 pub(crate) mod uia;

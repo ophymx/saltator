@@ -5,14 +5,15 @@ use saltator_shard::{ApplyCtx, ReadCtx, ShardApp};
 use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
-    account_data_key, device_scoped_key, prefix_end, to_device_key, user_key, Account,
-    AccountDataEntry, AccountState, AccountV2, AliasEntry, BackupVersionMeta, ClaimedKey, Device,
-    FallbackEntry, KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, RegToken,
+    account_data_key, device_scoped_key, external_key, prefix_end, to_device_key, user_key,
+    Account, AccountDataEntry, AccountState, AccountV2, AliasEntry, BackupVersionMeta, ClaimedKey,
+    Device, FallbackEntry, KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, RegToken,
     SessionCmd, TokenEntry, TokenKind, UiaSession, UserChangePayload, UserCommand, UserResponse,
     T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR,
-    T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_EDU_OUTBOX, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE,
-    T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_REG_TOKEN, T_TOKEN,
-    T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
+    T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_EDU_OUTBOX, T_EXTERNAL_ID, T_EXTERNAL_ID_USER,
+    T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA, T_MEMBERSHIP, T_ONE_TIME_KEY,
+    T_PROFILE, T_PUSHER, T_REG_TOKEN, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX,
+    T_UIA_SESSION, T_UIA_SESSION_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -1189,6 +1190,64 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             ctx.delete(T_REG_TOKEN, token.as_bytes());
             Ok(UserResponse::Ok)
         }
+        UserCommand::LinkExternalId {
+            user_id,
+            auth_provider,
+            external_id,
+        } => {
+            let ukey = user_id.as_bytes();
+            let Some(account): Option<Account> = get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            // A deactivated account is terminal. Linking one would stage a
+            // credential for an identity that is meant to be gone — and
+            // the link would still be there when the IdP is switched on.
+            if account.state == AccountState::Deactivated {
+                return Ok(UserResponse::InvalidState);
+            }
+            let fwd = external_key(auth_provider, external_id);
+            if let Some(owner) = ctx.get(T_EXTERNAL_ID, &fwd)? {
+                let owner: String = dec("external id owner decode", &owner)?;
+                if owner != *user_id {
+                    return Ok(UserResponse::ExternalIdInUse(owner));
+                }
+            }
+            // Relinking replaces: drop the subject this account used to
+            // hold at this provider, or the forward row would outlive the
+            // reverse one and keep the old subject reserved forever.
+            let rev = user_key(user_id, auth_provider);
+            if let Some(prev) = ctx.get(T_EXTERNAL_ID_USER, &rev)? {
+                let prev: String = dec("external id decode", &prev)?;
+                if prev != *external_id {
+                    ctx.delete(T_EXTERNAL_ID, &external_key(auth_provider, &prev));
+                }
+            }
+            ctx.put(
+                T_EXTERNAL_ID,
+                &fwd,
+                enc("external id owner encode", user_id)?,
+            );
+            ctx.put(
+                T_EXTERNAL_ID_USER,
+                &rev,
+                enc("external id encode", external_id)?,
+            );
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::UnlinkExternalId {
+            user_id,
+            auth_provider,
+        } => {
+            let rev = user_key(user_id, auth_provider);
+            let Some(external_id) = ctx.get(T_EXTERNAL_ID_USER, &rev)? else {
+                return Ok(UserResponse::NotFound);
+            };
+            let external_id: String = dec("external id decode", &external_id)?;
+            ctx.delete(T_EXTERNAL_ID, &external_key(auth_provider, &external_id));
+            ctx.delete(T_EXTERNAL_ID_USER, &rev);
+            Ok(UserResponse::Ok)
+        }
         UserCommand::SetErased { user_id } => {
             let ukey = user_id.as_bytes();
             let Some(mut account): Option<Account> =
@@ -1521,6 +1580,38 @@ impl UserStore {
             let token = String::from_utf8(k)
                 .map_err(|_| StoreError::Engine("registration token not UTF-8".into()))?;
             out.push((token, dec("reg token decode", &v)?));
+        }
+        Ok(out)
+    }
+
+    /// The account linked to `(auth_provider, external_id)`, if any — the
+    /// lookup an IdP callback will do, and the one the admin API exposes
+    /// so an operator can answer "who is this subject?".
+    pub fn external_id_owner(
+        &self,
+        auth_provider: &str,
+        external_id: &str,
+    ) -> StoreResult<Option<String>> {
+        self.get_typed(
+            "external id owner decode",
+            T_EXTERNAL_ID,
+            &external_key(auth_provider, external_id),
+        )
+    }
+
+    /// Every `(auth_provider, external_id)` this account is linked to, in
+    /// provider order. Unpaginated: the row count is the number of
+    /// identity providers a deployment runs, not user data.
+    pub fn external_ids(&self, user_id: &str) -> StoreResult<Vec<(String, String)>> {
+        let start = user_key(user_id, "");
+        let mut out = Vec::new();
+        for (k, v) in self
+            .read
+            .range(T_EXTERNAL_ID_USER, &start, &user_end(user_id))?
+        {
+            let provider = String::from_utf8(k[start.len()..].to_vec())
+                .map_err(|_| StoreError::Engine("auth provider not UTF-8".into()))?;
+            out.push((provider, dec("external id decode", &v)?));
         }
         Ok(out)
     }

@@ -103,6 +103,20 @@ pub const T_UIA_SESSION: u8 = APP_TABLE_FIRST + 24;
 pub const T_UIA_SESSION_IDX: u8 = APP_TABLE_FIRST + 25;
 /// `token → RegToken` — registration tokens.
 pub const T_REG_TOKEN: u8 = APP_TABLE_FIRST + 26;
+/// `auth_provider ++ 0x00 ++ external_id → user_id` — the identity link
+/// table (docs/design-admin-identity.md slice 4). Uniqueness is on the
+/// key: one subject at one provider maps to exactly one account.
+///
+/// `auth_provider` is a stable opaque key, never a display name — Synapse
+/// carries a grandfathered `oidc-` prefix precisely because renaming a
+/// provider would otherwise orphan every linked account.
+pub const T_EXTERNAL_ID: u8 = APP_TABLE_FIRST + 27;
+/// `user_id ++ 0x00 ++ auth_provider → external_id` — the reverse index
+/// over [`T_EXTERNAL_ID`], so "what is this account linked to" and
+/// "unlink this provider" are lookups rather than table scans. Synapse
+/// bolted its equivalent on later as a background update; ours is written
+/// in the same batch as the forward row, so the two cannot drift.
+pub const T_EXTERNAL_ID_USER: u8 = APP_TABLE_FIRST + 28;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -111,6 +125,15 @@ pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
     k.push(0);
     k.extend_from_slice(rest.as_bytes());
     k
+}
+
+/// Forward link key: `auth_provider ++ 0x00 ++ external_id`. The provider
+/// goes first because it is the half with a bounded vocabulary, and
+/// because it is NUL-free (validated at the admin boundary) the first NUL
+/// is unambiguously the separator — two different pairs cannot encode to
+/// the same key.
+pub(crate) fn external_key(auth_provider: &str, external_id: &str) -> Vec<u8> {
+    user_key(auth_provider, external_id)
 }
 
 /// Device-scoped key: `user_id ++ 0x00 ++ device_id ++ 0x00 ++ rest`
@@ -679,6 +702,28 @@ pub enum UserCommand {
     DeleteRegistrationToken {
         token: String,
     },
+    /// Link an account to its subject at an external identity provider
+    /// (docs/design-admin-identity.md slice 4). Writes both index rows in
+    /// one batch.
+    ///
+    /// Deliberately writable before any provider is configured: an
+    /// operator pre-links accounts, *then* turns the IdP on, which is the
+    /// migration path that avoids a flag day. Nothing reads these rows
+    /// until the OIDC slice.
+    ///
+    /// Relinking the same `(user, provider)` to a new subject replaces the
+    /// link, forward row included. Claiming a subject another account
+    /// already holds is refused ([`UserResponse::ExternalIdInUse`]).
+    LinkExternalId {
+        user_id: String,
+        auth_provider: String,
+        external_id: String,
+    },
+    /// Drop the link between an account and one provider.
+    UnlinkExternalId {
+        user_id: String,
+        auth_provider: String,
+    },
 }
 
 /// A stored one-time key ([`T_ONE_TIME_KEY`]) with its upload slot:
@@ -811,6 +856,11 @@ pub enum UserResponse {
     InvalidToken,
     /// A registration token with this value already exists.
     TokenExists,
+    /// The `(auth_provider, external_id)` pair is already linked to a
+    /// different account. Carries the owner so an operator is told which
+    /// one without a second lookup — they are already privileged enough
+    /// to enumerate every account.
+    ExternalIdInUse(String),
 }
 
 /// Change-stream payload of the user shard: something about `user_id`

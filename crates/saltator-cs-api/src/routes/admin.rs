@@ -1,5 +1,6 @@
-//! The admin API (`/_saltator/admin/v1`) — account inspection and
-//! lifecycle (docs/design-admin-identity.md slices 1 and 2).
+//! The admin API (`/_saltator/admin/v1`) — account inspection, lifecycle,
+//! registration tokens and identity links
+//! (docs/design-admin-identity.md slices 1–4).
 //!
 //! These are not Matrix endpoints and carry no ruma types: the request
 //! and response shapes are ours, hand-rolled like `/capabilities`. Errors
@@ -209,6 +210,72 @@ pub async fn delete_device(
             .admin()
             .delete_devices(&target, Some(&device_id))
             .await?,
+    )
+}
+
+// -- identity links (slice 4) --------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LinkBody {
+    /// The provider's own identifier for this user (an OIDC `sub`, say).
+    external_id: String,
+}
+
+/// `PUT /_saltator/admin/v1/users/{user_id}/external_ids/{auth_provider}`
+///
+/// Idempotent, and a re-link to a different subject replaces the old one.
+pub async fn link_external_id(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path((user_id, auth_provider)): Path<(String, String)>,
+    axum::Json(body): axum::Json<LinkBody>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    tracing::info!(
+        admin = %auth.user_id(), %target, provider = %auth_provider,
+        "admin: link external identity"
+    );
+    detail_response(
+        state
+            .admin()
+            .link_external_id(&target, &auth_provider, &body.external_id)
+            .await?,
+    )
+}
+
+/// `DELETE /_saltator/admin/v1/users/{user_id}/external_ids/{auth_provider}`
+pub async fn unlink_external_id(
+    State(state): State<Arc<CsState>>,
+    auth: AdminAuth,
+    Path((user_id, auth_provider)): Path<(String, String)>,
+) -> Result<axum::Json<serde_json::Value>> {
+    let target = target(&user_id)?;
+    tracing::info!(
+        admin = %auth.user_id(), %target, provider = %auth_provider,
+        "admin: unlink external identity"
+    );
+    detail_response(
+        state
+            .admin()
+            .unlink_external_id(&target, &auth_provider)
+            .await?,
+    )
+}
+
+/// `GET /_saltator/admin/v1/auth_providers/{auth_provider}/users/{external_id}`
+///
+/// The reverse lookup. The external id is a path segment, so a subject
+/// containing `/` has to be percent-encoded — which is what an opaque
+/// identifier in a URL always requires.
+pub async fn lookup_external_id(
+    State(state): State<Arc<CsState>>,
+    _auth: AdminAuth,
+    Path((auth_provider, external_id)): Path<(String, String)>,
+) -> Result<axum::Json<serde_json::Value>> {
+    detail_response(
+        state
+            .admin()
+            .lookup_external_id(&auth_provider, &external_id)?,
     )
 }
 

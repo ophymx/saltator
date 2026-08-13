@@ -10282,3 +10282,129 @@ async fn uia_session_does_not_cross_endpoints() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+// -- identity links (docs/design-admin-identity.md slice 4) ---------------
+
+/// The link surface is admin-only, like everything else under
+/// `/_saltator/admin`: an ordinary account authenticates and is refused.
+#[tokio::test]
+async fn link_endpoints_are_admin_only() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let mallory = env.register("mallory", "pw-12345678").await;
+
+    for (method, path, body) in [
+        (
+            "PUT",
+            "/_saltator/admin/v1/users/@mallory:hs.test/external_ids/oidc-keycloak",
+            Some(json!({"external_id": "sub-1"})),
+        ),
+        (
+            "DELETE",
+            "/_saltator/admin/v1/users/@mallory:hs.test/external_ids/oidc-keycloak",
+            None,
+        ),
+        (
+            "GET",
+            "/_saltator/admin/v1/auth_providers/oidc-keycloak/users/sub-1",
+            None,
+        ),
+    ] {
+        let (status, resp) = env.req(method, path, Some(&mallory), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {resp}");
+    }
+    env.shutdown().await;
+}
+
+/// A link written through the API shows up on the account and by reverse
+/// lookup, and unlinking clears both views. The subject carries a `/` to
+/// prove the path form survives percent-encoding — opaque IdP subjects
+/// are not URL-safe by nature.
+#[tokio::test]
+async fn external_ids_round_trip_through_the_admin_api() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    env.register("alice", "pw-12345678").await;
+    const LINK: &str = "/_saltator/admin/v1/users/@alice:hs.test/external_ids/oidc-keycloak";
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            LINK,
+            Some(&root),
+            Some(json!({"external_id": "sub/1"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["external_ids"][0]["auth_provider"], "oidc-keycloak");
+    assert_eq!(body["external_ids"][0]["external_id"], "sub/1");
+
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_saltator/admin/v1/auth_providers/oidc-keycloak/users/sub%2F1",
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@alice:hs.test");
+
+    let (status, body) = env.req("DELETE", LINK, Some(&root), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["external_ids"].as_array().unwrap().len(), 0);
+
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_saltator/admin/v1/auth_providers/oidc-keycloak/users/sub%2F1",
+            Some(&root),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    env.shutdown().await;
+}
+
+/// Two accounts cannot hold the same subject at one provider: the second
+/// write is a conflict that names the holder.
+#[tokio::test]
+async fn linking_a_taken_subject_is_a_conflict() {
+    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
+    let root = env.register("root", "pw-12345678").await;
+    env.register("alice", "pw-12345678").await;
+    env.register("bob", "pw-12345678").await;
+
+    async fn link(env: &Env, user: &str, token: &str) -> (StatusCode, Value) {
+        env.req(
+            "PUT",
+            &format!("/_saltator/admin/v1/users/{user}/external_ids/oidc-keycloak"),
+            Some(token),
+            Some(json!({"external_id": "sub-1"})),
+        )
+        .await
+    }
+    let (status, body) = link(&env, "@alice:hs.test", &root).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = link(&env, "@bob:hs.test", &root).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("@alice:hs.test"),
+        "{body}"
+    );
+    env.shutdown().await;
+}
+
+/// `GET /login` derives its flows from the configured providers now
+/// rather than a literal. With only local passwords configured the wire
+/// shape must be exactly what it was.
+#[tokio::test]
+async fn login_flows_advertise_password() {
+    let env = start_env().await;
+    let (status, body) = env.req("GET", "/_matrix/client/v3/login", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let flows = body["flows"].as_array().unwrap();
+    assert_eq!(flows.len(), 1, "{body}");
+    assert_eq!(flows[0]["type"], "m.login.password");
+    env.shutdown().await;
+}

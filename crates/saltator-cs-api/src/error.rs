@@ -188,6 +188,12 @@ impl From<UserError> for ApiError {
             UserError::TokenExists => {
                 Self::new(StatusCode::CONFLICT, "M_INVALID_PARAM", e.to_string())
             }
+            // Naming the current owner is safe here: only an administrator
+            // can reach a link write, and they can already list every
+            // account.
+            UserError::ExternalIdInUse(_) => {
+                Self::new(StatusCode::CONFLICT, "M_INVALID_PARAM", e.to_string())
+            }
             UserError::AliasExists => {
                 Self::new(StatusCode::CONFLICT, "M_UNKNOWN", "Alias already exists")
             }

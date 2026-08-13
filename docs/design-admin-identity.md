@@ -186,6 +186,28 @@ Two rules that come straight from Synapse's scar tissue:
   internal-now/OIDC-later story, so the admin write path lands in this
   step even though nothing reads the table until the OIDC slice.
 
+Three lifecycle questions the sketch above did not answer, resolved while
+building slice 4:
+
+- **Relinking replaces, and releases the old subject.** Writing a new
+  subject for a `(user, provider)` that already has one deletes the
+  superseded forward row in the same batch. Keeping it would reserve a
+  subject that no account claims and no operator can find — the reverse
+  index exists precisely so this is a lookup rather than a scan.
+- **Deactivation keeps links; a deactivated account gains none.** The two
+  rules point the same way: a dead account's subject must not be silently
+  recycled into a new account by the next SSO login, and a link written
+  onto a terminal account would still be there when the IdP is switched
+  on. `DELETE .../external_ids/{provider}` works regardless of account
+  state, so freeing a subject is a deliberate act. Synapse behaves the
+  same way by omission — `remove_user_external_id`
+  (`registration.py:955`) has no caller in the deactivation path.
+- **Both halves are validated at the boundary, not in `apply`.** They are
+  opaque strings, so the only rules are the ones the key encoding needs:
+  non-empty, no NUL (the tables separate key parts with one), and
+  bounded. A malformed key would otherwise be a durable, replicated
+  mistake.
+
 ### Authentication indirection
 
 Introduce `crates/saltator-cs-api/src/services/auth.rs` alongside the
@@ -207,6 +229,28 @@ It owns two things the routes hardcode today:
 
 The OIDC slice adds a second implementation. It does not touch the
 first.
+
+Two notes from building it:
+
+- **The provider list is a constant, not config.** `CsState::AUTH_PROVIDERS`
+  is the single place providers are enumerated, and both the
+  advertisement and the login path read it — which is the property that
+  matters, because it is what stops them from disagreeing. Making it a
+  config field today would add a knob whose only legal value is its
+  default: local passwords are the only credential this server can
+  verify. The OIDC slice replaces the constant with a list built from its
+  own config block, and nothing downstream changes.
+- **Identify and verify are two calls, not one.** The login rate limiter
+  has to be keyed on the account being attacked and has to run *before*
+  the Argon2 verify, so the route asks `identify` which account a login
+  names, limits, and only then calls `login`. Folding them together would
+  either move rate limiting into the service or spend the verify first.
+
+The UIA password stage (`services/uia.rs`) still calls
+`UserServer::verify_user_password` directly. It is the same credential
+check one layer down, and it moves behind this service when `m.login.sso`
+becomes a UIA stage — at which point the stage needs to know which
+providers are configured, which is exactly what this service holds.
 
 ### Real UIA sessions
 
@@ -250,6 +294,8 @@ inventory to what a small operator actually uses:
 | `POST /users/{id}/reset_password` | `{new_password, logout_devices}` |
 | `PUT /users/{id}/admin` | grant/revoke the stored flag |
 | `DELETE /users/{id}/devices[/{device_id}]` | admin session revocation |
+| `PUT /users/{id}/external_ids/{provider}` | `{external_id}`; replaces this provider's link |
+| `DELETE /users/{id}/external_ids/{provider}` | frees the subject for another account |
 | `GET /auth_providers/{provider}/users/{external_id}` | reverse link lookup |
 
 Two notes from building slice 2. A composite **`PUT /users/{id}`**

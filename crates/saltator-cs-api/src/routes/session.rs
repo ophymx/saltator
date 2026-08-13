@@ -8,7 +8,6 @@ use ruma::api::client::account::{get_username_availability, register, whoami};
 use ruma::api::client::discovery::get_capabilities;
 use ruma::api::client::discovery::get_supported_versions;
 use ruma::api::client::session::{get_login_types, login, logout, logout_all, refresh_token};
-use ruma::api::client::uiaa::UserIdentifier;
 
 use saltator_core::RoomVersion;
 use saltator_userserver::Session;
@@ -174,27 +173,23 @@ pub async fn register_available(
 }
 
 pub async fn get_login_types(
+    State(state): State<Arc<CsState>>,
     _req: Ar<get_login_types::v3::Request>,
 ) -> Ra<get_login_types::v3::Response> {
-    use get_login_types::v3::{LoginType, PasswordLoginType};
-    Ra(get_login_types::v3::Response::new(vec![
-        LoginType::Password(PasswordLoginType::new()),
-    ]))
+    Ra(get_login_types::v3::Response::new(
+        state.authn().login_types(),
+    ))
 }
 
 pub async fn login(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<login::v3::Request>,
 ) -> Result<Ra<login::v3::Response>> {
-    let login::v3::LoginInfo::Password(pw) = &req.login_info else {
-        return Err(ApiError::forbidden("Unsupported login type"));
-    };
-    #[allow(deprecated)]
-    let user = match (&pw.identifier, &pw.user) {
-        (Some(UserIdentifier::Matrix(m)), _) => m.user.clone(),
-        (None, Some(u)) => u.clone(),
-        _ => return Err(ApiError::forbidden("Unsupported identifier type")),
-    };
+    let authn = state.authn();
+    // Identify first, verify second: the rate limiter has to be keyed on
+    // the account being attacked, and it must run before the Argon2
+    // verify rather than after it.
+    let user = authn.identify(&req.login_info)?;
     // Keyed by the CANONICAL account id: login normalizes case and accepts
     // both localpart and full `@user:server` forms, so the raw string would
     // let an attacker multiply the per-account budget with cosmetic
@@ -206,11 +201,9 @@ pub async fn login(
         .map(|u| u.to_string())
         .unwrap_or_else(|_| user.to_lowercase());
     state.rate_limit(crate::ratelimit::Kind::Login, &limit_key)?;
-    let session = state
-        .users
-        .login_password(
-            &user,
-            &pw.password,
+    let session = authn
+        .login(
+            &req.login_info,
             req.device_id.as_ref().map(|d| d.to_string()),
             req.initial_device_display_name.clone(),
             req.refresh_token,

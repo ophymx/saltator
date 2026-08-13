@@ -21,6 +21,33 @@ type Result<T> = std::result::Result<T, ApiError>;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
+/// Longest accepted provider key or external id. Both are opaque strings
+/// that end up in a storage key, so the cap is about keeping keys sane
+/// rather than about any format.
+const MAX_KEY_LEN: usize = 255;
+
+/// Validate one half of an identity link. Both halves are opaque — a
+/// provider key is a stable identifier chosen by the operator, an
+/// external id is whatever the IdP calls the subject — so the only rules
+/// are the ones the key encoding actually needs: non-empty, no NUL (the
+/// link tables separate their key parts with one), and bounded.
+fn opaque_key(what: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(ApiError::invalid_param(format!("{what} must not be empty")));
+    }
+    if value.len() > MAX_KEY_LEN {
+        return Err(ApiError::invalid_param(format!(
+            "{what} must be at most {MAX_KEY_LEN} bytes"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(ApiError::invalid_param(format!(
+            "{what} must not contain NUL"
+        )));
+    }
+    Ok(())
+}
+
 /// The admin service. Borrow-cheap: construct per call site via
 /// [`crate::CsState::admin`].
 pub(crate) struct Admin<'a> {
@@ -61,6 +88,25 @@ pub(crate) struct UserDetail {
     /// account is external or disabled.
     pub has_password: bool,
     pub devices: Vec<DeviceSummary>,
+    /// Identity-provider links (slice 4). Empty until an operator writes
+    /// one; nothing reads them until the OIDC slice.
+    pub external_ids: Vec<ExternalIdEntry>,
+}
+
+/// One identity-provider link on an account.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct ExternalIdEntry {
+    pub auth_provider: String,
+    pub external_id: String,
+}
+
+/// The answer to "who is this subject?" — the reverse lookup an operator
+/// does when an IdP shows them a `sub` they cannot place.
+#[derive(Debug, Serialize)]
+pub(crate) struct ExternalIdOwner {
+    pub auth_provider: String,
+    pub external_id: String,
+    pub user_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +178,15 @@ impl Admin<'_> {
             })
             .collect();
         devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        let external_ids = store
+            .external_ids(user_id)
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .map(|(auth_provider, external_id)| ExternalIdEntry {
+                auth_provider,
+                external_id,
+            })
+            .collect();
         Ok(UserDetail {
             summary: UserSummary {
                 user_id: user_id.to_owned(),
@@ -144,6 +199,7 @@ impl Admin<'_> {
             avatar_url: profile.and_then(|p| p.avatar_url),
             has_password: account.password_hash.is_some(),
             devices,
+            external_ids,
         })
     }
 
@@ -305,6 +361,65 @@ impl Admin<'_> {
         Ok(self.users.delete_registration_token(token).await?)
     }
 
+    // -- identity links (slice 4) ----------------------------------------
+
+    /// Link an account to its subject at an identity provider.
+    ///
+    /// Deliberately allowed before any provider is configured: Synapse's
+    /// own docstring notes external ids "are not validated against
+    /// configured IdPs… it might be useful to pre-configure users before
+    /// enabling a new IdP", and that pre-link-then-switch-on path is how
+    /// this deployment avoids a flag day when OIDC arrives.
+    pub async fn link_external_id(
+        &self,
+        target: &UserId,
+        auth_provider: &str,
+        external_id: &str,
+    ) -> Result<UserDetail> {
+        opaque_key("auth_provider", auth_provider)?;
+        opaque_key("external_id", external_id)?;
+        self.users
+            .link_external_id(target, auth_provider, external_id)
+            .await?;
+        self.user_detail(target.as_str())
+    }
+
+    /// Drop an account's link to one provider.
+    ///
+    /// Works on a deactivated account, which is the point: deactivation
+    /// leaves links in place so a dead account's subject is not silently
+    /// recycled, and this is the deliberate act that frees it.
+    pub async fn unlink_external_id(
+        &self,
+        target: &UserId,
+        auth_provider: &str,
+    ) -> Result<UserDetail> {
+        opaque_key("auth_provider", auth_provider)?;
+        self.users.unlink_external_id(target, auth_provider).await?;
+        self.user_detail(target.as_str())
+    }
+
+    /// Reverse lookup: the account behind a provider's subject.
+    pub fn lookup_external_id(
+        &self,
+        auth_provider: &str,
+        external_id: &str,
+    ) -> Result<ExternalIdOwner> {
+        opaque_key("auth_provider", auth_provider)?;
+        opaque_key("external_id", external_id)?;
+        let user_id = self
+            .users
+            .store()
+            .external_id_owner(auth_provider, external_id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("No account is linked to that identity"))?;
+        Ok(ExternalIdOwner {
+            auth_provider: auth_provider.to_owned(),
+            external_id: external_id.to_owned(),
+            user_id,
+        })
+    }
+
     /// Revoke one session, or every session when `device_id` is `None`.
     pub async fn delete_devices(
         &self,
@@ -331,7 +446,7 @@ mod tests {
     use saltator_store::RocksEngine;
     use saltator_userserver::UserServer;
 
-    use super::{AccountState, Admin};
+    use super::{AccountState, Admin, ExternalIdEntry};
 
     const SERVER: &str = "hs.test";
 
@@ -707,6 +822,292 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    // -- identity links (slice 4) ----------------------------------------
+
+    /// A link is written to both indices: it shows on the account, and the
+    /// reverse lookup finds the account from the subject.
+    #[tokio::test]
+    async fn link_is_visible_from_both_directions() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let svc = admin(&users);
+
+        let detail = svc
+            .link_external_id(&uid("alice"), "oidc-keycloak", "sub-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.external_ids,
+            [ExternalIdEntry {
+                auth_provider: "oidc-keycloak".to_owned(),
+                external_id: "sub-1".to_owned(),
+            }]
+        );
+
+        let owner = svc.lookup_external_id("oidc-keycloak", "sub-1").unwrap();
+        assert_eq!(owner.user_id, "@alice:hs.test");
+        assert_eq!(
+            svc.lookup_external_id("oidc-keycloak", "sub-2")
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    /// One account may be linked at several providers; the links are
+    /// independent and provider-ordered.
+    #[tokio::test]
+    async fn one_account_links_to_several_providers() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let svc = admin(&users);
+        svc.link_external_id(&uid("alice"), "oidc-okta", "okta-9")
+            .await
+            .unwrap();
+        let detail = svc
+            .link_external_id(&uid("alice"), "oidc-keycloak", "sub-1")
+            .await
+            .unwrap();
+        let pairs: Vec<(&str, &str)> = detail
+            .external_ids
+            .iter()
+            .map(|e| (e.auth_provider.as_str(), e.external_id.as_str()))
+            .collect();
+        assert_eq!(pairs, [("oidc-keycloak", "sub-1"), ("oidc-okta", "okta-9")]);
+    }
+
+    /// Relinking the same account at the same provider replaces the
+    /// subject — and releases the old one. A forward row left behind would
+    /// reserve a subject nobody could ever claim again.
+    #[tokio::test]
+    async fn relinking_replaces_and_releases_the_old_subject() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let svc = admin(&users);
+        svc.link_external_id(&uid("alice"), "oidc-keycloak", "old-sub")
+            .await
+            .unwrap();
+        let detail = svc
+            .link_external_id(&uid("alice"), "oidc-keycloak", "new-sub")
+            .await
+            .unwrap();
+
+        assert_eq!(detail.external_ids.len(), 1, "one link per provider");
+        assert_eq!(detail.external_ids[0].external_id, "new-sub");
+        assert_eq!(
+            users
+                .store()
+                .external_id_owner("oidc-keycloak", "old-sub")
+                .unwrap(),
+            None,
+            "the superseded forward row must be gone"
+        );
+    }
+
+    /// Linking is idempotent: the same pair twice is not a conflict with
+    /// itself.
+    #[tokio::test]
+    async fn relinking_the_same_pair_is_idempotent() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let svc = admin(&users);
+        for _ in 0..2 {
+            svc.link_external_id(&uid("alice"), "oidc-keycloak", "sub-1")
+                .await
+                .unwrap();
+        }
+        let detail = svc.user_detail("@alice:hs.test").unwrap();
+        assert_eq!(detail.external_ids.len(), 1);
+    }
+
+    /// A subject already claimed by another account is refused, and the
+    /// refusal names the holder — the operator is privileged enough to
+    /// know, and "conflict" without a subject is unactionable.
+    #[tokio::test]
+    async fn a_subject_belongs_to_exactly_one_account() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        register(&users, "bob", Some("pw")).await;
+        let svc = admin(&users);
+        svc.link_external_id(&uid("alice"), "oidc-keycloak", "sub-1")
+            .await
+            .unwrap();
+
+        let err = svc
+            .link_external_id(&uid("bob"), "oidc-keycloak", "sub-1")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
+        assert!(err.message.contains("@alice:hs.test"), "{}", err.message);
+        // The refusal is total: bob gained nothing, alice lost nothing.
+        assert!(svc
+            .user_detail("@bob:hs.test")
+            .unwrap()
+            .external_ids
+            .is_empty());
+        assert_eq!(
+            svc.lookup_external_id("oidc-keycloak", "sub-1")
+                .unwrap()
+                .user_id,
+            "@alice:hs.test"
+        );
+    }
+
+    /// Unlinking clears both indices, and doing it twice is a 404 rather
+    /// than a silent success.
+    #[tokio::test]
+    async fn unlink_clears_both_indices() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let svc = admin(&users);
+        svc.link_external_id(&uid("alice"), "oidc-keycloak", "sub-1")
+            .await
+            .unwrap();
+
+        let detail = svc
+            .unlink_external_id(&uid("alice"), "oidc-keycloak")
+            .await
+            .unwrap();
+        assert!(detail.external_ids.is_empty());
+        assert_eq!(
+            users
+                .store()
+                .external_id_owner("oidc-keycloak", "sub-1")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            svc.unlink_external_id(&uid("alice"), "oidc-keycloak")
+                .await
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Deactivation leaves links alone, so a dead account's subject is not
+    /// silently recycled into a new account by the next SSO login. An
+    /// explicit unlink is the deliberate act that frees it.
+    #[tokio::test]
+    async fn deactivation_keeps_the_link_until_it_is_unlinked() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        register(&users, "bob", Some("pw")).await;
+        let svc = admin(&users);
+        svc.link_external_id(&uid("alice"), "oidc-keycloak", "sub-1")
+            .await
+            .unwrap();
+        svc.deactivate(&uid("root"), &uid("alice"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            svc.lookup_external_id("oidc-keycloak", "sub-1")
+                .unwrap()
+                .user_id,
+            "@alice:hs.test",
+            "deactivation must not release the subject"
+        );
+        // And a new account cannot take it over by accident...
+        assert_eq!(
+            svc.link_external_id(&uid("bob"), "oidc-keycloak", "sub-1")
+                .await
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        // ...only after the operator unlinks it deliberately.
+        svc.unlink_external_id(&uid("alice"), "oidc-keycloak")
+            .await
+            .unwrap();
+        assert!(svc
+            .link_external_id(&uid("bob"), "oidc-keycloak", "sub-1")
+            .await
+            .is_ok());
+    }
+
+    /// A deactivated account gains no new links: the state is terminal,
+    /// and a link written now would still be there when the IdP is
+    /// switched on.
+    #[tokio::test]
+    async fn deactivated_accounts_cannot_be_linked() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let svc = admin(&users);
+        svc.deactivate(&uid("root"), &uid("alice"), false)
+            .await
+            .unwrap();
+        let err = svc
+            .link_external_id(&uid("alice"), "oidc-keycloak", "sub-1")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// A locked account can be linked: locking is a temporary auth
+    /// kill-switch, not a teardown, and pre-linking a locked user is a
+    /// reasonable thing to do before unlocking them.
+    #[tokio::test]
+    async fn locked_accounts_can_be_linked() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let svc = admin(&users);
+        svc.set_locked(&uid("root"), &uid("alice"), true)
+            .await
+            .unwrap();
+        assert!(svc
+            .link_external_id(&uid("alice"), "oidc-keycloak", "sub-1")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn linking_an_unknown_account_is_not_found() {
+        let (_dir, users) = stack().await;
+        let err = admin(&users)
+            .link_external_id(&uid("nobody"), "oidc-keycloak", "sub-1")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// The two halves of a link are opaque, but they land in a storage key
+    /// whose parts are NUL-separated — so empty, oversized and
+    /// NUL-bearing values are refused at the boundary rather than
+    /// corrupting a key.
+    #[tokio::test]
+    async fn link_halves_are_validated() {
+        let (_dir, users) = stack().await;
+        register(&users, "alice", Some("pw")).await;
+        let svc = admin(&users);
+        let alice = uid("alice");
+        let long = "x".repeat(256);
+
+        for (provider, external_id) in [
+            ("", "sub-1"),
+            ("oidc-keycloak", ""),
+            ("oidc\0keycloak", "sub-1"),
+            ("oidc-keycloak", "sub\0-1"),
+            (long.as_str(), "sub-1"),
+            ("oidc-keycloak", long.as_str()),
+        ] {
+            let err = svc
+                .link_external_id(&alice, provider, external_id)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{provider:?}/{external_id:?} should be refused"
+            );
+        }
+        assert!(svc
+            .user_detail(alice.as_str())
+            .unwrap()
+            .external_ids
+            .is_empty());
     }
 
     #[tokio::test]
