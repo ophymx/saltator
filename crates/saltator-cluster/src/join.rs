@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use tonic::transport::Channel;
+use tonic::transport::ClientTlsConfig;
 
 use crate::proto::control_service_client::ControlServiceClient;
 use crate::proto::JoinRequest;
@@ -23,6 +23,19 @@ pub async fn join_cluster(
     advertise_addr: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    join_cluster_with_tls(seeds, node_id, advertise_addr, timeout, None).await
+}
+
+/// [`join_cluster`] over mutual TLS: seeds are contacted with the cluster
+/// client certificate, so a node with no CA-signed cert cannot join
+/// (security review 2026-08-13, Vuln 4).
+pub async fn join_cluster_with_tls(
+    seeds: &[String],
+    node_id: NodeId,
+    advertise_addr: &str,
+    timeout: Duration,
+    tls: Option<&ClientTlsConfig>,
+) -> anyhow::Result<()> {
     if seeds.is_empty() {
         anyhow::bail!("no seeds configured to join");
     }
@@ -33,7 +46,7 @@ pub async fn join_cluster(
 
     loop {
         for target in std::mem::take(&mut targets) {
-            match try_join(&target, node_id, advertise_addr).await {
+            match try_join(&target, node_id, advertise_addr, tls).await {
                 Ok(Outcome::Joined) => {
                     tracing::info!(node_id, seed = %target, "admitted to metadata group");
                     return Ok(());
@@ -60,10 +73,13 @@ enum Outcome {
     NoLeaderYet,
 }
 
-async fn try_join(target: &str, node_id: NodeId, advertise_addr: &str) -> anyhow::Result<Outcome> {
-    let channel = Channel::from_shared(format!("http://{target}"))?
-        .connect()
-        .await?;
+async fn try_join(
+    target: &str,
+    node_id: NodeId,
+    advertise_addr: &str,
+    tls: Option<&ClientTlsConfig>,
+) -> anyhow::Result<Outcome> {
+    let channel = crate::forward::connect(target, tls).await?;
     let mut client = ControlServiceClient::new(channel);
     let resp = client
         .join(JoinRequest {

@@ -11,7 +11,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use serde::{Deserialize, Serialize};
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 
 use saltator_shard::ShardId;
 
@@ -25,13 +25,25 @@ pub const METADATA_GROUP: u64 = ShardId::METADATA.group();
 /// the receiving node can route to the right Raft instance.
 pub struct GrpcRaftNetworkFactory {
     group: u64,
+    /// Present on multi-node deployments: every peer channel is mutual-TLS
+    /// (security review 2026-08-13, Vuln 4). `None` = plaintext (loopback
+    /// single-node and test harnesses).
+    tls: Option<ClientTlsConfig>,
 }
 
 impl GrpcRaftNetworkFactory {
     pub fn new(shard: ShardId) -> Self {
         Self {
             group: shard.group(),
+            tls: None,
         }
+    }
+
+    /// Carry a client TLS config, so every peer connection this factory
+    /// opens is mutual-TLS.
+    pub fn with_tls(mut self, tls: Option<ClientTlsConfig>) -> Self {
+        self.tls = tls;
+        self
     }
 }
 
@@ -43,6 +55,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcRaftNetworkFactory {
             group: self.group,
             target,
             addr: node.addr.clone(),
+            tls: self.tls.clone(),
             client: None,
         }
     }
@@ -52,15 +65,16 @@ pub struct GrpcRaftConnection {
     group: u64,
     target: NodeId,
     addr: String,
+    tls: Option<ClientTlsConfig>,
     client: Option<RaftServiceClient<Channel>>,
 }
 
 impl GrpcRaftConnection {
     async fn client(&mut self) -> Result<&mut RaftServiceClient<Channel>, Unreachable> {
         if self.client.is_none() {
-            let endpoint = Channel::from_shared(format!("http://{}", self.addr))
+            let channel = crate::forward::connect(&self.addr, self.tls.as_ref())
+                .await
                 .map_err(|e| Unreachable::new(&e))?;
-            let channel = endpoint.connect().await.map_err(|e| Unreachable::new(&e))?;
             self.client = Some(RaftServiceClient::new(channel));
         }
         Ok(self.client.as_mut().expect("client just set"))

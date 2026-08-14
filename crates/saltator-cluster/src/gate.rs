@@ -5,6 +5,8 @@
 //! command it cannot apply and wedge the replica; enforcing this in code
 //! (not documentation) was an explicit design decision.
 
+use tonic::transport::ClientTlsConfig;
+
 use saltator_shard::migrate::MigrationGate;
 use saltator_shard::{NodeId, ShardHandle, ShardId};
 
@@ -18,14 +20,24 @@ pub struct ClusterGate {
     /// This binary's schema versions per keyspace discriminant — what we
     /// report for ourselves without a loopback RPC.
     self_schemas: Vec<(u32, u32)>,
+    /// Present on multi-node deployments: the voter probe is mutual-TLS,
+    /// same as every other internal client (security review 2026-08-13,
+    /// Vuln 4).
+    tls: Option<ClientTlsConfig>,
 }
 
 impl ClusterGate {
-    pub fn new(handle: ShardHandle, self_node: NodeId, self_schemas: Vec<(u32, u32)>) -> Self {
+    pub fn new(
+        handle: ShardHandle,
+        self_node: NodeId,
+        self_schemas: Vec<(u32, u32)>,
+        tls: Option<ClientTlsConfig>,
+    ) -> Self {
         Self {
             handle,
             self_node,
             self_schemas,
+            tls,
         }
     }
 
@@ -46,15 +58,11 @@ impl MigrationGate for ClusterGate {
                 }
                 continue;
             }
-            let endpoint = if addr.starts_with("http") {
-                addr.clone()
-            } else {
-                format!("http://{addr}")
-            };
-            let Ok(mut client) = ControlServiceClient::connect(endpoint).await else {
+            let Ok(channel) = crate::forward::connect(&addr, self.tls.as_ref()).await else {
                 tracing::debug!(node_id, %addr, "migration gate: voter unreachable");
                 return false;
             };
+            let mut client = ControlServiceClient::new(channel);
             let Ok(resp) = client.status(StatusRequest {}).await else {
                 tracing::debug!(node_id, %addr, "migration gate: status failed");
                 return false;

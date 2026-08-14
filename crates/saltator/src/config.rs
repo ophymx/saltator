@@ -1,7 +1,7 @@
 //! Node configuration: one TOML file (spec.md §2 "operational simplicity").
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -124,6 +124,56 @@ pub struct ClusterConfig {
     /// default) means: bootstrap a new single-node cluster if none exists.
     #[serde(default)]
     pub seeds: Vec<String>,
+    /// PEM certificate chain for this node's internal-RPC identity. Set
+    /// together with `tls_key` and `tls_ca` to protect the control plane
+    /// with mutual TLS.
+    ///
+    /// REQUIRED for any multi-node deployment: without it the internal
+    /// listener is unauthenticated, and anyone who can reach it can drive
+    /// the cluster's Raft groups directly. A node whose internal listener
+    /// binds a non-loopback address refuses to start without TLS. The
+    /// certificate must carry `server_name` as a SAN (that is what peers
+    /// verify against, since nodes dial each other by address).
+    #[serde(default)]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key matching `tls_cert`.
+    #[serde(default)]
+    pub tls_key: Option<PathBuf>,
+    /// PEM CA bundle that signs every cluster member's `tls_cert`. Both the
+    /// inbound listener and every outbound peer connection verify against
+    /// it — membership in the mesh is holding a cert this CA signed.
+    #[serde(default)]
+    pub tls_ca: Option<PathBuf>,
+}
+
+impl ClusterConfig {
+    /// The internal-RPC TLS paths, present only when all three are set. A
+    /// partial trio is a configuration error, not silently plaintext.
+    pub fn tls_files(&self) -> anyhow::Result<Option<(&Path, &Path, &Path)>> {
+        match (&self.tls_cert, &self.tls_key, &self.tls_ca) {
+            (Some(c), Some(k), Some(a)) => Ok(Some((c, k, a))),
+            (None, None, None) => Ok(None),
+            _ => anyhow::bail!(
+                "cluster.tls_cert, cluster.tls_key and cluster.tls_ca must be set together"
+            ),
+        }
+    }
+}
+
+/// Refuse a control plane exposed to the network without authentication
+/// (security review 2026-08-13, Vuln 4). Plaintext internal RPC is only
+/// safe on loopback — single-node deployments and test harnesses; a
+/// routable internal listener with no TLS is the exposure the review
+/// flagged.
+pub fn require_tls_or_loopback(internal: SocketAddr, has_tls: bool) -> anyhow::Result<()> {
+    if has_tls || internal.ip().is_loopback() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "listeners.internal binds a non-loopback address ({internal}) but cluster TLS is not \
+         configured; set cluster.tls_cert/tls_key/tls_ca, or bind internal to loopback for a \
+         single-node deployment"
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -169,8 +219,17 @@ advertise = "127.0.0.1:7400"
 # Empty seeds on a fresh data dir bootstraps a new single-node cluster.
 # To join an existing cluster, list peer internal-RPC addresses here.
 seeds = []
+# Mutual TLS for the internal control plane. REQUIRED for multi-node: the
+# internal listener is otherwise unauthenticated, and a node that binds it
+# to a non-loopback address refuses to start without these. Every node's
+# cert is signed by the shared CA and carries `server_name` as a SAN.
+# tls_cert = "/etc/saltator/internal/node.crt"
+# tls_key  = "/etc/saltator/internal/node.key"
+# tls_ca   = "/etc/saltator/internal/ca.crt"
 
 [listeners]
+# internal RPC — keep on loopback for a single node; on a private,
+# TLS-protected interface for a cluster.
 internal = "127.0.0.1:7400"
 client = "127.0.0.1:8008"
 federation = "127.0.0.1:8448"
@@ -206,5 +265,50 @@ mod tests {
         assert_eq!(cfg.node.id, 1);
         assert!(cfg.cluster.seeds.is_empty());
         assert_eq!(cfg.listeners.internal.port(), 7400);
+    }
+
+    fn cluster_tls(cert: bool, key: bool, ca: bool) -> ClusterConfig {
+        ClusterConfig {
+            seeds: vec![],
+            tls_cert: cert.then(|| PathBuf::from("c")),
+            tls_key: key.then(|| PathBuf::from("k")),
+            tls_ca: ca.then(|| PathBuf::from("a")),
+        }
+    }
+
+    #[test]
+    fn tls_files_is_all_or_nothing() {
+        assert!(cluster_tls(false, false, false)
+            .tls_files()
+            .unwrap()
+            .is_none());
+        assert!(cluster_tls(true, true, true).tls_files().unwrap().is_some());
+        // Any partial combination is a configuration error, not silent
+        // plaintext.
+        for (c, k, a) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            assert!(cluster_tls(c, k, a).tls_files().is_err(), "{c}{k}{a}");
+        }
+    }
+
+    #[test]
+    fn plaintext_internal_is_refused_off_loopback() {
+        let loop_v4: SocketAddr = "127.0.0.1:7400".parse().unwrap();
+        let loop_v6: SocketAddr = "[::1]:7400".parse().unwrap();
+        let routable: SocketAddr = "10.0.0.5:7400".parse().unwrap();
+
+        // Loopback plaintext is fine (single-node, harnesses).
+        assert!(require_tls_or_loopback(loop_v4, false).is_ok());
+        assert!(require_tls_or_loopback(loop_v6, false).is_ok());
+        // A routable listener demands TLS...
+        assert!(require_tls_or_loopback(routable, false).is_err());
+        // ...and is fine once TLS is configured.
+        assert!(require_tls_or_loopback(routable, true).is_ok());
     }
 }
