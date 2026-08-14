@@ -35,22 +35,23 @@ type FedResult = Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<s
 ///
 /// No user shard wired (key-only deployments) means no blocks exist to
 /// enforce.
+///
+/// Fails CLOSED on a store error: a block that a transient read failure
+/// could lift is not a block. This matches the client-side `ensure_joinable`
+/// (security review 2026-08-13, Low #6).
 fn refuse_if_blocked(
     state: &FedState,
     room_id: &str,
 ) -> Result<(), (StatusCode, axum::Json<serde_json::Value>)> {
-    let blocked = state
-        .users
-        .as_ref()
-        .is_some_and(|users| users.store().blocked_room(room_id).ok().flatten().is_some());
-    if blocked {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            "M_FORBIDDEN",
-            "This room has been blocked by a server administrator",
-        ));
+    let Some(users) = state.users.as_ref() else {
+        return Ok(());
+    };
+    let refuse = |msg: &str| Err(err(StatusCode::FORBIDDEN, "M_FORBIDDEN", msg));
+    match users.store().blocked_room(room_id) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => refuse("This room has been blocked by a server administrator"),
+        Err(_) => refuse("Could not verify the room's block status"),
     }
-    Ok(())
 }
 
 /// The `room_id` of a membership event body, for the block check.
@@ -172,9 +173,16 @@ pub async fn send_knock(
     // spec: /send_knock accepts only an m.room.member knock with
     // state_key == sender; anything else is a 400.
     require_membership_event(&raw, "knock")?;
-    if let Some(room_id) = event_room_id(&raw) {
-        refuse_if_blocked(&state, room_id)?;
-    }
+    // Unconditional: an event with no `room_id` must be refused, not have
+    // the block silently skipped (security review 2026-08-13, Vuln 2).
+    let room_id = event_room_id(&raw).ok_or_else(|| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "M_MISSING_PARAM",
+            "event has no room_id",
+        )
+    })?;
+    refuse_if_blocked(&state, room_id)?;
 
     match rooms.send_knock(raw).await {
         Ok(result) => Ok(axum::Json(serde_json::json!({
@@ -307,11 +315,17 @@ async fn send_join_apply(
         }
     };
     require_membership_event(&raw, "join")?;
-    // From the event, not the path: the event is what gets applied, and
-    // the two are not checked against each other here.
-    if let Some(room_id) = event_room_id(&raw) {
-        refuse_if_blocked(&state, room_id)?;
-    }
+    // From the event, because the event is what gets applied. Unconditional:
+    // a missing `room_id` is refused, not a silently skipped block
+    // (security review 2026-08-13, Vuln 2).
+    let room_id = event_room_id(&raw).ok_or_else(|| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "M_MISSING_PARAM",
+            "event has no room_id",
+        )
+    })?;
+    refuse_if_blocked(&state, room_id)?;
 
     match rooms.send_join(raw).await {
         Ok(result) => Ok(serde_json::json!({
@@ -538,9 +552,18 @@ pub async fn invite(
     }
     // An invite is the other way into a room. Refusing joins but signing
     // invites would leave the block one click from useless.
-    if let Some(room_id) = event_room_id(&event) {
-        refuse_if_blocked(&state, room_id)?;
+    //
+    // Check the block against the PATH room — that is the room we record
+    // the pending invite for and, when we host it, ingest into. Reading
+    // the block from the event body while acting on the path let a
+    // mismatched or absent event `room_id` slip a pending invite (with
+    // attacker-controlled stripped state) into a blocked room (security
+    // review 2026-08-13, Vuln 2). Require the two to agree.
+    let room_id = ruma::RoomId::parse(&_room_id).map_err(|_| invalid("bad room id"))?;
+    if event_room_id(&event) != Some(room_id.as_str()) {
+        return Err(invalid("event room_id does not match the invite path"));
     }
+    refuse_if_blocked(&state, room_id.as_str())?;
 
     // Verify the origin's signature on the event.
     let now = crate::now_ms();

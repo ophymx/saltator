@@ -249,7 +249,6 @@ impl CsState {
         services::notices::Notices {
             users: &self.users,
             rooms: &self.rooms,
-            server_name: self.config.server_name.as_str(),
             localpart: self.config.server_notices_localpart.as_deref(),
             room_version: self.config.default_room_version,
         }

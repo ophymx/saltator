@@ -129,11 +129,21 @@ pub(crate) struct KickFailure {
     pub error: String,
 }
 
+/// Whether `user_id` belongs to `server_name`.
+///
+/// Parses the id rather than splitting on a colon: a user id's server part
+/// is everything after the FIRST colon, and a server name can itself carry
+/// a `:port`. Splitting on the last colon made `@a:hs.test:8448` parse its
+/// server as `8448`, so on any ported deployment `local_members` returned
+/// empty and a room shutdown kicked nobody while reporting success
+/// (security review 2026-08-13, Vuln 3).
+fn user_is_on(user_id: &str, server_name: &str) -> bool {
+    ruma::UserId::parse(user_id).is_ok_and(|u| u.server_name().as_str() == server_name)
+}
+
 impl RoomAdmin<'_> {
     fn is_local(&self, user_id: &str) -> bool {
-        user_id
-            .rsplit_once(':')
-            .is_some_and(|(_, server)| server == self.server_name)
+        user_is_on(user_id, self.server_name)
     }
 
     /// Refuse the caller's way into a blocked room.
@@ -442,4 +452,30 @@ pub(crate) struct BlockedState {
     pub room_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<BlockInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_is_on;
+
+    /// The membership index of a room shutdown keys off this. A ported
+    /// server name must still match its own users, or shutdown silently
+    /// kicks nobody (security review 2026-08-13, Vuln 3).
+    #[test]
+    fn user_is_on_handles_ported_server_names() {
+        // Unported: the ordinary case still holds.
+        assert!(user_is_on("@alice:hs.test", "hs.test"));
+        assert!(!user_is_on("@alice:other.test", "hs.test"));
+
+        // Ported: the server part is everything after the FIRST colon,
+        // including the port. The old last-colon split matched none of these.
+        assert!(user_is_on("@alice:hs.test:8448", "hs.test:8448"));
+        assert!(!user_is_on("@alice:hs.test:8448", "hs.test"));
+        assert!(!user_is_on("@alice:hs.test", "hs.test:8448"));
+        assert!(!user_is_on("@alice:evil.test:8448", "hs.test:8448"));
+
+        // Garbage is not local.
+        assert!(!user_is_on("not-a-user-id", "hs.test"));
+        assert!(!user_is_on("", "hs.test"));
+    }
 }

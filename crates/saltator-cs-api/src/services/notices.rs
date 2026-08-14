@@ -33,7 +33,6 @@ const ROOM_NAME: &str = "Server Notices";
 pub(crate) struct Notices<'a> {
     pub users: &'a Arc<UserServer>,
     pub rooms: &'a Arc<RoomServer>,
-    pub server_name: &'a str,
     /// Localpart of the sending account; `None` disables the feature.
     pub localpart: Option<&'a str>,
     pub room_version: RoomVersion,
@@ -56,7 +55,13 @@ impl Notices<'_> {
                 "Server notices are not configured; set client.server_notices_localpart",
             )
         })?;
-        ruma::OwnedUserId::try_from(format!("@{localpart}:{}", self.server_name))
+        // Canonicalise, so the sending identity is exactly the account the
+        // registration reservation protects. Building `@{localpart}:{server}`
+        // raw would let a configured `Notices` send as `@Notices:...` while
+        // the reservation guards `@notices:...` — a permanent divergence
+        // (security review 2026-08-13, Vuln 1).
+        self.users
+            .canonical_user_id(localpart)
             .map_err(|e| ApiError::internal(format!("bad server_notices_localpart: {e}")))
     }
 

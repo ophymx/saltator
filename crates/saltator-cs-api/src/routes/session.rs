@@ -66,6 +66,29 @@ pub async fn get_capabilities(
     }))
 }
 
+/// Whether `candidate` (a localpart or a full `@user:server` id) names the
+/// reserved server-notices account.
+///
+/// Both sides are canonicalised before comparing, because the string that
+/// is checked here is not the string that becomes the account: registration
+/// lowercases the localpart and accepts the `@user:server` form, so a raw
+/// byte comparison (as this once did) let `Notices` or `@notices:hs` slip
+/// past the reservation and seize the server's own voice (security review
+/// 2026-08-13, Vuln 1). A candidate that does not canonicalise is not
+/// reserved — it will be refused as an invalid username further on.
+fn is_reserved_notices(state: &CsState, candidate: &str) -> bool {
+    let Some(reserved) = state.config.server_notices_localpart.as_deref() else {
+        return false;
+    };
+    matches!(
+        (
+            state.users.canonical_user_id(reserved),
+            state.users.canonical_user_id(candidate),
+        ),
+        (Ok(reserved), Ok(candidate)) if reserved == candidate
+    )
+}
+
 pub async fn register(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<register::v3::Request>,
@@ -87,12 +110,7 @@ pub async fn register(
     // The server-notices account is the server's own voice. If a user
     // could register that localpart they would receive other people's
     // notices and be able to send what looks like server mail.
-    if state
-        .config
-        .server_notices_localpart
-        .as_deref()
-        .is_some_and(|reserved| reserved == localpart)
-    {
+    if is_reserved_notices(&state, &localpart) {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
             "M_USER_IN_USE",
@@ -173,12 +191,7 @@ pub async fn register_available(
     }
     let user_id = state.users.canonical_user_id(&req.username)?;
     let store = state.users.store();
-    let reserved = state
-        .config
-        .server_notices_localpart
-        .as_deref()
-        .is_some_and(|reserved| reserved == user_id.localpart());
-    if reserved
+    if is_reserved_notices(&state, &req.username)
         || store
             .account(user_id.as_str())
             .map_err(ApiError::internal)?

@@ -7104,6 +7104,144 @@ async fn inbound_federated_invite_appears_in_sync() {
     b_users.shutdown().await.unwrap();
 }
 
+/// A blocked room's inbound `/invite` is refused on the PATH room, and an
+/// event whose `room_id` names a different, unblocked room cannot smuggle a
+/// pending invite into the blocked room (security review 2026-08-13,
+/// Vuln 2). The block check once read the event body while the handler
+/// recorded the invite under the path room.
+#[tokio::test]
+async fn inbound_invite_into_a_blocked_room_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let a_name = ruma::OwnedServerName::try_from("a.test").unwrap();
+    let (a_signer, _) = saltator_roomserver::ServerSigner::generate(a_name.clone(), "1".to_owned());
+    let a_signer = Arc::new(a_signer);
+    let a_key_base = spawn_fed("a.test", a_signer.clone(), None, None).await;
+
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let engine = Arc::new(RocksEngine::open(&b_dir.join("db")).unwrap());
+    let b_name = ruma::OwnedServerName::try_from("b.test").unwrap();
+    let (b_signer, _) = saltator_roomserver::ServerSigner::generate(b_name.clone(), "1".to_owned());
+    let b_signer = Arc::new(b_signer);
+    let b_rooms = RoomServer::start(
+        1,
+        engine.clone(),
+        b_signer.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    let b_users = UserServer::start(
+        1,
+        engine,
+        b_name.clone(),
+        NoopNetworkFactory,
+        Some("127.0.0.1:0".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
+        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    }
+
+    // Block a room this server does not host — exactly the case the block
+    // exists for.
+    let admin = ruma::OwnedUserId::try_from("@root:b.test").unwrap();
+    b_users
+        .set_room_blocked("!blocked:a.test", true, &admin)
+        .await
+        .unwrap();
+
+    let b_fed = Arc::new(FedState {
+        server_name: b_name.clone(),
+        signer: b_signer.clone(),
+        old_keys: Vec::new(),
+        key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
+        rooms: Some(b_rooms.clone()),
+        users: Some(b_users.clone()),
+        client: None,
+        edu_sink: None,
+        media: None,
+        delivery_backoff: None,
+        txn_replay: saltator_federation::TxnReplayCache::default(),
+    });
+    let b_fed_base = {
+        let app = saltator_federation::router(b_fed);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+    let client = FederationClient::with_base_url(a_signer.clone(), b_fed_base);
+
+    // A signed invite for @bob:b.test whose event names `event_room`, PUT to
+    // the /invite path for `path_room`.
+    let signed_invite = |event_room: &str| {
+        let a_signer = a_signer.clone();
+        let event_room = event_room.to_owned();
+        async move {
+            let mut invite = match ruma::CanonicalJsonValue::try_from(json!({
+                "type": "m.room.member",
+                "room_id": event_room,
+                "sender": "@alice:a.test",
+                "state_key": "@bob:b.test",
+                "content": {"membership": "invite"},
+                "origin_server_ts": 1000,
+                "depth": 5,
+                "prev_events": [],
+                "auth_events": [],
+            }))
+            .unwrap()
+            {
+                ruma::CanonicalJsonValue::Object(o) => o,
+                _ => panic!(),
+            };
+            a_signer
+                .hash_and_sign_event(&mut invite, saltator_core::RoomVersion::V11)
+                .unwrap();
+            json!({
+                "room_version": "11",
+                "event": ruma::CanonicalJsonValue::Object(invite),
+                "invite_room_state": [json!({"type":"m.room.create","state_key":"","sender":"@alice:a.test","content":{"room_version":"11"}})],
+            })
+        }
+    };
+    // Path is percent-encoded `!blocked:a.test`.
+    let path = "/_matrix/federation/v2/invite/%21blocked:a.test/$evt";
+
+    // 1. Event names the blocked room too: refused by the block.
+    let err = client
+        .put("b.test", path, &signed_invite("!blocked:a.test").await)
+        .await
+        .expect_err("blocked room invite must be refused");
+    assert!(format!("{err:?}").contains("403"), "{err:?}");
+
+    // 2. Event names a *different*, unblocked room while the path is the
+    //    blocked one: the mismatch is refused (400), so the attacker cannot
+    //    launder a pending invite into the blocked room.
+    let err = client
+        .put("b.test", path, &signed_invite("!elsewhere:a.test").await)
+        .await
+        .expect_err("mismatched room_id must be refused");
+    assert!(format!("{err:?}").contains("400"), "{err:?}");
+
+    // And bob has no pending invite for the blocked room.
+    assert!(b_users
+        .store()
+        .invite_state("@bob:b.test", "!blocked:a.test")
+        .unwrap()
+        .is_none());
+
+    b_rooms.shutdown().await.unwrap();
+    b_users.shutdown().await.unwrap();
+}
+
 // --- Outbound federated invite (full round-trip) -------------------------
 
 async fn cs_stack(
@@ -10954,6 +11092,43 @@ async fn notices_need_configuring_and_reserve_their_localpart() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["errcode"], "M_USER_IN_USE");
     on.shutdown().await;
+}
+
+/// The reservation canonicalises: registration lowercases the localpart and
+/// accepts the `@user:server` form, so neither a case variant nor the full
+/// id may slip past and seize the server's own voice (security review
+/// 2026-08-13, Vuln 1). Every form must map to the one reserved account.
+#[tokio::test]
+async fn reserved_notices_localpart_cannot_be_taken_by_a_case_or_full_form() {
+    let env = start_env_notices(&["@root:hs.test"], "notices").await;
+    for username in ["Notices", "NOTICES", "@notices:hs.test", "@Notices:hs.test"] {
+        let (status, body) = env
+            .req(
+                "POST",
+                "/_matrix/client/v3/register",
+                None,
+                Some(json!({
+                    "username": username,
+                    "password": "pw-12345678",
+                    "auth": {"type": "m.login.dummy"}
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{username}: {body}");
+        assert_eq!(body["errcode"], "M_USER_IN_USE", "{username}: {body}");
+
+        let (status, body) = env
+            .req(
+                "GET",
+                &format!("/_matrix/client/v3/register/available?username={username}"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "avail {username}: {body}");
+        assert_eq!(body["errcode"], "M_USER_IN_USE", "avail {username}: {body}");
+    }
+    env.shutdown().await;
 }
 
 /// A notice to an account that does not exist is a 404, not a room
