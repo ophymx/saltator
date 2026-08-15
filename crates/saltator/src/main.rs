@@ -431,22 +431,27 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             })?),
             None => None,
         };
+    // Whether outbound federation may reach private/loopback addresses.
+    // False in production; the destination is attacker-influenced and
+    // resolved before any signature check (security review Vuln 5 / M2).
+    let allow_private_ips = cfg.federation.allow_private_ips;
     // Signed client for outbound federation, shared by the CS `/join` path
     // and the event sender.
-    let fed_client = Arc::new(match &outbound_ca {
-        Some(ca) => saltator_federation::FederationClient::with_ca(signer.clone(), ca),
-        None => saltator_federation::FederationClient::new(signer.clone()),
-    });
+    let fed_client = Arc::new(saltator_federation::FederationClient::with_policy(
+        signer.clone(),
+        outbound_ca.as_deref(),
+        allow_private_ips,
+    ));
     // One key cache for the whole process. The CS import paths (remote join,
     // backfill) verify fetched events and so learn the authoring servers'
     // keys; inbound federation auth needs those same keys. Keeping separate
     // caches made every server pay a fresh key fetch — a full cold HTTPS
     // round trip, ~55ms — inside the auth extractor on the first request it
     // received from a server it had just finished talking to.
-    let key_cache = Arc::new(match &outbound_ca {
-        Some(ca) => saltator_federation::KeyCache::with_ca(ca),
-        None => saltator_federation::KeyCache::new(),
-    });
+    let key_cache = Arc::new(saltator_federation::KeyCache::with_policy(
+        outbound_ca.as_deref(),
+        allow_private_ips,
+    ));
     // Parsed here rather than at the use site so a malformed admin user id
     // fails the daemon at startup instead of silently never matching.
     let admin_users = cfg

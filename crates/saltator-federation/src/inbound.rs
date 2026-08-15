@@ -58,6 +58,16 @@ impl FromRequest<Arc<FedState>> for Authenticated {
             .map(|pq| pq.as_str())
             .unwrap_or(parts.uri.path());
 
+        // Validate the origin as a Matrix server name before it is used to
+        // fetch keys: `keys_for` resolves and connects to it, and this runs
+        // before any signature is verified, so a garbage or crafted origin
+        // must not reach the resolver (security review 2026-08-13,
+        // Vuln 5 / M2). A literal-IP server name is still valid here; the
+        // resolver's own SSRF guard refuses a private target.
+        if ruma::ServerName::parse(&params.origin).is_err() {
+            return Err(AuthRejection::Malformed);
+        }
+
         let origin_keys = state
             .key_cache
             .keys_for(&params.origin, now_ms())
