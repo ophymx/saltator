@@ -101,6 +101,72 @@ pub struct ClientConfig {
     /// take the name and send what looks like server mail.
     #[serde(default)]
     pub server_notices_localpart: Option<String>,
+    /// Browser-visible base URL of this server's client API, e.g.
+    /// `https://matrix.example.org`. Required by OIDC and used for
+    /// nothing else: the IdP redirects a browser back to
+    /// `{public_base_url}/_saltator/client/oidc/callback`, and we cannot
+    /// derive that from a listener address behind a reverse proxy.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    /// External OpenID Connect identity providers. Empty (the default)
+    /// leaves `GET /login` advertising passwords alone and every SSO
+    /// route 404ing.
+    #[serde(default)]
+    pub oidc_providers: Vec<OidcProvider>,
+}
+
+/// One `[[client.oidc_providers]]` block.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcProvider {
+    /// Stable identifier, used in the SSO redirect path and — prefixed
+    /// `oidc-` — as the `auth_provider` key of every identity link this
+    /// provider writes. **Renaming it orphans every linked account.**
+    pub idp_id: String,
+    /// Name clients show on the SSO button. Free to change.
+    pub name: String,
+    /// Issuer URL. Its `/.well-known/openid-configuration` is fetched on
+    /// first use, and must name this same issuer.
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    #[serde(default = "default_scopes")]
+    pub scopes: Vec<String>,
+    /// Send a PKCE (S256) challenge with the authorization request.
+    #[serde(default = "default_true")]
+    pub pkce: bool,
+    /// Let a first SSO login claim an existing *unlinked* account whose
+    /// localpart matches the mapped one, writing the link permanently —
+    /// the migration path for a server that already has accounts.
+    ///
+    /// Off by default, and worth understanding before turning on: with
+    /// passwords also enabled, whoever controls a matching subject at the
+    /// IdP takes over the account. The safer migration is to pre-link
+    /// accounts through the admin API and leave this false.
+    #[serde(default)]
+    pub allow_existing_users: bool,
+    /// Let a first SSO login create an account that does not exist.
+    #[serde(default = "default_true")]
+    pub enable_registration: bool,
+    /// ID-token claim the localpart is derived from.
+    #[serde(default = "default_localpart_claim")]
+    pub localpart_claim: String,
+    /// ID-token claim used as the display name of accounts this provider
+    /// creates.
+    #[serde(default = "default_display_name_claim")]
+    pub display_name_claim: String,
+}
+
+fn default_scopes() -> Vec<String> {
+    ["openid", "profile"].map(str::to_owned).to_vec()
+}
+
+fn default_localpart_claim() -> String {
+    "preferred_username".to_owned()
+}
+
+fn default_display_name_claim() -> String {
+    "name".to_owned()
 }
 
 impl Default for ClientConfig {
@@ -116,6 +182,8 @@ impl Default for ClientConfig {
             appservice_registration_dir: None,
             admin_users: Vec::new(),
             server_notices_localpart: None,
+            public_base_url: None,
+            oidc_providers: Vec::new(),
         }
     }
 }
@@ -218,6 +286,26 @@ allow_internal_fetch = false
 # A fresh server has no admin account and no way to grant one from inside,
 # so the first administrator has to be named here.
 # admin_users = ["@root:example.org"]
+# Browser-visible base URL of the client API. Required for OIDC: the IdP
+# redirects back to {public_base_url}/_saltator/client/oidc/callback,
+# which cannot be derived from a listener address behind a proxy.
+# public_base_url = "https://matrix.example.org"
+
+# External OpenID Connect providers. One block each; omit for none.
+# Register {public_base_url}/_saltator/client/oidc/callback as the
+# redirect URI with the provider.
+# [[client.oidc_providers]]
+# idp_id = "keycloak"           # NEVER rename: linked accounts key off it
+# name = "Company SSO"          # shown on the client's SSO button
+# issuer = "https://id.example.org/realms/main"
+# client_id = "saltator"
+# client_secret = "…"
+# scopes = ["openid", "profile"]
+# pkce = true
+# enable_registration = true    # first login may create the account
+# allow_existing_users = false  # see the note in config.rs before enabling
+# localpart_claim = "preferred_username"
+# display_name_claim = "name"
 
 [federation]
 # Serve the federation port over HTTPS. Real federation requires TLS;

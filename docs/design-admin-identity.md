@@ -546,9 +546,37 @@ Slices 1–4 are the ones the user's constraint is really about. 5, 6 and
 - **The SSO browser flow itself** — templates, IdP picker, localpart
   picker, callback. That is the OIDC slice, below.
 
-## What the OIDC slice costs later
+## What the OIDC slice cost — DONE 2026-08-17
 
-The point of slices 1–4 is that this list is all *additive*:
+Built as forecast, and the forecast held: every item below was additive,
+and the password path was not edited. Operator documentation lives in
+`docs/oidc.md`; the tests are `crates/saltator-cs-api/tests/oidc.rs`,
+which drives the whole flow against a stub IdP serving a real discovery
+document, a real JWKS and real RS256 ID tokens.
+
+Four things worth recording, because three of them were only found by
+writing the tests:
+
+- **Grandfathering had to exclude already-linked accounts.**
+  `LinkExternalId` treats a re-link as a *replace* — right for an
+  administrator repointing an account, catastrophic on the SSO path,
+  where it let a second IdP subject presenting a matching username take
+  over a linked account. The mapping now refuses when the account holds
+  any link at that provider. `ExternalIdInUse` does not cover this: it
+  fires on the subject being taken, not the account.
+- **A locked account leaked its state through the status code.** The
+  callback surfaced `InvalidState` as 400 "the account's state does not
+  allow this" to an unauthenticated browser. Flattened to 403.
+- **Clients send `{"type": "m.login.sso"}` where the spec describes a
+  bare fallback acknowledgement.** ruma has no variant for it, so it
+  arrives as `_Custom`. The completed browser flow is the proof either
+  way, so the label is not what is checked.
+- **Pending-redirect state is per-node, in memory.** SSO therefore needs
+  sticky routing in a cluster. Deliberate — it is one browser's
+  half-finished redirect, worthless in fifteen minutes — but it is a real
+  constraint, and a signed cookie would remove it.
+
+The original forecast, for the record:
 
 1. `oidc_providers` config block (issuer, client_id/secret, scopes,
    PKCE, `allow_existing_users`, `enable_registration`) — modelled on

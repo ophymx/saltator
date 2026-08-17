@@ -73,14 +73,7 @@ pub struct CsConfig {
     pub server_notices_localpart: Option<String>,
 }
 
-/// The credential providers this server offers, and the single place the
-/// list is built. A constant rather than a config field because local
-/// passwords are the only credential the server can verify today — the
-/// OIDC slice replaces this with a list derived from its config block,
-/// and everything downstream (`GET /login`, the login path) already reads
-/// from here (docs/design-admin-identity.md slice 4).
-const AUTH_PROVIDERS: &[services::auth::AuthProvider] =
-    &[services::auth::AuthProvider::LocalPassword];
+pub use services::oidc::OidcProviderConfig;
 
 /// Shared state of every CS route.
 pub struct CsState {
@@ -116,6 +109,15 @@ pub struct CsState {
     /// sender identity plus `?ts` timestamp massaging; namespaces,
     /// impersonation, and outbound event push are not implemented).
     pub(crate) appservices: Vec<AppServiceRegistration>,
+    /// The credential providers this server offers, the single place the
+    /// list is built (docs/design-admin-identity.md slice 4). Local
+    /// passwords always; `with_oidc` appends external providers, and
+    /// everything downstream (`GET /login`, the login path) derives from
+    /// here so the advertisement and the login path cannot disagree.
+    pub(crate) auth_providers: Vec<services::auth::AuthProvider>,
+    /// Runtime state of the SSO browser flows; `None` until `with_oidc`
+    /// configures a provider, and every SSO route 404s while it is.
+    pub(crate) sso: Option<services::oidc::SsoRuntime>,
 }
 
 /// One application service registration (the subset of the registration
@@ -263,7 +265,10 @@ impl CsState {
 
     /// The user-interactive-auth service.
     pub(crate) fn uia(&self) -> services::uia::Uia<'_> {
-        services::uia::Uia { users: &self.users }
+        services::uia::Uia {
+            users: &self.users,
+            sso: self.sso.as_ref(),
+        }
     }
 
     /// The authentication service: login flows and credential
@@ -271,7 +276,7 @@ impl CsState {
     pub(crate) fn authn(&self) -> services::auth::Authn<'_> {
         services::auth::Authn {
             users: &self.users,
-            providers: AUTH_PROVIDERS,
+            providers: &self.auth_providers,
         }
     }
 
@@ -305,7 +310,30 @@ impl CsState {
             rate_limiter: ratelimit::RateLimiter::new(),
             appservices: Vec::new(),
             cluster: None,
+            auth_providers: vec![services::auth::AuthProvider::LocalPassword],
+            sso: None,
         })
+    }
+
+    /// Configure external OIDC identity providers (the OIDC slice).
+    /// `public_base_url` is the browser-visible origin of this server —
+    /// the IdP redirects back to `{public_base_url}/_saltator/client/oidc/callback`,
+    /// and that exact URL must be registered with each provider.
+    pub fn with_oidc(
+        mut self: Arc<Self>,
+        providers: Vec<OidcProviderConfig>,
+        public_base_url: String,
+    ) -> Arc<Self> {
+        let state = Arc::get_mut(&mut self).expect("with_oidc called on a shared CsState");
+        for cfg in providers {
+            state
+                .auth_providers
+                .push(services::auth::AuthProvider::Oidc(
+                    services::oidc::OidcProvider::new(cfg),
+                ));
+        }
+        state.sso = Some(services::oidc::SsoRuntime::new(public_base_url));
+        self
     }
 
     /// Take one rate-limit token for `(kind, key)`; 429 when drained.
@@ -347,8 +375,8 @@ impl CsState {
 /// Build the client-server router. Serve this on the client listener.
 pub fn router(state: Arc<CsState>) -> axum::Router {
     use routes::{
-        account, admin, backup, keys, media, push, relations, rooms, search, session, spaces, sync,
-        to_device,
+        account, admin, backup, keys, media, push, relations, rooms, search, session, spaces, sso,
+        sync, to_device,
     };
 
     let mut app = axum::Router::new()
@@ -359,7 +387,11 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/.well-known/matrix/client",
             get(session::well_known_client),
-        );
+        )
+        // The IdP's redirect target. Our own namespace, not `/_matrix`:
+        // it is not a spec endpoint, and the spec leaves the callback
+        // URL entirely to the server (decision 1).
+        .route("/_saltator/client/oidc/callback", get(sso::oidc_callback));
 
     // Endpoints under both `/r0` (legacy) and `/v3` prefixes.
     for prefix in ["/_matrix/client/r0", "/_matrix/client/v3"] {
@@ -370,6 +402,15 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
             .route(&p("/register"), post(session::register))
             .route(&p("/register/available"), get(session::register_available))
             .route(&p("/login"), get(session::get_login_types))
+            .route(&p("/login/sso/redirect"), get(sso::sso_redirect))
+            .route(
+                &p("/login/sso/redirect/{idp_id}"),
+                get(sso::sso_redirect_idp),
+            )
+            .route(
+                &p("/auth/m.login.sso/fallback/web"),
+                get(sso::sso_fallback_web),
+            )
             .route(&p("/login"), post(session::login))
             .route(&p("/logout"), post(session::logout))
             .route(&p("/logout/all"), post(session::logout_all))

@@ -7,13 +7,14 @@ use saltator_store::{Result as StoreResult, StoreError};
 use crate::types::{
     account_data_key, device_scoped_key, external_key, prefix_end, to_device_key, user_key,
     Account, AccountDataEntry, AccountState, AccountV2, AliasEntry, BackupVersionMeta, BlockedRoom,
-    ClaimedKey, Device, FallbackEntry, KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry,
-    Profile, RegToken, SessionCmd, TokenEntry, TokenKind, UiaSession, UserChangePayload,
+    ClaimedKey, Device, FallbackEntry, KeyChangeEntry, LoginTokenEntry, MediaMeta, MembershipEntry,
+    OtkEntry, Profile, RegToken, SessionCmd, TokenEntry, TokenKind, UiaSession, UserChangePayload,
     UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION,
     T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_EDU_OUTBOX, T_EXTERNAL_ID,
-    T_EXTERNAL_ID_USER, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
-    T_MEMBERSHIP, T_NOTICES_ROOM, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_REG_TOKEN, T_ROOM_BLOCKED,
-    T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
+    T_EXTERNAL_ID_USER, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_LOGIN_TOKEN,
+    T_MEDIA, T_MEMBERSHIP, T_NOTICES_ROOM, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_REG_TOKEN,
+    T_ROOM_BLOCKED, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_UIA_SESSION,
+    T_UIA_SESSION_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -1283,6 +1284,70 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
             Ok(UserResponse::Ok)
         }
+        UserCommand::CreateLoginToken {
+            token_hash,
+            user_id,
+            expires_ts,
+            now_ts,
+        } => {
+            // Abandoned tokens (the browser never redeemed them) would
+            // otherwise accumulate forever; the table is tiny, so the
+            // sweep is a full walk here rather than a time index.
+            let mut stale = Vec::new();
+            for (k, v) in ctx.range(T_LOGIN_TOKEN, &[], &[])? {
+                let entry: LoginTokenEntry = dec("login token decode", &v)?;
+                if entry.expires_ts <= *now_ts {
+                    stale.push(k);
+                }
+            }
+            for k in stale {
+                ctx.delete(T_LOGIN_TOKEN, &k);
+            }
+            let account: Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, user_id.as_bytes())?;
+            let Some(account) = account else {
+                return Ok(UserResponse::NotFound);
+            };
+            // A token is a credential-in-waiting; never stage one for an
+            // account that could not log in directly.
+            if !account.state.can_authenticate() {
+                return Ok(UserResponse::InvalidState);
+            }
+            ctx.put(
+                T_LOGIN_TOKEN,
+                token_hash,
+                enc(
+                    "login token encode",
+                    &LoginTokenEntry {
+                        user_id: user_id.clone(),
+                        expires_ts: *expires_ts,
+                    },
+                )?,
+            );
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::ConsumeLoginToken { token_hash, now_ts } => {
+            let Some(raw) = ctx.get(T_LOGIN_TOKEN, token_hash)? else {
+                return Ok(UserResponse::InvalidGrant);
+            };
+            // Deleted before any check: a token that reaches this command
+            // is spent whatever the outcome, which is what single-use
+            // means under a concurrent second redemption.
+            ctx.delete(T_LOGIN_TOKEN, token_hash);
+            let entry: LoginTokenEntry = dec("login token decode", &raw)?;
+            if entry.expires_ts <= *now_ts {
+                return Ok(UserResponse::InvalidGrant);
+            }
+            // The account may have been locked or deactivated in the
+            // window since the token was minted; judge it now, at
+            // redemption, not then.
+            let account: Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, entry.user_id.as_bytes())?;
+            if !account.is_some_and(|a| a.state.can_authenticate()) {
+                return Ok(UserResponse::InvalidGrant);
+            }
+            Ok(UserResponse::LoginTokenOwner(entry.user_id))
+        }
         UserCommand::SetErased { user_id } => {
             let ukey = user_id.as_bytes();
             let Some(mut account): Option<Account> =
@@ -1596,6 +1661,13 @@ impl UserStore {
             out.push((user_id, dec("account decode", &v)?));
         }
         Ok((out, next))
+    }
+
+    /// Peek at a login token without spending it — the login route's
+    /// rate limiter needs the account name before the consume command
+    /// runs. Redemption itself never trusts this read.
+    pub fn login_token(&self, token_hash: &[u8; 32]) -> StoreResult<Option<LoginTokenEntry>> {
+        self.get_typed("login token decode", T_LOGIN_TOKEN, token_hash)
     }
 
     pub fn uia_session(&self, session_id: &str) -> StoreResult<Option<UiaSession>> {

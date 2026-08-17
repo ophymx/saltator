@@ -28,9 +28,9 @@ use saltator_store::Keyspace;
 pub use machine::{UserApp, UserStore};
 pub use types::{
     Account, AccountDataEntry, AccountState, AliasEntry, BackupVersionMeta, BlockedRoom,
-    ClaimRequest, ClaimedKey, Device, KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry,
-    OutboundEdu, Profile, RegToken, SessionCmd, ToDeviceMessage, TokenEntry, TokenKind, UiaSession,
-    UserChangePayload, UserCommand, UserResponse,
+    ClaimRequest, ClaimedKey, Device, KeyChangeEntry, LoginTokenEntry, MediaMeta, MembershipChange,
+    MembershipEntry, OutboundEdu, Profile, RegToken, SessionCmd, ToDeviceMessage, TokenEntry,
+    TokenKind, UiaSession, UserChangePayload, UserCommand, UserResponse,
 };
 
 /// M2 runs a single user shard; the fixed shard count and placement land
@@ -59,6 +59,11 @@ pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 
 /// Access tokens issued alongside a refresh token expire after this long.
 pub const ACCESS_TOKEN_LIFETIME_MS: u64 = 60 * 60 * 1000;
+
+/// How long an `m.login.token` login token stays redeemable. It only has
+/// to survive the IdP-callback → client redirect, so short: a stolen
+/// token from a logged URL should already be dead.
+pub const LOGIN_TOKEN_LIFETIME_MS: u64 = 2 * 60 * 1000;
 
 /// How long a user-interactive auth session stays valid. Long enough for
 /// a human to work through a multi-stage flow, short enough that a
@@ -239,6 +244,62 @@ impl UserServer {
         if !verify_password(password.to_owned(), hash).await? {
             return Err(UserError::Forbidden);
         }
+        let (session, cmd) = new_session(user_id, device_id, display_name, want_refresh);
+        match self.propose(&UserCommand::CreateSession(cmd)).await? {
+            UserResponse::Ok => Ok(session),
+            UserResponse::NotFound => Err(UserError::Forbidden),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Mint a single-use login token for `user_id`, who an external
+    /// identity provider has just authenticated (the OIDC slice). The
+    /// returned token goes into the browser redirect; only its hash is
+    /// stored.
+    pub async fn create_login_token(&self, user_id: &UserId) -> Result<String> {
+        let token = generate_token();
+        let now = now_ms();
+        match self
+            .propose(&UserCommand::CreateLoginToken {
+                token_hash: token_hash(&token),
+                user_id: user_id.to_string(),
+                expires_ts: now + LOGIN_TOKEN_LIFETIME_MS,
+                now_ts: now,
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(token),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            UserResponse::InvalidState => Err(UserError::InvalidState),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `m.login.token`: spend a login token and mint a session. The
+    /// consume is a single shard command, so a token redeems exactly once
+    /// however many clients race on it.
+    pub async fn login_with_token(
+        &self,
+        token: &str,
+        device_id: Option<String>,
+        display_name: Option<String>,
+        want_refresh: bool,
+    ) -> Result<Session> {
+        let user_id = match self
+            .propose(&UserCommand::ConsumeLoginToken {
+                token_hash: token_hash(token),
+                now_ts: now_ms(),
+            })
+            .await?
+        {
+            UserResponse::LoginTokenOwner(user_id) => OwnedUserId::try_from(user_id)
+                .map_err(|e| UserError::Internal(format!("stored user id: {e}")))?,
+            // Unknown, expired, already spent, or the account can no
+            // longer authenticate: all the same forbidden, for the same
+            // reason failed passwords are.
+            UserResponse::InvalidGrant => return Err(UserError::Forbidden),
+            other => return Err(unexpected(other)),
+        };
         let (session, cmd) = new_session(user_id, device_id, display_name, want_refresh);
         match self.propose(&UserCommand::CreateSession(cmd)).await? {
             UserResponse::Ok => Ok(session),

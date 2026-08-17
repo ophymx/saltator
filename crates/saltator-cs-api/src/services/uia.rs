@@ -31,6 +31,7 @@ type Result<T> = std::result::Result<T, ApiError>;
 const DUMMY: &str = "m.login.dummy";
 const PASSWORD: &str = "m.login.password";
 const REGISTRATION_TOKEN: &str = "m.login.registration_token";
+const SSO: &str = "m.login.sso";
 
 /// What the caller is authenticating *for*, which decides both the flows
 /// offered and how each stage is verified.
@@ -52,13 +53,21 @@ pub(crate) struct UiaOk {
 
 pub(crate) struct Uia<'a> {
     pub users: &'a Arc<UserServer>,
+    /// SSO runtime, when OIDC is configured: re-authentication may then
+    /// be satisfied through the browser instead of a password, which is
+    /// the only option an SSO-only account has.
+    pub sso: Option<&'a crate::services::oidc::SsoRuntime>,
 }
 
 impl Purpose<'_> {
     /// The flows to advertise. Matches Synapse's shape: requiring a token
     /// prepends the stage to every existing flow rather than replacing
     /// them, so the dummy stage still terminates the flow.
-    fn flows(&self) -> Vec<Vec<&'static str>> {
+    ///
+    /// `sso` adds an alternative *flow*, never a stage inside the
+    /// password one: an account may have a password, a link, or both,
+    /// and either alone must be enough.
+    fn flows(&self, sso: bool) -> Vec<Vec<&'static str>> {
         match self {
             Purpose::Register {
                 requires_token: false,
@@ -66,6 +75,7 @@ impl Purpose<'_> {
             Purpose::Register {
                 requires_token: true,
             } => vec![vec![REGISTRATION_TOKEN, DUMMY]],
+            Purpose::Reauth(_) if sso => vec![vec![PASSWORD], vec![SSO]],
             Purpose::Reauth(_) => vec![vec![PASSWORD]],
         }
     }
@@ -87,7 +97,7 @@ impl Uia<'_> {
         request_id: &str,
         auth: Option<&AuthData>,
     ) -> Result<UiaOk> {
-        let flows = purpose.flows();
+        let flows = purpose.flows(self.sso.is_some());
         let refs = flow_refs(&flows);
         let request_hash = *blake3::hash(request_id.as_bytes()).as_bytes();
 
@@ -138,10 +148,19 @@ impl Uia<'_> {
         session_id: &str,
     ) -> Result<(&'static str, Option<String>)> {
         match auth {
-            // A fallback acknowledgement asserts the stage was completed
-            // in the web fallback. We have no fallback pages, so it can
-            // only stand in for the stage that needs no proof.
-            AuthData::Dummy(_) | AuthData::FallbackAcknowledgement(_) => Ok((DUMMY, None)),
+            AuthData::Dummy(_) => Ok((DUMMY, None)),
+
+            // A fallback acknowledgement asserts a stage was completed in
+            // a browser page. The SSO fallback is the only one we serve,
+            // so honour it as `m.login.sso` when this session really did
+            // finish one; otherwise it can still stand in for the stage
+            // that needs no proof.
+            AuthData::FallbackAcknowledgement(_) => {
+                match self.take_sso_stage(purpose, session_id)? {
+                    Some(stage) => Ok(stage),
+                    None => Ok((DUMMY, None)),
+                }
+            }
 
             AuthData::RegistrationToken(t) => {
                 if !matches!(purpose, Purpose::Register { .. }) {
@@ -182,10 +201,42 @@ impl Uia<'_> {
                 Ok((PASSWORD, None))
             }
 
-            // A stage no flow here contains: re-challenge rather than
-            // erroring, so the client learns what is actually on offer.
-            _ => Err(ApiError::uiaa(flows, session_id.to_owned())),
+            // An explicit `{"type": "m.login.sso"}` lands here — ruma has
+            // no variant for it, and clients send it as often as the bare
+            // acknowledgement the spec describes. The proof is the
+            // completed browser flow either way, never the label.
+            //
+            // Otherwise: a stage no flow here contains. Re-challenge
+            // rather than error, so the client learns what is on offer.
+            _ => match self.take_sso_stage(purpose, session_id)? {
+                Some(stage) => Ok(stage),
+                None => Err(ApiError::uiaa(flows, session_id.to_owned())),
+            },
         }
+    }
+
+    /// Spend this session's completed SSO fallback, if it has one. The
+    /// mark is single-use and bound to the user the IdP authenticated —
+    /// honouring it for anyone else would be a session transplant.
+    fn take_sso_stage(
+        &self,
+        purpose: &Purpose<'_>,
+        session_id: &str,
+    ) -> Result<Option<(&'static str, Option<String>)>> {
+        // Purpose first: a mark is only ever spendable on re-auth, and
+        // consuming one to then reject it would burn a real completion.
+        let Purpose::Reauth(expected) = purpose else {
+            return Ok(None);
+        };
+        let Some(user) = self.sso.and_then(|s| s.take_uia_done(session_id)) else {
+            return Ok(None);
+        };
+        if user != expected.as_str() {
+            return Err(ApiError::forbidden(
+                "SSO authenticated a different user than this session",
+            ));
+        }
+        Ok(Some((SSO, None)))
     }
 }
 
@@ -241,10 +292,13 @@ mod tests {
     #[tokio::test]
     async fn absent_auth_challenges_with_flows() {
         let (_dir, users) = stack().await;
-        let err = Uia { users: &users }
-            .check(&open(), "register:alice", None)
-            .await
-            .unwrap_err();
+        let err = Uia {
+            users: &users,
+            sso: None,
+        }
+        .check(&open(), "register:alice", None)
+        .await
+        .unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
         assert_eq!(err.extra["flows"][0]["stages"][0], "m.login.dummy");
         assert!(err.extra["session"].is_string());
@@ -256,14 +310,17 @@ mod tests {
     #[tokio::test]
     async fn single_stage_completes_without_a_session_id() {
         let (_dir, users) = stack().await;
-        let ok = Uia { users: &users }
-            .check(
-                &open(),
-                "register:alice",
-                Some(&AuthData::Dummy(Dummy::new())),
-            )
-            .await
-            .unwrap();
+        let ok = Uia {
+            users: &users,
+            sso: None,
+        }
+        .check(
+            &open(),
+            "register:alice",
+            Some(&AuthData::Dummy(Dummy::new())),
+        )
+        .await
+        .unwrap();
         assert!(ok.registration_token.is_none());
     }
 
@@ -273,7 +330,10 @@ mod tests {
     #[tokio::test]
     async fn a_session_cannot_be_replayed_against_another_request() {
         let (_dir, users) = stack().await;
-        let svc = Uia { users: &users };
+        let svc = Uia {
+            users: &users,
+            sso: None,
+        };
 
         // Complete a stage for one request and learn its session id.
         let err = svc.check(&gated(), "op:a", None).await.unwrap_err();
@@ -301,7 +361,10 @@ mod tests {
             .create_registration_token("invite-code", Some(1), None)
             .await
             .unwrap();
-        let svc = Uia { users: &users };
+        let svc = Uia {
+            users: &users,
+            sso: None,
+        };
 
         let mut dummy = Dummy::new();
         let err = svc
@@ -341,7 +404,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_or_exhausted_token_is_refused() {
         let (_dir, users) = stack().await;
-        let svc = Uia { users: &users };
+        let svc = Uia {
+            users: &users,
+            sso: None,
+        };
 
         let err = svc
             .check(
@@ -382,16 +448,19 @@ mod tests {
             .create_registration_token("stale", None, Some(1))
             .await
             .unwrap();
-        let err = Uia { users: &users }
-            .check(
-                &gated(),
-                "register:alice",
-                Some(&AuthData::RegistrationToken(RegistrationToken::new(
-                    "stale".to_owned(),
-                ))),
-            )
-            .await
-            .unwrap_err();
+        let err = Uia {
+            users: &users,
+            sso: None,
+        }
+        .check(
+            &gated(),
+            "register:alice",
+            Some(&AuthData::RegistrationToken(RegistrationToken::new(
+                "stale".to_owned(),
+            ))),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.extra["errcode"], "M_FORBIDDEN");
     }
 
@@ -406,16 +475,19 @@ mod tests {
             .await
             .unwrap();
         let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
-        let err = Uia { users: &users }
-            .check(
-                &Purpose::Reauth(&alice),
-                "deactivate:@alice:hs.test",
-                Some(&AuthData::RegistrationToken(RegistrationToken::new(
-                    "anything".to_owned(),
-                ))),
-            )
-            .await
-            .unwrap_err();
+        let err = Uia {
+            users: &users,
+            sso: None,
+        }
+        .check(
+            &Purpose::Reauth(&alice),
+            "deactivate:@alice:hs.test",
+            Some(&AuthData::RegistrationToken(RegistrationToken::new(
+                "anything".to_owned(),
+            ))),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
         assert!(err.extra.get("completed").is_none());
     }
