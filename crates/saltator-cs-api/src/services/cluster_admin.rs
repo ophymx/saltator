@@ -21,9 +21,9 @@
 //! **A drained node must be taken out of service.** It keeps its old local
 //! state but stops receiving updates, so reads go stale and writes — which
 //! forward to the leader and then wait for *local* applied state to catch
-//! up — hang. Nothing here can enforce that; there is no readiness
-//! endpoint for a load balancer to poll yet, and adding one is the honest
-//! follow-up.
+//! up — hang. Draining now says so itself: `GET /_saltator/health/ready`
+//! answers 503 `draining` on such a node ([`super::health`]), so whatever
+//! fronts it removes it from the pool without an operator remembering to.
 
 use saltator_cluster::placement::RosterError;
 use saltator_cluster::{ClusterError, MetadataHandle, NodeStatus};
