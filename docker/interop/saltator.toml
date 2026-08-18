@@ -22,3 +22,6 @@ federation = "0.0.0.0:8448"
 tls_cert = "/certs/saltator.crt"
 tls_key = "/certs/saltator.key"
 ca_cert = "/certs/ca.crt"
+# The interop peers (Synapse, etc.) live on the isolated Docker network on
+# private IPs; production keeps this false (pre-auth SSRF guard).
+allow_private_ips = true

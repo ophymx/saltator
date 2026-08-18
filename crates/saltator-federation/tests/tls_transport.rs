@@ -47,7 +47,7 @@ async fn outbound_client_reaches_https_federation_listener() {
     });
 
     // A plain client (system roots only) must reject the self-signed cert.
-    let untrusting = build_http_client(None);
+    let untrusting = build_http_client(None, true);
     let rejected = untrusting
         .get(format!("https://{addr}/_matrix/federation/v1/version"))
         .send()
@@ -58,7 +58,7 @@ async fn outbound_client_reaches_https_federation_listener() {
     );
 
     // A client trusting our cert as an extra CA connects over TLS.
-    let trusting = build_http_client(Some(cert.cert.pem().as_bytes()));
+    let trusting = build_http_client(Some(cert.cert.pem().as_bytes()), true);
     let resp = trusting
         .get(format!("https://{addr}/_matrix/federation/v1/version"))
         .send()

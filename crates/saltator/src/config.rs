@@ -44,6 +44,15 @@ pub struct FederationConfig {
     /// to the system roots — e.g. Complement's or a test harness's CA.
     #[serde(default)]
     pub ca_cert: Option<PathBuf>,
+    /// Allow outbound federation to reach private/loopback/link-local
+    /// addresses. MUST stay false in production: the target server name is
+    /// attacker-controlled (an inbound request's `origin`, a room's member
+    /// servers, a well-known/SRV delegation), and is resolved before any
+    /// signature is verified — so an unguarded resolver is a pre-auth SSRF
+    /// into the internal network. Enable only in network-isolated test
+    /// harnesses (Complement, interop) whose peers live on private IPs.
+    #[serde(default)]
+    pub allow_private_ips: bool,
 }
 
 /// Client-server API behavior.
@@ -286,6 +295,11 @@ allow_internal_fetch = false
 # Extra CA to trust for outbound federation, beyond the system roots
 # (private PKI / test harnesses like Complement).
 # ca_cert = "/etc/saltator/ca.crt"
+# Allow outbound federation to private/loopback addresses. Keep false in
+# production — the destination is attacker-controlled and resolved before
+# any signature check, so this would be a pre-auth SSRF. Enable only in
+# network-isolated test harnesses.
+# allow_private_ips = false
 "#;
 
 #[cfg(test)]

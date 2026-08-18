@@ -28,31 +28,52 @@ pub struct FederationClient {
     warmed: Mutex<HashSet<String>>,
     /// Test override: a fixed base URL that skips resolution.
     base_url: Option<String>,
+    /// Allow private-IP targets. False in production (Vuln 5 / M2).
+    allow_private_ips: bool,
 }
 
 impl FederationClient {
+    /// Production default: no extra CA, private-IP targets refused.
     pub fn new(signer: Arc<ServerSigner>) -> Self {
-        Self::from_http(signer, build_http_client(None), None)
+        Self::with_policy(signer, None, false)
     }
 
     /// Trust `ca_pem` in addition to the system roots (e.g. Complement's CA).
     pub fn with_ca(signer: Arc<ServerSigner>, ca_pem: &[u8]) -> Self {
+        Self::with_policy(signer, Some(ca_pem), false)
+    }
+
+    /// The production constructor: an optional extra CA and the SSRF
+    /// policy. `allow_private_ips` comes from `federation.allow_private_ips`
+    /// and MUST be false outside network-isolated test harnesses.
+    pub fn with_policy(
+        signer: Arc<ServerSigner>,
+        ca_pem: Option<&[u8]>,
+        allow_private_ips: bool,
+    ) -> Self {
         Self::from_http(
             signer,
-            build_http_client(Some(ca_pem)),
-            Some(ca_pem.to_vec()),
+            build_http_client(ca_pem, allow_private_ips),
+            ca_pem.map(<[u8]>::to_vec),
+            allow_private_ips,
         )
     }
 
-    fn from_http(signer: Arc<ServerSigner>, http: reqwest::Client, ca: Option<Vec<u8>>) -> Self {
+    fn from_http(
+        signer: Arc<ServerSigner>,
+        http: reqwest::Client,
+        ca: Option<Vec<u8>>,
+        allow_private_ips: bool,
+    ) -> Self {
         Self {
-            resolver: ServerResolver::new(http.clone()),
+            resolver: ServerResolver::new(http.clone(), allow_private_ips),
             http,
             signer,
             ca,
             overrides: Mutex::new(HashMap::new()),
             warmed: Mutex::new(HashSet::new()),
             base_url: None,
+            allow_private_ips,
         }
     }
 
@@ -102,7 +123,12 @@ impl FederationClient {
         overrides
             .entry(key)
             .or_insert_with(|| {
-                build_http_client_with_resolve(self.ca.as_deref(), &resolved.host_header, addr)
+                build_http_client_with_resolve(
+                    self.ca.as_deref(),
+                    &resolved.host_header,
+                    addr,
+                    self.allow_private_ips,
+                )
             })
             .clone()
     }
@@ -110,19 +136,32 @@ impl FederationClient {
     /// Resolve `destination` to (client, base URL, optional Host header).
     /// A pinned `base_url` (tests) skips resolution and uses the shared
     /// client with no Host override.
-    async fn route(&self, destination: &str) -> (reqwest::Client, String, Option<String>) {
+    ///
+    /// Refuses a private/loopback target before any connection: every
+    /// signed request runs against a destination the caller does not fully
+    /// control (a room's member servers, a well-known/SRV delegation), so
+    /// the SSRF guard belongs on this common path, not just the key fetch
+    /// (Vuln 5 / M2).
+    async fn route(
+        &self,
+        destination: &str,
+    ) -> Result<(reqwest::Client, String, Option<String>), OutboundError> {
         match &self.base_url {
-            Some(base) => (self.http.clone(), base.clone(), None),
+            Some(base) => Ok((self.http.clone(), base.clone(), None)),
             None => {
                 let r = self.resolver.resolve(destination).await;
-                (self.client_for(&r), r.base_url, Some(r.host_header))
+                self.resolver
+                    .ensure_allowed(&r)
+                    .map_err(OutboundError::Ssrf)?;
+                Ok((self.client_for(&r), r.base_url, Some(r.host_header)))
             }
         }
     }
 
-    /// Route all requests at a fixed base URL (test doubles, no TLS).
+    /// Route all requests at a fixed base URL (test doubles, no TLS). These
+    /// point at loopback mock servers, so private-IP targets are allowed.
     pub fn with_base_url(signer: Arc<ServerSigner>, base_url: impl Into<String>) -> Self {
-        let mut c = Self::new(signer);
+        let mut c = Self::with_policy(signer, None, true);
         c.base_url = Some(base_url.into());
         c
     }
@@ -165,7 +204,7 @@ impl FederationClient {
     ) -> Result<(Vec<u8>, Option<String>), OutboundError> {
         let auth = sign_request(&self.signer, "GET", path, destination, None)
             .map_err(|e| OutboundError::Sign(e.to_string()))?;
-        let (client, base, host_header) = self.route(destination).await;
+        let (client, base, host_header) = self.route(destination).await?;
         let url = format!("{base}{path}");
         let mut req = client
             .get(&url)
@@ -209,7 +248,7 @@ impl FederationClient {
         let auth = sign_request(&self.signer, method, path, destination, content.as_ref())
             .map_err(|e| OutboundError::Sign(e.to_string()))?;
 
-        let (client, base, host_header) = self.route(destination).await;
+        let (client, base, host_header) = self.route(destination).await?;
         let url = format!("{base}{path}");
         let mut req = client
             .request(method.parse().map_err(|_| OutboundError::BadMethod)?, &url)
@@ -246,6 +285,8 @@ pub enum OutboundError {
     BadMethod,
     #[error("remote response exceeded the size cap")]
     TooLarge,
+    #[error("blocked by SSRF guard: {0}")]
+    Ssrf(&'static str),
 }
 
 /// Largest JSON federation response we buffer (state dumps, backfill, key

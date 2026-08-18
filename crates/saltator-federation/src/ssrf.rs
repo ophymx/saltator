@@ -99,7 +99,16 @@ pub fn guarded_client(allow_internal: bool) -> reqwest::ClientBuilder {
     if allow_internal {
         return reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(5));
     }
-    reqwest::Client::builder()
+    apply_guard(reqwest::Client::builder())
+}
+
+/// Add the SSRF guard — private-IP-filtering DNS plus a redirect policy
+/// that re-checks each hop's IP literal and caps the chain — to an
+/// existing builder, so callers that need their own TLS/timeout/`resolve`
+/// options (federation) can still opt into the guard without discarding
+/// them.
+pub fn apply_guard(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
         .dns_resolver(std::sync::Arc::new(GuardedResolver))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if let Some(host) = attempt.url().host_str() {

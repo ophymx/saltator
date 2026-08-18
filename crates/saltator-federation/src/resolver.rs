@@ -34,15 +34,48 @@ pub struct ServerResolver {
     http: reqwest::Client,
     cache: Mutex<HashMap<String, (ResolvedServer, Instant)>>,
     dns: std::sync::OnceLock<Option<hickory_resolver::TokioResolver>>,
+    allow_private_ips: bool,
 }
 
 impl ServerResolver {
-    pub fn new(http: reqwest::Client) -> Self {
+    pub fn new(http: reqwest::Client, allow_private_ips: bool) -> Self {
         Self {
             http,
             cache: Mutex::new(HashMap::new()),
             dns: std::sync::OnceLock::new(),
+            allow_private_ips,
         }
+    }
+
+    /// Refuse a resolution that would dial a private/loopback/link-local
+    /// address, unless `allow_private_ips` was set for a trusted harness
+    /// (security review 2026-08-13, Vuln 5 / M2). This covers the two
+    /// targets the guarded DNS resolver cannot see: an IP-literal
+    /// `base_url` (reqwest connects to it without a DNS lookup) and an SRV
+    /// `connect_addr` (applied as a fixed `resolve` override that bypasses
+    /// the resolver). Hostname `base_url`s with no override are vetted by
+    /// the guarded client at connect time.
+    pub fn ensure_allowed(&self, resolved: &ResolvedServer) -> Result<(), &'static str> {
+        if self.allow_private_ips {
+            return Ok(());
+        }
+        if let Some(addr) = resolved.connect_addr {
+            if crate::ssrf::is_blocked_ip(&addr.ip()) {
+                return Err("server resolves to a disallowed (internal) address");
+            }
+        }
+        // The base_url authority may itself be an IP literal (an IP-literal
+        // server name, or a well-known/SRV delegation to one).
+        if let Ok(url) = reqwest::Url::parse(&resolved.base_url) {
+            if let Some(host) = url.host_str() {
+                if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+                    if crate::ssrf::is_blocked_ip(&ip) {
+                        return Err("server resolves to a disallowed (internal) address");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The DNS resolver, built from system config on first use. `None` if
@@ -239,6 +272,71 @@ fn plan_default(host: &str) -> ResolvedServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolver(allow_private_ips: bool) -> ServerResolver {
+        ServerResolver::new(reqwest::Client::new(), allow_private_ips)
+    }
+
+    fn resolved(base_url: &str, connect_addr: Option<&str>) -> ResolvedServer {
+        ResolvedServer {
+            base_url: base_url.to_owned(),
+            host_header: "example.org".to_owned(),
+            connect_addr: connect_addr.map(|a| a.parse().unwrap()),
+        }
+    }
+
+    /// The pre-auth SSRF guard (Vuln 5 / M2): an IP-literal base_url or an
+    /// SRV connect address in a private range is refused, a public one
+    /// passes, and a hostname base_url is left to the guarded client.
+    #[test]
+    fn ensure_allowed_blocks_private_targets() {
+        let r = resolver(false);
+        // IP-literal base_url in a private/loopback/link-local range.
+        for base in [
+            "https://127.0.0.1:8448",
+            "https://10.1.2.3:8448",
+            "https://192.168.0.5:8448",
+            "https://169.254.169.254:80", // cloud metadata
+            "https://[::1]:8448",
+        ] {
+            assert!(
+                r.ensure_allowed(&resolved(base, None)).is_err(),
+                "{base} must be refused"
+            );
+        }
+        // An SRV connect_addr pointing at a private IP, even with a public
+        // base_url authority.
+        assert!(r
+            .ensure_allowed(&resolved("https://example.org:8448", Some("10.0.0.9:8448")))
+            .is_err());
+
+        // Public targets pass.
+        assert!(r
+            .ensure_allowed(&resolved("https://1.1.1.1:8448", None))
+            .is_ok());
+        assert!(r
+            .ensure_allowed(&resolved(
+                "https://example.org:8448",
+                Some("93.184.216.34:8448")
+            ))
+            .is_ok());
+        // A hostname base_url with no override is vetted later, at connect.
+        assert!(r
+            .ensure_allowed(&resolved("https://example.org:8448", None))
+            .is_ok());
+    }
+
+    /// A trusted harness (allow_private_ips) skips the guard entirely.
+    #[test]
+    fn ensure_allowed_permits_private_when_allowed() {
+        let r = resolver(true);
+        assert!(r
+            .ensure_allowed(&resolved("https://127.0.0.1:8448", None))
+            .is_ok());
+        assert!(r
+            .ensure_allowed(&resolved("https://example.org:8448", Some("10.0.0.9:8448")))
+            .is_ok());
+    }
 
     #[test]
     fn ipv4_literal_default_port() {

@@ -62,29 +62,44 @@ pub struct KeyCache {
     overrides: Mutex<std::collections::HashMap<(String, std::net::SocketAddr), reqwest::Client>>,
     /// Test override: a fixed base URL that skips resolution.
     base_url: Option<String>,
+    /// Allow private-IP targets. False in production; the resolver and the
+    /// HTTP client both enforce it (Vuln 5 / M2).
+    allow_private_ips: bool,
 }
 
 impl KeyCache {
+    /// Production default: no extra CA, private-IP targets refused.
     pub fn new() -> Self {
-        Self::from_http(crate::http_client::build_http_client(None), None)
+        Self::with_policy(None, false)
     }
 
     /// Trust `ca_pem` in addition to the system roots (Complement's CA).
+    /// Private-IP targets still refused unless [`Self::with_policy`] is
+    /// used with `allow_private_ips`.
     pub fn with_ca(ca_pem: &[u8]) -> Self {
+        Self::with_policy(Some(ca_pem), false)
+    }
+
+    /// The production constructor: an optional extra CA and the SSRF
+    /// policy. `allow_private_ips` comes from `federation.allow_private_ips`
+    /// and MUST be false outside network-isolated test harnesses.
+    pub fn with_policy(ca_pem: Option<&[u8]>, allow_private_ips: bool) -> Self {
         Self::from_http(
-            crate::http_client::build_http_client(Some(ca_pem)),
-            Some(ca_pem.to_vec()),
+            crate::http_client::build_http_client(ca_pem, allow_private_ips),
+            ca_pem.map(<[u8]>::to_vec),
+            allow_private_ips,
         )
     }
 
-    fn from_http(http: reqwest::Client, ca: Option<Vec<u8>>) -> Self {
+    fn from_http(http: reqwest::Client, ca: Option<Vec<u8>>, allow_private_ips: bool) -> Self {
         Self {
-            resolver: crate::resolver::ServerResolver::new(http.clone()),
+            resolver: crate::resolver::ServerResolver::new(http.clone(), allow_private_ips),
             http,
             cache: Mutex::new(BTreeMap::new()),
             ca,
             overrides: Mutex::new(std::collections::HashMap::new()),
             base_url: None,
+            allow_private_ips,
         }
     }
 
@@ -102,14 +117,16 @@ impl KeyCache {
                     self.ca.as_deref(),
                     &resolved.host_header,
                     addr,
+                    self.allow_private_ips,
                 )
             })
             .clone()
     }
 
-    /// Route all fetches at a fixed base URL (test doubles, no TLS).
+    /// Route all fetches at a fixed base URL (test doubles, no TLS). These
+    /// point at loopback mock servers, so private-IP targets are allowed.
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
-        let mut c = Self::new();
+        let mut c = Self::with_policy(None, true);
         c.base_url = Some(base_url.into());
         c
     }
@@ -176,6 +193,10 @@ impl KeyCache {
             Some(base) => (self.http.clone(), base.clone(), None),
             None => {
                 let r = self.resolver.resolve(server).await;
+                // Refuse a private/loopback target before connecting: this
+                // fetch runs on an attacker-controlled `origin` before the
+                // request's signature is verified (Vuln 5 / M2).
+                self.resolver.ensure_allowed(&r).map_err(KeyError::Ssrf)?;
                 (self.client_for(&r), r.base_url, Some(r.host_header))
             }
         };
@@ -269,12 +290,38 @@ pub enum KeyError {
     Malformed(&'static str),
     #[error("key response self-signature invalid: {0}")]
     BadSelfSignature(String),
+    #[error("blocked by SSRF guard: {0}")]
+    Ssrf(&'static str),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use saltator_roomserver::ServerSigner;
+
+    /// The pre-auth SSRF (Vuln 5 / M2): an inbound request's `origin` reaches
+    /// `keys_for` before any signature is verified. A private-IP origin must
+    /// be refused before any connection is attempted.
+    #[tokio::test]
+    async fn key_fetch_refuses_a_private_ip_origin() {
+        let cache = KeyCache::new(); // production: allow_private_ips = false
+        for origin in ["127.0.0.1:9", "10.0.0.1", "192.168.1.1:8448", "[::1]:8448"] {
+            match cache.keys_for(origin, 0).await {
+                Err(KeyError::Ssrf(_)) => {}
+                other => panic!("{origin} should be refused by the SSRF guard, got {other:?}"),
+            }
+        }
+        // A trusted harness allows the target — it then fails to connect,
+        // which is a transport error, not an SSRF refusal.
+        let allowed = KeyCache::with_policy(None, true);
+        assert!(
+            !matches!(
+                allowed.keys_for("127.0.0.1:9", 0).await,
+                Err(KeyError::Ssrf(_))
+            ),
+            "allow_private_ips must not trip the SSRF guard"
+        );
+    }
 
     fn signed_key_response(signer: &ServerSigner, valid_until_ts: i64) -> serde_json::Value {
         let mut key_obj = CanonicalJsonObject::new();

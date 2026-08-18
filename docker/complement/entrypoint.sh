@@ -46,10 +46,14 @@ fi
 # Write one node's config. Args: dir id internal client fed seeds
 write_config() {
     _dir="$1"; _id="$2"; _internal="$3"; _client="$4"; _fed="$5"; _seeds="$6"
-    _fed_tls=""
-    if [ -n "$HAVE_TLS" ]; then
-        _fed_tls="
+    # Complement's homeservers live on the isolated test network (private
+    # IPs), so outbound federation must be allowed to reach them; production
+    # keeps this false (pre-auth SSRF guard).
+    _fed_tls="
 [federation]
+allow_private_ips = true"
+    if [ -n "$HAVE_TLS" ]; then
+        _fed_tls="$_fed_tls
 tls_cert = \"/data/fed.crt\"
 tls_key = \"/data/fed.key\"
 ca_cert = \"$CA_CRT\""
