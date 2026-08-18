@@ -5,14 +5,15 @@ use saltator_shard::{ApplyCtx, ReadCtx, ShardApp};
 use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
-    account_data_key, device_scoped_key, prefix_end, to_device_key, user_key, Account,
-    AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimedKey, Device, FallbackEntry,
-    KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry, Profile, SessionCmd, TokenEntry,
-    TokenKind, UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS,
-    T_BACKUP_KEY, T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS,
-    T_DIRECTORY, T_EDU_OUTBOX, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
-    T_MEMBERSHIP, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN,
-    T_TO_DEVICE_SEEN_IDX,
+    account_data_key, device_scoped_key, external_key, prefix_end, to_device_key, user_key,
+    Account, AccountDataEntry, AccountState, AccountV2, AliasEntry, BackupVersionMeta, BlockedRoom,
+    ClaimedKey, Device, FallbackEntry, KeyChangeEntry, MediaMeta, MembershipEntry, OtkEntry,
+    Profile, RegToken, SessionCmd, TokenEntry, TokenKind, UiaSession, UserChangePayload,
+    UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION,
+    T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_EDU_OUTBOX, T_EXTERNAL_ID,
+    T_EXTERNAL_ID_USER, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_MEDIA,
+    T_MEMBERSHIP, T_NOTICES_ROOM, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_REG_TOKEN, T_ROOM_BLOCKED,
+    T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -25,6 +26,29 @@ fn enc<T: serde::Serialize>(what: &str, v: &T) -> StoreResult<Vec<u8>> {
 
 fn dec<T: for<'de> serde::Deserialize<'de>>(what: &str, b: &[u8]) -> StoreResult<T> {
     postcard::from_bytes(b).map_err(|e| codec_err(what, e))
+}
+
+/// One page of [`UserStore::accounts`]: the rows, and the start key of
+/// the page after this one (`None` on the last page).
+pub type AccountPage = (Vec<(String, Account)>, Option<String>);
+
+/// The v2 → v3 account mapping (schema step 3). Pure, so the encoding
+/// contract can be tested without a shard: existing accounts keep their
+/// credential and creation time, a `deactivated` bool becomes the
+/// corresponding lifecycle state, and nobody is grandfathered into being
+/// an administrator.
+fn account_v2_to_v3(old: AccountV2) -> Account {
+    Account {
+        password_hash: old.password_hash,
+        created_ts: old.created_ts,
+        state: if old.deactivated {
+            AccountState::Deactivated
+        } else {
+            AccountState::Active
+        },
+        admin: false,
+        erased: false,
+    }
 }
 
 pub struct UserApp;
@@ -45,6 +69,21 @@ impl ShardApp for UserApp {
             2 => {
                 for (k, _) in ctx.range(T_EDU_OUTBOX, &[], &[])? {
                     ctx.delete(T_EDU_OUTBOX, &k);
+                }
+                Ok(())
+            }
+            // v3: `Account` gains state/admin/erased in place of the
+            // `deactivated` bool (docs/design-admin-identity.md). Rewrite
+            // every row: the two encodings are not compatible, so this
+            // must be total. Correct on an empty store.
+            3 => {
+                for (k, v) in ctx.range(T_ACCOUNT, &[], &[])? {
+                    let old: AccountV2 = dec("account v2 decode", &v)?;
+                    ctx.put(
+                        T_ACCOUNT,
+                        &k,
+                        enc("account encode", &account_v2_to_v3(old))?,
+                    );
                 }
                 Ok(())
             }
@@ -263,6 +302,102 @@ fn delete_devices_except(
 
 /// Log a device-list change for `user_id` so peers' `/sync` and
 /// `/keys/changes` tell them to re-query the user's keys.
+/// Tear an account down: mark it `Deactivated`, drop the local credential
+/// and invalidate every session.
+///
+/// Shared by the client's own `/account/deactivate` and the admin API, so
+/// there is exactly one definition of what deactivation *means*. A second
+/// implementation that forgot the device sweep would leave live tokens on
+/// a "deactivated" account.
+fn apply_deactivate(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<UserResponse> {
+    let ukey = user_id.as_bytes();
+    let Some(mut account): Option<Account> = get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+    else {
+        return Ok(UserResponse::NotFound);
+    };
+    account.state = AccountState::Deactivated;
+    account.password_hash = None;
+    ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+    if delete_devices_except(ctx, user_id, None)? {
+        log_key_change(ctx, user_id)?;
+    }
+    Ok(UserResponse::Ok)
+}
+
+/// Reserve a username, create the account, and consume a registration
+/// token if one was presented — all in one apply batch.
+///
+/// The token is re-checked *here* rather than trusted from the UIA stage:
+/// the stage runs against a read of the applied state, so two concurrent
+/// registrations can both see a one-use token as valid. Only the ordering
+/// the log gives us makes "one use" true.
+fn apply_register(
+    ctx: &mut ApplyCtx<'_>,
+    user_id: &str,
+    password_hash: &Option<String>,
+    ts: u64,
+    session: Option<&SessionCmd>,
+    registration_token: Option<&str>,
+) -> StoreResult<UserResponse> {
+    let ukey = user_id.as_bytes();
+    if ctx.get(T_ACCOUNT, ukey)?.is_some() {
+        return Ok(UserResponse::UserExists);
+    }
+    if let Some(token) = registration_token {
+        let Some(mut entry): Option<RegToken> =
+            get_typed(ctx, "reg token decode", T_REG_TOKEN, token.as_bytes())?
+        else {
+            return Ok(UserResponse::InvalidToken);
+        };
+        if !entry.usable(ts) {
+            return Ok(UserResponse::InvalidToken);
+        }
+        entry.used += 1;
+        ctx.put(
+            T_REG_TOKEN,
+            token.as_bytes(),
+            enc("reg token encode", &entry)?,
+        );
+    }
+    ctx.put(
+        T_ACCOUNT,
+        ukey,
+        enc(
+            "account encode",
+            &Account {
+                password_hash: password_hash.clone(),
+                created_ts: ts,
+                state: AccountState::Active,
+                admin: false,
+                erased: false,
+            },
+        )?,
+    );
+    if let Some(session) = session {
+        write_session(ctx, session)?;
+    }
+    Ok(UserResponse::Ok)
+}
+
+/// `T_UIA_SESSION_IDX` key: `created_ts (BE) ++ session_id`.
+fn uia_idx_key(created_ts: u64, session_id: &str) -> Vec<u8> {
+    let mut k = created_ts.to_be_bytes().to_vec();
+    k.extend_from_slice(session_id.as_bytes());
+    k
+}
+
+/// Drop UIA sessions created before `expire_before_ts`. Deterministic:
+/// the horizon is carried in the command, never read from a clock.
+fn sweep_uia_sessions(ctx: &mut ApplyCtx<'_>, expire_before_ts: u64) -> StoreResult<()> {
+    let end = expire_before_ts.to_be_bytes().to_vec();
+    for (k, _) in ctx.range(T_UIA_SESSION_IDX, &[], &end)? {
+        let session_id = &k[8..];
+        ctx.delete(T_UIA_SESSION, session_id);
+        ctx.delete(T_UIA_SESSION_IDX, &k);
+    }
+    Ok(())
+}
+
 fn log_key_change(ctx: &mut ApplyCtx<'_>, user_id: &str) -> StoreResult<()> {
     let seq = emit_user_change(ctx, user_id)?;
     put_key_change(ctx, seq, user_id, None)
@@ -295,28 +430,21 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             password_hash,
             ts,
             session,
-        } => {
-            let ukey = user_id.as_bytes();
-            if ctx.get(T_ACCOUNT, ukey)?.is_some() {
-                return Ok(UserResponse::UserExists);
-            }
-            ctx.put(
-                T_ACCOUNT,
-                ukey,
-                enc(
-                    "account encode",
-                    &Account {
-                        password_hash: password_hash.clone(),
-                        created_ts: *ts,
-                        deactivated: false,
-                    },
-                )?,
-            );
-            if let Some(session) = session {
-                write_session(ctx, session)?;
-            }
-            Ok(UserResponse::Ok)
-        }
+        } => apply_register(ctx, user_id, password_hash, *ts, session.as_ref(), None),
+        UserCommand::RegisterWithToken {
+            user_id,
+            password_hash,
+            ts,
+            session,
+            registration_token,
+        } => apply_register(
+            ctx,
+            user_id,
+            password_hash,
+            *ts,
+            session.as_ref(),
+            registration_token.as_deref(),
+        ),
         UserCommand::CreateSession(session) => {
             if ctx.get(T_ACCOUNT, session.user_id.as_bytes())?.is_none() {
                 return Ok(UserResponse::NotFound);
@@ -922,19 +1050,256 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
             Ok(UserResponse::Ok)
         }
-        UserCommand::Deactivate { user_id } => {
+        UserCommand::Deactivate { user_id } => apply_deactivate(ctx, user_id),
+        UserCommand::SetLocked { user_id, locked } => {
             let ukey = user_id.as_bytes();
             let Some(mut account): Option<Account> =
                 get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
             else {
                 return Ok(UserResponse::NotFound);
             };
-            account.deactivated = true;
-            account.password_hash = None;
+            // Deactivation is terminal: locking or unlocking past it would
+            // either be a no-op dressed as success or a resurrection.
+            if account.state == AccountState::Deactivated {
+                return Ok(UserResponse::InvalidState);
+            }
+            account.state = if *locked {
+                AccountState::Locked
+            } else {
+                AccountState::Active
+            };
             ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
-            if delete_devices_except(ctx, user_id, None)? {
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::SetAdmin { user_id, admin } => {
+            let ukey = user_id.as_bytes();
+            let Some(mut account): Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            account.admin = *admin;
+            ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::AdminSetPassword {
+            user_id,
+            password_hash,
+            logout_devices,
+        } => {
+            let ukey = user_id.as_bytes();
+            let Some(mut account): Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            // A deactivated account has had its credential deliberately
+            // cleared; handing it a new one would partially undo that.
+            if account.state == AccountState::Deactivated {
+                return Ok(UserResponse::InvalidState);
+            }
+            account.password_hash = Some(password_hash.clone());
+            ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+            // No device is kept: the administrator is not on one of them.
+            if *logout_devices && delete_devices_except(ctx, user_id, None)? {
                 log_key_change(ctx, user_id)?;
             }
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::CompleteUiaStage {
+            session_id,
+            request_hash,
+            stage,
+            registration_token,
+            now_ts,
+            expire_before_ts,
+        } => {
+            sweep_uia_sessions(ctx, *expire_before_ts)?;
+            let skey = session_id.as_bytes();
+            let existing: Option<UiaSession> =
+                get_typed(ctx, "uia session decode", T_UIA_SESSION, skey)?;
+            let mut session = match existing {
+                Some(s) => {
+                    // A session carries privilege — the stages already
+                    // satisfied. Honouring it for a different request would
+                    // let a client complete a password stage for something
+                    // harmless and spend it on something destructive.
+                    if s.request_hash != *request_hash {
+                        return Ok(UserResponse::UiaRequestMismatch);
+                    }
+                    s
+                }
+                // Absent means "first stage of this flow": a single-stage
+                // flow completes in one request, with no session id from
+                // the client, and the spec allows exactly that.
+                None => {
+                    ctx.put(
+                        T_UIA_SESSION_IDX,
+                        &uia_idx_key(*now_ts, session_id),
+                        Vec::new(),
+                    );
+                    UiaSession {
+                        request_hash: *request_hash,
+                        completed: Vec::new(),
+                        registration_token: None,
+                        created_ts: *now_ts,
+                    }
+                }
+            };
+            if !session.completed.iter().any(|s| s == stage) {
+                session.completed.push(stage.clone());
+            }
+            if registration_token.is_some() {
+                session.registration_token = registration_token.clone();
+            }
+            ctx.put(T_UIA_SESSION, skey, enc("uia session encode", &session)?);
+            Ok(UserResponse::UiaCompleted {
+                completed: session.completed,
+                registration_token: session.registration_token,
+            })
+        }
+        UserCommand::CreateRegistrationToken {
+            token,
+            uses_allowed,
+            expiry_ts,
+            ts,
+        } => {
+            let key = token.as_bytes();
+            if ctx.get(T_REG_TOKEN, key)?.is_some() {
+                return Ok(UserResponse::TokenExists);
+            }
+            ctx.put(
+                T_REG_TOKEN,
+                key,
+                enc(
+                    "reg token encode",
+                    &RegToken {
+                        uses_allowed: *uses_allowed,
+                        used: 0,
+                        expiry_ts: *expiry_ts,
+                        created_ts: *ts,
+                    },
+                )?,
+            );
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::DeleteRegistrationToken { token } => {
+            if ctx.get(T_REG_TOKEN, token.as_bytes())?.is_none() {
+                return Ok(UserResponse::NotFound);
+            }
+            ctx.delete(T_REG_TOKEN, token.as_bytes());
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::LinkExternalId {
+            user_id,
+            auth_provider,
+            external_id,
+        } => {
+            let ukey = user_id.as_bytes();
+            let Some(account): Option<Account> = get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            // A deactivated account is terminal. Linking one would stage a
+            // credential for an identity that is meant to be gone — and
+            // the link would still be there when the IdP is switched on.
+            if account.state == AccountState::Deactivated {
+                return Ok(UserResponse::InvalidState);
+            }
+            let fwd = external_key(auth_provider, external_id);
+            if let Some(owner) = ctx.get(T_EXTERNAL_ID, &fwd)? {
+                let owner: String = dec("external id owner decode", &owner)?;
+                if owner != *user_id {
+                    return Ok(UserResponse::ExternalIdInUse(owner));
+                }
+            }
+            // Relinking replaces: drop the subject this account used to
+            // hold at this provider, or the forward row would outlive the
+            // reverse one and keep the old subject reserved forever.
+            let rev = user_key(user_id, auth_provider);
+            if let Some(prev) = ctx.get(T_EXTERNAL_ID_USER, &rev)? {
+                let prev: String = dec("external id decode", &prev)?;
+                if prev != *external_id {
+                    ctx.delete(T_EXTERNAL_ID, &external_key(auth_provider, &prev));
+                }
+            }
+            ctx.put(
+                T_EXTERNAL_ID,
+                &fwd,
+                enc("external id owner encode", user_id)?,
+            );
+            ctx.put(
+                T_EXTERNAL_ID_USER,
+                &rev,
+                enc("external id encode", external_id)?,
+            );
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::UnlinkExternalId {
+            user_id,
+            auth_provider,
+        } => {
+            let rev = user_key(user_id, auth_provider);
+            let Some(external_id) = ctx.get(T_EXTERNAL_ID_USER, &rev)? else {
+                return Ok(UserResponse::NotFound);
+            };
+            let external_id: String = dec("external id decode", &external_id)?;
+            ctx.delete(T_EXTERNAL_ID, &external_key(auth_provider, &external_id));
+            ctx.delete(T_EXTERNAL_ID_USER, &rev);
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::SetNoticesRoom { user_id, room_id } => {
+            ctx.put(
+                T_NOTICES_ROOM,
+                user_id.as_bytes(),
+                enc("notices room encode", room_id)?,
+            );
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::SetRoomBlocked {
+            room_id,
+            blocked,
+            by,
+            ts,
+        } => {
+            let key = room_id.as_bytes();
+            if *blocked {
+                ctx.put(
+                    T_ROOM_BLOCKED,
+                    key,
+                    enc(
+                        "blocked room encode",
+                        &BlockedRoom {
+                            by: by.clone(),
+                            ts: *ts,
+                        },
+                    )?,
+                );
+            } else {
+                // Unblocking an unblocked room is a no-op, not an error:
+                // the operator's intent ("this room is open") holds either
+                // way, and a 404 here would only invite a retry loop.
+                ctx.delete(T_ROOM_BLOCKED, key);
+            }
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::SetErased { user_id } => {
+            let ukey = user_id.as_bytes();
+            let Some(mut account): Option<Account> =
+                get_typed(ctx, "account decode", T_ACCOUNT, ukey)?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            // Erasure is a modifier on deactivation, not an alternative to
+            // it: erasing a live account would leave it able to log in.
+            if account.state != AccountState::Deactivated {
+                return Ok(UserResponse::InvalidState);
+            }
+            account.erased = true;
+            ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+            // The profile is the PII this server can actually remove
+            // today. Message redaction is not implemented.
+            ctx.delete(T_PROFILE, ukey);
             Ok(UserResponse::Ok)
         }
         UserCommand::CreateBackupVersion {
@@ -1200,6 +1565,117 @@ impl UserStore {
 
     pub fn account(&self, user_id: &str) -> StoreResult<Option<Account>> {
         self.get_typed("account decode", T_ACCOUNT, user_id.as_bytes())
+    }
+
+    /// One page of accounts in user-id order, starting at `from`
+    /// (inclusive) — for the admin user list. Bounded by construction:
+    /// there is no unpaginated variant, because an operator listing every
+    /// account should not be a whole-table materialization.
+    ///
+    /// Returns at most `limit` entries plus the next start key, which is
+    /// `None` on the last page.
+    pub fn accounts(&self, from: Option<&str>, limit: usize) -> StoreResult<AccountPage> {
+        // One extra row tells us whether a further page exists without a
+        // second query; it is the next page's start key, not a result.
+        let rows = self.read.scan(
+            T_ACCOUNT,
+            from.unwrap_or("").as_bytes(),
+            &[],
+            limit.saturating_add(1),
+            false,
+        )?;
+        let mut out = Vec::with_capacity(rows.len().min(limit));
+        let mut next = None;
+        for (i, (k, v)) in rows.into_iter().enumerate() {
+            let user_id = String::from_utf8(k)
+                .map_err(|_| StoreError::Engine("account key not UTF-8".into()))?;
+            if i == limit {
+                next = Some(user_id);
+                break;
+            }
+            out.push((user_id, dec("account decode", &v)?));
+        }
+        Ok((out, next))
+    }
+
+    pub fn uia_session(&self, session_id: &str) -> StoreResult<Option<UiaSession>> {
+        self.get_typed("uia session decode", T_UIA_SESSION, session_id.as_bytes())
+    }
+
+    pub fn registration_token(&self, token: &str) -> StoreResult<Option<RegToken>> {
+        self.get_typed("reg token decode", T_REG_TOKEN, token.as_bytes())
+    }
+
+    /// Every registration token. Unpaginated on purpose: this is an
+    /// operator-managed set of invite codes, not user data, and a
+    /// deployment with enough of them to matter has a different problem.
+    pub fn registration_tokens(&self) -> StoreResult<Vec<(String, RegToken)>> {
+        let mut out = Vec::new();
+        for (k, v) in self.read.range(T_REG_TOKEN, &[], &[])? {
+            let token = String::from_utf8(k)
+                .map_err(|_| StoreError::Engine("registration token not UTF-8".into()))?;
+            out.push((token, dec("reg token decode", &v)?));
+        }
+        Ok(out)
+    }
+
+    /// The room carrying this user's server notices, if one has been
+    /// created.
+    pub fn notices_room(&self, user_id: &str) -> StoreResult<Option<String>> {
+        self.get_typed("notices room decode", T_NOTICES_ROOM, user_id.as_bytes())
+    }
+
+    /// Why a room is closed to joins, or `None` if it is open. On the
+    /// latency path of every join, local and federated, so it is a point
+    /// lookup and nothing more.
+    pub fn blocked_room(&self, room_id: &str) -> StoreResult<Option<BlockedRoom>> {
+        self.get_typed("blocked room decode", T_ROOM_BLOCKED, room_id.as_bytes())
+    }
+
+    /// Every blocked room, id-ordered. Unpaginated: this is an
+    /// operator-curated set, and one large enough to matter is its own
+    /// problem. It is also the only way to see blocks on rooms this server
+    /// does not host, which have no row in the room shard to list.
+    pub fn blocked_rooms(&self) -> StoreResult<Vec<(String, BlockedRoom)>> {
+        let mut out = Vec::new();
+        for (k, v) in self.read.range(T_ROOM_BLOCKED, &[], &[])? {
+            let room_id = String::from_utf8(k)
+                .map_err(|_| StoreError::Engine("blocked room id not UTF-8".into()))?;
+            out.push((room_id, dec("blocked room decode", &v)?));
+        }
+        Ok(out)
+    }
+
+    /// The account linked to `(auth_provider, external_id)`, if any — the
+    /// lookup an IdP callback will do, and the one the admin API exposes
+    /// so an operator can answer "who is this subject?".
+    pub fn external_id_owner(
+        &self,
+        auth_provider: &str,
+        external_id: &str,
+    ) -> StoreResult<Option<String>> {
+        self.get_typed(
+            "external id owner decode",
+            T_EXTERNAL_ID,
+            &external_key(auth_provider, external_id),
+        )
+    }
+
+    /// Every `(auth_provider, external_id)` this account is linked to, in
+    /// provider order. Unpaginated: the row count is the number of
+    /// identity providers a deployment runs, not user data.
+    pub fn external_ids(&self, user_id: &str) -> StoreResult<Vec<(String, String)>> {
+        let start = user_key(user_id, "");
+        let mut out = Vec::new();
+        for (k, v) in self
+            .read
+            .range(T_EXTERNAL_ID_USER, &start, &user_end(user_id))?
+        {
+            let provider = String::from_utf8(k[start.len()..].to_vec())
+                .map_err(|_| StoreError::Engine("auth provider not UTF-8".into()))?;
+            out.push((provider, dec("external id decode", &v)?));
+        }
+        Ok(out)
     }
 
     pub fn profile(&self, user_id: &str) -> StoreResult<Option<Profile>> {
@@ -1571,5 +2047,73 @@ impl UserStore {
 
     pub fn media(&self, media_id: &str) -> StoreResult<Option<MediaMeta>> {
         self.get_typed("media decode", T_MEDIA, media_id.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A v2 account row must not silently decode as v3. Postcard encodes
+    /// fields positionally, so a v2 blob read as v3 lands the `deactivated`
+    /// bool on the state discriminant and then runs out of bytes. That
+    /// failure is what makes the migration load-bearing rather than
+    /// cosmetic — if this ever starts succeeding, old rows would be
+    /// misread as `Active` with garbage flags.
+    #[test]
+    fn v2_account_does_not_decode_as_v3() {
+        let v2 = AccountV2 {
+            password_hash: Some("$argon2id$v=19$dummy".into()),
+            created_ts: 1_700_000_000_000,
+            deactivated: false,
+        };
+        let blob = postcard::to_stdvec(&v2).unwrap();
+        assert!(
+            postcard::from_bytes::<Account>(&blob).is_err(),
+            "v2 blob must not be readable as a v3 Account"
+        );
+    }
+
+    #[test]
+    fn v3_migration_maps_deactivation_to_state() {
+        let live = account_v2_to_v3(AccountV2 {
+            password_hash: Some("hash".into()),
+            created_ts: 7,
+            deactivated: false,
+        });
+        assert_eq!(live.state, AccountState::Active);
+        assert_eq!(live.password_hash.as_deref(), Some("hash"));
+        assert_eq!(live.created_ts, 7);
+
+        let gone = account_v2_to_v3(AccountV2 {
+            password_hash: None,
+            created_ts: 7,
+            deactivated: true,
+        });
+        assert_eq!(gone.state, AccountState::Deactivated);
+    }
+
+    /// Nobody is grandfathered into privilege by the migration — the
+    /// bootstrap admin comes from config, never from existing data.
+    #[test]
+    fn v3_migration_grants_no_admin() {
+        for deactivated in [false, true] {
+            let a = account_v2_to_v3(AccountV2 {
+                password_hash: None,
+                created_ts: 0,
+                deactivated,
+            });
+            assert!(!a.admin);
+            assert!(!a.erased);
+        }
+    }
+
+    /// Only `Active` may authenticate, so a state added later is refused
+    /// until something deliberately allows it.
+    #[test]
+    fn only_active_authenticates() {
+        assert!(AccountState::Active.can_authenticate());
+        assert!(!AccountState::Locked.can_authenticate());
+        assert!(!AccountState::Deactivated.can_authenticate());
     }
 }

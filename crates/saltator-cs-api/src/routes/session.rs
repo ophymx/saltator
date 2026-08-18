@@ -3,12 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use ruma::api::client::account::{get_username_availability, register, whoami};
 use ruma::api::client::discovery::get_capabilities;
 use ruma::api::client::discovery::get_supported_versions;
 use ruma::api::client::session::{get_login_types, login, logout, logout_all, refresh_token};
-use ruma::api::client::uiaa::{AuthData, UserIdentifier};
 
 use saltator_core::RoomVersion;
 use saltator_userserver::Session;
@@ -67,6 +66,29 @@ pub async fn get_capabilities(
     }))
 }
 
+/// Whether `candidate` (a localpart or a full `@user:server` id) names the
+/// reserved server-notices account.
+///
+/// Both sides are canonicalised before comparing, because the string that
+/// is checked here is not the string that becomes the account: registration
+/// lowercases the localpart and accepts the `@user:server` form, so a raw
+/// byte comparison (as this once did) let `Notices` or `@notices:hs` slip
+/// past the reservation and seize the server's own voice (security review
+/// 2026-08-13, Vuln 1). A candidate that does not canonicalise is not
+/// reserved — it will be refused as an invalid username further on.
+fn is_reserved_notices(state: &CsState, candidate: &str) -> bool {
+    let Some(reserved) = state.config.server_notices_localpart.as_deref() else {
+        return false;
+    };
+    matches!(
+        (
+            state.users.canonical_user_id(reserved),
+            state.users.canonical_user_id(candidate),
+        ),
+        (Ok(reserved), Ok(candidate)) if reserved == candidate
+    )
+}
+
 pub async fn register(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<register::v3::Request>,
@@ -81,33 +103,47 @@ pub async fn register(
     if !state.config.registration_enabled {
         return Err(ApiError::forbidden("Registration is disabled"));
     }
-    // Single-stage UIA: m.login.dummy.
-    match &req.auth {
-        Some(AuthData::Dummy(_)) | Some(AuthData::FallbackAcknowledgement(_)) => {}
-        _ => {
-            return Err(ApiError::uiaa(
-                &[&["m.login.dummy"]],
-                saltator_userserver::generate_token(),
-            ))
-        }
-    }
-
     let localpart = match &req.username {
         Some(u) => u.clone(),
         None => random_localpart(),
     };
+    // The server-notices account is the server's own voice. If a user
+    // could register that localpart they would receive other people's
+    // notices and be able to send what looks like server mail.
+    if is_reserved_notices(&state, &localpart) {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "M_USER_IN_USE",
+            "Desired user ID is already taken",
+        ));
+    }
+    // The UIA session is bound to the account being created, so a flow
+    // completed for one username cannot be spent on another.
+    let request_id = format!("register:{localpart}");
+    let outcome = state
+        .uia()
+        .check(
+            &crate::services::uia::Purpose::Register {
+                requires_token: state.config.registration_requires_token,
+            },
+            &request_id,
+            req.auth.as_ref(),
+        )
+        .await?;
+
     // Registration is unauthenticated, so the budget is server-global.
     state.rate_limit(crate::ratelimit::Kind::Registration, "")?;
     let (user_id, session) = state
         .users
-        .register(
-            &localpart,
-            req.password.as_deref(),
-            req.device_id.as_ref().map(|d| d.to_string()),
-            req.initial_device_display_name.clone(),
-            req.refresh_token,
-            req.inhibit_login,
-        )
+        .register_with_token(saltator_userserver::RegisterRequest {
+            localpart: &localpart,
+            password: req.password.as_deref(),
+            device_id: req.device_id.as_ref().map(|d| d.to_string()),
+            display_name: req.initial_device_display_name.clone(),
+            want_refresh: req.refresh_token,
+            inhibit_login: req.inhibit_login,
+            registration_token: outcome.registration_token.as_deref(),
+        })
         .await?;
 
     let mut resp = register::v3::Response::new(user_id);
@@ -120,6 +156,32 @@ pub async fn register(
     Ok(Ra(resp))
 }
 
+/// `GET /_matrix/client/v1/register/m.login.registration_token/validity`
+///
+/// Lets a client tell the user their invite code is bad *before* they
+/// fill in a username and password. Unauthenticated by spec, and answers
+/// only yes/no — never why, or anything about other tokens.
+pub async fn registration_token_validity(
+    State(state): State<Arc<CsState>>,
+    Query(q): Query<TokenValidityQuery>,
+) -> Result<axum::Json<serde_json::Value>> {
+    // Unauthenticated and token-guessable, so it shares registration's
+    // server-global budget rather than having none.
+    state.rate_limit(crate::ratelimit::Kind::Registration, "")?;
+    let valid = state
+        .users
+        .store()
+        .registration_token(&q.token)
+        .map_err(ApiError::internal)?
+        .is_some_and(|t| t.usable(crate::now_ms()));
+    Ok(axum::Json(serde_json::json!({ "valid": valid })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TokenValidityQuery {
+    token: String,
+}
+
 pub async fn register_available(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_username_availability::v3::Request>,
@@ -129,10 +191,11 @@ pub async fn register_available(
     }
     let user_id = state.users.canonical_user_id(&req.username)?;
     let store = state.users.store();
-    if store
-        .account(user_id.as_str())
-        .map_err(ApiError::internal)?
-        .is_some()
+    if is_reserved_notices(&state, &req.username)
+        || store
+            .account(user_id.as_str())
+            .map_err(ApiError::internal)?
+            .is_some()
     {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -144,27 +207,23 @@ pub async fn register_available(
 }
 
 pub async fn get_login_types(
+    State(state): State<Arc<CsState>>,
     _req: Ar<get_login_types::v3::Request>,
 ) -> Ra<get_login_types::v3::Response> {
-    use get_login_types::v3::{LoginType, PasswordLoginType};
-    Ra(get_login_types::v3::Response::new(vec![
-        LoginType::Password(PasswordLoginType::new()),
-    ]))
+    Ra(get_login_types::v3::Response::new(
+        state.authn().login_types(),
+    ))
 }
 
 pub async fn login(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<login::v3::Request>,
 ) -> Result<Ra<login::v3::Response>> {
-    let login::v3::LoginInfo::Password(pw) = &req.login_info else {
-        return Err(ApiError::forbidden("Unsupported login type"));
-    };
-    #[allow(deprecated)]
-    let user = match (&pw.identifier, &pw.user) {
-        (Some(UserIdentifier::Matrix(m)), _) => m.user.clone(),
-        (None, Some(u)) => u.clone(),
-        _ => return Err(ApiError::forbidden("Unsupported identifier type")),
-    };
+    let authn = state.authn();
+    // Identify first, verify second: the rate limiter has to be keyed on
+    // the account being attacked, and it must run before the Argon2
+    // verify rather than after it.
+    let user = authn.identify(&req.login_info)?;
     // Keyed by the CANONICAL account id: login normalizes case and accepts
     // both localpart and full `@user:server` forms, so the raw string would
     // let an attacker multiply the per-account budget with cosmetic
@@ -176,11 +235,9 @@ pub async fn login(
         .map(|u| u.to_string())
         .unwrap_or_else(|_| user.to_lowercase());
     state.rate_limit(crate::ratelimit::Kind::Login, &limit_key)?;
-    let session = state
-        .users
-        .login_password(
-            &user,
-            &pw.password,
+    let session = authn
+        .login(
+            &req.login_info,
             req.device_id.as_ref().map(|d| d.to_string()),
             req.initial_device_display_name.clone(),
             req.refresh_token,

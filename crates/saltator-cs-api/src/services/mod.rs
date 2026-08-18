@@ -4,4 +4,10 @@
 //! rule is that route files gain no *new* domain logic, and existing
 //! logic moves here when touched).
 
+pub(crate) mod admin;
+pub(crate) mod auth;
+pub(crate) mod cluster_admin;
 pub(crate) mod e2ee;
+pub(crate) mod notices;
+pub(crate) mod room_admin;
+pub(crate) mod uia;

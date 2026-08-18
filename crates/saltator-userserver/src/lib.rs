@@ -27,9 +27,10 @@ use saltator_store::Keyspace;
 
 pub use machine::{UserApp, UserStore};
 pub use types::{
-    Account, AccountDataEntry, AliasEntry, BackupVersionMeta, ClaimRequest, ClaimedKey, Device,
-    KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry, OutboundEdu, Profile, SessionCmd,
-    ToDeviceMessage, TokenEntry, TokenKind, UserChangePayload, UserCommand, UserResponse,
+    Account, AccountDataEntry, AccountState, AliasEntry, BackupVersionMeta, BlockedRoom,
+    ClaimRequest, ClaimedKey, Device, KeyChangeEntry, MediaMeta, MembershipChange, MembershipEntry,
+    OutboundEdu, Profile, RegToken, SessionCmd, ToDeviceMessage, TokenEntry, TokenKind, UiaSession,
+    UserChangePayload, UserCommand, UserResponse,
 };
 
 /// M2 runs a single user shard; the fixed shard count and placement land
@@ -41,12 +42,28 @@ pub use types::{
 /// migration drops the orphaned `T_EDU_OUTBOX`. Gated in the daemon on
 /// the fed-out drain marker covering every remaining row
 /// (docs/design-federation-out.md §drain).
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// v3 (step 5, slice 1): `Account` gains an explicit lifecycle state, an
+/// admin flag and an erasure marker, replacing the `deactivated` bool
+/// (docs/design-admin-identity.md). The migration rewrites every
+/// `T_ACCOUNT` row in place; no cross-shard coordination, so no gate.
+///
+/// Still v3 after slices 3, 4 and 5: each only *added* tables (UIA
+/// sessions, registration tokens, identity links, blocked rooms, notices
+/// rooms). A new table starts empty and no existing row changes shape, so
+/// there is nothing for a migration to do — the version tracks layout
+/// changes to data that already exists.
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 
 /// Access tokens issued alongside a refresh token expire after this long.
 pub const ACCESS_TOKEN_LIFETIME_MS: u64 = 60 * 60 * 1000;
+
+/// How long a user-interactive auth session stays valid. Long enough for
+/// a human to work through a multi-stage flow, short enough that a
+/// half-completed session is not a standing credential.
+pub const UIA_SESSION_TTL_MS: u64 = 15 * 60 * 1000;
 
 /// Cursor key of the room/0 → user/0 membership projection.
 const ROOM_SOURCE: &str = "room/0";
@@ -65,6 +82,16 @@ pub enum UserError {
     InvalidGrant,
     #[error("not found")]
     NotFound,
+    #[error("the account's state does not allow this")]
+    InvalidState,
+    #[error("this authentication session was started for a different request")]
+    UiaRequestMismatch,
+    #[error("unknown, expired, or exhausted registration token")]
+    InvalidToken,
+    #[error("registration token already exists")]
+    TokenExists,
+    #[error("that external identity is already linked to {0}")]
+    ExternalIdInUse(String),
     #[error("alias already exists")]
     AliasExists,
     #[error("shard: {0}")]
@@ -81,6 +108,20 @@ type Result<T> = std::result::Result<T, UserError>;
 
 fn storage_err(e: impl std::fmt::Display) -> UserError {
     UserError::Storage(e.to_string())
+}
+
+/// Everything `/register` needs. A struct rather than a parameter list:
+/// six of the seven fields are `Option`s and bools, which positionally is
+/// a bug waiting to happen.
+pub struct RegisterRequest<'a> {
+    pub localpart: &'a str,
+    pub password: Option<&'a str>,
+    pub device_id: Option<String>,
+    pub display_name: Option<String>,
+    pub want_refresh: bool,
+    pub inhibit_login: bool,
+    /// Consumed atomically with the username reservation when set.
+    pub registration_token: Option<&'a str>,
 }
 
 /// A freshly created session's credentials (the only moment the raw
@@ -162,35 +203,16 @@ impl UserServer {
         want_refresh: bool,
         inhibit_login: bool,
     ) -> Result<(OwnedUserId, Option<Session>)> {
-        let user_id = self.user_id_for(localpart)?;
-        let password_hash = match password {
-            Some(p) => Some(hash_password(p).await?),
-            None => None,
-        };
-        let (session, cmd) = if inhibit_login {
-            (None, None)
-        } else {
-            let (s, c) = new_session(user_id.clone(), device_id, display_name, want_refresh);
-            (Some(s), Some(c))
-        };
-        match self
-            .propose(&UserCommand::Register {
-                user_id: user_id.to_string(),
-                password_hash,
-                ts: now_ms(),
-                session: cmd,
-            })
-            .await?
-        {
-            UserResponse::Ok => {}
-            UserResponse::UserExists => return Err(UserError::UserExists),
-            other => return Err(unexpected(other)),
-        }
-        // Default displayname = localpart (what Synapse does; clients and
-        // member events expect a name from the start).
-        self.set_profile(&user_id, Some(Some(user_id.localpart().to_owned())), None)
-            .await?;
-        Ok((user_id, session))
+        self.register_with_token(RegisterRequest {
+            localpart,
+            password,
+            device_id,
+            display_name,
+            want_refresh,
+            inhibit_login,
+            registration_token: None,
+        })
+        .await
     }
 
     /// Password login. `user` may be a full user ID or a localpart.
@@ -207,7 +229,7 @@ impl UserServer {
             .store()
             .account(user_id.as_str())
             .map_err(storage_err)?
-            .filter(|a| !a.deactivated);
+            .filter(|a| a.state.can_authenticate());
         let Some(hash) = account.and_then(|a| a.password_hash) else {
             // No such account (or no password): still spend an Argon2 verify
             // so latency doesn't disclose account existence.
@@ -231,7 +253,7 @@ impl UserServer {
             .store()
             .account(user_id.as_str())
             .map_err(storage_err)?
-            .filter(|a| !a.deactivated);
+            .filter(|a| a.state.can_authenticate());
         let Some(hash) = account.and_then(|a| a.password_hash) else {
             dummy_verify().await;
             return Ok(false);
@@ -282,14 +304,15 @@ impl UserServer {
         let user_id = OwnedUserId::try_from(entry.user_id)
             .map_err(|e| UserError::Internal(format!("stored user id: {e}")))?;
         // Defence in depth: deactivation already deletes a user's tokens,
-        // but never honour a token for a deactivated account even if one
+        // but never honour a token for a non-active account even if one
         // survived (a missed deletion path, projection lag, a future
-        // session command that skips the check).
+        // session command that skips the check). `Locked` has no teardown
+        // at all, so this check is the whole kill-switch.
         if self
             .store()
             .account(user_id.as_str())
             .map_err(storage_err)?
-            .is_none_or(|a| a.deactivated)
+            .is_none_or(|a| !a.state.can_authenticate())
         {
             return Ok(None);
         }
@@ -659,6 +682,242 @@ impl UserServer {
         {
             UserResponse::Ok => Ok(()),
             UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    // -- user-interactive auth + registration tokens ----------------------
+
+    /// Record a completed UIA stage, returning every stage completed on
+    /// the session so far. Creates the session when the client sent no id.
+    ///
+    /// Returns the completed stages and the registration token the session
+    /// remembers. `Err(UserError::UiaRequestMismatch)` means the session was
+    /// started for a different request — see [`UiaSession`].
+    pub async fn complete_uia_stage(
+        &self,
+        session_id: &str,
+        request_hash: [u8; 32],
+        stage: &str,
+        registration_token: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>)> {
+        let now = now_ms();
+        match self
+            .propose(&UserCommand::CompleteUiaStage {
+                session_id: session_id.to_owned(),
+                request_hash,
+                stage: stage.to_owned(),
+                registration_token: registration_token.map(str::to_owned),
+                now_ts: now,
+                expire_before_ts: now.saturating_sub(UIA_SESSION_TTL_MS),
+            })
+            .await?
+        {
+            UserResponse::UiaCompleted {
+                completed,
+                registration_token,
+            } => Ok((completed, registration_token)),
+            UserResponse::UiaRequestMismatch => Err(UserError::UiaRequestMismatch),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Register, consuming `registration_token` atomically when given.
+    pub async fn register_with_token(
+        &self,
+        req: RegisterRequest<'_>,
+    ) -> Result<(OwnedUserId, Option<Session>)> {
+        let user_id = self.user_id_for(req.localpart)?;
+        let password_hash = match req.password {
+            Some(p) => Some(hash_password(p).await?),
+            None => None,
+        };
+        let (session, cmd) = if req.inhibit_login {
+            (None, None)
+        } else {
+            let (s, c) = new_session(
+                user_id.clone(),
+                req.device_id,
+                req.display_name,
+                req.want_refresh,
+            );
+            (Some(s), Some(c))
+        };
+        match self
+            .propose(&UserCommand::RegisterWithToken {
+                user_id: user_id.to_string(),
+                password_hash,
+                ts: now_ms(),
+                session: cmd,
+                registration_token: req.registration_token.map(str::to_owned),
+            })
+            .await?
+        {
+            UserResponse::Ok => {}
+            UserResponse::UserExists => return Err(UserError::UserExists),
+            UserResponse::InvalidToken => return Err(UserError::InvalidToken),
+            other => return Err(unexpected(other)),
+        }
+        // Default displayname = localpart (what Synapse does; clients and
+        // member events expect a name from the start).
+        self.set_profile(&user_id, Some(Some(user_id.localpart().to_owned())), None)
+            .await?;
+        Ok((user_id, session))
+    }
+
+    pub async fn create_registration_token(
+        &self,
+        token: &str,
+        uses_allowed: Option<u64>,
+        expiry_ts: Option<u64>,
+    ) -> Result<()> {
+        match self
+            .propose(&UserCommand::CreateRegistrationToken {
+                token: token.to_owned(),
+                uses_allowed,
+                expiry_ts,
+                ts: now_ms(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::TokenExists => Err(UserError::TokenExists),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub async fn delete_registration_token(&self, token: &str) -> Result<()> {
+        match self
+            .propose(&UserCommand::DeleteRegistrationToken {
+                token: token.to_owned(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    // -- admin lifecycle (docs/design-admin-identity.md) ------------------
+
+    /// Lock or unlock an account. Reversible: no session is destroyed, so
+    /// unlocking restores the user's existing devices.
+    pub async fn set_locked(&self, user_id: &UserId, locked: bool) -> Result<()> {
+        self.lifecycle(&UserCommand::SetLocked {
+            user_id: user_id.to_string(),
+            locked,
+        })
+        .await
+    }
+
+    /// Grant or revoke the server-administrator flag.
+    pub async fn set_admin(&self, user_id: &UserId, admin: bool) -> Result<()> {
+        self.lifecycle(&UserCommand::SetAdmin {
+            user_id: user_id.to_string(),
+            admin,
+        })
+        .await
+    }
+
+    /// Administratively set a password. Unlike `change_password` this
+    /// keeps no device, because the caller is not on one of the target's
+    /// sessions.
+    pub async fn admin_set_password(
+        &self,
+        user_id: &UserId,
+        new_password: &str,
+        logout_devices: bool,
+    ) -> Result<()> {
+        let password_hash = hash_password(new_password).await?;
+        self.lifecycle(&UserCommand::AdminSetPassword {
+            user_id: user_id.to_string(),
+            password_hash,
+            logout_devices,
+        })
+        .await
+    }
+
+    /// Mark a (already deactivated) account erased and drop its profile.
+    /// Message redaction is not implemented — see the command's docs.
+    pub async fn set_erased(&self, user_id: &UserId) -> Result<()> {
+        self.lifecycle(&UserCommand::SetErased {
+            user_id: user_id.to_string(),
+        })
+        .await
+    }
+
+    /// Remember the room carrying a user's server notices.
+    pub async fn set_notices_room(&self, user_id: &UserId, room_id: &str) -> Result<()> {
+        self.expect_ok(&UserCommand::SetNoticesRoom {
+            user_id: user_id.to_string(),
+            room_id: room_id.to_owned(),
+        })
+        .await
+    }
+
+    /// Close a room to joins, or reopen it. `by` is the acting
+    /// administrator, kept for the audit trail.
+    pub async fn set_room_blocked(&self, room_id: &str, blocked: bool, by: &UserId) -> Result<()> {
+        self.expect_ok(&UserCommand::SetRoomBlocked {
+            room_id: room_id.to_owned(),
+            blocked,
+            by: by.to_string(),
+            ts: now_ms(),
+        })
+        .await
+    }
+
+    // -- identity links (docs/design-admin-identity.md slice 4) -----------
+
+    /// Link an account to its subject at an external identity provider.
+    ///
+    /// Writable before any provider is configured — pre-linking accounts
+    /// and *then* enabling the IdP is the migration path that avoids a
+    /// flag day, and it is why this lands before any OIDC code exists.
+    pub async fn link_external_id(
+        &self,
+        user_id: &UserId,
+        auth_provider: &str,
+        external_id: &str,
+    ) -> Result<()> {
+        match self
+            .propose(&UserCommand::LinkExternalId {
+                user_id: user_id.to_string(),
+                auth_provider: auth_provider.to_owned(),
+                external_id: external_id.to_owned(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            UserResponse::InvalidState => Err(UserError::InvalidState),
+            UserResponse::ExternalIdInUse(owner) => Err(UserError::ExternalIdInUse(owner)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Drop an account's link to one provider.
+    pub async fn unlink_external_id(&self, user_id: &UserId, auth_provider: &str) -> Result<()> {
+        match self
+            .propose(&UserCommand::UnlinkExternalId {
+                user_id: user_id.to_string(),
+                auth_provider: auth_provider.to_owned(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Propose a lifecycle command, mapping the two ways it can decline.
+    async fn lifecycle(&self, cmd: &UserCommand) -> Result<()> {
+        match self.propose(cmd).await? {
+            UserResponse::Ok => Ok(()),
+            UserResponse::NotFound => Err(UserError::NotFound),
+            UserResponse::InvalidState => Err(UserError::InvalidState),
             other => Err(unexpected(other)),
         }
     }

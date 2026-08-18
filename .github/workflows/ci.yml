@@ -20,8 +20,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  frontend:
+    name: admin console (bundle)
+    # The console bundle is built here, once, and shared as an artifact —
+    # the same contract as the release binary below. cargo NEVER shells
+    # out to npm (crates/saltator-admin-ui/build.rs), so this is the only
+    # place Node is required and `cargo build` keeps needing nothing but a
+    # Rust toolchain. See docs/design-admin-ui.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          # rust-cache does not cover node_modules, and without an explicit
+          # cache every PR pays a cold `npm ci`.
+          cache: npm
+          cache-dependency-path: web/admin/package-lock.json
+      - run: npm ci
+        working-directory: web/admin
+      - run: npm run check
+        working-directory: web/admin
+      - run: npm run build
+        working-directory: web/admin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: admin-ui-dist
+          path: crates/saltator-admin-ui/dist
+          retention-days: 1
+
   build:
     name: build (release)
+    needs: [frontend]
     # One release build shared (as an artifact) by every job that runs the
     # binary. Pinned (not -latest): the binary executes inside the
     # ubuntu:24.04 Complement image, so builder and image glibc must stay
@@ -34,8 +64,14 @@ jobs:
         with:
           # Main-only saves; see the fmt+clippy+test job's cache note.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: admin-ui-dist
+          path: crates/saltator-admin-ui/dist
       - name: Build saltator (release)
-        run: cargo build --release -p saltator
+        # The shipped binary carries the console; the feature is off by
+        # default, so this is the one place it is turned on.
+        run: cargo build --release -p saltator --features admin-ui
       - uses: actions/upload-artifact@v7
         with:
           name: saltator-release
@@ -99,6 +135,12 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy (admin-ui)
+        # A default-off feature is unchecked unless we check it. No Node
+        # here on purpose — this job already deletes ~25 GB to survive
+        # linking, and build.rs guarantees a dist/ (its stub) exists, so
+        # the feature compiles without a bundle.
+        run: cargo clippy --workspace --all-targets --features admin-ui -- -D warnings
       - name: build tests
         # Compilation is deterministic and, on a cache-key change (any
         # Cargo.toml/lock edit), legitimately long — no timeout. Keeping
@@ -111,6 +153,10 @@ jobs:
         # is a separate, untimeouted step.
         timeout-minutes: 5
         run: cargo test --workspace
+      - name: run tests (admin-ui)
+        # Only the feature-gated tests: everything else already ran above.
+        timeout-minutes: 5
+        run: cargo test -p saltator-cs-api --features admin-ui --test cs_api admin_ui
 
   cluster-smoke:
     name: cluster (2-node)

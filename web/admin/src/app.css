@@ -1,0 +1,331 @@
+/* One stylesheet. The console is tables, forms and badges; a component
+   library would cost more bundle than it saves in markup, and the bundle
+   is embedded in the server binary. */
+
+:root {
+  --bg: #ffffff;
+  --panel: #f7f7f8;
+  --border: #d9d9de;
+  --text: #16161a;
+  --muted: #6b6b76;
+  --accent: #2f5bd8;
+  --accent-text: #ffffff;
+  --danger: #b4232b;
+  --danger-bg: #fdeceb;
+  --warn: #8a5a00;
+  --warn-bg: #fdf3dd;
+  --ok: #1c6b3c;
+  --ok-bg: #e6f4ea;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16161a;
+    --panel: #1e1e24;
+    --border: #33333c;
+    --text: #ececf1;
+    --muted: #9a9aa6;
+    --accent: #7f9dff;
+    --accent-text: #10101a;
+    --danger: #ff8c8c;
+    --danger-bg: #3a1d1f;
+    --warn: #f0c26b;
+    --warn-bg: #3a2f1a;
+    --ok: #7bd6a0;
+    --ok-bg: #14301f;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+code,
+.mono {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.92em;
+}
+
+a {
+  color: var(--accent);
+}
+
+/* -- layout ------------------------------------------------------------ */
+
+header.top {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0 1.25rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+header.top .brand {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  padding: 0.9rem 0;
+}
+
+header.top nav {
+  display: flex;
+  gap: 0.25rem;
+  flex: 1;
+}
+
+header.top nav a {
+  padding: 0.9rem 0.75rem;
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+header.top nav a:hover {
+  color: var(--text);
+}
+
+header.top nav a.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+header.top .who {
+  color: var(--muted);
+  font-size: 0.9em;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+main {
+  max-width: 68rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 4rem;
+}
+
+h1 {
+  font-size: 1.35rem;
+  margin: 0 0 0.25rem;
+}
+
+h2 {
+  font-size: 1.05rem;
+  margin: 2rem 0 0.75rem;
+}
+
+.sub {
+  color: var(--muted);
+  margin: 0 0 1.25rem;
+}
+
+.row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.spread {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.panel {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 1rem;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+/* -- tables ------------------------------------------------------------ */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.94rem;
+}
+
+th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 0.6rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+td {
+  padding: 0.55rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+tbody tr:hover {
+  background: var(--panel);
+}
+
+td.right,
+th.right {
+  text-align: right;
+}
+
+.empty {
+  color: var(--muted);
+  padding: 2rem 0.6rem;
+  text-align: center;
+}
+
+/* -- controls ---------------------------------------------------------- */
+
+button {
+  font: inherit;
+  padding: 0.4rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 550;
+}
+
+button.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+button.link {
+  border: none;
+  background: none;
+  color: var(--accent);
+  padding: 0;
+}
+
+input,
+select {
+  font: inherit;
+  padding: 0.4rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  min-width: 0;
+}
+
+label.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+}
+
+/* -- badges and messages ----------------------------------------------- */
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.badge.ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+  border-color: transparent;
+}
+
+.badge.warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-color: transparent;
+}
+
+.badge.danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-color: transparent;
+}
+
+.notice {
+  padding: 0.6rem 0.8rem;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+  border: 1px solid transparent;
+}
+
+.notice.error {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.notice.ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 0.85rem;
+}
+
+/* -- login ------------------------------------------------------------- */
+
+.centre {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+
+.centre form,
+.centre .panel {
+  width: min(24rem, 100%);
+}

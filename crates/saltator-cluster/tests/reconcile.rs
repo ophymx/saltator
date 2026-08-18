@@ -1,14 +1,18 @@
 //! Two-node shard-group reconciliation (spec.md §4.2): a data shard group,
 //! bootstrapped single-voter on node 1, gains node 2 as a voter purely by
 //! the reconciler converging its membership to the metadata placement — the
-//! same path a real room/user group takes when a node joins.
+//! same path a real room/user group takes when a node joins. And the way
+//! back out: draining node 2 releases the replica by the same mechanism
+//! (docs/design-admin-identity.md slice 6).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use saltator_cluster::network::GrpcRaftNetworkFactory;
 use saltator_cluster::{
     join_cluster, reconcile_once, serve_internal, ClusterConfig, LocalGroup, MetadataHandle,
+    NodeStatus,
 };
 use saltator_shard::{ApplyCtx, ShardApp, ShardHandle, ShardId, ShardRegistry, APP_TABLE_MIN};
 use saltator_store::{Keyspace, Result as StoreResult, RocksEngine};
@@ -84,15 +88,53 @@ async fn start_room(
     .unwrap()
 }
 
-#[tokio::test]
-async fn reconciler_admits_a_new_replica_to_a_shard_group() {
-    let dir = tempfile::tempdir().unwrap();
+/// A live two-node cluster: metadata group on both, `Room/0` running on
+/// both, node 1 leading and node 2 admitted but not yet a room voter.
+struct TwoNodes {
+    m1: MetadataHandle,
+    m2: MetadataHandle,
+    room1: ShardHandle,
+    room2: ShardHandle,
+    room_group: u64,
+    _serve1: tokio::sync::oneshot::Sender<()>,
+    _serve2: tokio::sync::oneshot::Sender<()>,
+}
+
+impl TwoNodes {
+    /// Run the reconciler on node 1 (the room leader) until it reports the
+    /// voter set `want`.
+    ///
+    /// The leader's view is the authority, and it is the only view that
+    /// can be asserted on for a *removal*: a node dropped from the group
+    /// stops receiving the log, so whether it ever applies the entry that
+    /// removed it is a race with its own eviction.
+    async fn reconcile_until_voters(&self, want: &BTreeSet<u64>) -> bool {
+        let groups = vec![LocalGroup::new(self.room_group, self.room1.clone())];
+        for _ in 0..30 {
+            reconcile_once(&self.m1, &groups).await;
+            if self.room1.voter_ids() == *want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        false
+    }
+
+    async fn shutdown(self) {
+        self.m1.shutdown().await.unwrap();
+        self.m2.shutdown().await.unwrap();
+        self.room1.shutdown().await.unwrap();
+        self.room2.shutdown().await.unwrap();
+    }
+}
+
+async fn two_nodes(dir: &std::path::Path) -> TwoNodes {
     let addr1 = ephemeral_addr();
     let addr2 = ephemeral_addr();
     let room_group = ShardId::new(Keyspace::Room, 0).group();
 
     // --- Node 1: metadata + control plane + a bootstrapped Room/0 ---
-    let e1 = Arc::new(RocksEngine::open(&dir.path().join("n1")).unwrap());
+    let e1 = Arc::new(RocksEngine::open(&dir.join("n1")).unwrap());
     let reg1 = ShardRegistry::new();
     let m1 = MetadataHandle::start(1, e1.clone(), Some(addr1.to_string()), Some(&reg1))
         .await
@@ -111,15 +153,15 @@ async fn reconciler_admits_a_new_replica_to_a_shard_group() {
         .wait_for_leader(Duration::from_secs(10))
         .await
         .unwrap();
-    let _s1 = spawn_serve(m1.clone(), reg1, addr1);
+    let serve1 = spawn_serve(m1.clone(), reg1, addr1);
 
     // --- Node 2: joins metadata, then starts Room/0 uninitialized ---
-    let e2 = Arc::new(RocksEngine::open(&dir.path().join("n2")).unwrap());
+    let e2 = Arc::new(RocksEngine::open(&dir.join("n2")).unwrap());
     let reg2 = ShardRegistry::new();
     let m2 = MetadataHandle::start(2, e2.clone(), None, Some(&reg2))
         .await
         .unwrap();
-    let _s2 = spawn_serve(m2.clone(), reg2.clone(), addr2);
+    let serve2 = spawn_serve(m2.clone(), reg2.clone(), addr2);
     join_cluster(
         &[addr1.to_string()],
         2,
@@ -144,26 +186,44 @@ async fn reconciler_admits_a_new_replica_to_a_shard_group() {
         "placement never listed node 2 for the room group"
     );
 
-    // --- Reconcile on node 1 (the room leader) until node 2 is a voter ---
-    let groups = vec![LocalGroup::new(room_group, room1.clone())];
-    let both: std::collections::BTreeSet<u64> = [1, 2].into_iter().collect();
-    let mut ok = false;
-    for _ in 0..30 {
-        reconcile_once(&m1, &groups).await;
-        if room1.voter_ids() == both && room2.voter_ids() == both {
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    TwoNodes {
+        m1,
+        m2,
+        room1,
+        room2,
+        room_group,
+        _serve1: serve1,
+        _serve2: serve2,
     }
+}
+
+#[tokio::test]
+async fn reconciler_admits_a_new_replica_to_a_shard_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = two_nodes(dir.path()).await;
+
+    // --- Reconcile on node 1 (the room leader) until node 2 is a voter ---
+    let both: BTreeSet<u64> = [1, 2].into_iter().collect();
     assert!(
-        ok,
+        c.reconcile_until_voters(&both).await,
         "reconciler did not make node 2 a voter: {:?}",
-        room2.voter_ids()
+        c.room1.voter_ids()
+    );
+    // And node 2 learns it is one — unlike a removal, an addition always
+    // reaches the node it concerns.
+    let room2 = c.room2.clone();
+    assert!(
+        eventually(Duration::from_secs(10), || room2.voter_ids() == both).await,
+        "node 2 never saw itself join the group: {:?}",
+        c.room2.voter_ids()
     );
 
     // A write on the room leader now replicates to node 2's applied state.
-    room1.propose(b"hello-from-node-1".to_vec()).await.unwrap();
+    c.room1
+        .propose(b"hello-from-node-1".to_vec())
+        .await
+        .unwrap();
+    let room2 = c.room2.clone();
     assert!(
         eventually(Duration::from_secs(10), || {
             room2
@@ -178,8 +238,60 @@ async fn reconciler_admits_a_new_replica_to_a_shard_group() {
         "room write did not replicate to node 2"
     );
 
-    m1.shutdown().await.unwrap();
-    m2.shutdown().await.unwrap();
-    room1.shutdown().await.unwrap();
-    room2.shutdown().await.unwrap();
+    c.shutdown().await;
+}
+
+/// The way out, end to end (docs/design-admin-identity.md slice 6): drain
+/// takes node 2 out of the placement, the ordinary reconciler releases the
+/// replica it was holding, and only then may the node be removed from the
+/// metadata group.
+#[tokio::test]
+async fn draining_releases_a_replica_and_then_the_node_can_be_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = two_nodes(dir.path()).await;
+    let both: BTreeSet<u64> = [1, 2].into_iter().collect();
+    let alone: BTreeSet<u64> = [1].into_iter().collect();
+    assert!(c.reconcile_until_voters(&both).await, "setup: node 2 voter");
+
+    // Removal before draining is refused — an active node still holds
+    // replicas, and cutting it out of the metadata group is what would
+    // strand them.
+    let err = c.m1.remove_node(2).await.unwrap_err();
+    assert!(err.to_string().contains("drained"), "{err}");
+
+    // Drain: node 2 leaves the placement but stays in the roster, which is
+    // how it keeps hearing that it should stand down.
+    let roster = c.m1.drain_node(2).await.unwrap();
+    assert_eq!(roster[&2].status, NodeStatus::Draining);
+    assert_eq!(roster.len(), 2, "draining is not removal");
+    assert!(
+        !c.m1
+            .placement()
+            .await
+            .unwrap()
+            .replicas(c.room_group)
+            .contains(&2),
+        "a draining node must not be a placement target"
+    );
+
+    // The ordinary reconciler — no drain-specific code path — demotes it.
+    assert!(
+        c.reconcile_until_voters(&alone).await,
+        "reconciler did not release node 2: {:?}",
+        c.room1.voter_ids()
+    );
+
+    // Now removal is allowed, and takes it out of the metadata group too.
+    let roster = c.m1.remove_node(2).await.unwrap();
+    assert_eq!(roster.keys().copied().collect::<Vec<_>>(), [1]);
+    assert!(
+        eventually(Duration::from_secs(10), || c.m1.voter_ids() == alone).await,
+        "node 2 is still a metadata voter: {:?}",
+        c.m1.voter_ids()
+    );
+
+    // The cluster still works with what is left.
+    c.room1.propose(b"after-drain".to_vec()).await.unwrap();
+
+    c.shutdown().await;
 }

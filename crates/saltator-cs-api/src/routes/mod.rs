@@ -1,4 +1,5 @@
 pub mod account;
+pub mod admin;
 pub mod backup;
 pub mod edu;
 pub mod keys;

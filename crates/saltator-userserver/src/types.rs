@@ -94,6 +94,45 @@ pub const T_TO_DEVICE_SEEN: u8 = APP_TABLE_FIRST + 22;
 /// `ts_ms (u64 BE) ++ origin ++ 0x00 ++ message_id → ()` — time index
 /// over [`T_TO_DEVICE_SEEN`] so the horizon prune is a range delete.
 pub const T_TO_DEVICE_SEEN_IDX: u8 = APP_TABLE_FIRST + 23;
+/// `session_id → UiaSession` — user-interactive auth sessions
+/// (docs/design-admin-identity.md slice 3).
+pub const T_UIA_SESSION: u8 = APP_TABLE_FIRST + 24;
+/// `created_ts (u64 BE) ++ session_id → ()` — time index over
+/// [`T_UIA_SESSION`] so the expiry sweep is a bounded range scan rather
+/// than a full table walk on every stage completion.
+pub const T_UIA_SESSION_IDX: u8 = APP_TABLE_FIRST + 25;
+/// `token → RegToken` — registration tokens.
+pub const T_REG_TOKEN: u8 = APP_TABLE_FIRST + 26;
+/// `auth_provider ++ 0x00 ++ external_id → user_id` — the identity link
+/// table (docs/design-admin-identity.md slice 4). Uniqueness is on the
+/// key: one subject at one provider maps to exactly one account.
+///
+/// `auth_provider` is a stable opaque key, never a display name — Synapse
+/// carries a grandfathered `oidc-` prefix precisely because renaming a
+/// provider would otherwise orphan every linked account.
+pub const T_EXTERNAL_ID: u8 = APP_TABLE_FIRST + 27;
+/// `user_id ++ 0x00 ++ auth_provider → external_id` — the reverse index
+/// over [`T_EXTERNAL_ID`], so "what is this account linked to" and
+/// "unlink this provider" are lookups rather than table scans. Synapse
+/// bolted its equivalent on later as a background update; ours is written
+/// in the same batch as the forward row, so the two cannot drift.
+pub const T_EXTERNAL_ID_USER: u8 = APP_TABLE_FIRST + 28;
+/// `room_id → BlockedRoom` — rooms an administrator has closed to joins
+/// (docs/design-admin-identity.md slice 5).
+///
+/// Server-global room metadata, so it lives here beside the public
+/// directory ([`T_DIRECTORY`]) and the alias table rather than in the room
+/// shard. Two reasons: a block must apply to rooms this server does *not*
+/// host (there is no room row to hang it on, and a remote room the local
+/// users keep rejoining is exactly what an operator blocks), and the
+/// federation surface holds a `UserServer` but reaches room state only
+/// through the pipeline it is trying to refuse.
+pub const T_ROOM_BLOCKED: u8 = APP_TABLE_FIRST + 29;
+/// `user_id → room_id` — the server-notices room for a user
+/// (docs/design-admin-identity.md slice 5). One per user, created on the
+/// first notice and reused forever: remembering it is what stops the
+/// second notice opening a second room.
+pub const T_NOTICES_ROOM: u8 = APP_TABLE_FIRST + 30;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -102,6 +141,15 @@ pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
     k.push(0);
     k.extend_from_slice(rest.as_bytes());
     k
+}
+
+/// Forward link key: `auth_provider ++ 0x00 ++ external_id`. The provider
+/// goes first because it is the half with a bounded vocabulary, and
+/// because it is NUL-free (validated at the admin boundary) the first NUL
+/// is unambiguously the separator — two different pairs cannot encode to
+/// the same key.
+pub(crate) fn external_key(auth_provider: &str, external_id: &str) -> Vec<u8> {
+    user_key(auth_provider, external_id)
 }
 
 /// Device-scoped key: `user_id ++ 0x00 ++ device_id ++ 0x00 ++ rest`
@@ -149,13 +197,107 @@ pub(crate) fn account_data_key(user_id: &str, room_id: &str, data_type: &str) ->
     k
 }
 
+/// Account lifecycle (docs/design-admin-identity.md). Postcard encodes
+/// the variant index, so this is append-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountState {
+    Active,
+    /// Reversible auth kill-switch: tokens rejected, data and rooms
+    /// untouched. Nothing sets this until the lifecycle slice; the
+    /// authentication check already honours it.
+    Locked,
+    /// Irreversible teardown: password cleared, every device deleted.
+    Deactivated,
+}
+
+impl AccountState {
+    /// Whether an account in this state may authenticate. Anything but
+    /// `Active` is refused, so new states are closed by default.
+    pub fn can_authenticate(self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     /// Argon2 PHC string; `None` for passwordless accounts (appservices,
-    /// later login types).
+    /// later login types). Means "no local credential" and nothing else —
+    /// never infer the account's kind or state from it.
+    pub password_hash: Option<String>,
+    pub created_ts: u64,
+    pub state: AccountState,
+    /// Server administrator. Never read this at a call site: authorization
+    /// resolves through one function (`CsState::is_admin`) so it can grow
+    /// a token-scope arm later.
+    pub admin: bool,
+    /// GDPR erasure — a modifier on `Deactivated`, not a state of its own.
+    pub erased: bool,
+}
+
+/// The v2 shape of [`Account`], read only by the v3 migration.
+///
+/// `Serialize` is derived purely so tests can mint a genuine v2 blob and
+/// assert the encoding contract; nothing in the server ever writes one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AccountV2 {
     pub password_hash: Option<String>,
     pub created_ts: u64,
     pub deactivated: bool,
+}
+
+/// An in-progress user-interactive authentication.
+///
+/// The session is bound to the request that started it: `request_hash`
+/// covers the body with `auth` removed. Without that, a client could
+/// satisfy a password stage for a harmless request and replay the
+/// completed session against a destructive one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiaSession {
+    pub request_hash: [u8; 32],
+    /// Stage types completed so far, in completion order.
+    pub completed: Vec<String>,
+    /// The registration token presented to the token stage, remembered
+    /// because a later stage in the same flow arrives in a different
+    /// request that no longer carries it.
+    pub registration_token: Option<String>,
+    pub created_ts: u64,
+}
+
+/// A registration token: an invite code that authorises `/register` when
+/// the server is otherwise closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegToken {
+    /// `None` = unlimited.
+    pub uses_allowed: Option<u64>,
+    /// Registrations actually completed with this token. There is no
+    /// separate "pending" count: the token is consumed inside the
+    /// register command itself, so a claim cannot be stranded by an
+    /// abandoned session.
+    pub used: u64,
+    /// `None` = never expires (ms since epoch).
+    pub expiry_ts: Option<u64>,
+    pub created_ts: u64,
+}
+
+impl RegToken {
+    /// Whether the token may still authorise a registration at `now`.
+    pub fn usable(&self, now: u64) -> bool {
+        self.expiry_ts.is_none_or(|e| now < e)
+            && self.uses_allowed.is_none_or(|allowed| self.used < allowed)
+    }
+}
+
+/// A room closed to joins by an administrator ([`T_ROOM_BLOCKED`]).
+///
+/// Presence in the table is the fact; the fields are the audit trail an
+/// operator needs six months later, when the only question is who did
+/// this and when.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockedRoom {
+    /// The administrator who blocked it.
+    pub by: String,
+    pub ts: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,6 +664,112 @@ pub enum UserCommand {
         ts_ms: u64,
         messages: Vec<ToDeviceMessage>,
     },
+    /// Admin: lock or unlock an account (docs/design-admin-identity.md).
+    /// Reversible and non-destructive — sessions stay on disk and start
+    /// working again on unlock, because the refusal lives in the
+    /// authentication check rather than in a teardown. Refuses to touch a
+    /// `Deactivated` account: that state is terminal.
+    SetLocked {
+        user_id: String,
+        locked: bool,
+    },
+    /// Admin: grant or revoke the server-administrator flag.
+    SetAdmin {
+        user_id: String,
+        admin: bool,
+    },
+    /// Admin password reset. Distinct from [`UserCommand::ChangePassword`]
+    /// because there is no device to keep: the administrator is not on one
+    /// of the target's sessions.
+    AdminSetPassword {
+        user_id: String,
+        password_hash: String,
+        logout_devices: bool,
+    },
+    /// Admin: mark an account erased and clear its profile. Only the
+    /// marker and the profile — message redaction is not implemented, so
+    /// this is not yet a complete erasure.
+    SetErased {
+        user_id: String,
+    },
+    /// Record one completed UIA stage, creating the session if this is the
+    /// first (a single-stage flow legitimately completes in one request,
+    /// with no session id from the client).
+    ///
+    /// `now_ts` also drives the expiry sweep: apply must not read a clock,
+    /// so the gateway stamps the time and the prune happens here.
+    CompleteUiaStage {
+        session_id: String,
+        request_hash: [u8; 32],
+        stage: String,
+        /// Set when the stage being completed is the registration-token
+        /// one; remembered on the session for the eventual register.
+        registration_token: Option<String>,
+        now_ts: u64,
+        /// Sessions created before this are swept in the same batch.
+        expire_before_ts: u64,
+    },
+    /// Register, atomically consuming a registration token when one is
+    /// given. Supersedes [`UserCommand::Register`], which stays for log
+    /// replay: consuming the token in the same batch as the username
+    /// reservation is what makes a one-use token actually one-use under
+    /// concurrent registrations.
+    RegisterWithToken {
+        user_id: String,
+        password_hash: Option<String>,
+        ts: u64,
+        session: Option<SessionCmd>,
+        registration_token: Option<String>,
+    },
+    CreateRegistrationToken {
+        token: String,
+        uses_allowed: Option<u64>,
+        expiry_ts: Option<u64>,
+        ts: u64,
+    },
+    DeleteRegistrationToken {
+        token: String,
+    },
+    /// Link an account to its subject at an external identity provider
+    /// (docs/design-admin-identity.md slice 4). Writes both index rows in
+    /// one batch.
+    ///
+    /// Deliberately writable before any provider is configured: an
+    /// operator pre-links accounts, *then* turns the IdP on, which is the
+    /// migration path that avoids a flag day. Nothing reads these rows
+    /// until the OIDC slice.
+    ///
+    /// Relinking the same `(user, provider)` to a new subject replaces the
+    /// link, forward row included. Claiming a subject another account
+    /// already holds is refused ([`UserResponse::ExternalIdInUse`]).
+    LinkExternalId {
+        user_id: String,
+        auth_provider: String,
+        external_id: String,
+    },
+    /// Drop the link between an account and one provider.
+    UnlinkExternalId {
+        user_id: String,
+        auth_provider: String,
+    },
+    /// Remember which room carries a user's server notices. Written once,
+    /// just after the room is created; the room itself is ordinary state
+    /// in the room shard.
+    SetNoticesRoom {
+        user_id: String,
+        room_id: String,
+    },
+    /// Admin: close a room to joins, or reopen it
+    /// (docs/design-admin-identity.md slice 5). Takes a room id rather
+    /// than requiring the room to exist locally — blocking a room this
+    /// server does not host is the point.
+    SetRoomBlocked {
+        room_id: String,
+        blocked: bool,
+        /// The acting administrator, recorded for the audit trail.
+        by: String,
+        ts: u64,
+    },
 }
 
 /// A stored one-time key ([`T_ONE_TIME_KEY`]) with its upload slot:
@@ -632,6 +880,33 @@ pub enum UserResponse {
         count: u64,
         etag: u64,
     },
+    /// The account exists but its lifecycle state forbids the operation
+    /// (unlocking a deactivated account, say). Distinct from `NotFound`,
+    /// which would tell an operator the wrong thing.
+    ///
+    /// Appended, like every variant here: responses cross nodes via the
+    /// leader-forwarding `Propose` RPC, and postcard encodes the variant
+    /// index — inserting one mid-enum would make a rolling upgrade decode
+    /// every later variant as its neighbour.
+    InvalidState,
+    /// A UIA session exists but was started for a different request, so
+    /// its completed stages must not be honoured here.
+    UiaRequestMismatch,
+    /// The stages completed so far on this session, and the registration
+    /// token it remembers (if any).
+    UiaCompleted {
+        completed: Vec<String>,
+        registration_token: Option<String>,
+    },
+    /// The registration token is unknown, expired, or exhausted.
+    InvalidToken,
+    /// A registration token with this value already exists.
+    TokenExists,
+    /// The `(auth_provider, external_id)` pair is already linked to a
+    /// different account. Carries the owner so an operator is told which
+    /// one without a second lookup — they are already privileged enough
+    /// to enumerate every account.
+    ExternalIdInUse(String),
 }
 
 /// Change-stream payload of the user shard: something about `user_id`

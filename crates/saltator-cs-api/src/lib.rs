@@ -17,8 +17,8 @@ mod typing;
 
 use std::sync::Arc;
 
-use axum::routing::{get, post, put};
-use ruma::OwnedServerName;
+use axum::routing::{delete, get, post, put};
+use ruma::{OwnedServerName, OwnedUserId};
 
 use saltator_core::RoomVersion;
 use saltator_federation::FederationClient;
@@ -40,6 +40,9 @@ pub struct CsConfig {
     pub default_room_version: RoomVersion,
     /// Whether `POST /register` is open.
     pub registration_enabled: bool,
+    /// Require a registration token to register. Independent of
+    /// `registration_enabled`: closed still means closed.
+    pub registration_requires_token: bool,
     /// Media upload cap in bytes.
     pub max_upload_size: u64,
     /// Base URL advertised in `/.well-known/matrix/client`
@@ -54,7 +57,30 @@ pub struct CsConfig {
     /// enable only in trusted, network-isolated test harnesses whose
     /// mock servers live on loopback/private IPs.
     pub allow_internal_fetch: bool,
+    /// Server administrators named in config, unioned with the account
+    /// flag by [`CsState::is_admin`]. This is the bootstrap: a fresh
+    /// server has no admin account and no way to grant one, so the first
+    /// administrator has to come from outside the database.
+    pub admin_users: Vec<OwnedUserId>,
+    /// Localpart of the account that delivers server notices, e.g.
+    /// `notices` → `@notices:example.org`. `None` disables the feature.
+    ///
+    /// Off by default because turning it on creates and reserves an
+    /// account: an operator should choose that name, not inherit it. Once
+    /// set, the localpart is refused to `/register` — otherwise a user
+    /// could take the name and receive, or send, what looks like server
+    /// mail.
+    pub server_notices_localpart: Option<String>,
 }
+
+/// The credential providers this server offers, and the single place the
+/// list is built. A constant rather than a config field because local
+/// passwords are the only credential the server can verify today — the
+/// OIDC slice replaces this with a list derived from its config block,
+/// and everything downstream (`GET /login`, the login path) already reads
+/// from here (docs/design-admin-identity.md slice 4).
+const AUTH_PROVIDERS: &[services::auth::AuthProvider] =
+    &[services::auth::AuthProvider::LocalPassword];
 
 /// Shared state of every CS route.
 pub struct CsState {
@@ -82,6 +108,10 @@ pub struct CsState {
     pub(crate) push_rule_locks:
         tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) rate_limiter: ratelimit::RateLimiter,
+    /// The cluster control plane, for the admin node/drain endpoints.
+    /// `None` in stacks that run the shard servers without a metadata
+    /// group (most tests): the cluster endpoints then say so.
+    pub(crate) cluster: Option<saltator_cluster::MetadataHandle>,
     /// Registered application services (minimal support: `as_token` →
     /// sender identity plus `?ts` timestamp massaging; namespaces,
     /// impersonation, and outbound event push are not implemented).
@@ -148,6 +178,18 @@ impl CsState {
         self
     }
 
+    /// Attach the cluster control plane, enabling the admin node/drain
+    /// endpoints (docs/design-admin-identity.md slice 6).
+    pub fn with_cluster(
+        mut self: Arc<Self>,
+        cluster: saltator_cluster::MetadataHandle,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("with_cluster called on a shared CsState")
+            .cluster = Some(cluster);
+        self
+    }
+
     /// Attach application service registrations (loaded from registration
     /// files at startup).
     pub fn with_appservices(
@@ -158,6 +200,79 @@ impl CsState {
             .expect("with_appservices called on a shared CsState")
             .appservices = appservices;
         self
+    }
+
+    /// Whether the caller is a server administrator.
+    ///
+    /// The single resolution point, deliberately: no route reads the
+    /// account's `admin` flag directly, so a later token-scope or
+    /// external-IdP arm lands here and nowhere else
+    /// (docs/design-admin-identity.md).
+    pub(crate) fn is_admin(&self, auth: &extract::Auth) -> Result<bool, ApiError> {
+        // Appservices are never administrators: an AS identity is
+        // synthesized from config and has no account row at all, so there
+        // is nothing to carry the flag.
+        if auth.appservice {
+            return Ok(false);
+        }
+        if self.config.admin_users.contains(&auth.user_id) {
+            return Ok(true);
+        }
+        Ok(self
+            .users
+            .store()
+            .account(auth.user_id.as_str())
+            .map_err(ApiError::internal)?
+            .is_some_and(|a| a.admin))
+    }
+
+    /// The admin/user-management domain service over this state's shards.
+    pub(crate) fn admin(&self) -> services::admin::Admin<'_> {
+        services::admin::Admin {
+            users: &self.users,
+            admin_users: &self.config.admin_users,
+        }
+    }
+
+    /// The room-administration service: room inspection, shutdown and the
+    /// join block (docs/design-admin-identity.md slice 5).
+    pub(crate) fn room_admin(&self) -> services::room_admin::RoomAdmin<'_> {
+        services::room_admin::RoomAdmin {
+            users: &self.users,
+            rooms: &self.rooms,
+            server_name: self.config.server_name.as_str(),
+        }
+    }
+
+    /// The server-notices service (docs/design-admin-identity.md slice 5).
+    pub(crate) fn notices(&self) -> services::notices::Notices<'_> {
+        services::notices::Notices {
+            users: &self.users,
+            rooms: &self.rooms,
+            localpart: self.config.server_notices_localpart.as_deref(),
+            room_version: self.config.default_room_version,
+        }
+    }
+
+    /// The cluster-administration service.
+    pub(crate) fn cluster_admin(&self) -> services::cluster_admin::ClusterAdmin<'_> {
+        services::cluster_admin::ClusterAdmin {
+            meta: self.cluster.as_ref(),
+        }
+    }
+
+    /// The user-interactive-auth service.
+    pub(crate) fn uia(&self) -> services::uia::Uia<'_> {
+        services::uia::Uia { users: &self.users }
+    }
+
+    /// The authentication service: login flows and credential
+    /// verification (docs/design-admin-identity.md slice 4).
+    pub(crate) fn authn(&self) -> services::auth::Authn<'_> {
+        services::auth::Authn {
+            users: &self.users,
+            providers: AUTH_PROVIDERS,
+        }
     }
 
     /// The E2EE/device-list domain service over this state's shards.
@@ -189,6 +304,7 @@ impl CsState {
             push_rule_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             rate_limiter: ratelimit::RateLimiter::new(),
             appservices: Vec::new(),
+            cluster: None,
         })
     }
 
@@ -231,7 +347,7 @@ impl CsState {
 /// Build the client-server router. Serve this on the client listener.
 pub fn router(state: Arc<CsState>) -> axum::Router {
     use routes::{
-        account, backup, keys, media, push, relations, rooms, search, session, spaces, sync,
+        account, admin, backup, keys, media, push, relations, rooms, search, session, spaces, sync,
         to_device,
     };
 
@@ -466,6 +582,10 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_matrix/client/v1/room_summary/{room_id_or_alias}",
             get(spaces::get_room_summary),
+        )
+        .route(
+            "/_matrix/client/v1/register/m.login.registration_token/validity",
+            get(session::registration_token_validity),
         );
 
     // -- media (authenticated endpoints only, Matrix 1.11+)
@@ -520,7 +640,99 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route("/_matrix/key/v2/query", post(notary_query))
         .route("/_matrix/key/v2/query/{server_name}", get(notary_query));
 
-    app.fallback(unrecognized)
+    // -- admin API (docs/design-admin-identity.md). Our own namespace: no
+    // `_synapse`-prefixed paths and no aliases for other servers' admin
+    // tooling. Registered before the CORS layer deliberately — the admin
+    // console may be served from a separate listener, and cross-origin
+    // bearer-token calls need the same permissive treatment as the rest
+    // of the API (there are no cookies anywhere, so this grants a browser
+    // nothing it did not already hold a token for).
+    app = app
+        .route("/_saltator/admin/v1/users", get(admin::list_users))
+        .route(
+            "/_saltator/admin/v1/users/{user_id}",
+            get(admin::user_detail),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/lock",
+            post(admin::lock_user),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/unlock",
+            post(admin::unlock_user),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/deactivate",
+            post(admin::deactivate_user),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/reset_password",
+            post(admin::reset_password),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/admin",
+            put(admin::set_admin),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/devices",
+            delete(admin::delete_all_devices),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/devices/{device_id}",
+            delete(admin::delete_device),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/external_ids/{auth_provider}",
+            put(admin::link_external_id).delete(admin::unlink_external_id),
+        )
+        .route(
+            "/_saltator/admin/v1/auth_providers/{auth_provider}/users/{external_id}",
+            get(admin::lookup_external_id),
+        )
+        .route(
+            "/_saltator/admin/v1/users/{user_id}/notice",
+            post(admin::send_notice),
+        )
+        .route(
+            "/_saltator/admin/v1/cluster/nodes",
+            get(admin::list_cluster_nodes),
+        )
+        .route(
+            "/_saltator/admin/v1/cluster/nodes/{node_id}",
+            delete(admin::remove_cluster_node),
+        )
+        .route(
+            "/_saltator/admin/v1/cluster/nodes/{node_id}/drain",
+            post(admin::drain_node),
+        )
+        .route(
+            "/_saltator/admin/v1/cluster/nodes/{node_id}/undrain",
+            post(admin::undrain_node),
+        )
+        .route("/_saltator/admin/v1/rooms", get(admin::list_rooms))
+        .route(
+            "/_saltator/admin/v1/rooms/{room_id}",
+            get(admin::room_detail).delete(admin::shutdown_room),
+        )
+        .route(
+            "/_saltator/admin/v1/rooms/{room_id}/block",
+            put(admin::set_room_blocked),
+        )
+        .route(
+            "/_saltator/admin/v1/blocked_rooms",
+            get(admin::list_blocked_rooms),
+        )
+        .route(
+            "/_saltator/admin/v1/registration_tokens",
+            get(admin::list_registration_tokens).post(admin::create_registration_token),
+        )
+        .route(
+            "/_saltator/admin/v1/registration_tokens/{token}",
+            get(admin::get_registration_token).delete(admin::delete_registration_token),
+        );
+
+    let app = app
+        .fallback(unrecognized)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(
             tower_http::cors::CorsLayer::new()
@@ -528,8 +740,40 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
                 .allow_methods(tower_http::cors::Any)
                 .allow_headers(tower_http::cors::Any),
         )
-        .with_state(state)
+        .with_state(state);
+
+    // The console mounts AFTER the CORS layer, and that placement is the
+    // whole opt-out: `Router::layer` applies only to routes registered
+    // before it, so `Access-Control-Allow-Origin: *` never lands on the
+    // console's responses. The permissive layer exists for Matrix
+    // clients; an admin console has no reason to be readable
+    // cross-origin.
+    //
+    // `nest`, not `merge`: axum panics when merging two routers that both
+    // carry a fallback, and the root has one (`unrecognized`). Nesting
+    // gives the SPA its own inner fallback for client-side routes without
+    // disturbing `M_UNRECOGNIZED` on `/_matrix/*`.
+    #[cfg(feature = "admin-ui")]
+    let app = app
+        .nest(ADMIN_UI_PREFIX, saltator_admin_ui::router())
+        // `nest` covers the bare prefix and `/{*rest}`, and a wildcard
+        // needs at least one character — so the trailing-slash form, which
+        // is exactly what the bundle's own asset URLs are relative to,
+        // needs its own route.
+        .route(
+            &format!("{ADMIN_UI_PREFIX}/"),
+            get(saltator_admin_ui::index),
+        );
+
+    app
 }
+
+/// Where the console is served. Under our own prefix, beside the API it
+/// drives — the UI rides wherever the admin API rides, so same-origin
+/// holds on the shared client listener and on the optional separate admin
+/// listener alike.
+#[cfg(feature = "admin-ui")]
+pub const ADMIN_UI_PREFIX: &str = "/_saltator/admin/ui";
 
 async fn unrecognized() -> ApiError {
     ApiError::unrecognized()

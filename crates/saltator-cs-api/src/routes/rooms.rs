@@ -573,6 +573,9 @@ async fn join_with_body(
     via: &[String],
     mut body: serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
+    // Before anything else, including the remote handshake: an
+    // administrator has closed this room.
+    state.room_admin().ensure_joinable(room_id.as_str())?;
     let reason = body
         .remove("reason")
         .and_then(|v| v.as_str().map(ToOwned::to_owned));
@@ -1194,6 +1197,8 @@ pub async fn knock_room(
         }
         Err(alias) => resolve_alias(&state, alias.as_str())?,
     };
+    // A knock is a request to join, so it is closed off by the same block.
+    state.room_admin().ensure_joinable(room_id.as_str())?;
     let reason = body
         .get("reason")
         .and_then(|v| v.as_str().map(ToOwned::to_owned));

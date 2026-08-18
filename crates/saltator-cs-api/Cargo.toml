@@ -5,14 +5,26 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# The embedded admin console (docs/design-admin-ui.md). Default-OFF, and
+# the workspace's first feature: enabling it makes this origin serve HTML,
+# which is a conscious act rather than something an upgrade brings.
+admin-ui = ["dep:saltator-admin-ui"]
+
 [dependencies]
 saltator-core.workspace = true
+saltator-admin-ui = { workspace = true, optional = true }
 saltator-roomserver.workspace = true
 saltator-userserver.workspace = true
 saltator-fedout.workspace = true
 saltator-media.workspace = true
 saltator-federation.workspace = true
+# The cluster control plane, for the admin node/drain endpoints. A handle,
+# like the shard servers above — not a new layer.
+saltator-cluster.workspace = true
+saltator-shard.workspace = true
 
+blake3.workspace = true
 ruma.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,7 +42,6 @@ bytes.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
-saltator-shard.workspace = true
 saltator-store.workspace = true
 saltator-testsupport.workspace = true
 tempfile.workspace = true

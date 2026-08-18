@@ -53,6 +53,15 @@ pub struct ClientConfig {
     /// Whether `POST /register` is open.
     #[serde(default = "default_true")]
     pub registration_enabled: bool,
+    /// Require a registration token on `/register`. Independent of
+    /// `registration_enabled` — closed still means closed. Mint tokens
+    /// through the admin API.
+    ///
+    /// Turn this on only once an administrator exists: the gate applies to
+    /// everyone, and only an admin can mint a token, so enabling it on an
+    /// empty server locks it with nobody inside.
+    #[serde(default)]
+    pub registration_requires_token: bool,
     /// Room version for `/createRoom` when the client names none.
     #[serde(default = "default_room_version")]
     pub default_room_version: String,
@@ -79,18 +88,34 @@ pub struct ClientConfig {
     /// massaging.
     #[serde(default)]
     pub appservice_registration_dir: Option<String>,
+    /// Full user IDs granted server-administrator rights, unioned with
+    /// the per-account admin flag. This is the bootstrap: a fresh server
+    /// has no admin account and no way to grant one from inside.
+    #[serde(default)]
+    pub admin_users: Vec<String>,
+    /// Localpart of the account that delivers server notices (e.g.
+    /// `notices`). Unset disables the feature.
+    ///
+    /// Setting it creates and reserves that account on first use: the
+    /// localpart is refused to `/register` from then on, so nobody can
+    /// take the name and send what looks like server mail.
+    #[serde(default)]
+    pub server_notices_localpart: Option<String>,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             registration_enabled: true,
+            registration_requires_token: false,
             default_room_version: default_room_version(),
             max_upload_size: default_max_upload(),
             well_known_client: None,
             rate_limits_enabled: true,
             allow_internal_fetch: false,
             appservice_registration_dir: None,
+            admin_users: Vec::new(),
+            server_notices_localpart: None,
         }
     }
 }
@@ -236,6 +261,10 @@ federation = "127.0.0.1:8448"
 
 [client]
 registration_enabled = true
+# Require an invite code from the admin API's registration_tokens surface.
+# Turn on only AFTER an administrator has registered: the gate applies to
+# everyone and only an admin can mint tokens.
+registration_requires_token = false
 default_room_version = "12"
 max_upload_size = 52428800
 # Login/registration/message rate limiting (429 M_LIMIT_EXCEEDED).
@@ -244,6 +273,10 @@ rate_limits_enabled = true
 # Keep false in production (SSRF protection); true only in isolated tests.
 allow_internal_fetch = false
 # well_known_client = "https://matrix.example.org"
+# Server administrators, in addition to accounts carrying the admin flag.
+# A fresh server has no admin account and no way to grant one from inside,
+# so the first administrator has to be named here.
+# admin_users = ["@root:example.org"]
 
 [federation]
 # Serve the federation port over HTTPS. Real federation requires TLS;

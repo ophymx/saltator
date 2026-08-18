@@ -51,7 +51,7 @@ use saltator_core::{Event, RoomVersion};
 use saltator_shard::{ChangeRecord, NodeId, ShardHandle, ShardId, ShardRegistry, TypeConfig};
 use saltator_store::Keyspace;
 
-pub use machine::{RoomApp, RoomStore};
+pub use machine::{RoomApp, RoomPage, RoomStore};
 pub use signer::{ServerSigner, SignError};
 pub use types::{
     AppendEvent, ChangePayload, ReceiptCmd, ReceiptRecord, Rejected, RoomCommand, RoomMeta,

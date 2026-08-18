@@ -20,6 +20,7 @@ saltator-cs-api = { path = "crates/saltator-cs-api" }
 saltator-federation = { path = "crates/saltator-federation" }
 saltator-media = { path = "crates/saltator-media" }
 saltator-testsupport = { path = "crates/saltator-testsupport" }
+saltator-admin-ui = { path = "crates/saltator-admin-ui" }
 
 anyhow = "1"
 thiserror = "2"
@@ -37,6 +38,7 @@ prost = "0.13"
 tonic-build = "0.12"
 protoc-bin-vendored = "3"
 toml = "0.8"
+include_dir = "0.7"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 argon2 = "0.5"

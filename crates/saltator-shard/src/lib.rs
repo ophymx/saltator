@@ -56,6 +56,25 @@ impl ShardId {
     pub const fn group(self) -> u64 {
         ((self.keyspace as u64) << 16) | self.index as u64
     }
+
+    /// The inverse of [`Self::group`] — for turning a placement's group
+    /// numbers back into something an operator can read. `None` if the
+    /// keyspace byte belongs to no keyspace this binary knows.
+    pub fn from_group(group: u64) -> Option<Self> {
+        let index = (group & 0xffff) as u16;
+        let keyspace = group >> 16;
+        for ks in [
+            Keyspace::Meta,
+            Keyspace::Room,
+            Keyspace::User,
+            Keyspace::FedOut,
+        ] {
+            if keyspace == ks as u64 {
+                return Some(Self::new(ks, index));
+            }
+        }
+        None
+    }
 }
 
 impl std::fmt::Display for ShardId {

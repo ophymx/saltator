@@ -13,7 +13,7 @@ use ruma::api::client::presence::{get_presence, set_presence};
 use ruma::api::client::profile::{
     get_avatar_url, get_display_name, get_profile, set_avatar_url, set_display_name,
 };
-use ruma::api::client::uiaa::{AuthData, UserIdentifier};
+use ruma::api::client::uiaa::AuthData;
 use ruma::UserId;
 
 use saltator_userserver::Profile;
@@ -403,35 +403,26 @@ pub async fn update_device(
     Ok(Ra(update_device::v3::Response::new()))
 }
 
-/// The single-password UIA stage shared by destructive account
-/// endpoints: challenge when auth is absent, 401 `M_FORBIDDEN` (with the
-/// flows) on a wrong password.
+/// The password re-authentication stage shared by the destructive account
+/// endpoints.
+///
+/// `request_id` identifies the operation and binds the UIA session to it:
+/// two different destructive endpoints must never share one, or a session
+/// completed for the milder could be spent on the harsher.
 pub(crate) async fn require_password_uia(
     state: &CsState,
     auth: &Auth,
+    request_id: &str,
     req_auth: &Option<AuthData>,
 ) -> Result<()> {
-    const FLOWS: &[&[&str]] = &[&["m.login.password"]];
-    let Some(AuthData::Password(pw)) = req_auth else {
-        return Err(ApiError::uiaa(FLOWS, saltator_userserver::generate_token()));
-    };
-    if let UserIdentifier::Matrix(m) = &pw.identifier {
-        let claimed = m.user.trim_start_matches('@');
-        let expected = auth.user_id.as_str().trim_start_matches('@');
-        if claimed != expected && Some(claimed) != expected.split(':').next() {
-            return Err(ApiError::forbidden("Identifier does not match session"));
-        }
-    }
-    if !state
-        .users
-        .verify_user_password(&auth.user_id, &pw.password)
-        .await?
-    {
-        return Err(ApiError::uiaa_forbidden(
-            FLOWS,
-            saltator_userserver::generate_token(),
-        ));
-    }
+    state
+        .uia()
+        .check(
+            &crate::services::uia::Purpose::Reauth(&auth.user_id),
+            request_id,
+            req_auth.as_ref(),
+        )
+        .await?;
     Ok(())
 }
 
@@ -440,7 +431,8 @@ pub async fn delete_device(
     auth: Auth,
     Ar(req): Ar<delete_device::v3::Request>,
 ) -> Result<Ra<delete_device::v3::Response>> {
-    require_password_uia(&state, &auth, &req.auth).await?;
+    let request_id = format!("delete_device:{}:{}", auth.user_id, req.device_id);
+    require_password_uia(&state, &auth, &request_id, &req.auth).await?;
     state
         .users
         .delete_device(&auth.user_id, req.device_id.as_str())
@@ -458,7 +450,8 @@ pub async fn change_password(
     auth: Auth,
     Ar(req): Ar<change_password::v3::Request>,
 ) -> Result<Ra<change_password::v3::Response>> {
-    require_password_uia(&state, &auth, &req.auth).await?;
+    let request_id = format!("change_password:{}", auth.user_id);
+    require_password_uia(&state, &auth, &request_id, &req.auth).await?;
     // Capture the devices about to die so their deletion is announced.
     let others: Vec<String> = if req.logout_devices {
         state
@@ -497,7 +490,8 @@ pub async fn deactivate(
     auth: Auth,
     Ar(req): Ar<deactivate::v3::Request>,
 ) -> Result<Ra<deactivate::v3::Response>> {
-    require_password_uia(&state, &auth, &req.auth).await?;
+    let request_id = format!("deactivate:{}", auth.user_id);
+    require_password_uia(&state, &auth, &request_id, &req.auth).await?;
     let devices: Vec<String> = state
         .users
         .store()
