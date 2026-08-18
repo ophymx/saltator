@@ -12,11 +12,13 @@ pub mod network;
 pub mod placement;
 pub mod reconcile;
 mod rpc;
+pub mod tls;
 
 pub use gate::ClusterGate;
+pub use tls::InternalTls;
 pub mod types;
 
-pub use join::join_cluster;
+pub use join::{join_cluster, join_cluster_with_tls};
 pub use placement::{ClusterConfig, NodeInfo, NodeStatus, Placement, Roster};
 pub use reconcile::{reconcile_once, spawn_reconciler, LocalGroup};
 
@@ -131,12 +133,27 @@ impl MetadataHandle {
         bootstrap_addr: Option<String>,
         registry: Option<&ShardRegistry>,
     ) -> Result<Self> {
+        Self::start_with_tls(node_id, stores, bootstrap_addr, registry, None).await
+    }
+
+    /// [`start`](Self::start) with mutual TLS on the metadata group's peer
+    /// connections (security review 2026-08-13, Vuln 4). The server side is
+    /// configured separately, in [`serve_internal_with_tls`].
+    pub async fn start_with_tls(
+        node_id: NodeId,
+        stores: impl Into<saltator_store::Stores>,
+        bootstrap_addr: Option<String>,
+        registry: Option<&ShardRegistry>,
+        tls: Option<tls::InternalTls>,
+    ) -> Result<Self> {
+        let factory = network::GrpcRaftNetworkFactory::new(ShardId::METADATA)
+            .with_tls(tls.as_ref().map(|t| t.client()));
         let inner = ShardHandle::start(
             ShardId::METADATA,
             node_id,
             stores,
             Arc::new(MetaApp),
-            network::GrpcRaftNetworkFactory::new(ShardId::METADATA),
+            factory,
             bootstrap_addr,
             registry,
         )
@@ -307,8 +324,8 @@ impl MetadataHandle {
 
 /// Serve the internal gRPC surface (control channel) until `shutdown`
 /// resolves. Incoming Raft messages route to any shard group registered in
-/// `registry`. mTLS wiring lands with multi-node (M4); until then this
-/// binds plaintext on the internal listener.
+/// `registry`. Plaintext — for loopback single-node and test harnesses;
+/// multi-node deployments use [`serve_internal_with_tls`].
 pub async fn serve_internal(
     handle: MetadataHandle,
     registry: ShardRegistry,
@@ -317,10 +334,41 @@ pub async fn serve_internal(
     listen: std::net::SocketAddr,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    serve_internal_with_tls(
+        handle,
+        registry,
+        server_name,
+        schemas,
+        listen,
+        None,
+        shutdown,
+    )
+    .await
+}
+
+/// [`serve_internal`] with mutual TLS: when `tls` is set the listener
+/// requires and verifies a client certificate signed by the cluster CA, so
+/// only a cluster member can reach `RaftService`/`ControlService` — the
+/// authentication the plaintext surface lacked (security review
+/// 2026-08-13, Vuln 4).
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_internal_with_tls(
+    handle: MetadataHandle,
+    registry: ShardRegistry,
+    server_name: String,
+    schemas: Vec<(u32, u32)>,
+    listen: std::net::SocketAddr,
+    tls: Option<tls::InternalTls>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let svc = rpc::InternalRpc::new(handle, registry, server_name, schemas);
     let svc = Arc::new(svc);
 
-    tonic::transport::Server::builder()
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = &tls {
+        builder = builder.tls_config(tls.server())?;
+    }
+    builder
         .add_service(proto::raft_service_server::RaftServiceServer::from_arc(
             svc.clone(),
         ))

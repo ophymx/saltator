@@ -190,12 +190,27 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // join/reconciliation so a joining node can receive replication.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Mutual TLS for the internal control plane (security review
+    // 2026-08-13, Vuln 4). Peer certs verify against `server_name`, so
+    // nodes can dial each other by bare address.
+    let internal_tls = match cfg.cluster.tls_files()? {
+        Some((cert, key, ca)) => Some(saltator_cluster::InternalTls::from_files(
+            cert,
+            key,
+            ca,
+            &cfg.server_name,
+        )?),
+        None => None,
+    };
+    config::require_tls_or_loopback(cfg.listeners.internal, internal_tls.is_some())?;
+
     let registry = saltator_shard::ShardRegistry::new();
-    let meta = saltator_cluster::MetadataHandle::start(
+    let meta = saltator_cluster::MetadataHandle::start_with_tls(
         cfg.node.id,
         stores.clone(),
         founding.then(|| cfg.node.advertise.clone()),
         Some(&registry),
+        internal_tls.clone(),
     )
     .await?;
 
@@ -225,28 +240,34 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // replication; every node needs it for cross-node Raft traffic).
     let internal_task = {
         let mut rx = shutdown_rx.clone();
-        tokio::spawn(saltator_cluster::serve_internal(
+        tokio::spawn(saltator_cluster::serve_internal_with_tls(
             meta.clone(),
             registry.clone(),
             cfg.server_name.clone(),
             schemas.clone(),
             cfg.listeners.internal,
+            internal_tls.clone(),
             async move {
                 let _ = rx.wait_for(|stop| *stop).await;
             },
         ))
     };
-    tracing::info!(listen = %cfg.listeners.internal, "internal RPC listening");
+    tracing::info!(
+        listen = %cfg.listeners.internal,
+        tls = internal_tls.is_some(),
+        "internal RPC listening"
+    );
 
     // A joiner asks a seed to admit it to the metadata group before anything
     // else can be read from it.
     if fresh_bootstrap && !cfg.cluster.seeds.is_empty() {
         tracing::info!(seeds = ?cfg.cluster.seeds, "joining existing cluster");
-        saltator_cluster::join_cluster(
+        saltator_cluster::join::join_cluster_with_tls(
             &cfg.cluster.seeds,
             cfg.node.id,
             &cfg.node.advertise,
             Duration::from_secs(30),
+            internal_tls.as_ref().map(|t| t.client()).as_ref(),
         )
         .await?;
     }
@@ -282,7 +303,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         cfg.node.id,
         stores.clone(),
         signer.clone(),
-        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_roomserver::ROOM_SHARD),
+        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_roomserver::ROOM_SHARD)
+            .with_tls(internal_tls.as_ref().map(|t| t.client())),
         shard_bootstrap.clone(),
         Some(&registry),
     )
@@ -297,7 +319,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         cfg.node.id,
         stores.clone(),
         server_name.clone(),
-        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_userserver::USER_SHARD),
+        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_userserver::USER_SHARD)
+            .with_tls(internal_tls.as_ref().map(|t| t.client())),
         shard_bootstrap,
         Some(&registry),
     )
@@ -311,7 +334,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let fedout = saltator_fedout::FedOutServer::start(
         cfg.node.id,
         stores.clone(),
-        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_fedout::FED_OUT_SHARD),
+        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_fedout::FED_OUT_SHARD)
+            .with_tls(internal_tls.as_ref().map(|t| t.client())),
         shard_bootstrap_fedout,
         Some(&registry),
     )
@@ -325,7 +349,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // Proposal forwarding: any node serves any write by handing it to the
     // shard's leader over the internal RPC (a load balancer needs no
     // leader awareness).
-    let forwarder = saltator_cluster::forward::RpcProposeForwarder::new();
+    let forwarder = saltator_cluster::forward::RpcProposeForwarder::with_tls(
+        internal_tls.as_ref().map(|t| t.client()),
+    );
     rooms.shard_handle().set_forwarder(forwarder.clone());
     users.shard_handle().set_forwarder(forwarder.clone());
     fedout.shard_handle().set_forwarder(forwarder.clone());
@@ -367,7 +393,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     for h in [rooms.shard_handle(), fedout.shard_handle()] {
         saltator_shard::migrate::spawn_migration_supervisor(
             h.clone(),
-            saltator_cluster::ClusterGate::new(h.clone(), cfg.node.id, schemas.clone()),
+            saltator_cluster::ClusterGate::new(
+                h.clone(),
+                cfg.node.id,
+                schemas.clone(),
+                internal_tls.as_ref().map(|t| t.client()),
+            ),
         );
     }
     saltator_shard::migrate::spawn_migration_supervisor(
@@ -377,6 +408,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                 users.shard_handle().clone(),
                 cfg.node.id,
                 schemas.clone(),
+                internal_tls.as_ref().map(|t| t.client()),
             ),
             users: users.clone(),
             fedout: fedout.clone(),
