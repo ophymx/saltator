@@ -33,4 +33,27 @@ TestCannotSendNonKnockViaSendKnock
 # wins; Synapse can't lose this race only because its join path takes
 # ≥10ms). Root-caused 2026-08-08; upstream fix = a tsBoundaryGuard sleep
 # before the federation joins in room_timestamp_to_event_test.go.
-TestJumpToDateEndpoint/parallel/federation/looking_backwards,_should_be_able_to_find_event_that_was_sent_before_we_joined
+#
+# The race is in the shared fixture, so it is NOT confined to one leaf —
+# it lands on whichever sibling happens to collide that run, and the
+# single-leaf entry below was mis-scoped. Observed 2026-08-18 on the two
+# paginate leaves, in back-to-back runs of branches that touch no
+# federation code (PR #49 hit `(start)`, PR #53 hit `(end)`), each with
+# the same signature: the query timestamp shares a millisecond with the
+# join, and we correctly return the membership at distance 0 —
+#
+#   Want $Tp… (ts …967) given …985, but got $CW… m.room.member (ts …985)
+#
+# At ~20% per leaf, one of the three fails about half of all runs, which
+# matches what CI did. So all three are listed. `looking_forwards` and
+# the imported-event leaf are deliberately left OUT: they have never been
+# seen flaking, and blanket-listing the family would blind the gate to a
+# real pagination regression.
+#
+# These carry the `?` flaky marker: tolerated when they fail, and never
+# reported stale when they pass. They pass most runs by construction, so
+# without the marker the gate would stand there advising their removal —
+# which would break the build on the next collision.
+?TestJumpToDateEndpoint/parallel/federation/looking_backwards,_should_be_able_to_find_event_that_was_sent_before_we_joined
+?TestJumpToDateEndpoint/parallel/federation/can_paginate_backwards_after_getting_remote_event_from_timestamp_to_event_endpoint_(start)
+?TestJumpToDateEndpoint/parallel/federation/can_paginate_backwards_after_getting_remote_event_from_timestamp_to_event_endpoint_(end)

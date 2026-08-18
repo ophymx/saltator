@@ -16,6 +16,13 @@
 # outright if zero tests passed (a broken image/deployer, not a protocol
 # gap).
 #
+# An entry may be prefixed `?` to mark it FLAKY rather than failing: it is
+# tolerated when it fails, exactly like any other entry, but it is never
+# reported stale when it passes. Without that, a test that fails ~20% of
+# runs emits "now passing; remove from the allowlist" on the other ~80% —
+# advice that would break the build on the next collision, and the kind of
+# standing false warning that teaches people to ignore the real ones.
+#
 # Usage: complement-fed-gate.sh <results.json> <allowlist-file> [step-summary-file]
 set -euo pipefail
 
@@ -47,7 +54,12 @@ fi
 
 mapfile -t fails < <(jq -r 'select(.Action=="fail" and .Test != null) | .Test' "$json" | sort -u)
 mapfile -t passes < <(jq -r 'select(.Action=="pass" and .Test != null) | .Test' "$json" | sort -u)
-mapfile -t allow < <(grep -vE '^[[:space:]]*(#|$)' "$allowlist" | sed 's/[[:space:]]*$//')
+mapfile -t allow_raw < <(grep -vE '^[[:space:]]*(#|$)' "$allowlist" | sed 's/[[:space:]]*$//')
+# Tolerated test names, with the `?` flaky marker stripped.
+mapfile -t allow < <(printf '%s\n' "${allow_raw[@]}" | sed 's/^?//')
+# Only unmarked entries are candidates for the stale check: a flaky entry
+# passing is its normal behaviour, not evidence the allowance is spent.
+mapfile -t allow_strict < <(printf '%s\n' "${allow_raw[@]}" | grep -v '^?' || true)
 
 in_list() { local x="$1" a; for a in "${allow[@]}"; do [ "$a" = "$x" ] && return 0; done; return 1; }
 # Leaf = a failing test with no failing descendant.
@@ -63,7 +75,8 @@ done
 # not stale — `-skip`-filtered tests emit no JSON events at all, and the
 # per-push run skips the v7-only knock bucket that the weekly unfiltered
 # run lets fail.)
-for a in "${allow[@]}"; do
+for a in "${allow_strict[@]}"; do
+  [ -n "$a" ] || continue
   if printf '%s\n' "${passes[@]}" | grep -qxF "$a"; then
     echo "::warning::allowlisted federation test now passing; remove from ${allowlist}: ${a}"
   fi
