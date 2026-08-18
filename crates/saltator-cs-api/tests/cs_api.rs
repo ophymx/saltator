@@ -11149,6 +11149,49 @@ async fn a_notice_needs_a_real_recipient() {
     env.shutdown().await;
 }
 
+// -- health probes --------------------------------------------------------
+
+/// Both probes answer without a token: whatever fronts this node — a load
+/// balancer, an orchestrator — has no credentials to offer.
+#[tokio::test]
+async fn health_probes_need_no_auth() {
+    let env = start_env().await;
+    for path in ["/_saltator/health/live", "/_saltator/health/ready"] {
+        let (status, body) = env.req("GET", path, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    env.shutdown().await;
+}
+
+/// A healthy node is live and ready, with a control plane or without one.
+#[tokio::test]
+async fn a_healthy_node_is_live_and_ready() {
+    for env in [start_env().await, start_env_cluster(&[]).await] {
+        let (status, body) = env.req("GET", "/_saltator/health/live", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "ok");
+
+        let (status, body) = env.req("GET", "/_saltator/health/ready", None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "ready");
+        env.shutdown().await;
+    }
+}
+
+/// The probes say nothing about the cluster's shape. They are the one
+/// unauthenticated surface that could enumerate it, so the body carries a
+/// status and a reason and no node ids, addresses or counts.
+#[tokio::test]
+async fn health_bodies_do_not_leak_topology() {
+    let env = start_env_cluster(&[]).await;
+    let (_, body) = env.req("GET", "/_saltator/health/ready", None, None).await;
+    let rendered = body.to_string();
+    for leak in ["127.0.0.1", "node_id", "leader", "advertise"] {
+        assert!(!rendered.contains(leak), "readiness leaked {leak}: {body}");
+    }
+    env.shutdown().await;
+}
+
 // -- cluster admin (docs/design-admin-identity.md slice 6) ----------------
 
 const CLUSTER_NODES: &str = "/_saltator/admin/v1/cluster/nodes";

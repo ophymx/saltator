@@ -280,6 +280,15 @@ impl CsState {
         }
     }
 
+    /// Liveness/readiness, for the probes in front of this node.
+    pub(crate) fn health(&self) -> services::health::Health<'_> {
+        services::health::Health {
+            users: &self.users,
+            rooms: &self.rooms,
+            cluster: self.cluster.as_ref(),
+        }
+    }
+
     /// The E2EE/device-list domain service over this state's shards.
     pub(crate) fn e2ee(&self) -> services::e2ee::E2ee<'_> {
         services::e2ee::E2ee {
@@ -375,8 +384,8 @@ impl CsState {
 /// Build the client-server router. Serve this on the client listener.
 pub fn router(state: Arc<CsState>) -> axum::Router {
     use routes::{
-        account, admin, backup, keys, media, push, relations, rooms, search, session, spaces, sso,
-        sync, to_device,
+        account, admin, backup, health, keys, media, push, relations, rooms, search, session,
+        spaces, sso, sync, to_device,
     };
 
     let mut app = axum::Router::new()
@@ -391,7 +400,11 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         // The IdP's redirect target. Our own namespace, not `/_matrix`:
         // it is not a spec endpoint, and the spec leaves the callback
         // URL entirely to the server (decision 1).
-        .route("/_saltator/client/oidc/callback", get(sso::oidc_callback));
+        .route("/_saltator/client/oidc/callback", get(sso::oidc_callback))
+        // Probes. Unauthenticated: whatever fronts this node holds no
+        // token, and the bodies say nothing a prober should not see.
+        .route("/_saltator/health/live", get(health::live))
+        .route("/_saltator/health/ready", get(health::ready));
 
     // Endpoints under both `/r0` (legacy) and `/v3` prefixes.
     for prefix in ["/_matrix/client/r0", "/_matrix/client/v3"] {

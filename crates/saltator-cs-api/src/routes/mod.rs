@@ -2,6 +2,7 @@ pub mod account;
 pub mod admin;
 pub mod backup;
 pub mod edu;
+pub mod health;
 pub mod keys;
 pub mod media;
 pub mod push;
