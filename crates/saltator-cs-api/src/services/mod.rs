@@ -9,5 +9,6 @@ pub(crate) mod auth;
 pub(crate) mod cluster_admin;
 pub(crate) mod e2ee;
 pub(crate) mod notices;
+pub(crate) mod oidc;
 pub(crate) mod room_admin;
 pub(crate) mod uia;

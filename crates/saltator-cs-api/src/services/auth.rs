@@ -16,25 +16,27 @@
 
 use std::sync::Arc;
 
-use ruma::api::client::session::get_login_types::v3::{LoginType, PasswordLoginType};
+use ruma::api::client::session::get_login_types::v3::{
+    IdentityProvider, LoginType, PasswordLoginType, SsoLoginType, TokenLoginType,
+};
 use ruma::api::client::session::login::v3::LoginInfo;
 use ruma::api::client::uiaa::UserIdentifier;
-use saltator_userserver::{Session, UserServer};
+use saltator_userserver::{token_hash, Session, UserServer};
 
 use crate::error::ApiError;
+use crate::services::oidc::OidcProvider;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
 /// One configured way to prove an identity.
-///
-/// A single variant today, deliberately: local passwords are the only
-/// credential this server can verify. The OIDC slice adds
-/// `Oidc { idp_id, .. }` here, built from its own config block, and the
-/// two `match`es below gain an arm each — no existing path is edited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) enum AuthProvider {
     /// Argon2 password hashes held in this server's own account records.
     LocalPassword,
+    /// An external OpenID Connect provider (the OIDC slice). Proves *who*
+    /// the user is; sessions stay ours — the browser flow ends in a
+    /// single-use login token that `m.login.token` below redeems.
+    Oidc(Arc<OidcProvider>),
 }
 
 /// The authentication service. Borrow-cheap: construct per call site via
@@ -48,19 +50,46 @@ pub(crate) struct Authn<'a> {
 }
 
 impl Authn<'_> {
-    fn offers(&self, provider: AuthProvider) -> bool {
-        self.providers.contains(&provider)
-    }
-
-    /// The flows for `GET /login`, in configured order. With only local
-    /// passwords this is byte-identical to the literal it replaced.
-    pub fn login_types(&self) -> Vec<LoginType> {
+    fn offers_password(&self) -> bool {
         self.providers
             .iter()
-            .map(|p| match p {
-                AuthProvider::LocalPassword => LoginType::Password(PasswordLoginType::new()),
-            })
-            .collect()
+            .any(|p| matches!(p, AuthProvider::LocalPassword))
+    }
+
+    /// Every configured OIDC provider, in configured order.
+    pub fn oidc_providers_all(&self) -> impl Iterator<Item = &Arc<OidcProvider>> {
+        self.providers.iter().filter_map(|p| match p {
+            AuthProvider::Oidc(o) => Some(o),
+            AuthProvider::LocalPassword => None,
+        })
+    }
+
+    /// The provider behind `{idp_id}` in the SSO redirect path.
+    pub fn oidc_provider(&self, idp_id: &str) -> Option<&Arc<OidcProvider>> {
+        self.oidc_providers_all().find(|o| o.cfg.idp_id == idp_id)
+    }
+
+    /// The flows for `GET /login`, in configured order. Any number of
+    /// OIDC providers fold into one `m.login.sso` advertisement (they are
+    /// its `identity_providers`), which drags `m.login.token` in with it
+    /// — SSO ends in a login token, so offering one without the other
+    /// would advertise a flow no client could finish.
+    pub fn login_types(&self) -> Vec<LoginType> {
+        let mut types = Vec::new();
+        if self.offers_password() {
+            types.push(LoginType::Password(PasswordLoginType::new()));
+        }
+        let idps: Vec<IdentityProvider> = self
+            .oidc_providers_all()
+            .map(|o| IdentityProvider::new(o.cfg.idp_id.clone(), o.cfg.name.clone()))
+            .collect();
+        if !idps.is_empty() {
+            let mut sso = SsoLoginType::new();
+            sso.identity_providers = idps;
+            types.push(LoginType::Sso(sso));
+            types.push(LoginType::Token(TokenLoginType::new()));
+        }
+        types
     }
 
     /// The account a login attempt names, before any credential is
@@ -82,6 +111,22 @@ impl Authn<'_> {
                     _ => Err(ApiError::forbidden("Unsupported identifier type")),
                 }
             }
+            LoginInfo::Token(t) => {
+                // A peek, not the redemption: the limiter must key on the
+                // account before the consume command runs. An unknown
+                // token rate-limits under its own hash — there is no
+                // account to name, and the string itself must not reach
+                // the limiter's keyspace (it may still be redeemable).
+                let peeked = self
+                    .users
+                    .store()
+                    .login_token(&token_hash(&t.token))
+                    .map_err(ApiError::internal)?;
+                Ok(match peeked {
+                    Some(entry) => entry.user_id,
+                    None => format!("token:{}", hex_prefix(&t.token)),
+                })
+            }
             _ => Err(unsupported_login_type()),
         }
     }
@@ -96,7 +141,7 @@ impl Authn<'_> {
     ) -> Result<Session> {
         match info {
             LoginInfo::Password(pw) => {
-                if !self.offers(AuthProvider::LocalPassword) {
+                if !self.offers_password() {
                     return Err(unsupported_login_type());
                 }
                 let user = self.identify(info)?;
@@ -105,9 +150,26 @@ impl Authn<'_> {
                     .login_password(&user, &pw.password, device_id, display_name, want_refresh)
                     .await?)
             }
+            LoginInfo::Token(t) => {
+                // Offered exactly when SSO is: login tokens exist only as
+                // the tail of the OIDC browser flow.
+                if self.oidc_providers_all().next().is_none() {
+                    return Err(unsupported_login_type());
+                }
+                Ok(self
+                    .users
+                    .login_with_token(&t.token, device_id, display_name, want_refresh)
+                    .await?)
+            }
             _ => Err(unsupported_login_type()),
         }
     }
+}
+
+/// First 16 hex chars of the blake3 hash — an identifier for logs and
+/// rate-limit keys that cannot be replayed as the credential.
+fn hex_prefix(token: &str) -> String {
+    blake3::hash(token.as_bytes()).to_hex().as_str()[..16].to_owned()
 }
 
 /// A login type this server does not offer. The same message whether the

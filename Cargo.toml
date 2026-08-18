@@ -52,6 +52,9 @@ http = "1"
 bytes = "1"
 futures-util = "0.3"
 sha2 = "0.10"
+# ID-token validation for the OIDC login slice: JWKS parsing and
+# RS256/ES256 signature checks. Rides on `ring`, already in the tree.
+jsonwebtoken = "9"
 chacha20poly1305 = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

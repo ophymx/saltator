@@ -133,6 +133,15 @@ pub const T_ROOM_BLOCKED: u8 = APP_TABLE_FIRST + 29;
 /// first notice and reused forever: remembering it is what stops the
 /// second notice opening a second room.
 pub const T_NOTICES_ROOM: u8 = APP_TABLE_FIRST + 30;
+/// `token_hash → LoginTokenEntry` — single-use `m.login.token` tokens,
+/// minted by the SSO callback and spent by `POST /login` (the OIDC
+/// slice). Hashed like every other token ([`token_hash`]): the stored
+/// row must not be a usable credential.
+///
+/// No time index: tokens live two minutes and a server mints them at
+/// human login rates, so the create-side sweep is a full-table walk over
+/// a table that is almost always empty.
+pub const T_LOGIN_TOKEN: u8 = APP_TABLE_FIRST + 31;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -262,6 +271,17 @@ pub struct UiaSession {
     /// request that no longer carries it.
     pub registration_token: Option<String>,
     pub created_ts: u64,
+}
+
+/// A single-use login token ([`T_LOGIN_TOKEN`]): proof that an external
+/// identity provider authenticated `user_id` moments ago, redeemable for
+/// a session exactly once via `m.login.token`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginTokenEntry {
+    pub user_id: String,
+    /// Ms since epoch. Short (about two minutes): the token only has to
+    /// survive one browser redirect.
+    pub expires_ts: u64,
 }
 
 /// A registration token: an invite code that authorises `/register` when
@@ -770,6 +790,24 @@ pub enum UserCommand {
         by: String,
         ts: u64,
     },
+    /// Mint a single-use login token for an SSO-authenticated user (the
+    /// OIDC slice). The gateway generates the token and hashes it; the
+    /// shard only ever sees the hash.
+    CreateLoginToken {
+        token_hash: [u8; 32],
+        user_id: String,
+        expires_ts: u64,
+        /// Gateway clock, for the expired-row sweep — `apply()` has no
+        /// clock of its own.
+        now_ts: u64,
+    },
+    /// Spend a login token: delete-and-return in one command, which is
+    /// what makes it single-use under concurrent redemption.
+    ConsumeLoginToken {
+        token_hash: [u8; 32],
+        /// Gateway clock, against which expiry is judged.
+        now_ts: u64,
+    },
 }
 
 /// A stored one-time key ([`T_ONE_TIME_KEY`]) with its upload slot:
@@ -907,6 +945,8 @@ pub enum UserResponse {
     /// one without a second lookup — they are already privileged enough
     /// to enumerate every account.
     ExternalIdInUse(String),
+    /// A consumed login token, and the account it vouched for.
+    LoginTokenOwner(String),
 }
 
 /// Change-stream payload of the user shard: something about `user_id`

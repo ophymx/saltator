@@ -491,6 +491,46 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         Some(dir) => cs_state.with_appservices(load_appservice_registrations(dir)),
         None => cs_state,
     };
+    let cs_state = if cfg.client.oidc_providers.is_empty() {
+        cs_state
+    } else {
+        // Refuse to start rather than serve a redirect the IdP will
+        // reject: with no public base URL there is no callback to
+        // register, and every SSO login would fail at the last hop.
+        let base = cfg.client.public_base_url.clone().ok_or_else(|| {
+            anyhow::anyhow!("client.oidc_providers requires client.public_base_url")
+        })?;
+        let providers = cfg
+            .client
+            .oidc_providers
+            .iter()
+            .map(|p| {
+                if !p.scopes.iter().any(|s| s == "openid") {
+                    anyhow::bail!(
+                        "client.oidc_providers[{}].scopes must include \"openid\"",
+                        p.idp_id
+                    );
+                }
+                Ok(saltator_cs_api::OidcProviderConfig {
+                    idp_id: p.idp_id.clone(),
+                    name: p.name.clone(),
+                    issuer: p.issuer.clone(),
+                    client_id: p.client_id.clone(),
+                    client_secret: p.client_secret.clone(),
+                    scopes: p.scopes.clone(),
+                    pkce: p.pkce,
+                    allow_existing_users: p.allow_existing_users,
+                    enable_registration: p.enable_registration,
+                    localpart_claim: p.localpart_claim.clone(),
+                    display_name_claim: p.display_name_claim.clone(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for p in &providers {
+            tracing::info!(idp = %p.idp_id, issuer = %p.issuer, "OIDC provider configured");
+        }
+        cs_state.with_oidc(providers, base)
+    };
     // Typing/presence maps are shared with the federation surface (inbound
     // EDUs update them).
     let cs_typing = cs_state.typing_map();
