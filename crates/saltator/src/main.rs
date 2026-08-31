@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
             init_tracing();
             // rustls needs a process-default crypto provider before any TLS
             // (federation listener / outbound client) is set up.
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let _ = rustls::crypto::ring::default_provider().install_default();
             let cfg = Config::load(&config)?;
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

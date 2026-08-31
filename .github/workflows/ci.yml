@@ -18,6 +18,16 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The toolchain is pinned, not floating. `@stable` meant a Rust release
+  # could turn the repo red with no commit behind it — and with
+  # `clippy -- -D warnings` below, every new lint is that break.
+  # pg-agent-rs cut a release on a runner three versions ahead of the
+  # machine the change was verified on and found out the hard way.
+  #
+  # Keep in lockstep with rust-toolchain.toml, which is what cargo
+  # actually obeys here — the action only sets rustup's *default*, and a
+  # toolchain file outranks the default.
+  RUST_PIN: "1.98.0"
 
 jobs:
   frontend:
@@ -59,7 +69,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_PIN }}
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           # Main-only saves; see the fmt+clippy+test job's cache note.
@@ -119,8 +132,9 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_PIN }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -334,3 +348,21 @@ jobs:
           else
             echo "## Synapse interop: ❌ FAIL (see the interop step logs)" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  licenses:
+    # The graph is permissive but not uniformly MIT/Apache — `as_variant`
+    # is MPL-2.0 with no alternative, and rocksdb vendors C++ under a
+    # GPLv2-or-Apache dual. NOTICE records where and why. This job exists
+    # so a dependency bump cannot widen that set without somebody
+    # deciding to; the allow-list in deny.toml is the decision record.
+    #
+    # Independent of every other job on purpose: it needs no build, no
+    # artifact and no Docker, so it reports in seconds and does not queue
+    # behind the release build.
+    name: licenses (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

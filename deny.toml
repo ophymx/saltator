@@ -1,0 +1,55 @@
+# cargo-deny license policy. Run by CI as `cargo deny check licenses`.
+#
+# The point is not to discover that the tree is permissive — it mostly is,
+# and NOTICE explains where it is not purely MIT/Apache. The point is that
+# the next dependency bump cannot quietly widen this list. If a new crate
+# arrives under a license not named here, the build fails and somebody has
+# to decide, rather than finding out at release time.
+#
+# There is one live obligation behind this file rather than a hypothetical
+# one: `as_variant` is MPL-2.0 with no alternative offered, it arrives via
+# ruma, and it is in every saltator binary. See NOTICE.
+#
+# Targets are deliberately unset, so every platform's dependencies are
+# checked — including the Windows- and macOS-only crates a Linux build
+# never sees.
+
+[licenses]
+# Every license the graph currently resolves to. Where a crate offers a
+# choice, cargo-deny takes the first allowed option, so listing MIT and
+# Apache-2.0 covers the great majority of the ~650 crates.
+allow = [
+    "0BSD",                           # adler2, via the zlib path under rocksdb
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # rustix, linux-raw-sys
+    "BSD-1-Clause",
+    "BSD-2-Clause",                   # arrayref
+    "BSD-3-Clause",                   # curve25519-dalek, ed25519-dalek, subtle
+    "BSL-1.0",                        # ryu
+    "CC0-1.0",                        # blake3's second option
+    "CDLA-Permissive-2.0",            # webpki-roots: a CA bundle, as data
+    "ISC",                            # ring's second half, rustls-webpki, untrusted
+    "MIT",
+    "MIT-0",                          # constant_time_eq
+    "MPL-2.0",                        # as_variant, via ruma; see NOTICE
+    "Unicode-3.0",                    # ICU4X, via idna/url
+    "Unlicense",
+    "Zlib",
+]
+
+# Deliberately absent, and each absence is load-bearing:
+#
+#   LGPL-2.1-or-later  `r-efi` is "MIT OR Apache-2.0 OR LGPL-2.1-or-later".
+#                      Leaving LGPL out is what forces the MIT option to be
+#                      taken. It arrives via getrandom's UEFI support and
+#                      is never compiled for any target we ship, but the
+#                      policy should not depend on that staying true.
+#   GPL-*, AGPL-*      not in the graph. For a homeserver that federates
+#                      with GPL'd implementations this is worth stating
+#                      explicitly rather than leaving to inference.
+#   OpenSSL            not in the graph — TLS is rustls over ring — and
+#                      would want a conscious decision.
+#
+# A crate whose license text does not match its SPDX declaration closely
+# enough gets flagged rather than guessed at.
+confidence-threshold = 0.8

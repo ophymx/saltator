@@ -1,0 +1,18 @@
+# Pinned, not floating — the same pin chapbook and pg-agent-rs carry, and
+# for a reason pg-agent-rs paid for: with `@stable` in CI, every new lint
+# in every new Rust release is a build break that lands with no commit
+# behind it. pg-agent-rs cut v0.8.0 on a runner three versions ahead of
+# the machine the change was verified on, and clippy 1.98's
+# `result_large_err` turned a green precommit into a red release with the
+# tag already pushed. CI here runs `clippy -- -D warnings` too.
+#
+# So: everyone compiles with the same rustc, and a compiler upgrade is a
+# deliberate commit that can be tested like any other. The cost is that
+# new lints wait for the bump instead of arriving on their own.
+#
+# This is the TOOLCHAIN, not the MSRV. `rust-version` in Cargo.toml (1.85)
+# is the floor consumers must clear and is a separate promise. Keep
+# `RUST_PIN` in .github/workflows/ci.yml in lockstep with this.
+[toolchain]
+channel    = "1.98.0"
+components = ["rustfmt", "clippy"]
