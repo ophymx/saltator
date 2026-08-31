@@ -5,8 +5,20 @@
 #   cp target/release/saltator docker/complement/saltator
 #   docker build -t complement-saltator docker/complement
 #
-# Base matches the CI builder (ubuntu-latest) so the prebuilt binary's
-# glibc requirement is satisfied.
+# Base matches the CI builder (`build` runs on ubuntu-24.04, pinned there
+# for exactly this reason) so the prebuilt binary's glibc requirement is
+# satisfied. The coupling is the point to notice: a dynamically-linked
+# build carries its builder's glibc floor and nothing declares it, so the
+# two pins have to be moved together or the image dies at exec with
+# `GLIBC_2.xx not found`. Bumping one alone is the failure mode.
+#
+# The way out is the one pg-agent-rs took — build static against musl and
+# the floor stops existing — which saltator cannot do yet: librocksdb-sys
+# compiles C++, and Debian's `musl-tools` ships musl-gcc without a musl
+# g++. Until that is sorted (a musl cross image such as
+# messense/rust-musl-cross, or a C++-capable musl sysroot), keep the pins
+# married. INTENTION.md's "single static binary where possible" is the
+# standing intent.
 FROM ubuntu:24.04
 
 # haproxy + procps serve only CLUSTER_NODES>1 (the local hardening
