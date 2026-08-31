@@ -19,6 +19,18 @@
 # messense/rust-musl-cross, or a C++-capable musl sysroot), keep the pins
 # married. INTENTION.md's "single static binary where possible" is the
 # standing intent.
+#
+# The binary carries a second undeclared floor, for the same reason: CI
+# builds with `-C target-cpu=x86-64-v2 -C target-feature=+pclmulqdq` so
+# RocksDB gets hardware CRC32c, and RocksDB no longer does runtime feature
+# detection on x86 — it just runs the instructions. So this image needs a
+# host with SSE4.2 and PCLMULQDQ and dies with SIGILL without them.
+# PCLMULQDQ is the binding one (Intel Westmere 2010, AMD Bulldozer 2011),
+# but the practical floor is 2013: the low-power lines lag, and Silvermont
+# and Jaguar are where Atom-class silicon picks these up. Not a concern on
+# CI runners or any current server; it is a concern on a small or old box,
+# and nothing in the image declares it. See the RUSTFLAGS comment in
+# .github/workflows/ci.yml.
 FROM ubuntu:24.04
 
 # haproxy + procps serve only CLUSTER_NODES>1 (the local hardening
