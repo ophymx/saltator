@@ -349,3 +349,20 @@ jobs:
             echo "## Synapse interop: ❌ FAIL (see the interop step logs)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  licenses:
+    # The graph is permissive but not uniformly MIT/Apache — `as_variant`
+    # is MPL-2.0 with no alternative, and rocksdb vendors C++ under a
+    # GPLv2-or-Apache dual. NOTICE records where and why. This job exists
+    # so a dependency bump cannot widen that set without somebody
+    # deciding to; the allow-list in deny.toml is the decision record.
+    #
+    # Independent of every other job on purpose: it needs no build, no
+    # artifact and no Docker, so it reports in seconds and does not queue
+    # behind the release build.
+    name: licenses (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

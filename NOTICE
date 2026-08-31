@@ -1,0 +1,204 @@
+saltator — third-party notices
+==============================
+
+saltator itself is licensed under either of Apache License 2.0
+(LICENSE-APACHE) or the MIT license (LICENSE-MIT), at your option.
+
+This file is about the *other* code a saltator binary contains. A source
+checkout of this repository contains none of it — the crates below are
+fetched from crates.io at build time — so this matters when you distribute
+a built binary or a container image, not when you clone the repo.
+
+The list is the Linux dependency graph with every feature enabled, which is
+the largest a saltator build gets: 316 third-party crates, of which 271 are
+satisfiable by taking the MIT option alone. The remainder are named below,
+because each carries a term the MIT/Apache pair does not — plus the vendored
+C and C++, which no crate manifest describes at all.
+
+Nothing here conflicts with releasing saltator under MIT OR Apache-2.0.
+There is no GPL-, AGPL-, or LGPL-only dependency in the graph. Two vendored
+C/C++ libraries offer GPLv2 as one arm of a dual license; in both cases the
+permissive arm is elected, and §"Vendored C and C++" below says so.
+
+
+Regenerating this list, and the caveat
+--------------------------------------
+
+    cargo deny check licenses          # the CI gate; policy in deny.toml
+    cargo tree -e normal --all-features \
+        --target x86_64-unknown-linux-gnu \
+        --prefix none --format '{l}|{p}' | sort -u
+
+This file is a human-scale summary, not a substitute for shipping license
+texts. MIT and the BSD licenses require the copyright notice and permission
+text to travel with a binary, and reproducing 316 of those here would go
+stale on the first `cargo update`. Generate the full bundle at release time:
+
+    cargo about generate about.hbs > THIRD-PARTY-LICENSES.html
+
+
+Mozilla Public License 2.0
+--------------------------
+
+    as_variant           https://github.com/jplatte/as_variant
+
+One crate, and it is MPL-2.0 with no alternative offered. It provides the
+`as_variant!` macro, and four ruma crates depend on it: ruma-client-api,
+ruma-common, ruma-events and ruma-macros. ruma-common is the one that
+settles it — ruma-signatures needs it, and Ed25519 over canonical JSON is
+the federation trust model — so this is in *every* saltator binary and
+there is no feature that sheds it.
+
+MPL-2.0 is file-level copyleft, and §3.3 explicitly permits combining
+these files into a Larger Work distributed under other terms, which is
+what saltator does. The obligation that does follow you is §3.2:
+distributing in Executable Form requires that the Source Code Form of the
+MPL-covered files be made available at no charge, with recipients informed
+of how to get it.
+
+saltator uses as_variant unmodified, exactly as published on crates.io.
+Its Source Code Form is available from the repository above and from
+crates.io, at no charge, and this notice is where recipients of a saltator
+binary are informed of that. If you fork saltator and modify it, that
+exemption stops applying to your build and you must publish your modified
+files under MPL-2.0.
+
+
+Vendored C and C++
+------------------
+
+Read this section even if you skip the rest. Everything above and below is
+derived from crate metadata, which is what `cargo deny` reads. The code in
+this section is **invisible to that gate**: it is C and C++ source vendored
+*inside* crates whose own manifests declare something else entirely, and
+cargo-deny will never look at it. `librocksdb-sys` declares
+"MIT/Apache-2.0/BSD-3-Clause" — which describes the Rust binding, not the
+half-million lines of C++ it compiles.
+
+All of it enters through one dependency: `rocksdb`, whose default features
+are `snappy`, `lz4`, `zstd`, `zlib`, `bzip2`. saltator takes those defaults.
+
+    RocksDB (C++)        GPL-2.0 OR Apache-2.0     rocksdb/COPYING,
+                                                   rocksdb/LICENSE.Apache
+    LevelDB (C++)        BSD-3-Clause              rocksdb/LICENSE.leveldb
+                                                   (RocksDB descends from it)
+    snappy               BSD-3-Clause              Google
+    zstd                 GPL-2.0 OR BSD-3-Clause   zstd/COPYING, zstd/LICENSE
+    lz4                  BSD-2-Clause (lib/)       GPL-2.0 covers only
+                                                   programs/ and examples/,
+                                                   which are not compiled
+    zlib                 zlib license              via libz-sys
+    bzip2                BSD-style                 via bzip2-sys
+
+**RocksDB and zstd are elected under Apache-2.0 and BSD-3-Clause
+respectively.** Both are genuine dual licenses where the copyright holder
+offers a choice, and taking the permissive arm is what makes saltator
+distributable under MIT OR Apache-2.0. A `COPYING` file containing the
+GPLv2 text is present in both source trees and means only that the other
+arm exists — not that anything here is GPL'd. Record the election here
+rather than leaving a reader to find GPLv2 in the build tree and draw their
+own conclusion.
+
+If the compression set is ever narrowed — a homeserver does not obviously
+need five compression backends — this section shrinks with it, and so does
+the build. That is a size question, not a license one.
+
+
+Unicode License v3
+------------------
+
+    icu_collections      icu_normalizer       icu_properties_data
+    icu_locale_core      icu_normalizer_data  icu_provider
+    icu_properties       litemap              potential_utf
+    tinystr              writeable            yoke
+    yoke-derive          zerofrom             zerofrom-derive
+    zerotrie             zerovec              zerovec-derive
+                         https://github.com/unicode-org/icu4x
+
+    unicode-ident        https://github.com/dtolnay/unicode-ident
+                         "(MIT OR Apache-2.0) AND Unicode-3.0" — the
+                         Unicode half is required, not optional: the crate
+                         embeds Unicode character tables.
+
+ICU4X reaches the graph through `idna` → `url`, not through any deliberate
+internationalization choice. Unicode-3.0 is a permissive license whose one
+substantive requirement is that this notice accompany the data.
+
+
+BSD licenses
+------------
+
+    arrayref             BSD-2-Clause   https://github.com/droundy/arrayref
+    curve25519-dalek     BSD-3-Clause   https://github.com/dalek-cryptography/curve25519-dalek
+    ed25519-dalek        BSD-3-Clause   https://github.com/dalek-cryptography/curve25519-dalek
+    subtle               BSD-3-Clause   https://github.com/dalek-cryptography/subtle
+    matchit              MIT AND BSD-3-Clause
+                                        https://github.com/ibraheemdev/matchit
+                                        (both 0.7 and 0.8 are in the graph —
+                                        axum 0.8 wants one, tonic 0.12's
+                                        axum 0.7 the other)
+
+The dalek trio is Matrix's event-signing cryptography: Ed25519 signatures
+over canonical JSON are the federation trust model, so these are as
+load-bearing as anything in the tree.
+
+
+ISC
+---
+
+    ring                 Apache-2.0 AND ISC   https://github.com/briansmith/ring
+    rustls-webpki        ISC                  https://github.com/rustls/webpki
+    untrusted            ISC                  https://github.com/briansmith/untrusted
+    simple_asn1          ISC                  https://github.com/acw/simple_asn1
+
+`ring` is an AND, not a choice: both Apache-2.0 and ISC terms apply. It is
+the sole rustls crypto provider — see the workspace Cargo.toml on why
+aws-lc-rs is deliberately absent — and its C and assembly are the only
+native cryptographic code in the build.
+
+
+Everything else that needed naming
+----------------------------------
+
+    webpki-roots         CDLA-Permissive-2.0  https://github.com/rustls/webpki-roots
+                         The Mozilla CA bundle, licensed as data rather
+                         than as code.
+
+    const_panic          Zlib                 https://github.com/rodrimati1992/const_panic
+    konst                Zlib                 https://github.com/rodrimati1992/konst
+    typewit              Zlib                 https://github.com/rodrimati1992/typewit
+
+
+No MIT option
+-------------
+
+These offer no MIT arm, so a saltator binary is distributed with at least
+one of them under Apache-2.0 (or the named alternative). Apache-2.0 §4(d)
+propagates any NOTICE file the upstream ships, which is part of why this
+file exists.
+
+    anyerror             Apache-2.0                    via openraft
+    prost                Apache-2.0                    protobuf runtime
+    prost-derive         Apache-2.0
+    rocksdb              Apache-2.0                    the Rust binding
+    sync_wrapper         Apache-2.0                    via tower/axum
+    ryu                  Apache-2.0 OR BSL-1.0
+    blake3               CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception
+    constant_time_eq     CC0-1.0 OR MIT-0 OR Apache-2.0
+    moka                 (MIT OR Apache-2.0) AND Apache-2.0
+    moxcms               BSD-3-Clause OR Apache-2.0
+    pxfm                 BSD-3-Clause OR Apache-2.0
+
+
+What is not covered here
+------------------------
+
+Build-time-only dependencies are excluded (`cargo tree -e normal`), because
+they do not ship in the binary: `protoc-bin-vendored` and its per-platform
+protoc binaries, `tonic-build`, `bindgen`, and the proc-macro crates'
+build machinery. If saltator ever ships a source bundle rather than a
+binary, that exclusion stops being safe.
+
+The admin console's JavaScript dependencies are not in this file either.
+They are built out of band (`npm run build` in `web/admin`) and embedded by
+`saltator-admin-ui`; their notices belong with that bundle.
