@@ -89,6 +89,33 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 rcgen = "0.13"
 
+# Debug info, not debug *builds*. Measured on this tree: `target/debug`
+# was 6.5 GiB, of which the single `librocksdb_sys` rlib was 894 MB and
+# one integration-test binary was 748 MB — overwhelmingly DWARF, rewritten
+# to disk on every relink, and with one binary per integration-test file
+# there are a lot of relinks. It is also why CI's fmt+clippy+test job needs
+# a "Free disk space" step before it can link the test suite at all.
+#
+# Line tables, not the full DWARF, for our own crates. What survives is
+# what actually gets used: `.debug_line` still resolves a backtrace frame
+# to `crates/…/foo.rs:214`, so panics, `#[should_panic]` and RUST_BACKTRACE
+# read exactly as before. What goes is variable and type DWARF — stepping
+# in a debugger and printing locals. If you are reaching for gdb on
+# saltator's own code, build that crate with
+# `--config 'profile.dev.debug=2'`.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies get none at all, which is the half of the saving that costs
+# nothing anyone would notice: nobody steps into rocksdb, ruma or tokio
+# from here, and their debug info is the overwhelming majority of it.
+# `debug = false` also reaches the C/C++ compiles — cargo passes it through
+# as DEBUG=false and the `cc` crate drops `-g` — which is what takes
+# librocksdb-sys's 894 MB rlib apart. Frames through a dependency still
+# carry symbol names, only not file and line.
+[profile.dev.package."*"]
+debug = false
+
 # `release` is the everyday optimized profile: what CI ships to the
 # Complement image and what local iteration rebuilds after every edit.
 # No LTO and incremental on — LTO re-runs per *binary* at link time
@@ -106,3 +133,14 @@ incremental = true
 inherits = "release"
 lto = "thin"
 incremental = false
+# Cargo already drops debuginfo at this optimization level; this drops the
+# symbol table too, which is a meaningful slice of the binary and pure
+# weight in a container image. Panics still name the crate and the
+# message; only the backtrace frames go. chapbook and pg-agent-rs strip
+# their shipped builds for the same reason. Build with
+# `--config profile.dist.strip=false` when you do want a backtrace.
+#
+# Deliberately NOT on `release`: that profile is what the Complement
+# image and the cluster/chaos harnesses run, and those are exactly the
+# places a readable backtrace off a killed node earns its bytes.
+strip = "symbols"
