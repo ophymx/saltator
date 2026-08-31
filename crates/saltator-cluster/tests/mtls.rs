@@ -71,7 +71,7 @@ fn spawn_serve(
 
 #[tokio::test]
 async fn mtls_admits_a_trusted_node_and_rejects_an_untrusted_one() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let dir = tempfile::tempdir().unwrap();
 
     // The cluster CA is node 1's self-signed cert; node 2 is signed by (is)

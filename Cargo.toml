@@ -46,7 +46,20 @@ blake3 = "1"
 rand = "0.8"
 base64 = "0.22"
 axum = "0.8"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+# `tls-rustls-no-provider`, NOT `tls-rustls`: the latter is defined as
+# `["tls-rustls-no-provider", "rustls/aws-lc-rs"]`, and Cargo features are
+# additive across the whole graph — so naming it here turned on
+# `rustls/aws-lc-rs` for EVERYONE, silently overriding the explicit `ring`
+# choice below and compiling aws-lc-sys (cmake + C, plus a NASM blob) for
+# nothing. axum-server is the only crate in the tree that did this; tonic
+# and reqwest both declare their rustls dependency provider-free.
+#
+# The provider is ours to install instead, which `saltator` does at startup
+# (`rustls::crypto::ring::default_provider().install_default()`); the
+# integration tests that stand up their own listeners do the same.
+axum-server = { version = "0.7", default-features = false, features = [
+    "tls-rustls-no-provider",
+] }
 tower-http = { version = "0.6", features = ["cors"] }
 http = "1"
 bytes = "1"
@@ -58,7 +71,22 @@ jsonwebtoken = "9"
 chacha20poly1305 = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rustls = "0.23"
+# `ring` as the single crypto backend, and `default-features = false` is
+# what makes it single: rustls 0.23's defaults are
+# ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"], so the
+# plain `"0.23"` this replaces was a second, silent vote for aws-lc-rs on
+# top of axum-server's. Dropping `prefer-post-quantum` is the one real
+# cost — it is aws-lc-rs-only (X25519MLKEM768), and no Matrix homeserver
+# on the other end of a federation connection negotiates it today.
+#
+# One backend also keeps ring's C/asm as the only native crypto in the
+# build, the property pg-agent-rs relies on for its static musl target.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
 rcgen = "0.13"
 
 # `release` is the everyday optimized profile: what CI ships to the

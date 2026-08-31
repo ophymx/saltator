@@ -12,7 +12,7 @@ use saltator_roomserver::ServerSigner;
 #[tokio::test]
 async fn outbound_client_reaches_https_federation_listener() {
     // rustls needs a process-default crypto provider before any TLS use.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // A self-signed cert valid for 127.0.0.1 (the address we bind).
     let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
