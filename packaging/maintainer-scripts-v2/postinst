@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # System user only; the state directory is systemd's job
+        # (StateDirectory= in saltator.service), so nothing is chowned here.
+        if ! getent passwd saltator >/dev/null; then
+            adduser --system --group --no-create-home \
+                    --home /var/lib/saltator \
+                    --gecos "Saltator Matrix homeserver" \
+                    saltator >/dev/null
+        fi
+        # The config carries secrets once OIDC or cluster TLS is filled in.
+        if [ -d /etc/saltator ]; then
+            chgrp saltator /etc/saltator || true
+            chmod 750 /etc/saltator || true
+        fi
+        if [ -f /etc/saltator/saltator.toml ]; then
+            chgrp saltator /etc/saltator/saltator.toml || true
+            chmod 640 /etc/saltator/saltator.toml || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

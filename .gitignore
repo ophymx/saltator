@@ -19,3 +19,10 @@ __pycache__/
 # frontend job) exactly like the Complement image's prebuilt binary above.
 /web/admin/node_modules/
 /crates/saltator-admin-ui/dist/
+
+# Generated at package time from `saltator example-config` (packaging/Dockerfile),
+# so the shipped conffile cannot drift from config.rs.
+/packaging/config/
+
+# Built .debs (packaging/Dockerfile -o type=local,dest=dist).
+/dist/
