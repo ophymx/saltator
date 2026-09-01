@@ -1,0 +1,16 @@
+# Docker sends the context regardless of .gitignore, and two ignored things
+# would actively break this build:
+#
+#   .cargo/config.toml  is machine-local (mold, sccache, clang-as-linker per
+#                       the README's local-acceleration recipe). Inside the
+#                       image none of those exist, and clang would silently
+#                       swallow -static-libgcc the way it did on the dev box.
+#   target/             is gigabytes of host-glibc artifacts that a cache
+#                       mount replaces anyway.
+.cargo/
+target/
+.git/
+docker/
+web/**/node_modules/
+spec.pdf
+packaging/config/

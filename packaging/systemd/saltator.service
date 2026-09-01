@@ -1,0 +1,41 @@
+[Unit]
+Description=Saltator Matrix homeserver
+Documentation=https://github.com/ophymx/saltator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=saltator
+Group=saltator
+ExecStart=/usr/bin/saltator start --config /etc/saltator/saltator.toml
+Restart=on-failure
+RestartSec=5s
+
+# data_dir in the shipped config. systemd creates and chowns this, which is
+# why postinst does not: the unit is the single declaration of who owns it.
+StateDirectory=saltator
+StateDirectoryMode=0700
+
+# RocksDB opens a file per SST; the default 1024 is not enough for a store
+# that keeps one column family per shard.
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

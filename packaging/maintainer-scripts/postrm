@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Deliberately NOT removing /var/lib/saltator: it holds the signing
+        # key and every room this server has ever seen, and a purge that
+        # eats it is unrecoverable. Say so rather than doing it.
+        if [ -d /var/lib/saltator ]; then
+            echo "saltator: leaving /var/lib/saltator in place (signing key and room state)." >&2
+            echo "saltator: remove it by hand if you really mean to discard this server." >&2
+        fi
+        if getent passwd saltator >/dev/null; then
+            deluser --system saltator >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

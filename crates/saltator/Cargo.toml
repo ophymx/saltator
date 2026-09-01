@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Matrix homeserver as a self-clustering distributed system"
 
 [[bin]]
 name = "saltator"
@@ -45,3 +46,86 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 reqwest.workspace = true
+
+# Debian packaging (cargo-deb). Built by packaging/Dockerfile, not by a
+# bare `cargo deb` on a dev box: the whole point of the image is that it
+# is debian:11, so the binary's glibc floor is 2.31 and the deb installs
+# on every live Debian and Ubuntu. A deb built here would demand this
+# machine's glibc and silently narrow to it.
+#
+# Two variants, because the CPU floor is real and dpkg cannot express it:
+# `baseline` runs anywhere x86-64 runs, `v2` takes RocksDB's hardware
+# CRC32c and refuses to install without PCLMULQDQ (see
+# packaging/maintainer-scripts-v2/preinst).
+[package.metadata.deb]
+name = "saltator"
+maintainer = "Jeffrey T. Peckham <abic@ophymx.com>"
+copyright = "Copyright the Saltator authors. Dual-licensed MIT OR Apache-2.0."
+license-file = ["../../LICENSE-MIT", "0"]
+extended-description = """\
+A Matrix homeserver written from scratch in Rust, designed for high \
+availability: a self-clustering distributed system with no external \
+database and no role configuration. RocksDB is embedded, so there is no \
+Postgres to run alongside it."""
+section = "net"
+priority = "optional"
+assets = [
+    ["../../target/dist/saltator", "usr/bin/", "755"],
+    ["../../packaging/config/saltator.toml", "etc/saltator/saltator.toml", "640"],
+    ["../../README.md", "usr/share/doc/saltator/README.md", "644"],
+    ["../../NOTICE", "usr/share/doc/saltator/NOTICE", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/saltator/LICENSE-APACHE", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/saltator/LICENSE-MIT", "644"],
+]
+conf-files = ["/etc/saltator/saltator.toml"]
+maintainer-scripts = "../../packaging/maintainer-scripts"
+# `$auto` runs dpkg-shlibdeps, which is the entire reason the floor stops
+# being undeclared: it reads the binary's versioned symbols and writes the
+# real `libc6 (>= 2.xx)` into the control file. apt then refuses to install
+# on an older system instead of the binary dying at exec with
+# `GLIBC_2.xx not found`.
+# `adduser` is NOT implied: Debian 13 and Ubuntu 24.04 dropped it from the
+# base system, so postinst died with `adduser: not found` at configure
+# time on exactly the newest distros while older ones passed. Policy is
+# that a package using it in a maintainer script depends on it.
+depends = "$auto, adduser"
+
+# Not enabled and not started: server_name in the shipped config is
+# `example.org` and the daemon will not do anything useful until an
+# administrator edits it. Starting a broken unit on install teaches people
+# to ignore systemd failures.
+[package.metadata.deb.systemd-units]
+unit-scripts = "../../packaging/systemd"
+unit-name = "saltator"
+enable = false
+start = false
+restart-after-upgrade = true
+
+[package.metadata.deb.variants.baseline]
+name = "saltator"
+provides = "saltator-homeserver"
+conflicts = "saltator-x86-64-v2"
+
+[package.metadata.deb.variants.v2]
+name = "saltator-x86-64-v2"
+provides = "saltator-homeserver"
+conflicts = "saltator"
+maintainer-scripts = "../../packaging/maintainer-scripts-v2"
+assets = [
+    ["../../target/dist/saltator", "usr/bin/", "755"],
+    ["../../packaging/config/saltator.toml", "etc/saltator/saltator.toml", "640"],
+    ["../../README.md", "usr/share/doc/saltator-x86-64-v2/README.md", "644"],
+    ["../../NOTICE", "usr/share/doc/saltator-x86-64-v2/NOTICE", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/saltator-x86-64-v2/LICENSE-APACHE", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/saltator-x86-64-v2/LICENSE-MIT", "644"],
+]
+extended-description = """\
+A Matrix homeserver written from scratch in Rust, designed for high \
+availability: a self-clustering distributed system with no external \
+database and no role configuration. RocksDB is embedded, so there is no \
+Postgres to run alongside it.
+.
+This is the x86-64-v2 build: RocksDB gets hardware CRC32c, and the binary \
+therefore requires SSE4.2 and PCLMULQDQ (Intel Westmere 2010, AMD \
+Bulldozer 2011 and later). Install the `saltator` package instead on \
+older hardware."""

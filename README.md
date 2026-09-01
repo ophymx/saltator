@@ -45,6 +45,22 @@ cargo run -p saltator -- example-config > saltator.toml
 cargo run -p saltator -- start --config saltator.toml
 ```
 
+## Packages
+
+Two Debian packages, built in a `debian:11` container so the binary's glibc
+floor is 2.31 — which covers Debian 11/12/13 and Ubuntu 20.04/22.04/24.04 —
+rather than whatever the build machine runs:
+
+```sh
+DOCKER_BUILDKIT=1 docker build -f packaging/Dockerfile --target export \
+  -o type=local,dest=dist .
+```
+
+`saltator` runs on any x86-64; `saltator-x86-64-v2` takes RocksDB's hardware
+CRC32c and refuses to install without PCLMULQDQ rather than letting the
+daemon SIGILL later. The C++ runtime is linked statically, so `libstdc++` is
+not a dependency. See **[docs/packaging.md](docs/packaging.md)**.
+
 ## Development
 
 ```sh
