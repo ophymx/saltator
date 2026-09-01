@@ -63,6 +63,40 @@ compiles, mold as the linker (`linker = "clang"`,
 integration-test file makes link time dominate test builds), and cap
 `jobs` below core count if rustc pushes the machine into swap.
 
+CI builds with `RUSTFLAGS="-C target-cpu=x86-64-v2 -C
+target-feature=+pclmulqdq"`, which is what gives RocksDB hardware CRC32c;
+it checksums every block written and verifies every block read. Local
+builds deliberately do not — they stay portable and take the software
+path, which no local workload cares about. Add the same flags to your
+`.cargo/config.toml` if you want to benchmark against what ships.
+
+Note that this is a CPU floor, not a hint: RocksDB stopped doing runtime
+detection on x86, so a binary built with those flags runs SSE4.2 and
+PCLMULQDQ instructions unconditionally and will SIGILL on a host without
+them. PCLMULQDQ is the binding constraint — Intel Westmere (2010), AMD
+Bulldozer (2011) — but treat 2013 as the practical floor, because the
+low-power parts lag: Bonnell-era Atoms have no SSE4.2 at all, and
+Silvermont and Jaguar (both 2013) are where the low-power lines pick both
+up. That floor applies to the Complement image and any release artifact,
+alongside the glibc floor described in `docker/complement/Dockerfile`.
+
+This is worth checking if you are running on older server hardware, which
+homelabs often are. The line falls in an awkward place for Xeons: the
+Nehalem-EP **Xeon 5500** series (E5520, X5570 and friends, 2009) has
+SSE4.2 but *not* PCLMULQDQ, so it clears `x86-64-v2` and still dies on the
+prebuilt binary. Its very common successor, the Westmere-EP **Xeon 5600**
+(X5650 and friends, 2010), is the first that works. Anything Sandy Bridge
+or later (E5-2600 and up) is fine, and Core 2-era Xeons such as the 5400
+series have no SSE4.2 at all. Check before deploying:
+
+```sh
+grep -qw pclmulqdq /proc/cpuinfo && echo supported || echo "build it yourself"
+```
+
+If your CPU is below the floor, build from source. The flags are set by CI
+and nothing else, so a plain `cargo build --release` on your own machine
+already produces a portable binary that takes the software CRC path.
+
 ## License
 
 Licensed under either of

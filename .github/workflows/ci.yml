@@ -28,6 +28,39 @@ env:
   # actually obeys here — the action only sets rustup's *default*, and a
   # toolchain file outranks the default.
   RUST_PIN: "1.98.0"
+  # Hardware CRC32c for RocksDB, which checksums every block it writes and
+  # verifies every block it reads — so this is on both hot paths.
+  #
+  # librocksdb-sys derives its `-m` flags from CARGO_CFG_TARGET_FEATURE
+  # ("This is needed to enable hardware CRC32C", its build.rs says), and the
+  # stock x86-64 baseline is `fxsr,sse,sse2`. That yields `-msse2` and
+  # nothing else, and rocksdb's crc32c.cc gates its fast paths on the
+  # compiler-defined `__SSE4_2__` / `__PCLMUL__`, so the shipped object had
+  # zero crc32 and zero pclmulqdq instructions — measured, not assumed.
+  #
+  # `+pclmulqdq` has to be named on its own: it is in neither x86-64-v2 nor
+  # x86-64-v3, and rocksdb wants BOTH it and SSE4.2 before it selects the
+  # three-way pipelined implementation.
+  #
+  # This sets a CPU FLOOR on everything CI builds, and it is a real one.
+  # rocksdb's Choose_Extend() says "runtime detection no longer supported on
+  # x86" and returns crc32c_3way unconditionally once those macros are
+  # defined — there is no CPUID guard to fall back on, so a binary built
+  # here executes SSE4.2 and PCLMULQDQ or dies with SIGILL.
+  #
+  # PCLMULQDQ is the binding constraint, not SSE4.2, and it is half a
+  # generation newer: it shipped with AES-NI in Intel Westmere (2010) and
+  # AMD Bulldozer (2011), where SSE4.2 alone reaches back to Nehalem
+  # (2008). Treat 2013 as the practical floor rather than 2010 — the
+  # low-power lines are what actually bite. Bonnell-era Atoms have no
+  # SSE4.2 at all, and neither Intel nor AMD covered low-power silicon
+  # until Silvermont and Jaguar in 2013. A homeserver on a cheap VPS or a
+  # small box is exactly where that matters.
+  #
+  # Local builds do not get this and do not need it (see README) — they stay
+  # portable and take the software path. Changing this line re-mints every
+  # Rust cache once, because RUSTFLAGS is part of the cache key.
+  RUSTFLAGS: "-C target-cpu=x86-64-v2 -C target-feature=+pclmulqdq"
 
 jobs:
   frontend:

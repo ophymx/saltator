@@ -10,7 +10,7 @@ fetched from crates.io at build time — so this matters when you distribute
 a built binary or a container image, not when you clone the repo.
 
 The list is the Linux dependency graph with every feature enabled, which is
-the largest a saltator build gets: 316 third-party crates, of which 271 are
+the largest a saltator build gets: 329 third-party crates, of which 284 are
 satisfiable by taking the MIT option alone. The remainder are named below,
 because each carries a term the MIT/Apache pair does not — plus the vendored
 C and C++, which no crate manifest describes at all.
@@ -31,7 +31,7 @@ Regenerating this list, and the caveat
 
 This file is a human-scale summary, not a substitute for shipping license
 texts. MIT and the BSD licenses require the copyright notice and permission
-text to travel with a binary, and reproducing 316 of those here would go
+text to travel with a binary, and reproducing 329 of those here would go
 stale on the first `cargo update`. Generate the full bundle at release time:
 
     cargo about generate about.hbs > THIRD-PARTY-LICENSES.html
@@ -75,20 +75,31 @@ cargo-deny will never look at it. `librocksdb-sys` declares
 "MIT/Apache-2.0/BSD-3-Clause" — which describes the Rust binding, not the
 half-million lines of C++ it compiles.
 
-All of it enters through one dependency: `rocksdb`, whose default features
-are `snappy`, `lz4`, `zstd`, `zlib`, `bzip2`. saltator takes those defaults.
+It enters through two dependencies. `rocksdb` is the large one, and
+saltator does *not* take its default features: those are `snappy`, `lz4`,
+`zstd`, `zlib`, `bzip2`, and the workspace manifest selects `lz4` and
+`zstd` only. `rocks.rs` is the sole place a database is opened and it names
+exactly two codecs — Lz4 for state, None for the Raft log — so snappy, zlib
+and bzip2 were compiled and linked without ever being able to encode
+anything. They are gone, along with the `libz-sys` and `bzip2-sys` builds.
+(Both crates remain *listed* in Cargo.lock, which keeps optional
+dependencies whether or not a feature selects them, so `cargo deny` still
+license-checks them. They are absent from `cargo tree -e normal`, which is
+the graph that describes the binary.)
+
+The second is `tikv-jemalloc-sys`, pulled by librocksdb-sys's `jemalloc`
+feature, which vendors jemalloc's C.
 
     RocksDB (C++)        GPL-2.0 OR Apache-2.0     rocksdb/COPYING,
                                                    rocksdb/LICENSE.Apache
     LevelDB (C++)        BSD-3-Clause              rocksdb/LICENSE.leveldb
                                                    (RocksDB descends from it)
-    snappy               BSD-3-Clause              Google
     zstd                 GPL-2.0 OR BSD-3-Clause   zstd/COPYING, zstd/LICENSE
     lz4                  BSD-2-Clause (lib/)       GPL-2.0 covers only
                                                    programs/ and examples/,
                                                    which are not compiled
-    zlib                 zlib license              via libz-sys
-    bzip2                BSD-style                 via bzip2-sys
+    jemalloc (C)         BSD-2-Clause              jemalloc/COPYING, via
+                                                   tikv-jemalloc-sys
 
 **RocksDB and zstd are elected under Apache-2.0 and BSD-3-Clause
 respectively.** Both are genuine dual licenses where the copyright holder
@@ -99,9 +110,14 @@ arm exists — not that anything here is GPL'd. Record the election here
 rather than leaving a reader to find GPLv2 in the build tree and draw their
 own conclusion.
 
-If the compression set is ever narrowed — a homeserver does not obviously
-need five compression backends — this section shrinks with it, and so does
-the build. That is a size question, not a license one.
+That narrowing has now happened, and it is worth recording what it was and
+was not worth. Dropping snappy, zlib and bzip2 took 179 KB off the release
+binary (53,675,680 to 53,492,560 bytes) and three object files off a
+librocksdb.a that is still 178 MB. It was never a size win: RocksDB's own
+C++ is effectively all of it, and the codecs are rounding error. What it
+buys is that this section is shorter and truer — three fewer vendored C
+libraries whose terms someone would otherwise have to keep honest — and
+that is the reason to keep it narrow.
 
 
 Unicode License v3
