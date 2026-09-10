@@ -496,6 +496,7 @@ impl<A: ShardApp> RaftStateMachine<TypeConfig> for ShardStateMachine<A> {
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
     {
+        let started = std::time::Instant::now();
         let mut responses = Vec::new();
         let mut wb = WriteBatch::new();
         let mut last: Option<LogId<NodeId>> = None;
@@ -547,6 +548,7 @@ impl<A: ShardApp> RaftStateMachine<TypeConfig> for ShardStateMachine<A> {
         for (seq, payload) in emits {
             let _ = self.changes.send(ChangeRecord { seq, payload });
         }
+        crate::metrics::observe_apply(self.shard, started.elapsed(), responses.len());
         Ok(responses)
     }
 

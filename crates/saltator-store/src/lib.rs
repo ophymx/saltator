@@ -132,6 +132,20 @@ pub enum Keyspace {
     FedOut = 3,
 }
 
+impl Keyspace {
+    /// Stable lowercase name. Used as a metric label, so it is spelled out
+    /// rather than derived from `Debug`: a rename of the variant must not
+    /// silently rename a series somebody's alert is matching on.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Keyspace::Meta => "meta",
+            Keyspace::Room => "room",
+            Keyspace::User => "user",
+            Keyspace::FedOut => "fedout",
+        }
+    }
+}
+
 /// Key layout: `keyspace(1) | shard(2 BE) | table(1) | key(..)`.
 /// Whole shards are contiguous ranges — checkpoint/transfer/drop are range ops.
 pub fn key(ks: Keyspace, shard: u16, table: u8, k: &[u8]) -> Vec<u8> {

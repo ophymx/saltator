@@ -21,6 +21,7 @@ saltator-federation = { path = "crates/saltator-federation" }
 saltator-media = { path = "crates/saltator-media" }
 saltator-testsupport = { path = "crates/saltator-testsupport" }
 saltator-admin-ui = { path = "crates/saltator-admin-ui" }
+saltator-metrics = { path = "crates/saltator-metrics" }
 
 anyhow = "1"
 thiserror = "2"
@@ -31,6 +32,14 @@ postcard = { version = "1", features = ["use-std"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Metrics: the facade every instrumented crate uses (a no-op until a
+# recorder is installed, which is what keeps it out of the test path), and
+# the Prometheus recorder itself. `default-features = false` on the
+# exporter is load-bearing — its defaults pull a second HTTP server,
+# hyper-rustls, and a push-gateway client with prost and protobuf behind
+# it. Stripped, it is a recorder plus `PrometheusHandle::render()`.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 # Two codecs, not five. `rocks.rs` is the only place that opens a DB and it
 # writes exactly two things: Lz4 for state, None for the Raft log. snappy,

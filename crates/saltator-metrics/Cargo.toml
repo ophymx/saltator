@@ -1,0 +1,22 @@
+[package]
+name = "saltator-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+metrics.workspace = true
+# No default features: the exporter's defaults bring their own hyper
+# server, hyper-rustls, and a push-gateway client with prost behind it.
+# Stripped, it is a recorder plus `render()` — and this server already
+# has an HTTP stack to serve that string from.
+metrics-exporter-prometheus = { workspace = true }
+
+anyhow.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

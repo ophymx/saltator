@@ -287,6 +287,18 @@ pub struct Listeners {
     pub client: SocketAddr,
     /// Federation API (serves from M3).
     pub federation: SocketAddr,
+    /// Prometheus exporter (`GET /metrics`). Absent — the default — means
+    /// no exporter and no port: a server should not open one nobody asked
+    /// for.
+    ///
+    /// Its own listener, not a route on the client port, because a scrape
+    /// is not a health check: it reveals traffic volume, account and room
+    /// counts, cluster size, which shards this node leads, and how much
+    /// federation is failing. It carries no authentication, so the bind
+    /// address IS the access control — keep it on loopback or a
+    /// management interface (docs/design-observability.md).
+    #[serde(default)]
+    pub metrics: Option<SocketAddr>,
 }
 
 impl Default for Listeners {
@@ -295,6 +307,7 @@ impl Default for Listeners {
             internal: "127.0.0.1:7400".parse().expect("static addr"),
             client: "127.0.0.1:8008".parse().expect("static addr"),
             federation: "127.0.0.1:8448".parse().expect("static addr"),
+            metrics: None,
         }
     }
 }
@@ -335,6 +348,13 @@ seeds = []
 internal = "127.0.0.1:7400"
 client = "127.0.0.1:8008"
 federation = "127.0.0.1:8448"
+# Prometheus exporter (GET /metrics). Commented out = no exporter, no
+# port. It is UNAUTHENTICATED and a scrape describes this server's traffic
+# and cluster shape, so the bind address is the access control: loopback,
+# or a management interface Prometheus can reach and nobody else can.
+# (9464 is the OpenTelemetry Prometheus exporter's port; node_exporter
+# already owns 9100 on most hosts.)
+# metrics = "127.0.0.1:9464"
 
 [client]
 registration_enabled = true
@@ -400,6 +420,31 @@ mod tests {
         assert_eq!(cfg.node.id, 1);
         assert!(cfg.cluster.seeds.is_empty());
         assert_eq!(cfg.listeners.internal.port(), 7400);
+    }
+
+    #[test]
+    fn metrics_listener_is_absent_unless_asked_for() {
+        // The shipped example leaves it commented out: installing this
+        // package must not open a port nobody configured.
+        let cfg: Config = toml::from_str(EXAMPLE).unwrap();
+        assert!(cfg.listeners.metrics.is_none());
+
+        let cfg: Config = toml::from_str(
+            r#"
+            server_name = "example.org"
+            data_dir = "/tmp/x"
+            [node]
+            id = 1
+            advertise = "127.0.0.1:7400"
+            [listeners]
+            internal = "127.0.0.1:7400"
+            client = "127.0.0.1:8008"
+            federation = "127.0.0.1:8448"
+            metrics = "127.0.0.1:9464"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.listeners.metrics.unwrap().port(), 9464);
     }
 
     fn cluster_tls(cert: bool, key: bool, ca: bool) -> ClusterConfig {

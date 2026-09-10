@@ -56,6 +56,39 @@ pub enum ForwardOutcome {
     Redirect { leader_addr: Option<String> },
 }
 
+/// How a proposal ended, kept beside its result so the metric layer can
+/// label it. "Slow" means something different for each: a slow `local` is
+/// this group's own commit path, a slow `forwarded` includes a round trip
+/// to another node plus the read-your-writes barrier, and an `error` is
+/// usually an election in progress rather than a broken write.
+pub(crate) struct ProposeOutcome {
+    pub(crate) result: Result<Vec<u8>>,
+    pub(crate) kind: &'static str,
+}
+
+impl ProposeOutcome {
+    fn local(response: Vec<u8>) -> Self {
+        Self {
+            result: Ok(response),
+            kind: "local",
+        }
+    }
+
+    fn forwarded(response: Vec<u8>) -> Self {
+        Self {
+            result: Ok(response),
+            kind: "forwarded",
+        }
+    }
+
+    fn failed(error: ShardError) -> Self {
+        Self {
+            result: Err(error),
+            kind: "error",
+        }
+    }
+}
+
 /// Cross-node proposal transport, implemented by the cluster crate over
 /// the internal ControlService. Lets a follower serve writes by handing
 /// them to the leader (spec.md §9) — the piece that makes ANY node able
@@ -296,6 +329,17 @@ impl ShardHandle {
     }
 
     pub async fn propose(&self, command: Vec<u8>) -> Result<Vec<u8>> {
+        let started = std::time::Instant::now();
+        let outcome = self.propose_inner(command).await;
+        // Latency and outcome are recorded together, and the outcome
+        // distinguishes a write this node accepted from one it had to
+        // forward: both are "slow proposals" on a latency graph, but only
+        // the second says the client reached the wrong node.
+        crate::metrics::observe_proposal(self.shard, started.elapsed(), &outcome);
+        outcome.result
+    }
+
+    async fn propose_inner(&self, command: Vec<u8>) -> ProposeOutcome {
         use openraft::error::ClientWriteError;
         let deadline = tokio::time::Instant::now() + FORWARD_DEADLINE;
         // Standing leader hint from the last redirect, used when our own
@@ -305,9 +349,9 @@ impl ShardHandle {
             // Leadership may have arrived here since the last attempt, so
             // the local write is always tried first.
             let forward = match self.raft.client_write(command.clone()).await {
-                Ok(resp) => return Ok(resp.data),
+                Ok(resp) => return ProposeOutcome::local(resp.data),
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => f,
-                Err(e) => return Err(raft_err(e)),
+                Err(e) => return ProposeOutcome::failed(raft_err(e)),
             };
             if let Some(fwd) = self.forwarder.get() {
                 let addr = forward.leader_node.map(|n| n.addr).or_else(|| hint.take());
@@ -337,7 +381,7 @@ impl ShardHandle {
                                     "forwarded write acked before local apply caught up"
                                 );
                             }
-                            return Ok(response);
+                            return ProposeOutcome::forwarded(response);
                         }
                         Ok(ForwardOutcome::Redirect { leader_addr }) => hint = leader_addr,
                         // Transport failure (leader died, election under
@@ -349,7 +393,7 @@ impl ShardHandle {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(ShardError::Raft(format!(
+                return ProposeOutcome::failed(ShardError::Raft(format!(
                     "{}: no leader reachable to accept the proposal",
                     self.shard
                 )));
