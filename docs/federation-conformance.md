@@ -341,12 +341,17 @@ identical uploads 200) — looks like a cold-start/parallel race, not a
 deterministic filename bug. Investigate the upload handler's first-request
 path (shard readiness / put_media). Low confidence until root-caused.
 
-## Group 12 — Application service bridge user  ·  L  ·  out of scope now
+## Group 12 — Application service bridge user  ·  L  ·  DONE
 Tests: `TestJoinFederatedRoomFromApplicationServiceBridgeUser`.
 Status (2026-08-07): DONE — green 3× with the minimal AS support from
 Group 2 (as_token auth as the sender user; the bridge user then joins
-over ordinary federation). Full AS (namespaces, impersonation, event
-push) remains future work.
+over ordinary federation).
+Update (2026-09-10, appservices branch): full AS support landed —
+namespaces, `?user_id=` masquerading, `m.login.application_service`,
+durable outbound push, query-on-miss (CS + federation), ping, device
+management (docs/appservices.md). Complement at the CI pin exercises
+none of the new surface (its AppServiceUser is a pre-provisioned
+as_token client), so coverage lives in the cs_api + e2e suites.
 
 ---
 
@@ -439,7 +444,7 @@ compare with `grep -oE '"/_matrix[^"]*"' crates/saltator-federation/src/lib.rs`)
 | Cluster | Tests | Status |
 |---|---|---|
 | Room v6/v7 only | TestKnocking, TestKnockRoomsInPublicRoomsDirectory, TestCannotSendNonKnockViaSendKnock, TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6 | Justified red (server supports v8+ only) |
-| Application services | TestJoinFederatedRoomFromApplicationServiceBridgeUser, TestJumpToDateEndpoint (deployment needs an AS) | Out of scope until AS lands (Group 12) |
+| Application services | TestJoinFederatedRoomFromApplicationServiceBridgeUser, TestJumpToDateEndpoint (deployment needs an AS) | Both green since 2026-08-07 (minimal AS); full AS landed 2026-09-10 — see Group 12 |
 | Media | TestMediaFilenames, TestMediaWithoutFileName, TestRemotePngThumbnail (legacy /media/v3 subtests) | FIXED on branch media-remote-and-upload-race: legacy remote fetch + duplicate-upload temp race + raw-body federation media fallback |
 | E2EE over federation | TestDeviceListsUpdateOverFederation[OnRoomJoin], TestToDeviceMessagesOverFederation, TestFederationKeyUploadQuery | CLOSED 2026-08-05 (e2ee-federation branch): all four 3× green + gated — durable EDU outbox, on-join replay announce, rename propagation. See Group 9 |
 | Missing-events / auth-chain family | TestInboundCanReturnMissingEvents, TestOutboundFederationEventSizeGetMissingEvents, TestCorruptedAuthChain, TestInboundFederationRejectsEventsWithRejectedAuthEvents | CLOSED 2026-08-05 (federation-missing-events branch): all four 3× green locally + gated. See Group 6b for the auth-chain/rejection machinery; the size test needed codepoint (not byte) field limits pre-v11 + Synapse-parity guest_access preset events |

@@ -308,6 +308,36 @@ impl UserServer {
         }
     }
 
+    /// `m.login.application_service`: mint a session with no credential.
+    /// The caller (the CS login route) has already authenticated the
+    /// appservice's `as_token` and checked the user against its
+    /// namespaces; this only requires that the account exists and can
+    /// authenticate.
+    pub async fn login_appservice(
+        &self,
+        user: &str,
+        device_id: Option<String>,
+        display_name: Option<String>,
+        want_refresh: bool,
+    ) -> Result<Session> {
+        let user_id = self.user_id_for(user)?;
+        if self
+            .store()
+            .account(user_id.as_str())
+            .map_err(storage_err)?
+            .filter(|a| a.state.can_authenticate())
+            .is_none()
+        {
+            return Err(UserError::Forbidden);
+        }
+        let (session, cmd) = new_session(user_id, device_id, display_name, want_refresh);
+        match self.propose(&UserCommand::CreateSession(cmd)).await? {
+            UserResponse::Ok => Ok(session),
+            UserResponse::NotFound => Err(UserError::Forbidden),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Check a user's password (UIA stages, device deletion).
     pub async fn verify_user_password(&self, user_id: &UserId, password: &str) -> Result<bool> {
         let account = self
@@ -419,6 +449,29 @@ impl UserServer {
         {
             UserResponse::Ok => Ok(()),
             UserResponse::NotFound => Err(UserError::NotFound),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Create-or-rename a token-less device — appservice device
+    /// management (spec v1.17): a bridge needs devices for its ghosts'
+    /// E2EE without minting sessions through `/login`.
+    pub async fn upsert_device(
+        &self,
+        user_id: &UserId,
+        device_id: &str,
+        display_name: Option<String>,
+    ) -> Result<()> {
+        match self
+            .propose(&UserCommand::UpsertDevice {
+                user_id: user_id.to_string(),
+                device_id: device_id.to_owned(),
+                display_name,
+                ts: now_ms(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
             other => Err(unexpected(other)),
         }
     }

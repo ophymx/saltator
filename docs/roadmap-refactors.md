@@ -284,11 +284,15 @@ mechanically once cs-api's remaining direct uses thin out.
   "topological" leaves actually needed minimal appservice support, not
   tie-break work. All 7 leaves plus the AS-bridge leaf ratcheted off —
   allowlist is down to the 4 by-design v6/v7 entries (92/96).
-- **Application services, full** — minimal support landed with
-  jump-to-date (as_token auth as sender user, `?ts` massaging,
-  registration-file loading). Still missing: namespaces, `?user_id=`
-  impersonation, outbound event push (`hs_token`), `/register` with
-  `m.login.application_service`.
+- ~~**Application services, full**~~ DONE (appservices branch,
+  2026-09-10): full registration parsing (real YAML, fatal
+  validation), namespaces + `M_EXCLUSIVE` both directions, `?user_id=`
+  / `?device_id=` masquerading, `m.login.application_service` on
+  `/register` and `/login`, durable leader-gated outbound push
+  (fed-out `T_AS_CURSOR`, schema v2), query-on-miss (CS + federation),
+  ping, AS device management + UIA exemptions, `?ts` on `/state`.
+  Docs: docs/appservices.md, design in docs/design-appservices.md.
+  Deferred there: receive_ephemeral, legacy routes, /thirdparty.
 - **Federation delivery latency** (task #17): the CI race that motivated
   it was fixed at the decision level instead (PR #45 batching, PR #46
   recheck-on-change), and the instrumentation half is now DONE — the

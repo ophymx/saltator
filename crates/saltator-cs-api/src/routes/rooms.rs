@@ -1170,7 +1170,7 @@ pub async fn join_by_id_or_alias(
         Err(alias) if alias.server_name() != state.config.server_name => {
             resolve_remote_alias(&state, alias.as_str()).await?.0
         }
-        Err(alias) => resolve_alias(&state, alias.as_str())?,
+        Err(alias) => resolve_alias(&state, alias.as_str()).await?,
     };
     join_with_body(&state, &auth, &room_id, &via, body).await?;
     Ok(Ra(join_room_by_id_or_alias::v3::Response::new(room_id)))
@@ -1195,7 +1195,7 @@ pub async fn knock_room(
         Err(alias) if alias.server_name() != state.config.server_name => {
             resolve_remote_alias(&state, alias.as_str()).await?.0
         }
-        Err(alias) => resolve_alias(&state, alias.as_str())?,
+        Err(alias) => resolve_alias(&state, alias.as_str()).await?,
     };
     // A knock is a request to join, so it is closed off by the same block.
     state.room_admin().ensure_joinable(room_id.as_str())?;
@@ -1738,13 +1738,17 @@ pub async fn send_message_event(
         return Ok(Ra(send_message_event::v3::Response::new(event_id)));
     }
     // After the txn-cache check: idempotent retries must not be limited.
-    state.rate_limit(crate::ratelimit::Kind::Message, auth.user_id.as_str())?;
+    // Appservices may be exempt (`rate_limited: false`, and the sender
+    // always is) — a bridge relaying a busy remote room is not a spammer.
+    if !auth.rate_limit_exempt() {
+        state.rate_limit(crate::ratelimit::Kind::Message, auth.user_id.as_str())?;
+    }
     let content: serde_json::Value = serde_json::from_str(req.body.json().get())
         .map_err(|e| ApiError::bad_json(e.to_string()))?;
     // `?ts` timestamp massaging is an appservice-only ability (MSC3316);
     // for everyone else the parameter is ignored, as Synapse does.
     let ts_override = match req.timestamp {
-        Some(ts) if auth.appservice => Some(u64::from(ts.0)),
+        Some(ts) if auth.is_appservice() => Some(u64::from(ts.0)),
         _ => None,
     };
     let outcome = match ts_override {
@@ -1922,15 +1926,36 @@ pub async fn send_state_event(
             }
         }
     }
-    let event_id = send_state_checked(
-        &state,
-        &req.room_id,
-        &auth.user_id,
-        &req.event_type.to_string(),
-        &req.state_key,
-        content,
-    )
-    .await?;
+    // `?ts` massaging applies to `PUT /state` too (the spec routes /kick
+    // etc. through here for exactly that reason); appservice-only, same
+    // as /send.
+    let event_id = match req.timestamp {
+        Some(ts) if auth.is_appservice() => {
+            let outcome = state
+                .rooms
+                .send_state_at(
+                    &req.room_id,
+                    &auth.user_id,
+                    &req.event_type.to_string(),
+                    &req.state_key,
+                    content,
+                    u64::from(ts.0),
+                )
+                .await?;
+            accepted_event_id(outcome)?.0
+        }
+        _ => {
+            send_state_checked(
+                &state,
+                &req.room_id,
+                &auth.user_id,
+                &req.event_type.to_string(),
+                &req.state_key,
+                content,
+            )
+            .await?
+        }
+    };
     Ok(Ra(send_state_event::v3::Response::new(event_id)))
 }
 
@@ -2932,14 +2957,19 @@ fn parse_topo_token(token: &str) -> Result<PaginationBound> {
 
 // -- aliases / directory ---------------------------------------------------------
 
-pub(crate) fn resolve_alias(state: &CsState, alias: &str) -> Result<OwnedRoomId> {
-    let entry = state
-        .users
-        .store()
-        .alias(alias)
-        .map_err(internal)?
-        .ok_or_else(|| ApiError::not_found("Unknown room alias"))?;
-    OwnedRoomId::try_from(entry.room_id).map_err(internal)
+pub(crate) async fn resolve_alias(state: &CsState, alias: &str) -> Result<OwnedRoomId> {
+    if let Some(entry) = state.users.store().alias(alias).map_err(internal)? {
+        return OwnedRoomId::try_from(entry.room_id).map_err(internal);
+    }
+    // A miss inside an appservice's alias namespace is a question for
+    // that appservice: it may create the room (a bridge portal) while we
+    // block, then the local lookup answers (spec §Querying).
+    if state.as_querier.query_room_alias(alias).await {
+        if let Some(entry) = state.users.store().alias(alias).map_err(internal)? {
+            return OwnedRoomId::try_from(entry.room_id).map_err(internal);
+        }
+    }
+    Err(ApiError::not_found("Unknown room alias"))
 }
 
 pub async fn get_alias(
@@ -2951,7 +2981,7 @@ pub async fn get_alias(
         let (room_id, servers) = resolve_remote_alias(&state, req.room_alias.as_str()).await?;
         return Ok(Ra(get_alias::v3::Response::new(room_id, servers)));
     }
-    let room_id = resolve_alias(&state, req.room_alias.as_str())?;
+    let room_id = resolve_alias(&state, req.room_alias.as_str()).await?;
     Ok(Ra(get_alias::v3::Response::new(
         room_id,
         vec![state.config.server_name.clone()],
@@ -3013,11 +3043,43 @@ pub async fn create_alias(
     // The caller must be a member of the target room — otherwise anyone
     // could squat local aliases pointing at rooms they can't even see.
     require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    check_alias_ownership(&state, &auth, req.room_alias.as_str())?;
     state
         .users
         .create_alias(req.room_alias.as_str(), req.room_id.as_str(), &auth.user_id)
         .await?;
     Ok(Ra(create_alias::v3::Response::new()))
+}
+
+/// Namespace ownership for aliases, both directions (spec: exclusive
+/// namespaces "prevent humans and other application services from
+/// creating/deleting entities"): an appservice may not touch aliases
+/// outside its own namespaces when some namespace claims them; everyone
+/// else is barred from *exclusive* appservice namespaces.
+fn check_alias_ownership(state: &CsState, auth: &crate::extract::Auth, alias: &str) -> Result<()> {
+    match &auth.appservice {
+        Some(reg) => {
+            if !reg.is_interested_in_alias(alias)
+                && !state.appservices.alias_claimable_by_others(alias)
+            {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "M_EXCLUSIVE",
+                    "Alias is reserved by another application service",
+                ));
+            }
+        }
+        None => {
+            if !state.appservices.alias_claimable_by_others(alias) {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "M_EXCLUSIVE",
+                    "Alias is reserved by an application service",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// May `user_id` send state events of `event_type` in this room? Room
@@ -3080,6 +3142,7 @@ pub async fn delete_alias(
         .alias(req.room_alias.as_str())
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("Unknown room alias"))?;
+    check_alias_ownership(&state, &auth, req.room_alias.as_str())?;
     let state_map = current_state(&state.rooms, &entry.room_id)?;
     let meta = room_meta(&state.rooms, &entry.room_id)?;
     let version = room_version(&meta)?;

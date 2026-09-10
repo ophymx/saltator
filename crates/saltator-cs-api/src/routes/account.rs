@@ -39,7 +39,17 @@ async fn load_profile(state: &CsState, user_id: &UserId) -> Result<Profile> {
     // yield the empty profile.
     let store = state.users.store();
     if store.account(user_id.as_str()).map_err(internal)?.is_none() {
-        return Err(ApiError::not_found("Unknown user"));
+        // A miss inside an appservice's user namespace is the AS's to
+        // answer: it registers the ghost while we block, then the local
+        // lookup succeeds (spec §Querying).
+        if !state
+            .as_querier
+            .query_user(user_id.as_str(), state.config.server_name.as_str())
+            .await
+            || store.account(user_id.as_str()).map_err(internal)?.is_none()
+        {
+            return Err(ApiError::not_found("Unknown user"));
+        }
     }
     Ok(store
         .profile(user_id.as_str())
@@ -387,14 +397,28 @@ pub async fn update_device(
     auth: Auth,
     Ar(req): Ar<update_device::v3::Request>,
 ) -> Result<Ra<update_device::v3::Response>> {
-    state
-        .users
-        .set_device_name(
-            &auth.user_id,
-            req.device_id.as_str(),
-            req.display_name.clone(),
-        )
-        .await?;
+    if auth.is_appservice() {
+        // AS device management (spec v1.17): `PUT /devices/{id}` *creates*
+        // the device for an appservice — bridges need ghost devices for
+        // E2EE without `/login`.
+        state
+            .users
+            .upsert_device(
+                &auth.user_id,
+                req.device_id.as_str(),
+                req.display_name.clone(),
+            )
+            .await?;
+    } else {
+        state
+            .users
+            .set_device_name(
+                &auth.user_id,
+                req.device_id.as_str(),
+                req.display_name.clone(),
+            )
+            .await?;
+    }
     // A rename changes the device list (the display name rides in
     // /keys/query `unsigned.device_display_name`) — announce it.
     state
@@ -432,7 +456,11 @@ pub async fn delete_device(
     Ar(req): Ar<delete_device::v3::Request>,
 ) -> Result<Ra<delete_device::v3::Response>> {
     let request_id = format!("delete_device:{}:{}", auth.user_id, req.device_id);
-    require_password_uia(&state, &auth, &request_id, &req.auth).await?;
+    // Appservices skip UIA here (spec v1.17 MUST NOT): device deletion
+    // is part of AS device management and an AS has no password anyway.
+    if !auth.is_appservice() {
+        require_password_uia(&state, &auth, &request_id, &req.auth).await?;
+    }
     state
         .users
         .delete_device(&auth.user_id, req.device_id.as_str())

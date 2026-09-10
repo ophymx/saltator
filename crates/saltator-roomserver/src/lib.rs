@@ -456,6 +456,22 @@ impl RoomServer {
             .await
     }
 
+    /// [`send_state`](Self::send_state) with an appservice-supplied
+    /// `origin_server_ts` (`?ts` timestamp massaging; DAG position is
+    /// unaffected, exactly as for messages).
+    pub async fn send_state_at(
+        &self,
+        room_id: &ruma::RoomId,
+        sender: &UserId,
+        event_type: &str,
+        state_key: &str,
+        content: serde_json::Value,
+        ts: u64,
+    ) -> Result<Outcome> {
+        self.send_local(room_id, sender, event_type, Some(state_key), content, Some(ts))
+            .await
+    }
+
     /// Build, sign, and send a local message (non-state) event.
     pub async fn send_message(
         &self,

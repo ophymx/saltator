@@ -13,7 +13,7 @@ use saltator_core::RoomVersion;
 use saltator_userserver::Session;
 
 use crate::error::ApiError;
-use crate::extract::{Ar, Auth, Ra};
+use crate::extract::{Ar, AsAuth, Auth, Ra};
 use crate::CsState;
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -91,6 +91,7 @@ fn is_reserved_notices(state: &CsState, candidate: &str) -> bool {
 
 pub async fn register(
     State(state): State<Arc<CsState>>,
+    as_auth: AsAuth,
     Ar(req): Ar<register::v3::Request>,
 ) -> Result<Ra<register::v3::Response>> {
     if req.kind == register::RegistrationKind::Guest {
@@ -99,6 +100,13 @@ pub async fn register(
             "M_GUEST_ACCESS_FORBIDDEN",
             "Guest access is not implemented",
         ));
+    }
+    // `m.login.application_service`: an appservice creating a ghost (or
+    // its own sender account). Bypasses UIA, rate limits and the
+    // registration_enabled switch — the admin authorised all of this by
+    // installing the registration file.
+    if req.login_type == Some(register::LoginType::ApplicationService) {
+        return register_appservice(&state, as_auth.require()?, req).await;
     }
     if !state.config.registration_enabled {
         return Err(ApiError::forbidden("Registration is disabled"));
@@ -116,6 +124,16 @@ pub async fn register(
             "M_USER_IN_USE",
             "Desired user ID is already taken",
         ));
+    }
+    // A localpart inside an exclusive appservice namespace belongs to
+    // that appservice alone.
+    if let Ok(user_id) = state.users.canonical_user_id(&localpart) {
+        if !state
+            .appservices
+            .user_claimable_by_others(user_id.as_str(), state.config.server_name.as_str())
+        {
+            return Err(exclusive("This user ID is reserved by an application service"));
+        }
     }
     // The UIA session is bound to the account being created, so a flow
     // completed for one username cannot be spent on another.
@@ -146,6 +164,66 @@ pub async fn register(
         })
         .await?;
 
+    let mut resp = register::v3::Response::new(user_id);
+    if let Some(s) = session {
+        resp.access_token = Some(s.access_token);
+        resp.device_id = Some(s.device_id.into());
+        resp.refresh_token = s.refresh_token;
+        resp.expires_in = s.expires_in_ms.map(Duration::from_millis);
+    }
+    Ok(Ra(resp))
+}
+
+/// 400 `M_EXCLUSIVE` — the namespace-ownership refusal, both directions
+/// (an AS outside its namespace, anyone else inside an exclusive one).
+fn exclusive(msg: impl Into<String>) -> ApiError {
+    ApiError::new(axum::http::StatusCode::BAD_REQUEST, "M_EXCLUSIVE", msg)
+}
+
+/// The appservice arm of `/register` (spec §"Server admin style
+/// permissions"): passwordless, no UIA, no captcha — but never outside
+/// the AS's own `users` namespaces (its sender is always allowed, and
+/// registering it is how a bridge gets a real account row for
+/// `m.login.application_service` logins later).
+async fn register_appservice(
+    state: &CsState,
+    reg: Arc<saltator_appservice::AppServiceRegistration>,
+    req: register::v3::Request,
+) -> Result<Ra<register::v3::Response>> {
+    let Some(localpart) = req.username.clone() else {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "M_MISSING_PARAM",
+            "username is required for appservice registration",
+        ));
+    };
+    // The server's own voice stays its own: not even an appservice may
+    // claim the notices account.
+    if is_reserved_notices(state, &localpart) {
+        return Err(ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "M_USER_IN_USE",
+            "Desired user ID is already taken",
+        ));
+    }
+    let user_id = state.users.canonical_user_id(&localpart)?;
+    if !reg.is_interested_in_user(user_id.as_str(), state.config.server_name.as_str()) {
+        return Err(exclusive(
+            "username is not covered by this application service's namespaces",
+        ));
+    }
+    let (user_id, session) = state
+        .users
+        .register_with_token(saltator_userserver::RegisterRequest {
+            localpart: &localpart,
+            password: None,
+            device_id: req.device_id.as_ref().map(|d| d.to_string()),
+            display_name: req.initial_device_display_name.clone(),
+            want_refresh: req.refresh_token,
+            inhibit_login: req.inhibit_login,
+            registration_token: None,
+        })
+        .await?;
     let mut resp = register::v3::Response::new(user_id);
     if let Some(s) = session {
         resp.access_token = Some(s.access_token);
@@ -203,6 +281,12 @@ pub async fn register_available(
             "Desired user ID is already taken",
         ));
     }
+    if !state
+        .appservices
+        .user_claimable_by_others(user_id.as_str(), state.config.server_name.as_str())
+    {
+        return Err(exclusive("This user ID is reserved by an application service"));
+    }
     Ok(Ra(get_username_availability::v3::Response::new(true)))
 }
 
@@ -217,8 +301,38 @@ pub async fn get_login_types(
 
 pub async fn login(
     State(state): State<Arc<CsState>>,
+    as_auth: AsAuth,
     Ar(req): Ar<login::v3::Request>,
 ) -> Result<Ra<login::v3::Response>> {
+    // `m.login.application_service`: the as_token is the credential; the
+    // named user only has to exist (the AS registered it) and sit inside
+    // the AS's namespaces. Not rate-limited — there is no password to
+    // guess and the caller already holds the far stronger token.
+    if let login::v3::LoginInfo::ApplicationService(info) = &req.login_info {
+        let reg = as_auth.require()?;
+        #[allow(deprecated)]
+        let user = match (&info.identifier, &info.user) {
+            (Some(ruma::api::client::uiaa::UserIdentifier::Matrix(m)), _) => m.user.clone(),
+            (None, Some(u)) => u.clone(),
+            _ => return Err(ApiError::forbidden("Unsupported identifier type")),
+        };
+        let user_id = state.users.canonical_user_id(&user)?;
+        if !reg.is_interested_in_user(user_id.as_str(), state.config.server_name.as_str()) {
+            return Err(exclusive(
+                "user is not covered by this application service's namespaces",
+            ));
+        }
+        let session = state
+            .users
+            .login_appservice(
+                &user,
+                req.device_id.as_ref().map(|d| d.to_string()),
+                req.initial_device_display_name.clone(),
+                req.refresh_token,
+            )
+            .await?;
+        return Ok(Ra(login_response(session)));
+    }
     let authn = state.authn();
     // Identify first, verify second: the rate limiter has to be keyed on
     // the account being attacked, and it must run before the Argon2

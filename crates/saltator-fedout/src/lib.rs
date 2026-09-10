@@ -25,7 +25,7 @@ pub const FED_OUT_SHARD: ShardId = ShardId::new(Keyspace::FedOut, 0);
 
 /// This binary's schema version for this shard app — bump together with
 /// a `migrate` arm (see docs/design-schema-migrations.md).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// `room_shard (u16 BE) ++ destination → postcard(u64)` — the room-shard
 /// seq fully delivered to `destination`. Absent = nothing delivered yet
@@ -40,6 +40,15 @@ pub const T_EDU_OUTBOX: u8 = APP_TABLE_FIRST + 1;
 /// seq already enqueued here. The user shard's v2 migration gate reads
 /// this from its local replica (docs/design-federation-out.md §drain).
 pub const T_DRAIN: u8 = APP_TABLE_FIRST + 2;
+
+/// `as_id ++ 0x00 ++ room_shard (u16 BE) → postcard(u64)` — the
+/// room-shard seq fully delivered to an application service (v2,
+/// docs/design-appservices.md). Same charter as the PDU cursor: an AS
+/// transaction is a promise of delivery, so its progress is fed-out
+/// state. Absent = never delivered (the push worker seeds from the
+/// current tip: history predating AS support is not replayed at a
+/// bridge).
+pub const T_AS_CURSOR: u8 = APP_TABLE_FIRST + 3;
 
 const K_DRAIN_MARKER: &[u8] = b"user_outbox_drained";
 
@@ -80,6 +89,14 @@ pub enum FedOutCommand {
     /// Advance the user-outbox drain marker (monotonic; stale values are
     /// ignored so re-drains are idempotent).
     SetDrainMarker { up_to: u64 },
+    /// Record that everything in `room_shard`'s timeline up to `up_to`
+    /// has been delivered to appservice `as_id` (monotonic, like the PDU
+    /// cursor).
+    AdvanceAsCursor {
+        as_id: String,
+        room_shard: u16,
+        up_to: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +109,14 @@ fn dest_key(destination: &str, rest: &[u8]) -> Vec<u8> {
     k.extend_from_slice(destination.as_bytes());
     k.push(0);
     k.extend_from_slice(rest);
+    k
+}
+
+fn as_cursor_key(as_id: &str, room_shard: u16) -> Vec<u8> {
+    let mut k = Vec::with_capacity(as_id.len() + 3);
+    k.extend_from_slice(as_id.as_bytes());
+    k.push(0);
+    k.extend_from_slice(&room_shard.to_be_bytes());
     k
 }
 
@@ -108,6 +133,18 @@ pub struct FedOutApp;
 impl ShardApp for FedOutApp {
     fn schema_version(&self) -> u32 {
         SCHEMA_VERSION
+    }
+
+    fn migrate(&self, ctx: &mut ApplyCtx<'_>, to: u32) -> StoreResult<()> {
+        let _ = ctx;
+        match to {
+            // v2: appservice delivery cursors (T_AS_CURSOR) — a new,
+            // empty table; nothing to rewrite.
+            2 => Ok(()),
+            other => Err(StoreError::Engine(format!(
+                "no migration registered for fedout schema step v{other}"
+            ))),
+        }
     }
 
     fn apply(&self, ctx: &mut ApplyCtx<'_>, command: &[u8]) -> StoreResult<Vec<u8>> {
@@ -150,6 +187,23 @@ impl ShardApp for FedOutApp {
                     let enc = postcard::to_stdvec(&up_to)
                         .map_err(|e| StoreError::Engine(format!("cursor encode: {e}")))?;
                     ctx.put(T_PDU_CURSOR, &key, enc);
+                }
+            }
+            FedOutCommand::AdvanceAsCursor {
+                as_id,
+                room_shard,
+                up_to,
+            } => {
+                let key = as_cursor_key(&as_id, room_shard);
+                let current: u64 = match ctx.get(T_AS_CURSOR, &key)? {
+                    Some(b) => postcard::from_bytes(&b)
+                        .map_err(|e| StoreError::Engine(format!("as cursor decode: {e}")))?,
+                    None => 0,
+                };
+                if up_to > current {
+                    let enc = postcard::to_stdvec(&up_to)
+                        .map_err(|e| StoreError::Engine(format!("as cursor encode: {e}")))?;
+                    ctx.put(T_AS_CURSOR, &key, enc);
                 }
             }
             FedOutCommand::SetDrainMarker { up_to } => {
@@ -245,6 +299,20 @@ impl FedOutStore {
             out.push((room_shard, dest, seq));
         }
         Ok(out)
+    }
+
+    /// The appservice delivery cursor for `(as_id, room_shard)`; `None`
+    /// = never delivered (the push worker seeds from the current tip).
+    pub fn as_cursor(&self, as_id: &str, room_shard: u16) -> StoreResult<Option<u64>> {
+        Ok(
+            match self.read.get(T_AS_CURSOR, &as_cursor_key(as_id, room_shard))? {
+                Some(b) => Some(
+                    postcard::from_bytes(&b)
+                        .map_err(|e| StoreError::Engine(format!("as cursor decode: {e}")))?,
+                ),
+                None => None,
+            },
+        )
     }
 
     /// The user-outbox drain marker (0 = nothing drained).
@@ -344,6 +412,16 @@ impl FedOutServer {
         self.propose(&FedOutCommand::SetDrainMarker { up_to }).await
     }
 
+    /// Record appservice delivery progress against a room shard.
+    pub async fn advance_as_cursor(&self, as_id: &str, room_shard: u16, up_to: u64) -> Result<()> {
+        self.propose(&FedOutCommand::AdvanceAsCursor {
+            as_id: as_id.to_owned(),
+            room_shard,
+            up_to,
+        })
+        .await
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         Ok(self.handle.shutdown().await?)
     }
@@ -427,6 +505,19 @@ mod tests {
             server.store().pdu_cursors().unwrap(),
             vec![(0, "a.test".to_owned(), 10)]
         );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn as_cursor_is_monotonic_and_scoped() {
+        let (_dir, server) = start().await;
+        assert_eq!(server.store().as_cursor("irc", 0).unwrap(), None);
+        server.advance_as_cursor("irc", 0, 10).await.unwrap();
+        server.advance_as_cursor("irc", 0, 4).await.unwrap();
+        server.advance_as_cursor("telegram", 0, 7).await.unwrap();
+        assert_eq!(server.store().as_cursor("irc", 0).unwrap(), Some(10));
+        assert_eq!(server.store().as_cursor("telegram", 0).unwrap(), Some(7));
+        assert_eq!(server.store().as_cursor("irc", 1).unwrap(), None);
         server.shutdown().await.unwrap();
     }
 

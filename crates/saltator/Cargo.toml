@@ -21,6 +21,7 @@ saltator-core.workspace = true
 saltator-cs-api.workspace = true
 saltator-federation.workspace = true
 saltator-metrics.workspace = true
+saltator-appservice.workspace = true
 saltator-media.workspace = true
 saltator-roomserver.workspace = true
 saltator-shard.workspace = true

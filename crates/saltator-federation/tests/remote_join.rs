@@ -185,6 +185,7 @@ async fn remote_join_handshake_returns_room_state() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let a_base = spawn(router(a_state)).await;
@@ -327,6 +328,7 @@ async fn join_client_drives_the_full_handshake() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let a_base = spawn(router(a_state)).await;
@@ -476,6 +478,7 @@ async fn foreign_origin_transaction_verifies_against_fetched_keys() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let a_base = spawn(router(a_state)).await;
@@ -530,6 +533,7 @@ async fn foreign_origin_transaction_verifies_against_fetched_keys() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_base = spawn(router(b_state)).await;
@@ -621,6 +625,7 @@ async fn leave_client_rejects_over_federation() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let a_base = spawn(router(a_state)).await;
@@ -730,6 +735,7 @@ async fn knock_client_drives_the_full_handshake() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let a_base = spawn(router(a_state)).await;

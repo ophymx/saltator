@@ -283,7 +283,10 @@ pub async fn device_signing_upload(
         .cross_signing_key(auth.user_id.as_str(), "master")
         .map_err(ApiError::internal)?
         .is_some();
-    if has_master {
+    // Appservices skip the UIA stage (spec v1.17 MUST NOT): a bridge
+    // must be able to rotate its ghosts' cross-signing keys, and an AS
+    // identity has no password to prove anyway.
+    if has_master && !auth.is_appservice() {
         let req_auth = match body.get("auth") {
             Some(a) => Some(
                 serde_json::from_value(a.clone())

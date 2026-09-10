@@ -119,60 +119,6 @@ async fn rotate(cfg: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load appservice registrations (`*.yaml`) from a directory. Only the
-/// flat top-level scalars this server acts on are read (`as_token`,
-/// `sender_localpart`); nested blocks like `namespaces` are skipped —
-/// full YAML parsing can come with real AS event push.
-fn load_appservice_registrations(dir: &str) -> Vec<saltator_cs_api::AppServiceRegistration> {
-    let mut out = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(dir, error = %e, "appservice registration dir unreadable");
-            return out;
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let mut as_token = None;
-        let mut sender_localpart = None;
-        for line in text.lines() {
-            // Top-level scalars only: nested keys are indented.
-            if line.starts_with(char::is_whitespace) {
-                continue;
-            }
-            let Some((key, value)) = line.split_once(':') else {
-                continue;
-            };
-            let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
-            match key.trim() {
-                "as_token" => as_token = Some(value.to_owned()),
-                "sender_localpart" => sender_localpart = Some(value.to_owned()),
-                _ => {}
-            }
-        }
-        match (as_token, sender_localpart) {
-            (Some(as_token), Some(sender_localpart)) => {
-                tracing::info!(file = %path.display(), sender = %sender_localpart,
-                    "loaded appservice registration");
-                out.push(saltator_cs_api::AppServiceRegistration {
-                    as_token,
-                    sender_localpart,
-                });
-            }
-            _ => tracing::warn!(file = %path.display(),
-                "appservice registration missing as_token or sender_localpart; skipped"),
-        }
-    }
-    out
-}
-
 async fn run(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(
         server_name = %cfg.server_name,
@@ -206,6 +152,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             // series; nothing but this line knows they all exist.
             saltator_shard::metrics::describe();
             saltator_federation::metrics::describe();
+            saltator_cs_api::appservice_push::describe();
             Some(handle)
         }
         None => None,
@@ -522,9 +469,17 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     .with_federation(fed_client.clone(), signer.clone(), key_cache.clone())
     .with_fedout(fedout.clone())
     .with_cluster(meta.clone());
-    let cs_state = match &cfg.client.appservice_registration_dir {
-        Some(dir) => cs_state.with_appservices(load_appservice_registrations(dir)),
-        None => cs_state,
+    // Invalid registrations refuse the boot: a silently dropped bridge
+    // is worse than a refused start. The set is shared with the
+    // federation surface (query-on-miss for aliases/ghosts).
+    let appservices = std::sync::Arc::new(match &cfg.client.appservice_registration_dir {
+        Some(dir) => saltator_appservice::load_dir(dir)?,
+        None => saltator_appservice::AppServices::default(),
+    });
+    let cs_state = if appservices.is_empty() {
+        cs_state
+    } else {
+        cs_state.with_appservices(appservices.clone())
     };
     let cs_state = if cfg.client.oidc_providers.is_empty() {
         cs_state
@@ -572,6 +527,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let cs_presence = cs_state.presence_map();
     // HTTP push: notify gateways about new events for users with pushers.
     let push_delivery = saltator_cs_api::spawn_push_delivery(cs_state.clone());
+    // Appservice transaction push: interesting events to each registered
+    // AS, against durable fed-out cursors, gated on fed-out leadership.
+    let as_push = saltator_cs_api::spawn_appservice_push(cs_state.clone());
     // The measurement layer is applied here rather than inside the API
     // crates: it is the same layer on both surfaces, and neither
     // `saltator-cs-api` nor `saltator-federation` has to know it is being
@@ -597,6 +555,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         edu_sink: Some(edu_sink),
         media: Some(fed_media),
         delivery_backoff: Some(delivery_backoff.clone()),
+        appservices: if appservices.is_empty() {
+            None
+        } else {
+            Some(Arc::new(saltator_appservice::AppServiceQuerier::new(
+                appservices.clone(),
+            )))
+        },
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let fed_router =
@@ -743,6 +708,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     fed_task.await??;
     delivery.abort();
     push_delivery.abort();
+    if let Some(task) = &as_push {
+        task.abort();
+    }
     reconciler.abort();
     projection.abort();
     rooms.shutdown().await?;
@@ -779,41 +747,3 @@ impl saltator_shard::migrate::MigrationGate for UserMigrationGate {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    /// The registration loader hand-parses the YAML subset Complement and
-    /// typical bridges emit: flat top-level scalars, optional quoting,
-    /// nested blocks (namespaces) to be skipped.
-    #[test]
-    fn appservice_registration_parsing() {
-        let dir = std::env::temp_dir().join(format!("saltator-as-reg-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("my_as.yaml"),
-            concat!(
-                "id: my_as_id\n",
-                "hs_token: hs_secret\n",
-                "as_token: 'as_secret'\n",
-                "url: 'http://localhost:9000'\n",
-                "sender_localpart: the-bridge-user\n",
-                "rate_limited: false\n",
-                "namespaces:\n",
-                "  users:\n",
-                "    - exclusive: false\n",
-                "      regex: .*\n",
-                "  rooms: []\n",
-            ),
-        )
-        .unwrap();
-        // Missing required keys: skipped, not fatal.
-        std::fs::write(dir.join("broken.yaml"), "id: no_token_here\n").unwrap();
-        // Non-YAML files are ignored.
-        std::fs::write(dir.join("README.txt"), "as_token: not_loaded\n").unwrap();
-
-        let regs = super::load_appservice_registrations(dir.to_str().unwrap());
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(regs.len(), 1);
-        assert_eq!(regs[0].as_token, "as_secret");
-        assert_eq!(regs[0].sender_localpart, "the-bridge-user");
-    }
-}

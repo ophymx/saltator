@@ -28,6 +28,10 @@ struct Env {
     projection: tokio::task::JoinHandle<()>,
     /// The metadata group, when the env runs one (slice 6).
     cluster: Option<saltator_cluster::MetadataHandle>,
+    /// The fed-out shard, when the env runs one — kept alive here so the
+    /// appservice push worker's leader gate holds for the env's lifetime.
+    #[allow(dead_code)]
+    fedout: Option<Arc<saltator_fedout::FedOutServer>>,
 }
 
 async fn start_env() -> Env {
@@ -60,6 +64,25 @@ async fn start_env_cfg(
 /// tell apart.
 async fn start_env_admin(admins: &[&str], appservices: Vec<AppServiceRegistration>) -> Env {
     start_env_admin_cfg(admins, appservices, false).await
+}
+
+/// A registration for tests: token + sender, plus an optional exclusive
+/// users-namespace regex (empty = no namespaces). Built through the real
+/// YAML parser so tests exercise the same construction as production.
+fn test_registration(
+    as_token: &str,
+    sender_localpart: &str,
+    users_regex: &str,
+) -> AppServiceRegistration {
+    let mut yaml = format!(
+        "id: {sender_localpart}\nurl: null\nas_token: {as_token}\nhs_token: hs-{as_token}\nsender_localpart: {sender_localpart}\n"
+    );
+    if !users_regex.is_empty() {
+        yaml.push_str(&format!(
+            "namespaces:\n  users:\n  - exclusive: true\n    regex: '{users_regex}'\n"
+        ));
+    }
+    saltator_appservice::parse_registration("test.yaml", &yaml).expect("test registration")
 }
 
 async fn start_env_admin_cfg(
@@ -125,6 +148,30 @@ async fn start_env_full(
     registration_requires_token: bool,
     server_notices_localpart: Option<String>,
     with_cluster: bool,
+) -> Env {
+    start_env_full_fedout(
+        rate_limits,
+        allow_internal_fetch,
+        admin_users,
+        appservices,
+        registration_requires_token,
+        server_notices_localpart,
+        with_cluster,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_env_full_fedout(
+    rate_limits: saltator_cs_api::RateLimitConfig,
+    allow_internal_fetch: bool,
+    admin_users: Vec<ruma::OwnedUserId>,
+    appservices: Vec<AppServiceRegistration>,
+    registration_requires_token: bool,
+    server_notices_localpart: Option<String>,
+    with_cluster: bool,
+    with_fedout: bool,
 ) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
@@ -194,10 +241,37 @@ async fn start_env_full(
     let state = if appservices.is_empty() {
         state
     } else {
-        state.with_appservices(appservices)
+        state.with_appservices(std::sync::Arc::new(saltator_cs_api::AppServices {
+            services: appservices.into_iter().map(std::sync::Arc::new).collect(),
+        }))
     };
     let state = match &cluster {
         Some(meta) => state.with_cluster(meta.clone()),
+        None => state,
+    };
+    let fedout = if with_fedout {
+        let engine: Arc<dyn saltator_store::KvEngine> = Arc::new(
+            saltator_store::RocksEngine::open(&dir.path().join("fedout")).unwrap(),
+        );
+        let fedout = saltator_fedout::FedOutServer::start(
+            1,
+            engine,
+            NoopNetworkFactory,
+            Some("127.0.0.1:0".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        fedout
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        Some(fedout)
+    } else {
+        None
+    };
+    let state = match &fedout {
+        Some(f) => state.with_fedout(f.clone()),
         None => state,
     };
     Env {
@@ -208,6 +282,7 @@ async fn start_env_full(
         state,
         projection,
         cluster,
+        fedout,
     }
 }
 
@@ -5227,6 +5302,7 @@ async fn spawn_fed(
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     };
     if let Some(r) = rooms {
@@ -5798,6 +5874,7 @@ async fn client_joins_a_remote_room_by_remote_alias() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     };
     let a_app = saltator_federation::router(Arc::new(a_state));
@@ -6819,6 +6896,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_router = saltator_federation::router(b_fed);
@@ -6983,6 +7061,7 @@ async fn inbound_federated_invite_appears_in_sync() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7167,6 +7246,7 @@ async fn inbound_invite_into_a_blocked_room_is_refused() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7387,6 +7467,7 @@ async fn outbound_federated_invite_round_trip() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7575,6 +7656,7 @@ async fn receipt_edu_over_federation_surfaces_in_sync() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7684,6 +7766,7 @@ async fn to_device_over_federation_round_trip() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -7897,6 +7980,7 @@ async fn federated_key_query_claim_and_device_list_update() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -8146,6 +8230,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
         edu_sink: Some(sink),
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let b_fed_base = {
@@ -8342,6 +8427,7 @@ async fn client_downloads_remote_media_over_federation() {
         edu_sink: None,
         media: Some(a_media.clone()),
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
 
@@ -8581,6 +8667,7 @@ async fn client_queries_remote_profile_and_directory() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
 
@@ -9783,6 +9870,7 @@ async fn federation_public_rooms_lists_published_rooms() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let app = saltator_federation::router(fed);
@@ -9869,16 +9957,786 @@ async fn config_named_admin_may_list_users() {
 async fn appservice_token_is_never_admin() {
     let env = start_env_admin(
         &["@bridge:hs.test"],
-        vec![AppServiceRegistration {
-            as_token: "as-secret-token".to_owned(),
-            sender_localpart: "bridge".to_owned(),
-        }],
+        vec![test_registration("as-secret-token", "bridge", "")],
     )
     .await;
     let (status, body) = env
         .req("GET", ADMIN_USERS, Some("as-secret-token"), None)
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+const WHOAMI: &str = "/_matrix/client/v3/account/whoami";
+
+/// The full appservice identity-assertion flow: ghost registration via
+/// `m.login.application_service` (no UIA), then `?user_id=` masquerading
+/// — which requires the ghost to exist and to sit inside the AS's user
+/// namespaces.
+#[tokio::test]
+async fn appservice_registers_ghost_and_masquerades() {
+    let env = start_env_admin(&[], vec![test_registration("as-tok", "bridge", "@tg_.*")]).await;
+
+    // No user_id param: the AS is its own sender.
+    let (status, body) = env.req("GET", WHOAMI, Some("as-tok"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@bridge:hs.test");
+
+    // Masquerading as an unregistered ghost is refused (Synapse parity:
+    // the AS must /register it first).
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("{WHOAMI}?user_id=@tg_alice:hs.test"),
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Ghost registration: no UIA challenge, passwordless, one round trip.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/register",
+            Some("as-tok"),
+            Some(json!({"type": "m.login.application_service", "username": "tg_alice"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@tg_alice:hs.test");
+
+    // Now the masquerade resolves.
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("{WHOAMI}?user_id=@tg_alice:hs.test"),
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@tg_alice:hs.test");
+
+    // Outside the namespace: refused even though the account exists.
+    env.register("carol", "pw-12345678").await;
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("{WHOAMI}?user_id=@carol:hs.test"),
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // A masqueraded device must exist: unknown ids are the spec's 400
+    // M_UNKNOWN_DEVICE, not a silent synthetic device.
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("{WHOAMI}?user_id=@tg_alice:hs.test&device_id=NOPE"),
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_UNKNOWN_DEVICE");
+}
+
+/// Namespace ownership cuts both ways: the AS cannot register outside
+/// its namespaces, and ordinary users cannot register inside an
+/// exclusive one. Both are the spec's `M_EXCLUSIVE`.
+#[tokio::test]
+async fn appservice_namespace_exclusivity_on_register() {
+    let env = start_env_admin(&[], vec![test_registration("as-tok", "bridge", "@tg_.*")]).await;
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/register",
+            Some("as-tok"),
+            Some(json!({"type": "m.login.application_service", "username": "not_ours"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_EXCLUSIVE");
+
+    // The sender's own localpart is always registrable — that is how a
+    // bridge gets a real account row for AS login later.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/register",
+            Some("as-tok"),
+            Some(json!({"type": "m.login.application_service", "username": "bridge"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // An ordinary registration inside the exclusive namespace is refused
+    // before UIA even starts.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/register",
+            None,
+            Some(json!({"username": "tg_stolen", "password": "pw-12345678"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_EXCLUSIVE");
+
+    // And /register/available says why the name is unavailable.
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/register/available?username=tg_stolen",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_EXCLUSIVE");
+}
+
+/// `m.login.application_service`: the as_token is the credential; the
+/// minted session is a real device usable without the AS token.
+#[tokio::test]
+async fn appservice_login_mints_real_session() {
+    let env = start_env_admin(&[], vec![test_registration("as-tok", "bridge", "@tg_.*")]).await;
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/register",
+            Some("as-tok"),
+            Some(json!({
+                "type": "m.login.application_service",
+                "username": "tg_alice",
+                "inhibit_login": true,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("access_token").is_none(), "{body}");
+
+    // Without the as_token the login type is refused.
+    let login_body = json!({
+        "type": "m.login.application_service",
+        "identifier": {"type": "m.id.user", "user": "tg_alice"},
+    });
+    let (status, _) = env
+        .req("POST", "/_matrix/client/v3/login", None, Some(login_body.clone()))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/login",
+            Some("as-tok"),
+            Some(login_body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ghost_token = body["access_token"].as_str().unwrap().to_owned();
+    let device_id = body["device_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = env.req("GET", WHOAMI, Some(&ghost_token), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], "@tg_alice:hs.test");
+
+    // That real device is masqueradable via ?device_id=.
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("{WHOAMI}?user_id=@tg_alice:hs.test&device_id={device_id}"),
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["device_id"], device_id);
+
+    // Outside the namespace: M_EXCLUSIVE, not a password error.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/login",
+            Some("as-tok"),
+            Some(json!({
+                "type": "m.login.application_service",
+                "identifier": {"type": "m.id.user", "user": "someone_else"},
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_EXCLUSIVE");
+}
+
+/// A stub appservice: records transactions and pings, and answers the
+/// query endpoints by provisioning the entity through the homeserver's
+/// own router — exactly what a real bridge does, minus the bridge.
+/// `(txn_id, body, bearer)` for every recorded stub request.
+type StubLog = Arc<tokio::sync::Mutex<Vec<(String, Value, Option<String>)>>>;
+
+struct StubAs {
+    url: String,
+    /// Every transaction PUT, including attempts answered 500.
+    transactions: StubLog,
+    /// Fail the next N transaction PUTs with 500.
+    fail_next: Arc<std::sync::atomic::AtomicU32>,
+    /// Wired after env construction so query handlers can drive the CS
+    /// API: the router plus what the stub needs to provision with.
+    hs: Arc<tokio::sync::Mutex<Option<(axum::Router, String /* room for aliases */)>>>,
+    pings: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+}
+
+async fn start_stub_as() -> StubAs {
+    use axum::extract::{Path as AxPath, State as AxState};
+    use axum::response::IntoResponse;
+    use std::sync::atomic::Ordering;
+
+    type Shared = (
+        Arc<tokio::sync::Mutex<Vec<(String, Value, Option<String>)>>>,
+        Arc<std::sync::atomic::AtomicU32>,
+        Arc<tokio::sync::Mutex<Option<(axum::Router, String)>>>,
+        Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
+    );
+    let shared: Shared = (
+        Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        Arc::new(tokio::sync::Mutex::new(None)),
+        Arc::new(tokio::sync::Mutex::new(Vec::new())),
+    );
+
+    async fn put_txn(
+        AxState((txns, fail, _, _)): AxState<Shared>,
+        AxPath(txn_id): AxPath<String>,
+        headers: axum::http::HeaderMap,
+        axum::Json(body): axum::Json<Value>,
+    ) -> axum::response::Response {
+        let bearer = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(str::to_owned);
+        txns.lock().await.push((txn_id, body, bearer));
+        if fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+        }
+        axum::Json(json!({})).into_response()
+    }
+
+    async fn get_room(
+        AxState((_, _, hs, _)): AxState<Shared>,
+        AxPath(alias): AxPath<String>,
+    ) -> axum::response::Response {
+        // A real bridge would create the portal room here; the stub
+        // points a pre-made room at the queried alias.
+        let Some((router, room_id)) = hs.lock().await.clone() else {
+            return (StatusCode::NOT_FOUND, "").into_response();
+        };
+        let alias_enc = alias.replace('#', "%23").replace(':', "%3A");
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/_matrix/client/v3/directory/room/{alias_enc}"))
+            .header("Authorization", "Bearer as-tok")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "room_id": room_id })).unwrap(),
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        if resp.status().is_success() {
+            axum::Json(json!({})).into_response()
+        } else {
+            (StatusCode::NOT_FOUND, "").into_response()
+        }
+    }
+
+    async fn get_user(
+        AxState((_, _, hs, _)): AxState<Shared>,
+        AxPath(user_id): AxPath<String>,
+    ) -> axum::response::Response {
+        let Some((router, _)) = hs.lock().await.clone() else {
+            return (StatusCode::NOT_FOUND, "").into_response();
+        };
+        let localpart = user_id
+            .trim_start_matches('@')
+            .split(':')
+            .next()
+            .unwrap()
+            .to_owned();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/_matrix/client/v3/register")
+            .header("Authorization", "Bearer as-tok")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "type": "m.login.application_service",
+                    "username": localpart,
+                    "inhibit_login": true,
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        if resp.status().is_success() {
+            axum::Json(json!({})).into_response()
+        } else {
+            (StatusCode::NOT_FOUND, "").into_response()
+        }
+    }
+
+    async fn post_ping(
+        AxState((_, _, _, pings)): AxState<Shared>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> axum::Json<Value> {
+        pings
+            .lock()
+            .await
+            .push(body.get("transaction_id").and_then(|v| v.as_str()).map(str::to_owned));
+        axum::Json(json!({}))
+    }
+
+    let app = axum::Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            axum::routing::put(put_txn),
+        )
+        .route("/_matrix/app/v1/rooms/{alias}", axum::routing::get(get_room))
+        .route("/_matrix/app/v1/users/{user_id}", axum::routing::get(get_user))
+        .route("/_matrix/app/v1/ping", axum::routing::post(post_ping))
+        .with_state(shared.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    StubAs {
+        url,
+        transactions: shared.0,
+        fail_next: shared.1,
+        hs: shared.2,
+        pings: shared.3,
+    }
+}
+
+/// A registration whose HS→AS direction points at the stub: exclusive
+/// user namespace `@tg_.*`, alias namespace `#tg_.*`.
+fn stub_registration(url: &str) -> AppServiceRegistration {
+    saltator_appservice::parse_registration(
+        "stub.yaml",
+        &format!(
+            concat!(
+                "id: bridge\n",
+                "url: {url}\n",
+                "as_token: as-tok\n",
+                "hs_token: hs-as-tok\n",
+                "sender_localpart: bridge\n",
+                "namespaces:\n",
+                "  users:\n",
+                "  - {{exclusive: true, regex: '@tg_.*'}}\n",
+                "  aliases:\n",
+                "  - {{exclusive: true, regex: '#tg_.*'}}\n",
+            ),
+            url = url
+        ),
+    )
+    .unwrap()
+}
+
+async fn start_appservice_env(url: &str) -> Env {
+    start_env_full_fedout(
+        saltator_cs_api::RateLimitConfig::disabled(),
+        true,
+        Vec::new(),
+        vec![stub_registration(url)],
+        false,
+        None,
+        false,
+        true,
+    )
+    .await
+}
+
+/// End-to-end outbound push: interesting events arrive as transactions
+/// with the `hs_token`, uninteresting rooms never do, a 500 is retried
+/// with the identical transaction id and events, and delivery resumes
+/// from the durable cursor.
+#[tokio::test]
+async fn appservice_push_delivers_and_retries() {
+    let stub = start_stub_as().await;
+    let env = start_appservice_env(&stub.url).await;
+    let worker = saltator_cs_api::spawn_appservice_push(env.state.clone())
+        .expect("push worker should spawn: url + fedout are present");
+
+    // Ghost + room, all through the AS.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/register",
+            Some("as-tok"),
+            Some(json!({"type": "m.login.application_service", "username": "tg_alice"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some("as-tok"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().unwrap().to_owned();
+    let room_enc = room_id.replace(':', "%3A").replace('!', "%21");
+
+    // Ghost joins (invited by the sender, accepted by masquerade), then
+    // speaks.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/invite"),
+            Some("as-tok"),
+            Some(json!({"user_id": "@tg_alice:hs.test"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/join?user_id=@tg_alice:hs.test"),
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/tx1?user_id=@tg_alice:hs.test"),
+            Some("as-tok"),
+            Some(json!({"msgtype": "m.text", "body": "bridged hello"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hello_event = body["event_id"].as_str().unwrap().to_owned();
+
+    // Noise the AS must NOT see: an unrelated user's room.
+    let carol = env.register("carol", "pw-12345678").await;
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&carol),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let carol_room = body["room_id"].as_str().unwrap().to_owned();
+
+    // Wait for the hello to arrive.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let hello_txn = loop {
+        let txns = stub.transactions.lock().await;
+        let hit = txns.iter().find(|(_, body, _)| {
+            body["events"].as_array().is_some_and(|evs| {
+                evs.iter().any(|e| e["event_id"] == hello_event.as_str())
+            })
+        });
+        if let Some((txn_id, body, bearer)) = hit {
+            break (txn_id.clone(), body.clone(), bearer.clone());
+        }
+        drop(txns);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "transaction never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(hello_txn.2.as_deref(), Some("hs-as-tok"), "hs_token auth");
+    let ev = hello_txn.1["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_id"] == hello_event.as_str())
+        .unwrap();
+    assert_eq!(ev["type"], "m.room.message");
+    assert_eq!(ev["sender"], "@tg_alice:hs.test");
+    assert_eq!(ev["room_id"], room_id);
+    assert_eq!(ev["content"]["body"], "bridged hello");
+
+    // A 500 is retried: same transaction id, same events.
+    stub.fail_next
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/tx2?user_id=@tg_alice:hs.test"),
+            Some("as-tok"),
+            Some(json!({"msgtype": "m.text", "body": "second"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second_event = body["event_id"].as_str().unwrap().to_owned();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let txns = stub.transactions.lock().await;
+        let attempts: Vec<_> = txns
+            .iter()
+            .filter(|(_, body, _)| {
+                body["events"].as_array().is_some_and(|evs| {
+                    evs.iter().any(|e| e["event_id"] == second_event.as_str())
+                })
+            })
+            .collect();
+        if attempts.len() >= 2 {
+            assert_eq!(
+                attempts[0].0, attempts[1].0,
+                "retry must reuse the transaction id"
+            );
+            assert_eq!(
+                attempts[0].1, attempts[1].1,
+                "retry must carry the identical event set"
+            );
+            break;
+        }
+        drop(txns);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retry never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The uninteresting room never left the building.
+    let txns = stub.transactions.lock().await;
+    assert!(
+        txns.iter().all(|(_, body, _)| {
+            body["events"]
+                .as_array()
+                .is_none_or(|evs| evs.iter().all(|e| e["room_id"] != carol_room.as_str()))
+        }),
+        "carol's room must not be pushed"
+    );
+    drop(txns);
+    worker.abort();
+}
+
+/// The two query-on-miss paths: an unknown alias/user in the AS's
+/// namespaces makes the homeserver ask the AS, which provisions the
+/// entity through the ordinary CS API before answering.
+#[tokio::test]
+async fn appservice_query_on_miss_provisions() {
+    let stub = start_stub_as().await;
+    let env = start_appservice_env(&stub.url).await;
+
+    // A room for the stub to hang the queried alias on.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some("as-tok"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().unwrap().to_owned();
+    *stub.hs.lock().await = Some((env.router.clone(), room_id.clone()));
+
+    // Alias: unknown locally, inside the namespace → resolved via the AS.
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/directory/room/%23tg_portal%3Ahs.test",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["room_id"], room_id);
+
+    // Outside the namespace: a plain 404, no AS involved.
+    let (status, _) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/directory/room/%23other%3Ahs.test",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // User: profile of an unregistered ghost → the AS registers it
+    // during the blocking query and the profile answers.
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/profile/@tg_ghost%3Ahs.test",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = env
+        .req(
+            "GET",
+            &format!("{WHOAMI}?user_id=@tg_ghost:hs.test"),
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "ghost exists after the query");
+}
+
+/// The ping round trip, and its two refusals: a mismatched appservice id
+/// and a non-appservice token.
+#[tokio::test]
+async fn appservice_ping_round_trip() {
+    let stub = start_stub_as().await;
+    let env = start_appservice_env(&stub.url).await;
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v1/appservice/bridge/ping",
+            Some("as-tok"),
+            Some(json!({"transaction_id": "meow"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["duration_ms"].is_u64(), "{body}");
+    assert_eq!(stub.pings.lock().await.as_slice(), &[Some("meow".to_owned())]);
+
+    let (status, _) = env
+        .req(
+            "POST",
+            "/_matrix/client/v1/appservice/other/ping",
+            Some("as-tok"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let user_token = env.register("dora", "pw-12345678").await;
+    let (status, _) = env
+        .req(
+            "POST",
+            "/_matrix/client/v1/appservice/bridge/ping",
+            Some(&user_token),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// AS device management (v1.17): `PUT /devices/{id}` creates a device
+/// for an appservice, and device deletion skips UIA.
+#[tokio::test]
+async fn appservice_device_management() {
+    let env = start_env_admin(&[], vec![test_registration("as-tok", "bridge", "@tg_.*")]).await;
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/register",
+            Some("as-tok"),
+            Some(json!({"type": "m.login.application_service", "username": "tg_alice"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Create a ghost device out of thin air (no /login involved).
+    let (status, body) = env
+        .req(
+            "PUT",
+            "/_matrix/client/v3/devices/GHOSTDEV?user_id=@tg_alice:hs.test",
+            Some("as-tok"),
+            Some(json!({"display_name": "bridge device"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/devices/GHOSTDEV?user_id=@tg_alice:hs.test&device_id=GHOSTDEV",
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["display_name"], "bridge device");
+
+    // Deletion without UIA (spec v1.17 MUST NOT ask).
+    let (status, body) = env
+        .req(
+            "DELETE",
+            "/_matrix/client/v3/devices/GHOSTDEV?user_id=@tg_alice:hs.test",
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A normal user still gets the UIA challenge on device deletion.
+    let token = env.register("erin", "pw-12345678").await;
+    let (_, body) = env.req("GET", WHOAMI, Some(&token), None).await;
+    let device = body["device_id"].as_str().unwrap().to_owned();
+    let (status, _) = env
+        .req(
+            "DELETE",
+            &format!("/_matrix/client/v3/devices/{device}"),
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "UIA challenge expected");
+}
+
+/// `?ts` timestamp massaging applies to `PUT /state` (the spec routes
+/// kick-style operations through /state for exactly this reason).
+#[tokio::test]
+async fn appservice_ts_massaging_on_state_events() {
+    let env = start_env_admin(&[], vec![test_registration("as-tok", "bridge", "@tg_.*")]).await;
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some("as-tok"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let room_id = body["room_id"].as_str().unwrap().to_owned();
+    let room_enc = room_id.replace(':', "%3A").replace('!', "%21");
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/state/m.room.topic?ts=12345"),
+            Some("as-tok"),
+            Some(json!({"topic": "bridged"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let event_id = body["event_id"].as_str().unwrap().to_owned();
+    let event_enc = event_id.replace(':', "%3A").replace('$', "%24");
+
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{room_enc}/event/{event_enc}"),
+            Some("as-tok"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin_server_ts"], 12345, "{body}");
 }
 
 #[tokio::test]
@@ -10870,6 +11728,7 @@ async fn federated_join_into_a_blocked_room_is_refused() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let app = saltator_federation::router(fed);

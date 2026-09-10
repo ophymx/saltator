@@ -484,6 +484,31 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             }
             Ok(UserResponse::Ok)
         }
+        UserCommand::UpsertDevice {
+            user_id,
+            device_id,
+            display_name,
+            ts,
+        } => {
+            let dkey = user_key(user_id, device_id);
+            let existing: Option<Device> = get_typed(ctx, "device decode", T_DEVICE, &dkey)?;
+            let device = match existing {
+                Some(mut d) => {
+                    d.display_name = display_name.clone();
+                    d
+                }
+                None => Device {
+                    display_name: display_name.clone(),
+                    created_ts: *ts,
+                    access_token_hash: None,
+                    refresh_token_hash: None,
+                },
+            };
+            ctx.put(T_DEVICE, &dkey, enc("device encode", &device)?);
+            // Creation and rename are both device-list changes.
+            log_key_change(ctx, user_id)?;
+            Ok(UserResponse::Ok)
+        }
         UserCommand::SetDeviceName {
             user_id,
             device_id,
@@ -2084,6 +2109,20 @@ impl UserStore {
 
     pub fn alias(&self, alias: &str) -> StoreResult<Option<AliasEntry>> {
         self.get_typed("alias decode", T_ALIAS, alias.as_bytes())
+    }
+
+    /// Every registered alias, `(alias, entry)`. One range scan — the
+    /// appservice push worker builds a room→aliases reverse map from it
+    /// once per delivery pass.
+    pub fn aliases(&self) -> StoreResult<Vec<(String, AliasEntry)>> {
+        let mut out = Vec::new();
+        for (k, v) in self.read.range(T_ALIAS, &[], &[])? {
+            let alias = String::from_utf8_lossy(&k).into_owned();
+            let entry = postcard::from_bytes(&v)
+                .map_err(|e| StoreError::Engine(format!("alias decode: {e}")))?;
+            out.push((alias, entry));
+        }
+        Ok(out)
     }
 
     pub fn room_is_public(&self, room_id: &str) -> StoreResult<bool> {

@@ -3,6 +3,7 @@
 //! and user servers. This crate never touches storage directly — always
 //! through `saltator-roomserver` / `saltator-userserver`.
 
+pub mod appservice_push;
 mod error;
 mod extract;
 mod presence;
@@ -28,6 +29,7 @@ use saltator_userserver::UserServer;
 
 pub use error::ApiError;
 pub use presence::PresenceMap;
+pub use appservice_push::spawn_appservice_push;
 pub use push_gateway::spawn_push_delivery;
 pub use ratelimit::RateLimitConfig;
 pub use typing::TypingMap;
@@ -105,10 +107,14 @@ pub struct CsState {
     /// `None` in stacks that run the shard servers without a metadata
     /// group (most tests): the cluster endpoints then say so.
     pub(crate) cluster: Option<saltator_cluster::MetadataHandle>,
-    /// Registered application services (minimal support: `as_token` →
-    /// sender identity plus `?ts` timestamp massaging; namespaces,
-    /// impersonation, and outbound event push are not implemented).
-    pub(crate) appservices: Vec<AppServiceRegistration>,
+    /// Registered application services: identity assertion
+    /// (`?user_id=`/`?device_id=` masquerading), namespaces, `?ts`
+    /// massaging, ghost registration, and outbound event push
+    /// (docs/design-appservices.md).
+    pub(crate) appservices: Arc<AppServices>,
+    /// Query-on-miss client over the same registrations (alias/user
+    /// lookups block on the owning AS creating the entity).
+    pub(crate) as_querier: saltator_appservice::AppServiceQuerier,
     /// The credential providers this server offers, the single place the
     /// list is built (docs/design-admin-identity.md slice 4). Local
     /// passwords always; `with_oidc` appends external providers, and
@@ -120,16 +126,7 @@ pub struct CsState {
     pub(crate) sso: Option<services::oidc::SsoRuntime>,
 }
 
-/// One application service registration (the subset of the registration
-/// file this server understands).
-#[derive(Debug, Clone)]
-pub struct AppServiceRegistration {
-    /// The token the AS authenticates to us with (`hs_token`, the reverse
-    /// direction, is unused until outbound push exists).
-    pub as_token: String,
-    /// Localpart of the AS's own user (`@{sender_localpart}:{server}`).
-    pub sender_localpart: String,
-}
+pub use saltator_appservice::{AppServiceRegistration, AppServices};
 
 /// The bits of the federation surface the CS API drives directly: a signed
 /// client for remote requests and our signing identity.
@@ -194,13 +191,11 @@ impl CsState {
 
     /// Attach application service registrations (loaded from registration
     /// files at startup).
-    pub fn with_appservices(
-        mut self: Arc<Self>,
-        appservices: Vec<AppServiceRegistration>,
-    ) -> Arc<Self> {
-        Arc::get_mut(&mut self)
-            .expect("with_appservices called on a shared CsState")
-            .appservices = appservices;
+    pub fn with_appservices(mut self: Arc<Self>, appservices: Arc<AppServices>) -> Arc<Self> {
+        let state = Arc::get_mut(&mut self).expect("with_appservices called on a shared CsState");
+        state.appservices = appservices;
+        state.as_querier =
+            saltator_appservice::AppServiceQuerier::new(state.appservices.clone());
         self
     }
 
@@ -214,7 +209,7 @@ impl CsState {
         // Appservices are never administrators: an AS identity is
         // synthesized from config and has no account row at all, so there
         // is nothing to carry the flag.
-        if auth.appservice {
+        if auth.appservice.is_some() {
             return Ok(false);
         }
         if self.config.admin_users.contains(&auth.user_id) {
@@ -317,7 +312,10 @@ impl CsState {
             txns: txn::TxnCache::new(),
             push_rule_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             rate_limiter: ratelimit::RateLimiter::new(),
-            appservices: Vec::new(),
+            appservices: Arc::new(AppServices::default()),
+            as_querier: saltator_appservice::AppServiceQuerier::new(Arc::new(
+                AppServices::default(),
+            )),
             cluster: None,
             auth_providers: vec![services::auth::AuthProvider::LocalPassword],
             sso: None,
@@ -640,6 +638,10 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route(
             "/_matrix/client/v1/register/m.login.registration_token/validity",
             get(session::registration_token_validity),
+        )
+        .route(
+            "/_matrix/client/v1/appservice/{appservice_id}/ping",
+            post(routes::appservice::ping),
         );
 
     // -- media (authenticated endpoints only, Matrix 1.11+)
