@@ -15,6 +15,7 @@
 
 pub mod app;
 pub mod handle;
+pub mod metrics;
 pub mod migrate;
 pub mod registry;
 pub mod storage;

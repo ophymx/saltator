@@ -14,6 +14,7 @@ mod join_client;
 mod joins;
 mod keys;
 mod media;
+pub mod metrics;
 mod outbound;
 mod query;
 mod resolver;

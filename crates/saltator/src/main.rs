@@ -11,6 +11,12 @@ use clap::{Parser, Subcommand};
 
 use config::Config;
 
+/// How often shard gauges (leadership, sequence, voter count) are read.
+/// Ten seconds is below any sane scrape interval, so a scrape never sees a
+/// value older than the sample before last, and the read is a handful of
+/// in-memory lookups per shard.
+const SHARD_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+
 #[derive(Parser)]
 #[command(name = "saltator", version, about = "Matrix homeserver, natively HA")]
 struct Cli {
@@ -175,6 +181,35 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         "saltator {} starting",
         env!("CARGO_PKG_VERSION"),
     );
+
+    // The recorder goes in before anything that could emit a measurement:
+    // the shard runtimes start applying below, and a metric recorded
+    // before the recorder exists is simply lost. When no metrics listener
+    // is configured there is no recorder at all, and every `metrics!`
+    // macro in the tree stays the no-op it is by default.
+    let metrics_handle = match cfg.listeners.metrics {
+        Some(addr) => {
+            if !addr.ip().is_loopback() {
+                // Not an error: exporting to a management network is a
+                // legitimate deployment. But the exporter has no auth, so
+                // whoever wrote this address had better have meant it.
+                tracing::warn!(
+                    listen = %addr,
+                    "metrics listener is not on loopback and is unauthenticated; \
+                     anyone who can reach it can read this server's traffic and cluster shape",
+                );
+            }
+            let handle = saltator_metrics::install()?;
+            saltator_metrics::set_build_info(env!("CARGO_PKG_VERSION"));
+            // Help text is registered here, at startup, so no measurement
+            // site pays for it. Each instrumented crate describes its own
+            // series; nothing but this line knows they all exist.
+            saltator_shard::metrics::describe();
+            saltator_federation::metrics::describe();
+            Some(handle)
+        }
+        None => None,
+    };
 
     let fresh_bootstrap = !cfg.data_dir.join("db").exists();
     std::fs::create_dir_all(&cfg.data_dir)?;
@@ -537,7 +572,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let cs_presence = cs_state.presence_map();
     // HTTP push: notify gateways about new events for users with pushers.
     let push_delivery = saltator_cs_api::spawn_push_delivery(cs_state.clone());
-    let cs_router = saltator_cs_api::router(cs_state);
+    // The measurement layer is applied here rather than inside the API
+    // crates: it is the same layer on both surfaces, and neither
+    // `saltator-cs-api` nor `saltator-federation` has to know it is being
+    // measured. Applied to the finished router, so it sees the matched
+    // route template rather than the raw path.
+    let cs_router = saltator_metrics::instrument_http(saltator_cs_api::router(cs_state), "client");
     let cs_listener = tokio::net::TcpListener::bind(cfg.listeners.client).await?;
     tracing::info!(listen = %cfg.listeners.client, "client-server API listening");
 
@@ -559,7 +599,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         delivery_backoff: Some(delivery_backoff.clone()),
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
-    let fed_router = saltator_federation::router(fed_state);
+    let fed_router =
+        saltator_metrics::instrument_http(saltator_federation::router(fed_state), "federation");
     // Federation is served over HTTPS when a cert is configured; otherwise
     // plain HTTP (dev, or behind an external TLS terminator).
     let fed_tls = match (&cfg.federation.tls_cert, &cfg.federation.tls_key) {
@@ -588,6 +629,64 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         server_name.clone(),
         delivery_backoff.clone(),
     );
+
+    // Metrics: the exporter's own listener, plus the tick that reads
+    // current shard state. Gauges are sampled rather than written on
+    // change so no hot path pays for them and none can drift from the
+    // handle it describes.
+    if let (Some(handle), Some(addr)) = (metrics_handle, cfg.listeners.metrics) {
+        saltator_metrics::serve(addr, handle, shutdown_rx.clone()).await?;
+
+        let sample_rooms = rooms.clone();
+        let sample_users = users.clone();
+        let sample_fedout = fedout.clone();
+        let sample_meta = meta.clone();
+        let sample_backoff = delivery_backoff.clone();
+        let started = std::time::Instant::now();
+        // NOTE: every shard group this node runs must appear below — a
+        // group left out exports no gauges at all, and nothing errors
+        // about the omission.
+        saltator_metrics::spawn_sampler(SHARD_SAMPLE_INTERVAL, shutdown_rx.clone(), move || {
+            for h in [
+                sample_rooms.shard_handle(),
+                sample_users.shard_handle(),
+                sample_fedout.shard_handle(),
+            ] {
+                // An Err from seq() is a storage failure, not "no
+                // sequence": the gauge is left alone (None), but say why,
+                // so a frozen saltator_shard_seq has an explanation.
+                let seq = h
+                    .seq()
+                    .inspect_err(|e| {
+                        tracing::warn!(shard = %h.shard(), error = %e, "metrics: shard seq read failed");
+                    })
+                    .ok();
+                saltator_shard::metrics::sample_shard_gauges(
+                    h.shard(),
+                    h.is_leader(),
+                    seq,
+                    h.voter_ids().len(),
+                );
+            }
+            // The metadata group has no shard app and so no sequence of
+            // its own; its leadership is the one every other placement
+            // decision depends on, which is why it is sampled at all.
+            saltator_shard::metrics::sample_shard_gauges(
+                saltator_shard::ShardId::METADATA,
+                sample_meta.is_leader(),
+                None,
+                sample_meta.voter_ids().len(),
+            );
+            // The backoff count rides the same tick as every other
+            // current-state gauge; non-leaders report zero, because only
+            // the delivering node's backoff map describes anything.
+            saltator_federation::metrics::sample_delivery_gauges(
+                &sample_backoff,
+                sample_fedout.shard_handle().is_leader(),
+            );
+            saltator_metrics::set_uptime(started.elapsed());
+        });
+    }
 
     let mut cs_shutdown = shutdown_rx.clone();
     let cs_task = tokio::spawn(async move {

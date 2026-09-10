@@ -289,12 +289,15 @@ mechanically once cs-api's remaining direct uses thin out.
   registration-file loading). Still missing: namespaces, `?user_id=`
   impersonation, outbound event push (`hs_token`), `/register` with
   `m.login.application_service`.
-- **Federation delivery latency** (task #17, blocking-ish): the
-  restricted-join "uses power levels" family loses a ~40-100ms
-  eventual-consistency race in CI (~every run since #43 merged; V11 then
-  V12 variants). Instrument deliver_pdus latency, then attack the
-  dominant term (batch queued PDUs per txn — spec allows 50; parallel
-  per-dest sends; PDU-before-EDU priority).
+- **Federation delivery latency** (task #17): the CI race that motivated
+  it was fixed at the decision level instead (PR #45 batching, PR #46
+  recheck-on-change), and the instrumentation half is now DONE — the
+  observability branch turns `deliver_pdus`' `queue_ms`/`put_ms` into
+  `saltator_federation_pdu_{queue_delay,put_duration}_seconds`
+  (docs/observability.md). What remains is the attack on whichever term
+  the histograms show dominant: parallel per-destination sends,
+  PDU-before-EDU priority. Measure first — batching per txn already
+  landed.
 - Security-review follow-ups (see memory: resolver private-IP M2,
   cross-signing sig L1, L6/L8).
 - PDU sender: `deliver_to` gives up after 3 attempts per pass —

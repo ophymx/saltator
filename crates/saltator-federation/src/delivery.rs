@@ -67,6 +67,18 @@ impl DeliveryBackoff {
     pub fn mark_alive(&self, dest: &str) {
         self.0.lock().expect("backoff lock").remove(dest);
     }
+
+    /// Destinations currently serving a penalty. Counted rather than
+    /// named — see `metrics.rs` on why a destination is not a label.
+    pub(crate) fn backed_off(&self) -> usize {
+        let now = Instant::now();
+        self.0
+            .lock()
+            .expect("backoff lock")
+            .values()
+            .filter(|(at, _)| *at > now)
+            .count()
+    }
 }
 
 /// Spawn the delivery worker. Runs until aborted.
@@ -98,6 +110,13 @@ pub fn spawn_delivery_worker(
                 // re-election re-derives it from the durable cursors.
                 scan_pos = None;
             }
+            // The backed-off gauge is NOT written here: a delivery pass
+            // over many failing destinations can block this loop for
+            // destinations × timeout, and a gauge written at pass
+            // boundaries goes stale exactly when it is spiking. It is
+            // sampled on the node's gauge tick instead
+            // (`metrics::sample_delivery_gauges`), like every other
+            // current-state gauge.
             tokio::select! {
                 _ = tokio::time::sleep(IDLE_TICK) => {}
                 _ = room_changes.recv() => {}
@@ -214,32 +233,55 @@ async fn deliver_pdus(
             // Latency decomposition: queue_ms ≈ event creation → this PUT
             // starting (origin apply + worker wake + any pass-in-flight
             // wait); put_ms = the round trip (network + receiver ingest).
-            let newest_ots = chunk
-                .last()
+            // Queue delay is taken only from events THIS server authored:
+            // a relayed event (send_join/send_leave resident) carries the
+            // remote author's origin_server_ts, and that clock's skew
+            // would poison the one histogram whose whole point is naming
+            // delays that are ours to shorten.
+            let newest_local_ots = chunk
+                .iter()
+                .rev()
+                .find(|(_, raw)| {
+                    raw.get("sender")
+                        .and_then(|s| s.as_str())
+                        .and_then(|s| ruma::UserId::parse(s).ok())
+                        .is_some_and(|u| u.server_name().as_str() == server_name.as_str())
+                })
                 .and_then(|(_, raw)| raw.get("origin_server_ts"))
                 .and_then(|t| t.as_u64());
             let put_start = crate::now_ms();
             match client.put(&dest, &txn_path, &body).await {
                 Ok(_) => {
+                    // Taken before the cursor advance below: put_ms claims
+                    // to be the remote round trip, and the cursor advance
+                    // is a local Raft proposal that can stall through an
+                    // election — none of that is the remote's latency.
+                    let put_ms = crate::now_ms().saturating_sub(put_start);
                     backoff.success(&dest);
                     acked = last;
                     if let Err(e) = fedout.advance_pdu_cursor(room_shard, &dest, last).await {
                         tracing::warn!(error = %e, dest, "delivery: cursor advance failed");
                     }
-                    if let Some(ots) = newest_ots {
-                        tracing::debug!(
-                            dest,
-                            first,
-                            last,
-                            count = chunk.len(),
-                            queue_ms = put_start.saturating_sub(ots),
-                            put_ms = crate::now_ms().saturating_sub(put_start),
-                            "delivery: PDU transaction acked"
-                        );
-                    }
+                    crate::metrics::observe_transaction("pdu", true);
+                    let queue_ms = newest_local_ots.map(|ots| put_start.saturating_sub(ots));
+                    crate::metrics::observe_pdu_transaction(
+                        queue_ms.map(Duration::from_millis),
+                        Duration::from_millis(put_ms),
+                        chunk.len(),
+                    );
+                    tracing::debug!(
+                        dest,
+                        first,
+                        last,
+                        count = chunk.len(),
+                        queue_ms,
+                        put_ms,
+                        "delivery: PDU transaction acked"
+                    );
                 }
                 Err(e) => {
                     tracing::debug!(dest, error = %e, "delivery: PDU send failed; backing off");
+                    crate::metrics::observe_transaction("pdu", false);
                     backoff.failure(&dest);
                     stopped = true;
                     break;
@@ -351,6 +393,7 @@ async fn deliver_edus(
         let path = format!("/_matrix/federation/v1/send/edu{last_seq}");
         match client.put(&dest, &path, &txn).await {
             Ok(_) => {
+                crate::metrics::observe_transaction("edu", true);
                 backoff.success(&dest);
                 if let Err(e) = fedout.ack_edus(&dest, last_seq).await {
                     tracing::warn!(error = %e, dest, "delivery: EDU ack failed");
@@ -358,6 +401,7 @@ async fn deliver_edus(
             }
             Err(e) => {
                 tracing::debug!(dest, error = %e, "delivery: EDU send failed; backing off");
+                crate::metrics::observe_transaction("edu", false);
                 backoff.failure(&dest);
             }
         }

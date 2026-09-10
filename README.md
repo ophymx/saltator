@@ -31,6 +31,11 @@ stack works end to end, with every exit criterion proven in CI:
   directions across Saltator↔Synapse federation; also verified hands-on
   with real Element clients.
 
+- **Operability**: liveness/readiness probes, a graceful drain, an admin
+  API with a web console, and Prometheus metrics covering HTTP, the
+  shards' Raft groups, and federation delivery latency
+  ([docs/observability.md](docs/observability.md)).
+
 Still pre-release: hardening remains (durable federation-out cursors,
 per-event signature verification on trusted backfill imports, an SSRF
 blocklist for URL previews), the federation Complement suite is a
