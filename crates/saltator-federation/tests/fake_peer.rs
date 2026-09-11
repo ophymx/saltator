@@ -1346,3 +1346,99 @@ async fn delivery_resumes_from_durable_cursor_after_restart() {
     worker2.abort();
     our_rooms.shutdown().await.unwrap();
 }
+
+/// `/event`, `/backfill` and `/event_auth` serve room members only
+/// (Synapse parity): a server with no user in the room gets a 403, not
+/// the room's history. The member keeps full service through the same
+/// code path.
+#[tokio::test]
+async fn room_data_endpoints_refuse_strangers() {
+    use saltator_federation::{join_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    let peer = MockPeer::start("peer.test").await;
+    let stranger = MockPeer::start("stranger.test").await;
+    let room_id = peer.make_room(RoomVersion::V11, "charlie");
+
+    // Our server joins + imports the room — peer.test is a member on our
+    // copy (charlie lives there); stranger.test never appears in it.
+    let our_rooms = start_rooms("hs", hs_signer.clone(), dir.path()).await;
+    let client = Arc::new(FederationClient::with_base_url(
+        hs_signer.clone(),
+        peer.base_url.clone(),
+    ));
+    let resp = join_remote_room(&client, &hs_signer, "peer.test", &room_id, "@alice:hs.test")
+        .await
+        .expect("join");
+    our_rooms
+        .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+        .await
+        .expect("import");
+
+    // Two routers over the SAME room store, differing only in whose keys
+    // the KeyCache can fetch — so each caller authenticates as itself.
+    let fed_for = |base: String| {
+        Arc::new(FedState {
+            server_name: hs.clone(),
+            signer: hs_signer.clone(),
+            old_keys: Vec::<OldVerifyKey>::new(),
+            key_cache: Arc::new(KeyCache::with_base_url(base)),
+            rooms: Some(our_rooms.clone()),
+            users: None,
+            client: None,
+            edu_sink: None,
+            media: None,
+            delivery_backoff: None,
+            appservices: None,
+            txn_replay: saltator_federation::TxnReplayCache::default(),
+        })
+    };
+    let member_base = spawn(router(fed_for(peer.base_url.clone()))).await;
+    let stranger_base = spawn(router(fed_for(stranger.base_url.clone()))).await;
+
+    // Any stored event of the room will do as the probe target.
+    let event_id = our_rooms
+        .store()
+        .timeline(0, 64)
+        .unwrap()
+        .into_iter()
+        .find_map(|(_, e)| match e {
+            saltator_roomserver::SeqEntry::Event {
+                room_id: r,
+                event_id,
+            } if r == room_id => Some(event_id),
+            _ => None,
+        })
+        .expect("imported room has events");
+
+    let enc = |s: &str| {
+        s.replace('$', "%24")
+            .replace('!', "%21")
+            .replace(':', "%3A")
+    };
+    let paths = [
+        format!("/_matrix/federation/v1/event/{}", enc(&event_id)),
+        format!(
+            "/_matrix/federation/v1/backfill/{}?v={}",
+            enc(&room_id),
+            enc(&event_id)
+        ),
+        format!(
+            "/_matrix/federation/v1/event_auth/{}/{}",
+            enc(&room_id),
+            enc(&event_id)
+        ),
+    ];
+    for path in &paths {
+        let (status, body) = peer.signed_get(&member_base, "hs.test", path).await;
+        assert_eq!(status, 200, "member should be served {path}: {body}");
+
+        let (status, body) = stranger.signed_get(&stranger_base, "hs.test", path).await;
+        assert_eq!(status, 403, "stranger must be refused {path}: {body}");
+        assert_eq!(body["errcode"], "M_FORBIDDEN", "{path}: {body}");
+    }
+}

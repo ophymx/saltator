@@ -3904,19 +3904,12 @@ async fn cross_signing_upload_query_and_signatures() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let master = json!({
-        "user_id": user, "usage": ["master"],
-        "keys": {"ed25519:masterpub": "masterpub"},
-    });
-    let self_signing = json!({
-        "user_id": user, "usage": ["self_signing"],
-        "keys": {"ed25519:selfpub": "selfpub"},
-        "signatures": {&user: {"ed25519:masterpub": "sig-by-master"}},
-    });
-    let user_signing = json!({
-        "user_id": user, "usage": ["user_signing"],
-        "keys": {"ed25519:userpub": "userpub"},
-    });
+    // Real keys with a real chain: subkeys must verify against the
+    // master (L1), so the fixture signs like an actual client.
+    let master_cs = CrossSigning::generate();
+    let master = master_cs.key_json(&user, "master");
+    let self_signing = CrossSigning::generate().signed_by(&master_cs, &user, "self_signing");
+    let user_signing = CrossSigning::generate().signed_by(&master_cs, &user, "user_signing");
 
     // First upload: no UIA required.
     let (status, body) = env
@@ -4011,7 +4004,7 @@ async fn cross_signing_upload_query_and_signatures() {
                         "user_id": user, "device_id": device,
                         "signatures": {&user: {"ed25519:selfpub": "sig-by-self"}},
                     },
-                    "ed25519:masterpub": {
+                    format!("ed25519:{}", master_cs.pub_b64): {
                         "user_id": user, "usage": ["master"],
                         "signatures": {&user: {format!("ed25519:{device}"): "sig-by-device"}},
                     },
@@ -9966,6 +9959,124 @@ async fn appservice_token_is_never_admin() {
 }
 
 const WHOAMI: &str = "/_matrix/client/v3/account/whoami";
+
+/// A cross-signing identity like a real client builds: an ed25519 master
+/// key, and a helper that signs subkeys with it under the user's entity.
+struct CrossSigning {
+    pair: ruma::signatures::Ed25519KeyPair,
+    pub_b64: String,
+}
+
+impl CrossSigning {
+    fn generate() -> Self {
+        let der = ruma::signatures::Ed25519KeyPair::generate();
+        let tmp = ruma::signatures::Ed25519KeyPair::from_der(&der, "tmp".into()).unwrap();
+        let pub_b64 =
+            ruma::serde::Base64::<ruma::serde::base64::Standard>::new(tmp.public_key().to_vec())
+                .encode();
+        // Cross-signing key ids are `ed25519:<unpadded-base64-pubkey>`, so
+        // the pair's version must be the pubkey itself.
+        let pair = ruma::signatures::Ed25519KeyPair::from_der(&der, pub_b64.clone()).unwrap();
+        Self { pair, pub_b64 }
+    }
+
+    fn key_json(&self, user: &str, usage: &str) -> Value {
+        json!({
+            "user_id": user,
+            "usage": [usage],
+            "keys": { format!("ed25519:{}", self.pub_b64): self.pub_b64 },
+        })
+    }
+
+    fn signed_by(&self, signer: &CrossSigning, user: &str, usage: &str) -> Value {
+        let mut obj: ruma::CanonicalJsonObject =
+            serde_json::from_value(self.key_json(user, usage)).unwrap();
+        ruma::signatures::sign_json(user, &signer.pair, &mut obj).unwrap();
+        serde_json::to_value(&obj).unwrap()
+    }
+}
+
+/// Cross-signing subkeys must chain to the master key (security review
+/// L1): a valid master signature is accepted, a wrong-key signature and
+/// a chain with no master at all are refused.
+#[tokio::test]
+async fn cross_signing_subkeys_require_master_signature() {
+    let env = start_env().await;
+    const UPLOAD: &str = "/_matrix/client/v3/keys/device_signing/upload";
+
+    // Valid chain: master + self-signing signed by it.
+    let token = env.register("frank", "pw-12345678").await;
+    let master = CrossSigning::generate();
+    let self_signing = CrossSigning::generate();
+    let (status, body) = env
+        .req(
+            "POST",
+            UPLOAD,
+            Some(&token),
+            Some(json!({
+                "master_key": master.key_json("@frank:hs.test", "master"),
+                "self_signing_key":
+                    self_signing.signed_by(&master, "@frank:hs.test", "self_signing"),
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Signed by the wrong key: refused, and refused atomically (the
+    // master from the same request must not be stored either).
+    let token = env.register("grace", "pw-12345678").await;
+    let master = CrossSigning::generate();
+    let interloper = CrossSigning::generate();
+    let subkey = CrossSigning::generate();
+    let (status, body) = env
+        .req(
+            "POST",
+            UPLOAD,
+            Some(&token),
+            Some(json!({
+                "master_key": master.key_json("@grace:hs.test", "master"),
+                "self_signing_key":
+                    subkey.signed_by(&interloper, "@grace:hs.test", "self_signing"),
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["errcode"], "M_INVALID_SIGNATURE");
+    let stored = env
+        .users
+        .store()
+        .cross_signing_key("@grace:hs.test", "master")
+        .unwrap();
+    assert!(stored.is_none(), "rejected upload must store nothing");
+
+    // No master anywhere: nothing to chain to.
+    let token = env.register("heidi", "pw-12345678").await;
+    let lone = CrossSigning::generate();
+    let (status, body) = env
+        .req(
+            "POST",
+            UPLOAD,
+            Some(&token),
+            Some(json!({
+                "self_signing_key": lone.key_json("@heidi:hs.test", "self_signing"),
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // A master alone needs no chain.
+    let token = env.register("ivan", "pw-12345678").await;
+    let master = CrossSigning::generate();
+    let (status, body) = env
+        .req(
+            "POST",
+            UPLOAD,
+            Some(&token),
+            Some(json!({ "master_key": master.key_json("@ivan:hs.test", "master") })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
 
 /// The full appservice identity-assertion flow: ghost registration via
 /// `m.login.application_service` (no UIA), then `?user_id=` masquerading

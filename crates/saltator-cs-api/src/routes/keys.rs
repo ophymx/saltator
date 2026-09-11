@@ -316,6 +316,42 @@ pub async fn device_signing_upload(
     let master = key_of("master_key")?;
     let self_signing = key_of("self_signing_key")?;
     let user_signing = key_of("user_signing_key")?;
+    // A subkey is only as trustworthy as its chain to the master key:
+    // verify self-/user-signing uploads carry a valid master-key
+    // signature (security review 2026-08-02, L1). The effective master is
+    // the one in this request, else the stored one — with neither there
+    // is nothing a subkey could chain to.
+    if self_signing.is_some() || user_signing.is_some() {
+        let effective_master: Option<ruma::CanonicalJsonObject> = match &master {
+            Some(bytes) => serde_json::from_slice(bytes).ok(),
+            None => state
+                .users
+                .store()
+                .cross_signing_key(auth.user_id.as_str(), "master")
+                .map_err(ApiError::internal)?
+                .and_then(|b| serde_json::from_slice(&b).ok()),
+        };
+        let Some(effective_master) = effective_master else {
+            return Err(ApiError::bad_json(
+                "self_signing_key/user_signing_key without a master key to chain to",
+            ));
+        };
+        for (field, key) in [
+            ("self_signing_key", &self_signing),
+            ("user_signing_key", &user_signing),
+        ] {
+            let Some(bytes) = key else { continue };
+            let subkey: ruma::CanonicalJsonObject = serde_json::from_slice(bytes)
+                .map_err(|e| ApiError::bad_json(format!("{field}: {e}")))?;
+            if !subkey_signed_by_master(auth.user_id.as_str(), &effective_master, &subkey) {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "M_INVALID_SIGNATURE",
+                    format!("{field} is not signed by the master key"),
+                ));
+            }
+        }
+    }
     if master.is_some() || self_signing.is_some() || user_signing.is_some() {
         state
             .users
@@ -326,6 +362,56 @@ pub async fn device_signing_upload(
             .broadcast_update(auth.user_id.as_str(), &auth.device_id, false);
     }
     Ok(axum::Json(json!({})))
+}
+
+/// Whether `subkey` carries a valid ed25519 signature by one of
+/// `master`'s keys, under `signatures[user_id][ed25519:<master key id>]`
+/// (the cross-signing chain the spec defines). Canonicalisation drops
+/// `signatures`/`unsigned`, exactly as event signing does.
+fn subkey_signed_by_master(
+    user_id: &str,
+    master: &ruma::CanonicalJsonObject,
+    subkey: &ruma::CanonicalJsonObject,
+) -> bool {
+    use ruma::signatures::{to_canonical_json_string_for_signing, verify_canonical_json_bytes};
+    use ruma::CanonicalJsonValue as V;
+
+    let Ok(message) = to_canonical_json_string_for_signing(subkey) else {
+        return false;
+    };
+    let Some(V::Object(master_keys)) = master.get("keys") else {
+        return false;
+    };
+    let Some(V::Object(sig_map)) = subkey.get("signatures") else {
+        return false;
+    };
+    let Some(V::Object(user_sigs)) = sig_map.get(user_id) else {
+        return false;
+    };
+    let decode = |s: &str| ruma::serde::Base64::<ruma::serde::base64::Standard>::parse(s).ok();
+    for (key_id, pubkey) in master_keys {
+        if !key_id.starts_with("ed25519:") {
+            continue;
+        }
+        let V::String(pubkey) = pubkey else { continue };
+        let Some(V::String(sig)) = user_sigs.get(key_id) else {
+            continue;
+        };
+        let (Some(pubkey), Some(sig)) = (decode(pubkey), decode(sig)) else {
+            continue;
+        };
+        if verify_canonical_json_bytes(
+            &ruma::SigningKeyAlgorithm::Ed25519,
+            pubkey.as_bytes(),
+            sig.as_bytes(),
+            message.as_bytes(),
+        )
+        .is_ok()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// `POST /keys/signatures/upload`: merge new signatures into the caller's
