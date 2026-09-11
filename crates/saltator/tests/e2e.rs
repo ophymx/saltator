@@ -63,18 +63,23 @@ fn free_port() -> u16 {
 }
 
 /// The single-node config every e2e test shares, maintained once.
-/// `metrics_port` adds the metrics listener line; everything else is the
-/// same node shape.
+/// `metrics_port` adds the metrics listener line; `appservice_dir`
+/// points `[client]` at a registration directory; everything else is
+/// the same node shape.
 fn write_config(
     dir: &tempfile::TempDir,
     server_name: &str,
     client_port: u16,
     metrics_port: Option<u16>,
+    appservice_dir: Option<&std::path::Path>,
 ) -> std::path::PathBuf {
     let internal_port = free_port();
     let federation_port = free_port();
     let metrics_line = metrics_port
         .map(|p| format!("metrics = \"127.0.0.1:{p}\"\n"))
+        .unwrap_or_default();
+    let appservice_line = appservice_dir
+        .map(|p| format!("appservice_registration_dir = \"{}\"\n", p.display()))
         .unwrap_or_default();
     let config_path = dir.path().join("saltator.toml");
     std::fs::write(
@@ -95,7 +100,7 @@ federation = "127.0.0.1:{federation_port}"
 {metrics_line}
 [client]
 default_room_version = "12"
-"#,
+{appservice_line}"#,
             data = dir.path().join("data").display(),
         ),
     )
@@ -138,7 +143,7 @@ async fn register(client: &reqwest::Client, base: &str, user: &str, password: &s
 async fn two_element_shaped_users_chat_and_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
     let client_port = free_port();
-    let config_path = write_config(&dir, "e2e.test", client_port, None);
+    let config_path = write_config(&dir, "e2e.test", client_port, None, None);
 
     let mut node = Node::spawn(&config_path, client_port);
     node.wait_ready().await;
@@ -269,7 +274,7 @@ async fn metrics_listener_exports_a_running_node() {
     let dir = tempfile::tempdir().unwrap();
     let client_port = free_port();
     let metrics_port = free_port();
-    let config_path = write_config(&dir, "metrics.test", client_port, Some(metrics_port));
+    let config_path = write_config(&dir, "metrics.test", client_port, Some(metrics_port), None);
 
     let mut node = Node::spawn(&config_path, client_port);
     node.wait_ready().await;
@@ -354,5 +359,174 @@ async fn metrics_listener_exports_a_running_node() {
         );
     }
 
+    node.stop();
+}
+
+/// A registered appservice against the real daemon: registration file
+/// loading in main, ghost registration + masquerade through the wire,
+/// the ping round trip, and the outbound push worker delivering a
+/// transaction (with the `hs_token`) to the AS's listener.
+#[tokio::test]
+async fn appservice_bridge_against_a_running_node() {
+    use axum::extract::{Path as AxPath, State as AxState};
+
+    // The stub bridge: records transactions and pings.
+    type Log = std::sync::Arc<tokio::sync::Mutex<Vec<(String, Value, Option<String>)>>>;
+    let txns: Log = Default::default();
+    let pings: Log = Default::default();
+    async fn put_txn(
+        AxState((txns, _)): AxState<(Log, Log)>,
+        AxPath(txn_id): AxPath<String>,
+        headers: axum::http::HeaderMap,
+        axum::Json(body): axum::Json<Value>,
+    ) -> axum::Json<Value> {
+        let bearer = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(str::to_owned);
+        txns.lock().await.push((txn_id, body, bearer));
+        axum::Json(json!({}))
+    }
+    async fn post_ping(
+        AxState((_, pings)): AxState<(Log, Log)>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> axum::Json<Value> {
+        pings.lock().await.push((String::new(), body, None));
+        axum::Json(json!({}))
+    }
+    let app = axum::Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            axum::routing::put(put_txn),
+        )
+        .route("/_matrix/app/v1/ping", axum::routing::post(post_ping))
+        .with_state((txns.clone(), pings.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // A real registration file, as a bridge would ship it.
+    let dir = tempfile::tempdir().unwrap();
+    let as_dir = dir.path().join("appservices");
+    std::fs::create_dir_all(&as_dir).unwrap();
+    std::fs::write(
+        as_dir.join("bridge.yaml"),
+        format!(
+            concat!(
+                "id: bridge\n",
+                "url: {url}\n",
+                "as_token: e2e-as-token\n",
+                "hs_token: e2e-hs-token\n",
+                "sender_localpart: bridgebot\n",
+                "namespaces:\n",
+                "  users:\n",
+                "  - exclusive: true\n",
+                "    regex: '@tg_.*'\n",
+            ),
+            url = stub_url
+        ),
+    )
+    .unwrap();
+
+    let client_port = free_port();
+    let config_path = write_config(&dir, "as.test", client_port, None, Some(&as_dir));
+    let mut node = Node::spawn(&config_path, client_port);
+    node.wait_ready().await;
+    let http = reqwest::Client::new();
+    let base = node.base.clone();
+
+    // Ping: the daemon can reach the bridge.
+    let resp: Value = http
+        .post(format!("{base}/_matrix/client/v1/appservice/bridge/ping"))
+        .bearer_auth("e2e-as-token")
+        .json(&json!({"transaction_id": "hello"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resp["duration_ms"].is_u64(), "{resp}");
+    assert_eq!(pings.lock().await.len(), 1);
+
+    // Ghost + room + a masqueraded message.
+    let resp: Value = http
+        .post(format!("{base}/_matrix/client/v3/register"))
+        .bearer_auth("e2e-as-token")
+        .json(&json!({"type": "m.login.application_service", "username": "tg_alice"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["user_id"], "@tg_alice:as.test", "{resp}");
+    let room: Value = http
+        .post(format!("{base}/_matrix/client/v3/createRoom"))
+        .bearer_auth("e2e-as-token")
+        .json(&json!({"invite": ["@tg_alice:as.test"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let room_id = room["room_id"].as_str().unwrap().to_owned();
+    let room_enc = room_id.replace('!', "%21").replace(':', "%3A");
+    let st = http
+        .post(format!(
+            "{base}/_matrix/client/v3/rooms/{room_enc}/join?user_id=@tg_alice:as.test"
+        ))
+        .bearer_auth("e2e-as-token")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert!(st.status().is_success(), "{}", st.text().await.unwrap());
+    let sent: Value = http
+        .put(format!(
+            "{base}/_matrix/client/v3/rooms/{room_enc}/send/m.room.message/t1?user_id=@tg_alice:as.test&ts=4242"
+        ))
+        .bearer_auth("e2e-as-token")
+        .json(&json!({"msgtype": "m.text", "body": "over the bridge"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let event_id = sent["event_id"].as_str().unwrap().to_owned();
+
+    // The push worker (leader-gated, durable cursor) delivers it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let txns = txns.lock().await;
+        if let Some((_, body, bearer)) = txns.iter().find(|(_, body, _)| {
+            body["events"]
+                .as_array()
+                .is_some_and(|evs| evs.iter().any(|e| e["event_id"] == event_id.as_str()))
+        }) {
+            assert_eq!(bearer.as_deref(), Some("e2e-hs-token"));
+            let ev = body["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["event_id"] == event_id.as_str())
+                .unwrap();
+            assert_eq!(ev["content"]["body"], "over the bridge");
+            assert_eq!(ev["sender"], "@tg_alice:as.test");
+            assert_eq!(ev["origin_server_ts"], 4242, "?ts massaging held");
+            break;
+        }
+        drop(txns);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "transaction never reached the bridge"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     node.stop();
 }

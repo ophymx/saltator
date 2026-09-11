@@ -458,6 +458,15 @@ pub enum UserCommand {
         device_id: String,
         display_name: Option<String>,
     },
+    /// Create-or-rename a token-less device (appservice device
+    /// management, spec v1.17: `PUT /devices/{id}` *creates* for an AS).
+    /// `ts` rides in the command — apply must not read clocks.
+    UpsertDevice {
+        user_id: String,
+        device_id: String,
+        display_name: Option<String>,
+        ts: u64,
+    },
     /// `None` = leave unchanged; `Some(None)` = unset.
     SetProfile {
         user_id: String,

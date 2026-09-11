@@ -129,9 +129,31 @@ where
 pub struct Auth {
     pub user_id: OwnedUserId,
     pub device_id: String,
-    /// Authenticated with an application service's `as_token` — unlocks
-    /// AS-only abilities (`?ts` timestamp massaging).
-    pub appservice: bool,
+    /// Set when the caller authenticated with an application service's
+    /// `as_token` — unlocks the AS-only abilities (`?user_id=`
+    /// masquerading resolved here in the extractor, `?ts` massaging, the
+    /// UIA exemptions) and identifies which AS for namespace decisions.
+    pub appservice: Option<Arc<saltator_appservice::AppServiceRegistration>>,
+    /// An appservice acting as a namespaced user rather than its own
+    /// sender (`?user_id=` was present and differed). Only meaningful
+    /// when `appservice` is set; decides the `rate_limited` question.
+    pub masquerade: bool,
+}
+
+impl Auth {
+    pub fn is_appservice(&self) -> bool {
+        self.appservice.is_some()
+    }
+
+    /// Whether this caller skips rate limiting: the AS sender always
+    /// does; masqueraded users do iff the registration opted out with
+    /// `rate_limited: false`.
+    pub fn rate_limit_exempt(&self) -> bool {
+        match &self.appservice {
+            Some(reg) => !self.masquerade || !reg.rate_limited,
+            None => false,
+        }
+    }
 }
 
 impl FromRequestParts<Arc<CsState>> for Auth {
@@ -142,21 +164,10 @@ impl FromRequestParts<Arc<CsState>> for Auth {
         state: &Arc<CsState>,
     ) -> Result<Self, Self::Rejection> {
         let token = token_from_parts(parts).ok_or_else(ApiError::missing_token)?;
-        // An appservice token authenticates as the AS's sender user (its
-        // devices are virtual — a stable synthetic id keeps txn scoping
-        // working). Checked first: AS tokens live in config, not the user
-        // shard.
-        if let Some(reg) = state.appservices.iter().find(|a| a.as_token == token) {
-            let user_id = OwnedUserId::try_from(format!(
-                "@{}:{}",
-                reg.sender_localpart, state.config.server_name
-            ))
-            .map_err(|_| ApiError::unknown_token())?;
-            return Ok(Auth {
-                user_id,
-                device_id: format!("appservice_{}", reg.sender_localpart),
-                appservice: true,
-            });
+        // Appservice tokens are checked first: they live in config, not
+        // the user shard.
+        if let Some(reg) = state.appservices.by_token(&token) {
+            return appservice_auth(parts, state, reg.clone());
         }
         let (user_id, device_id) = state
             .users
@@ -166,9 +177,134 @@ impl FromRequestParts<Arc<CsState>> for Auth {
         Ok(Auth {
             user_id,
             device_id,
-            appservice: false,
+            appservice: None,
+            masquerade: false,
         })
     }
+}
+
+/// Resolve an `as_token`-authenticated request to its effective identity
+/// (the spec's "identity assertion"): `?user_id=` masquerades as any
+/// *registered* user in the AS's namespaces, `?device_id=` as an
+/// *existing* device of that user; absent, the AS acts as its sender
+/// through a stable synthetic device (which keeps txn scoping working —
+/// the sender deliberately has no account row, config is its identity).
+fn appservice_auth(
+    parts: &Parts,
+    state: &Arc<CsState>,
+    reg: Arc<saltator_appservice::AppServiceRegistration>,
+) -> Result<Auth, ApiError> {
+    let server_name = state.config.server_name.as_str();
+    let sender = reg.sender_user(server_name);
+    let user_param = query_param(parts, "user_id");
+    let (user_id, masquerade) = match user_param {
+        None => (sender, false),
+        Some(uid) if uid == sender => (sender, false),
+        Some(uid) => {
+            if !reg.is_interested_in_user(&uid, server_name) {
+                return Err(ApiError::forbidden(
+                    "Application service cannot masquerade as this user",
+                ));
+            }
+            // Masquerading requires the ghost to exist (Synapse parity):
+            // the AS creates it via /register first.
+            if state
+                .users
+                .store()
+                .account(&uid)
+                .map_err(ApiError::internal)?
+                .is_none()
+            {
+                return Err(ApiError::forbidden(
+                    "Application service has not registered this user",
+                ));
+            }
+            (uid, true)
+        }
+    };
+    let user_id = OwnedUserId::try_from(user_id).map_err(|_| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "M_INVALID_PARAM",
+            "Invalid user_id parameter",
+        )
+    })?;
+    let device_id = match query_param(parts, "device_id") {
+        Some(device_id) => {
+            let known = state
+                .users
+                .store()
+                .device(user_id.as_str(), &device_id)
+                .map_err(ApiError::internal)?
+                .is_some();
+            if !known {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "M_UNKNOWN_DEVICE",
+                    format!("Unknown device '{device_id}' for {user_id}"),
+                ));
+            }
+            device_id
+        }
+        None => format!("appservice_{}", reg.sender_localpart),
+    };
+    Ok(Auth {
+        user_id,
+        device_id,
+        appservice: Some(reg),
+        masquerade,
+    })
+}
+
+/// The appservice authenticated by the request's token, if any — for
+/// endpoints that are AS-aware but not `Auth`-shaped (`/register`, where
+/// there is no user yet; `/login`). Never rejects: no token or a
+/// non-AS token is simply `reg: None` — the handler decides whether
+/// that is `M_MISSING_TOKEN` (nothing sent) or `M_UNKNOWN_TOKEN`
+/// (something sent, not an appservice's).
+pub struct AsAuth {
+    pub reg: Option<Arc<saltator_appservice::AppServiceRegistration>>,
+    pub token_present: bool,
+}
+
+impl AsAuth {
+    /// The registration, or the spec's 401 for the AS-only paths.
+    pub fn require(self) -> Result<Arc<saltator_appservice::AppServiceRegistration>, ApiError> {
+        match self.reg {
+            Some(reg) => Ok(reg),
+            None if self.token_present => Err(ApiError::unknown_token()),
+            None => Err(ApiError::missing_token()),
+        }
+    }
+}
+
+impl FromRequestParts<Arc<CsState>> for AsAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<CsState>,
+    ) -> Result<Self, Self::Rejection> {
+        let token = token_from_parts(parts);
+        Ok(Self {
+            token_present: token.is_some(),
+            reg: token.and_then(|t| state.appservices.by_token(&t).cloned()),
+        })
+    }
+}
+
+/// One query-string parameter, URL-decoded.
+fn query_param(parts: &Parts, name: &str) -> Option<String> {
+    let query = parts.uri.query()?;
+    for pair in query.split('&') {
+        if let Some(v) = pair
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            return Some(url_decode(v));
+        }
+    }
+    None
 }
 
 /// An authenticated caller who is also a server administrator.

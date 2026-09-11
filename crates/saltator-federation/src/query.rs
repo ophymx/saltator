@@ -69,19 +69,30 @@ pub async fn profile(
         ));
     }
 
-    // Unknown user → 404 (spec).
-    if users
-        .store()
-        .account(parsed.as_str())
-        .map_err(|e| {
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            )
-        })?
-        .is_none()
-    {
+    // Unknown user → 404 (spec) — but a user an appservice's namespaces
+    // cover is the appservice's to provision first (spec §Querying), so
+    // a bridge ghost is visible to remote servers on first reference.
+    let known = |u: &saltator_userserver::UserServer| {
+        u.store().account(parsed.as_str()).map(|a| a.is_some())
+    };
+    let mut exists = known(users).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &e.to_string(),
+        )
+    })?;
+    if !exists {
+        if let Some(asq) = &state.appservices {
+            if asq
+                .query_user(parsed.as_str(), state.server_name.as_str())
+                .await
+            {
+                exists = known(users).unwrap_or(false);
+            }
+        }
+    }
+    if !exists {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown user"));
     }
     let prof = users
@@ -134,17 +145,27 @@ pub async fn directory(
             )
         })?;
 
-    let entry = users
-        .store()
-        .alias(&alias)
-        .map_err(|e| {
+    let lookup = |u: &saltator_userserver::UserServer| {
+        u.store().alias(&alias).map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "M_UNKNOWN",
                 &e.to_string(),
             )
-        })?
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room alias"))?;
+        })
+    };
+    let mut entry = lookup(users)?;
+    // An alias inside an appservice namespace: let the AS create the
+    // portal room while the remote caller blocks, then answer.
+    if entry.is_none() {
+        if let Some(asq) = &state.appservices {
+            if asq.query_room_alias(&alias).await {
+                entry = lookup(users)?;
+            }
+        }
+    }
+    let entry =
+        entry.ok_or_else(|| err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown room alias"))?;
 
     Ok(axum::Json(serde_json::json!({
         "room_id": entry.room_id,

@@ -3115,6 +3115,7 @@ dependencies = [
  "reqwest",
  "ruma",
  "rustls",
+ "saltator-appservice",
  "saltator-cluster",
  "saltator-core",
  "saltator-cs-api",
@@ -3141,6 +3142,21 @@ version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
  "include_dir",
+]
+
+[[package]]
+name = "saltator-appservice"
+version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3188,11 +3204,13 @@ dependencies = [
  "http",
  "image",
  "jsonwebtoken",
+ "metrics",
  "postcard",
  "rand 0.8.7",
  "reqwest",
  "ruma",
  "saltator-admin-ui",
+ "saltator-appservice",
  "saltator-cluster",
  "saltator-core",
  "saltator-federation",
@@ -3226,6 +3244,7 @@ dependencies = [
  "reqwest",
  "ruma",
  "rustls",
+ "saltator-appservice",
  "saltator-core",
  "saltator-fedout",
  "saltator-media",
@@ -3496,6 +3515,19 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -4198,6 +4230,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

@@ -27,6 +27,7 @@ fn fed_state(name: &str, key_cache: KeyCache) -> Arc<FedState> {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     })
 }

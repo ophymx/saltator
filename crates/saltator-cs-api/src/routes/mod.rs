@@ -1,5 +1,6 @@
 pub mod account;
 pub mod admin;
+pub mod appservice;
 pub mod backup;
 pub mod edu;
 pub mod health;

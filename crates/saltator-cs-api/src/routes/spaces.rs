@@ -44,7 +44,9 @@ pub async fn get_room_summary(
 ) -> Result<axum::Json<Value>> {
     let user = auth.user_id.as_str();
     let room_id = if room_id_or_alias.starts_with('#') {
-        crate::routes::rooms::resolve_alias(&state, &room_id_or_alias)?.to_string()
+        crate::routes::rooms::resolve_alias(&state, &room_id_or_alias)
+            .await?
+            .to_string()
     } else {
         room_id_or_alias
     };

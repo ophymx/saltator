@@ -1,0 +1,22 @@
+[package]
+name = "saltator-appservice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# Real YAML for registration files — bridges ship these, we don't write
+# them. serde_yaml_ng is the maintained serde_yaml fork; underneath is
+# unsafe-libyaml, a mechanical Rust translation of libyaml (no C).
+serde_yaml_ng.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+axum.workspace = true

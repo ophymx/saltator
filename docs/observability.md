@@ -113,6 +113,20 @@ transactions — a batch whose local ack failed (mid-election) is re-sent
 and counts again, so during cluster unrest `outcome="ok"` can exceed
 the number of logical deliveries.
 
+### Appservice delivery
+
+| metric | type | meaning |
+| --- | --- | --- |
+| `saltator_appservice_transactions_total` | counter | transaction PUTs, by `appservice` and `outcome` |
+| `saltator_appservice_events_pushed_total` | counter | events in accepted transactions, by `appservice` |
+| `saltator_appservice_transaction_seconds` | histogram | one transaction PUT's round trip, by `appservice` |
+
+The `appservice` label is the registration's `id` — operator config,
+bounded by the files installed on disk, which is why it is allowed
+where a remote server name is not (see below). Like the federation
+counter, `transactions_total` counts wire attempts: a 500-and-retry is
+two rows under two outcomes, one logical delivery.
+
 ### Process
 
 `saltator_build_info{version}` is always 1 — the label is the payload, so

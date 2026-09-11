@@ -36,6 +36,10 @@ stack works end to end, with every exit criterion proven in CI:
   shards' Raft groups, and federation delivery latency
   ([docs/observability.md](docs/observability.md)).
 
+- **Application services**: the full v1.19 AS API for bridges and bots —
+  registration files, namespaces, masquerading, durable outbound event
+  push, query-on-miss, ping ([docs/appservices.md](docs/appservices.md)).
+
 Still pre-release: hardening remains (durable federation-out cursors,
 per-event signature verification on trusted backfill imports, an SSRF
 blocklist for URL previews), the federation Complement suite is a

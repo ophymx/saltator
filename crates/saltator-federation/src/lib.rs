@@ -107,6 +107,11 @@ pub struct FedState {
     /// clears a destination's penalty (it is provably up). `None` when no
     /// delivery worker runs.
     pub delivery_backoff: Option<Arc<crate::delivery::DeliveryBackoff>>,
+    /// Appservice query-on-miss (docs/design-appservices.md): a remote
+    /// server asking about an alias or user an appservice owns gets the
+    /// same blocking provision-then-answer as a local client. `None`
+    /// when no appservices are registered.
+    pub appservices: Option<Arc<saltator_appservice::AppServiceQuerier>>,
     /// Replay cache for inbound transactions (spec "Transactions": a
     /// repeated `(origin, txn_id)` gets the stored response without
     /// reprocessing). In-memory and bounded: PDU ingest is idempotent by
@@ -171,6 +176,7 @@ impl FedState {
             edu_sink: None,
             media: None,
             delivery_backoff: None,
+            appservices: None,
             txn_replay: TxnReplayCache::default(),
         }
     }

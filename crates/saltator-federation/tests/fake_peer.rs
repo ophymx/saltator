@@ -172,6 +172,7 @@ async fn peer_pushed_message_is_ingested() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
@@ -238,6 +239,7 @@ async fn timestamp_to_event_serves_member_servers() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
@@ -318,6 +320,7 @@ async fn state_at_event_serves_pre_event_snapshot() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
@@ -390,6 +393,7 @@ async fn key_notary_co_signs_peer_keys() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
@@ -481,6 +485,7 @@ async fn pdu_with_undelivered_prev_is_recovered_via_event_fetch() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
@@ -559,6 +564,7 @@ async fn event_citing_rejected_auth_event_is_rejected() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
@@ -822,6 +828,7 @@ async fn peer_malformed_pdu_is_rejected() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;
@@ -1157,6 +1164,7 @@ async fn inbound_pdu_from_acl_denied_server_is_dropped() {
         edu_sink: None,
         media: None,
         delivery_backoff: None,
+        appservices: None,
         txn_replay: saltator_federation::TxnReplayCache::default(),
     });
     let our_base = spawn(router(our_fed)).await;

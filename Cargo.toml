@@ -22,6 +22,7 @@ saltator-media = { path = "crates/saltator-media" }
 saltator-testsupport = { path = "crates/saltator-testsupport" }
 saltator-admin-ui = { path = "crates/saltator-admin-ui" }
 saltator-metrics = { path = "crates/saltator-metrics" }
+saltator-appservice = { path = "crates/saltator-appservice" }
 
 anyhow = "1"
 thiserror = "2"
@@ -87,6 +88,8 @@ prost = "0.13"
 tonic-build = "0.12"
 protoc-bin-vendored = "3"
 toml = "0.8"
+serde_yaml_ng = "0.10"
+regex = "1"
 include_dir = "0.7"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
