@@ -40,11 +40,16 @@ stack works end to end, with every exit criterion proven in CI:
   registration files, namespaces, masquerading, durable outbound event
   push, query-on-miss, ping ([docs/appservices.md](docs/appservices.md)).
 
-Still pre-release: hardening remains (durable federation-out cursors,
-per-event signature verification on trusted backfill imports, an SSRF
-blocklist for URL previews), the federation Complement suite is a
-tracked work-in-progress rather than a gate, and the on-disk format
-still breaks between commits without migration.
+The Complement federation suite gates CI too (92/96 top-level; the
+remaining four need room versions 6/7, which this server deliberately
+does not implement), and the on-disk format is versioned with in-place
+migrations.
+
+Still pre-release: rooms live on a single shard group (multi-shard
+routing and resharding — the M-scale work — is designed for but not
+built, so replication factor is floored at node count), guest access,
+3PIDs, and room purge are unimplemented, and there are no published
+release artifacts yet.
 
 ## Try it
 
