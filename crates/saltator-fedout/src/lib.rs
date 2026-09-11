@@ -305,7 +305,10 @@ impl FedOutStore {
     /// = never delivered (the push worker seeds from the current tip).
     pub fn as_cursor(&self, as_id: &str, room_shard: u16) -> StoreResult<Option<u64>> {
         Ok(
-            match self.read.get(T_AS_CURSOR, &as_cursor_key(as_id, room_shard))? {
+            match self
+                .read
+                .get(T_AS_CURSOR, &as_cursor_key(as_id, room_shard))?
+            {
                 Some(b) => Some(
                     postcard::from_bytes(&b)
                         .map_err(|e| StoreError::Engine(format!("as cursor decode: {e}")))?,

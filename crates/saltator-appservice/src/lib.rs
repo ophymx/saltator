@@ -247,7 +247,10 @@ fn compile_ns(
             // `^(?:…)`: anchor the start, group so alternation in the raw
             // pattern cannot escape the anchor.
             Regex::new(&format!("^(?:{})", r.regex))
-                .map(|regex| Namespace { exclusive: r.exclusive, regex })
+                .map(|regex| Namespace {
+                    exclusive: r.exclusive,
+                    regex,
+                })
                 .map_err(|source| RegistrationError::BadRegex {
                     file: file.to_owned(),
                     ns,
@@ -275,7 +278,10 @@ pub fn parse_registration(
         ("sender_localpart", &raw.sender_localpart),
     ] {
         if value.is_empty() {
-            return Err(RegistrationError::EmptyField { file: file.to_owned(), field });
+            return Err(RegistrationError::EmptyField {
+                file: file.to_owned(),
+                field,
+            });
         }
     }
     let url = match raw.url {
@@ -426,9 +432,8 @@ namespaces:
     #[test]
     fn null_and_missing_url_disable_traffic() {
         for url_line in ["url: null", "url:", ""] {
-            let text = format!(
-                "id: x\n{url_line}\nas_token: a\nhs_token: h\nsender_localpart: bot\n"
-            );
+            let text =
+                format!("id: x\n{url_line}\nas_token: a\nhs_token: h\nsender_localpart: bot\n");
             let reg = parse_registration("t.yaml", &text).unwrap();
             assert!(reg.url.is_none(), "case {url_line:?}");
         }
@@ -455,7 +460,10 @@ namespaces:
             "id: x\nurl:\nas_token: a\nhs_token: h\nsender_localpart: b\nnamespaces:\n  users:\n  - regex: '@[unclosed'\n",
         )
         .unwrap_err();
-        assert!(matches!(err, RegistrationError::BadRegex { ns: "users", .. }));
+        assert!(matches!(
+            err,
+            RegistrationError::BadRegex { ns: "users", .. }
+        ));
     }
 
     #[test]
@@ -465,9 +473,14 @@ namespaces:
             "id: a\nurl:\nas_token: ta\nhs_token: h\nsender_localpart: abot\nnamespaces:\n  users:\n  - {exclusive: true, regex: '@irc_.*'}\n  aliases:\n  - {exclusive: false, regex: '#log_.*'}\n",
         )
         .unwrap();
-        let svcs = AppServices { services: vec![std::sync::Arc::new(a)] };
+        let svcs = AppServices {
+            services: vec![std::sync::Arc::new(a)],
+        };
         assert!(!svcs.user_claimable_by_others("@irc_bob:s", "s"));
-        assert!(!svcs.user_claimable_by_others("@abot:s", "s"), "sender is always exclusive");
+        assert!(
+            !svcs.user_claimable_by_others("@abot:s", "s"),
+            "sender is always exclusive"
+        );
         assert!(svcs.user_claimable_by_others("@alice:s", "s"));
         // Non-exclusive alias namespace: others may still create there.
         assert!(svcs.alias_claimable_by_others("#log_x:s"));
@@ -485,7 +498,10 @@ namespaces:
             .unwrap();
         }
         let err = load_dir(dir.to_str().unwrap()).unwrap_err();
-        assert!(matches!(err, RegistrationError::Duplicate { what: "id", .. }));
+        assert!(matches!(
+            err,
+            RegistrationError::Duplicate { what: "id", .. }
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

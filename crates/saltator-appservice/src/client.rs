@@ -101,10 +101,7 @@ impl AppServiceClient {
 
     /// `{base}/_matrix/app/v1/{segments…}` with each segment
     /// percent-encoded (user ids and aliases carry `#`, `@`, `:`).
-    fn url(
-        reg: &AppServiceRegistration,
-        segments: &[&str],
-    ) -> Option<reqwest::Url> {
+    fn url(reg: &AppServiceRegistration, segments: &[&str]) -> Option<reqwest::Url> {
         let base = reg.url.as_deref()?;
         let mut url = reqwest::Url::parse(base).ok()?;
         {

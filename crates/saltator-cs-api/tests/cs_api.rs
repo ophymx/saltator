@@ -250,9 +250,8 @@ async fn start_env_full_fedout(
         None => state,
     };
     let fedout = if with_fedout {
-        let engine: Arc<dyn saltator_store::KvEngine> = Arc::new(
-            saltator_store::RocksEngine::open(&dir.path().join("fedout")).unwrap(),
-        );
+        let engine: Arc<dyn saltator_store::KvEngine> =
+            Arc::new(saltator_store::RocksEngine::open(&dir.path().join("fedout")).unwrap());
         let fedout = saltator_fedout::FedOutServer::start(
             1,
             engine,
@@ -10125,7 +10124,12 @@ async fn appservice_login_mints_real_session() {
         "identifier": {"type": "m.id.user", "user": "tg_alice"},
     });
     let (status, _) = env
-        .req("POST", "/_matrix/client/v3/login", None, Some(login_body.clone()))
+        .req(
+            "POST",
+            "/_matrix/client/v3/login",
+            None,
+            Some(login_body.clone()),
+        )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
@@ -10221,7 +10225,8 @@ async fn start_stub_as() -> StubAs {
             .and_then(|s| s.strip_prefix("Bearer "))
             .map(str::to_owned);
         txns.lock().await.push((txn_id, body, bearer));
-        if fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        if fail
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
@@ -10295,10 +10300,11 @@ async fn start_stub_as() -> StubAs {
         AxState((_, _, _, pings)): AxState<Shared>,
         axum::Json(body): axum::Json<Value>,
     ) -> axum::Json<Value> {
-        pings
-            .lock()
-            .await
-            .push(body.get("transaction_id").and_then(|v| v.as_str()).map(str::to_owned));
+        pings.lock().await.push(
+            body.get("transaction_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+        );
         axum::Json(json!({}))
     }
 
@@ -10307,8 +10313,14 @@ async fn start_stub_as() -> StubAs {
             "/_matrix/app/v1/transactions/{txn_id}",
             axum::routing::put(put_txn),
         )
-        .route("/_matrix/app/v1/rooms/{alias}", axum::routing::get(get_room))
-        .route("/_matrix/app/v1/users/{user_id}", axum::routing::get(get_user))
+        .route(
+            "/_matrix/app/v1/rooms/{alias}",
+            axum::routing::get(get_room),
+        )
+        .route(
+            "/_matrix/app/v1/users/{user_id}",
+            axum::routing::get(get_user),
+        )
         .route("/_matrix/app/v1/ping", axum::routing::post(post_ping))
         .with_state(shared.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10445,9 +10457,9 @@ async fn appservice_push_delivers_and_retries() {
     let hello_txn = loop {
         let txns = stub.transactions.lock().await;
         let hit = txns.iter().find(|(_, body, _)| {
-            body["events"].as_array().is_some_and(|evs| {
-                evs.iter().any(|e| e["event_id"] == hello_event.as_str())
-            })
+            body["events"]
+                .as_array()
+                .is_some_and(|evs| evs.iter().any(|e| e["event_id"] == hello_event.as_str()))
         });
         if let Some((txn_id, body, bearer)) = hit {
             break (txn_id.clone(), body.clone(), bearer.clone());
@@ -10472,8 +10484,7 @@ async fn appservice_push_delivers_and_retries() {
     assert_eq!(ev["content"]["body"], "bridged hello");
 
     // A 500 is retried: same transaction id, same events.
-    stub.fail_next
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    stub.fail_next.store(1, std::sync::atomic::Ordering::SeqCst);
     let (status, body) = env
         .req(
             "PUT",
@@ -10491,9 +10502,9 @@ async fn appservice_push_delivers_and_retries() {
         let attempts: Vec<_> = txns
             .iter()
             .filter(|(_, body, _)| {
-                body["events"].as_array().is_some_and(|evs| {
-                    evs.iter().any(|e| e["event_id"] == second_event.as_str())
-                })
+                body["events"]
+                    .as_array()
+                    .is_some_and(|evs| evs.iter().any(|e| e["event_id"] == second_event.as_str()))
             })
             .collect();
         if attempts.len() >= 2 {
@@ -10508,10 +10519,7 @@ async fn appservice_push_delivers_and_retries() {
             break;
         }
         drop(txns);
-        assert!(
-            std::time::Instant::now() < deadline,
-            "retry never arrived"
-        );
+        assert!(std::time::Instant::now() < deadline, "retry never arrived");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -10612,7 +10620,10 @@ async fn appservice_ping_round_trip() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["duration_ms"].is_u64(), "{body}");
-    assert_eq!(stub.pings.lock().await.as_slice(), &[Some("meow".to_owned())]);
+    assert_eq!(
+        stub.pings.lock().await.as_slice(),
+        &[Some("meow".to_owned())]
+    );
 
     let (status, _) = env
         .req(

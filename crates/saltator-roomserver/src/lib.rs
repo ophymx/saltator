@@ -468,8 +468,15 @@ impl RoomServer {
         content: serde_json::Value,
         ts: u64,
     ) -> Result<Outcome> {
-        self.send_local(room_id, sender, event_type, Some(state_key), content, Some(ts))
-            .await
+        self.send_local(
+            room_id,
+            sender,
+            event_type,
+            Some(state_key),
+            content,
+            Some(ts),
+        )
+        .await
     }
 
     /// Build, sign, and send a local message (non-state) event.

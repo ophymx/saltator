@@ -746,4 +746,3 @@ impl saltator_shard::migrate::MigrationGate for UserMigrationGate {
         true
     }
 }
-

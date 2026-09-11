@@ -132,7 +132,9 @@ pub async fn register(
             .appservices
             .user_claimable_by_others(user_id.as_str(), state.config.server_name.as_str())
         {
-            return Err(exclusive("This user ID is reserved by an application service"));
+            return Err(exclusive(
+                "This user ID is reserved by an application service",
+            ));
         }
     }
     // The UIA session is bound to the account being created, so a flow
@@ -285,7 +287,9 @@ pub async fn register_available(
         .appservices
         .user_claimable_by_others(user_id.as_str(), state.config.server_name.as_str())
     {
-        return Err(exclusive("This user ID is reserved by an application service"));
+        return Err(exclusive(
+            "This user ID is reserved by an application service",
+        ));
     }
     Ok(Ra(get_username_availability::v3::Response::new(true)))
 }

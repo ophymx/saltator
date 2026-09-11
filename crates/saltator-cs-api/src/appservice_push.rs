@@ -137,12 +137,19 @@ async fn deliver_to(
     reg: &Arc<AppServiceRegistration>,
 ) -> Result<(), String> {
     let store = fedout.store();
-    let mut cursor = match store.as_cursor(&reg.id, ROOM_SHARD).map_err(|e| e.to_string())? {
+    let mut cursor = match store
+        .as_cursor(&reg.id, ROOM_SHARD)
+        .map_err(|e| e.to_string())?
+    {
         Some(c) => c,
         None => {
             // First contact: seed at the current tip. History predating
             // the registration is not replayed at a bridge.
-            let tip = state.rooms.shard_handle().seq().map_err(|e| e.to_string())?;
+            let tip = state
+                .rooms
+                .shard_handle()
+                .seq()
+                .map_err(|e| e.to_string())?;
             fedout
                 .advance_as_cursor(&reg.id, ROOM_SHARD, tip)
                 .await
@@ -186,7 +193,14 @@ async fn deliver_to(
             if raw_type(&raw) == Some("m.room.member") {
                 member_interest.remove(room_id);
             }
-            if !interested(state, reg, room_id, &raw, &mut member_interest, &mut room_aliases)? {
+            if !interested(
+                state,
+                reg,
+                room_id,
+                &raw,
+                &mut member_interest,
+                &mut room_aliases,
+            )? {
                 continue;
             }
             let meta = room_util::room_meta(&state.rooms, room_id).map_err(|e| e.message)?;
@@ -298,12 +312,7 @@ fn interested(
             Some(m) => m,
             None => {
                 let mut m: HashMap<String, Vec<String>> = HashMap::new();
-                for (alias, entry) in state
-                    .users
-                    .store()
-                    .aliases()
-                    .map_err(|e| e.to_string())?
-                {
+                for (alias, entry) in state.users.store().aliases().map_err(|e| e.to_string())? {
                     m.entry(entry.room_id).or_default().push(alias);
                 }
                 room_aliases.insert(m)

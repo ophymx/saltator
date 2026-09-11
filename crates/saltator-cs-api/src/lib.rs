@@ -27,9 +27,9 @@ use saltator_media::MediaStore;
 use saltator_roomserver::{RoomServer, ServerSigner};
 use saltator_userserver::UserServer;
 
+pub use appservice_push::spawn_appservice_push;
 pub use error::ApiError;
 pub use presence::PresenceMap;
-pub use appservice_push::spawn_appservice_push;
 pub use push_gateway::spawn_push_delivery;
 pub use ratelimit::RateLimitConfig;
 pub use typing::TypingMap;
@@ -194,8 +194,7 @@ impl CsState {
     pub fn with_appservices(mut self: Arc<Self>, appservices: Arc<AppServices>) -> Arc<Self> {
         let state = Arc::get_mut(&mut self).expect("with_appservices called on a shared CsState");
         state.appservices = appservices;
-        state.as_querier =
-            saltator_appservice::AppServiceQuerier::new(state.appservices.clone());
+        state.as_querier = saltator_appservice::AppServiceQuerier::new(state.appservices.clone());
         self
     }
 
