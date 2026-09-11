@@ -133,13 +133,23 @@ the signing key and every room this server has ever seen, and losing it is
 unrecoverable — a federated server that loses its signing key cannot be
 rebuilt from its peers.
 
+## The release job
+
+`.github/workflows/release.yml` runs on `v*` tags: amd64 builds both
+variants natively and must pass `verify.sh` (the six-distro install
+matrix and the v2 CPU-guard test) before anything publishes; arm64
+builds the baseline package under QEMU emulation (`--build-arg
+BUILD_V2=0` — the v2 variant is meaningless off x86) and is proven by
+`dpkg-deb` inspection instead of the matrix, which would multiply the
+emulation cost by six distros. The release gets all three debs plus a
+`SHA256SUMS`.
+
+QEMU is the pragmatic arm64 answer for a repo with no native arm64
+runner: a tag build can afford the hours. If a native runner ever
+appears, swap `runs-on` and drop the QEMU step — the Dockerfile itself
+is architecture-agnostic.
+
 ## Not covered
 
-- **arm64.** The builder is amd64-only. Cross-building RocksDB's C++ is the
-  work; the packaging above is architecture-agnostic apart from the v2
-  variant, which is meaningless off x86.
-- **A release job.** Nothing in `.github/workflows/ci.yml` builds these.
-  Wiring it up means running this image on a tag and attaching `dist/*.deb`
-  to the release.
 - **An apt repository.** These are standalone files; there is no signed
   suite to `apt-add-repository`.
