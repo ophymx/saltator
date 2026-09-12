@@ -19,7 +19,6 @@ use serde_json::{json, Value};
 use saltator_roomserver::hierarchy::{
     child_link_from_stripped, ordered_children, room_summary, ChildLink,
 };
-use saltator_roomserver::RoomServer;
 
 use crate::error::ApiError;
 use crate::extract::Auth;
@@ -51,14 +50,14 @@ pub async fn get_room_summary(
         room_id_or_alias
     };
 
-    let summary = room_summary(&state.rooms, &room_id)
+    let summary = room_summary(state.rooms.for_room(&room_id), &room_id)
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("Room not found."))?;
 
     // Accessible if the caller is a member, or the room is peekable (public /
     // knockable / world-readable) — otherwise it stays hidden (spec: 404).
     let current = current_state(&state.rooms, &room_id)?;
-    let membership = membership_in(&state.rooms, &current, user)?;
+    let membership = membership_in(&state.rooms, &room_id, &current, user)?;
     let peekable = matches!(
         summary.join_rule.as_str(),
         "public" | "knock" | "knock_restricted"
@@ -112,14 +111,15 @@ impl Node {
 /// the room is joinable/knockable/peekable per its join rules and history
 /// visibility (spec "GET /hierarchy", the `rooms` inclusion conditions).
 fn viewable(
-    rooms: &RoomServer,
+    rooms: &saltator_roomserver::RoomShards,
+    room_id: &str,
     current: &crate::room_util::StateMap,
     join_rule: &str,
     world_readable: bool,
     allowed_room_ids: &[String],
     user_id: &str,
 ) -> Result<bool> {
-    match membership_in(rooms, current, user_id)?.as_str() {
+    match membership_in(rooms, room_id, current, user_id)?.as_str() {
         "join" | "invite" => return Ok(true),
         _ => {}
     }
@@ -132,7 +132,7 @@ fn viewable(
                 let Ok(st) = current_state(rooms, allowed) else {
                     continue;
                 };
-                if membership_in(rooms, &st, user_id)? == "join" {
+                if membership_in(rooms, allowed, &st, user_id)? == "join" {
                     met = true;
                     break;
                 }
@@ -147,12 +147,14 @@ fn viewable(
 /// Build the node for a locally-hosted room, or `None` if this server does
 /// not host it (the federation fallback handles those).
 fn local_node(state: &CsState, room_id: &str, user_id: &str) -> Result<Option<Node>> {
-    let Some(summary) = room_summary(&state.rooms, room_id).map_err(internal)? else {
+    let Some(summary) = room_summary(state.rooms.for_room(room_id), room_id).map_err(internal)?
+    else {
         return Ok(None);
     };
     let current = current_state(&state.rooms, room_id)?;
     let viewable = viewable(
         &state.rooms,
+        room_id,
         &current,
         &summary.join_rule,
         summary.world_readable,
@@ -233,7 +235,8 @@ async fn remote_node(
             "public" | "knock" | "knock_restricted" => true,
             "restricted" => allowed.iter().any(|allowed_room| {
                 current_state(&state.rooms, allowed_room).is_ok_and(|st| {
-                    membership_in(&state.rooms, &st, user_id).is_ok_and(|m| m == "join")
+                    membership_in(&state.rooms, allowed_room, &st, user_id)
+                        .is_ok_and(|m| m == "join")
                 })
             }),
             _ => false,

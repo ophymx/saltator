@@ -127,9 +127,11 @@ Three planes, all embedded in the same binary:
 ### 4.1 Sharding model
 
 - Fixed count of **virtual shards** per keyspace, set at cluster creation
-  (default 64 room shards + 16 user shards; power of two). Virtual shards are
-  many-to-few mapped onto nodes, so rebalancing moves whole shards, never
-  individual rooms.
+  (default 16 room shards + 16 user shards; power of two — revised from 64
+  in docs/design-room-sharding.md review call 1: single-digit Raft-group
+  overhead on small clusters, and a deployment expecting more than 16
+  nodes sets 64 at creation). Virtual shards are many-to-few mapped onto
+  nodes, so rebalancing moves whole shards, never individual rooms.
 - **Room keyspace** — sharded by `hash(room_id)`. Contains: event store, room
   DAG metadata, current state and state snapshots, per-room receipts/typing,
   room aliases (by `hash(alias)` → pointer), room directory entries.

@@ -71,7 +71,12 @@ pub const LOGIN_TOKEN_LIFETIME_MS: u64 = 2 * 60 * 1000;
 pub const UIA_SESSION_TTL_MS: u64 = 15 * 60 * 1000;
 
 /// Cursor key of the room/0 → user/0 membership projection.
-const ROOM_SOURCE: &str = "room/0";
+/// Projection cursor key for one room shard's source stream. Shard 0's
+/// key is the historical `room/0`, so existing single-shard clusters
+/// keep their cursor untouched.
+fn room_source(idx: u16) -> String {
+    format!("room/{idx}")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum UserError {
@@ -1258,23 +1263,40 @@ const PROJECTION_BATCH: usize = 512;
 /// monotonic per source shard).
 pub fn spawn_membership_projection(
     users: Arc<UserServer>,
-    rooms: Arc<RoomServer>,
+    rooms: Arc<saltator_roomserver::RoomShards>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_membership_projection(&users, &rooms).await {
-            tracing::error!(error = %e, "membership projection stopped");
+        // One projection task per source shard — they share nothing but
+        // the user shard they write to, and each keeps its own durable
+        // cursor (`room/{idx}`). Dropping the JoinSet (via abort of this
+        // task) tears them all down.
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, shard) in rooms.iter() {
+            let users = users.clone();
+            let shard = shard.clone();
+            set.spawn(async move {
+                if let Err(e) = run_membership_projection(&users, idx, &shard).await {
+                    tracing::error!(error = %e, shard = idx, "membership projection stopped");
+                }
+            });
         }
+        while set.join_next().await.is_some() {}
     })
 }
 
-async fn run_membership_projection(users: &UserServer, rooms: &RoomServer) -> Result<()> {
+async fn run_membership_projection(
+    users: &UserServer,
+    shard_idx: u16,
+    rooms: &RoomServer,
+) -> Result<()> {
+    let source = room_source(shard_idx);
     // Subscribe before catching up, so nothing lands unseen between scan
     // and subscription. Lag/overflow just triggers another catch-up.
     let mut changes = rooms.subscribe();
     loop {
         // Catch up from the persisted cursor.
         loop {
-            let cursor = users.store().cursor(ROOM_SOURCE).map_err(storage_err)?;
+            let cursor = users.store().cursor(&source).map_err(storage_err)?;
             let batch = rooms
                 .store()
                 .timeline(cursor, PROJECTION_BATCH)
@@ -1292,7 +1314,7 @@ async fn run_membership_projection(users: &UserServer, rooms: &RoomServer) -> Re
                 }
             }
             users
-                .apply_room_changes(ROOM_SOURCE, upto_seq, changes_out)
+                .apply_room_changes(&source, upto_seq, changes_out)
                 .await?;
         }
         // Wait for more.
@@ -1351,10 +1373,16 @@ fn membership_change(
 
 /// Block until the projection cursor reaches `seq` (test/gateway helper
 /// for read-your-writes over the eventually consistent index).
-pub async fn wait_for_projection(users: &UserServer, seq: u64, timeout: Duration) -> Result<()> {
+pub async fn wait_for_projection(
+    users: &UserServer,
+    room_shard: u16,
+    seq: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let source = room_source(room_shard);
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if users.store().cursor(ROOM_SOURCE).map_err(storage_err)? >= seq {
+        if users.store().cursor(&source).map_err(storage_err)? >= seq {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {

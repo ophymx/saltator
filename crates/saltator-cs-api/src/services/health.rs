@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use saltator_cluster::{MetadataHandle, NodeStatus};
-use saltator_roomserver::RoomServer;
+use saltator_roomserver::RoomShards;
 use saltator_userserver::UserServer;
 
 /// Why a node is not ready. Ordered by what an operator should look at
@@ -66,7 +66,7 @@ impl NotReady {
 
 pub(crate) struct Health<'a> {
     pub users: &'a Arc<UserServer>,
-    pub rooms: &'a Arc<RoomServer>,
+    pub rooms: &'a Arc<RoomShards>,
     /// `None` in stacks without a control plane (single-node without
     /// clustering, and most test harnesses): there is then no roster to
     /// be draining in, and readiness rests on the shard checks alone.
@@ -95,8 +95,8 @@ impl Health<'_> {
                 .ok()
                 .and_then(|roster| roster.get(&meta.node_id()).map(|info| info.status))
         });
-        let shard_leaders = [self.users.shard_handle(), self.rooms.shard_handle()]
-            .iter()
+        let shard_leaders = std::iter::once(self.users.shard_handle())
+            .chain(self.rooms.iter().map(|(_, s)| s.shard_handle()))
             .all(|h| h.current_leader().is_some());
         decide(status, shard_leaders)
     }

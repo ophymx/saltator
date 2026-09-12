@@ -34,23 +34,84 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::internal(e)
 }
 
-/// Positions across the shards backing a sync response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Positions across the shards backing a sync response. `room` holds one
+/// seq per room shard, indexed by shard number
+/// (docs/design-room-sharding.md: a sync position is inherently
+/// multi-shard).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct SyncPos {
-    room: u64,
+    room: Vec<u64>,
     user: u64,
     typing: u64,
     presence: u64,
 }
 
-fn format_token(p: SyncPos) -> String {
-    format!("s{}_{}_{}_{}", p.room, p.user, p.typing, p.presence)
+impl SyncPos {
+    /// The room position for one shard; a short/empty vector reads as 0
+    /// (`SyncPos::default()` is "the beginning" for every shard).
+    fn room_at(&self, idx: u16) -> u64 {
+        self.room.get(usize::from(idx)).copied().unwrap_or(0)
+    }
 }
 
-fn parse_token(s: &str) -> Result<SyncPos> {
+/// Token wire formats. A count-1 cluster keeps the historical
+/// `s{room}_{user}_{typing}_{presence}` byte-for-byte; a multi-shard
+/// cluster — which is necessarily a NEW cluster, so no legacy token can
+/// exist there — uses `s{user}_{typing}_{presence}r{seq0.seq1.…}`. The
+/// `r` discriminates unambiguously: the legacy second field is numeric.
+fn format_token(p: &SyncPos) -> String {
+    if p.room.len() <= 1 {
+        format!(
+            "s{}_{}_{}_{}",
+            p.room.first().copied().unwrap_or(0),
+            p.user,
+            p.typing,
+            p.presence
+        )
+    } else {
+        let rooms: Vec<String> = p.room.iter().map(u64::to_string).collect();
+        format!(
+            "s{}_{}_{}r{}",
+            p.user,
+            p.typing,
+            p.presence,
+            rooms.join(".")
+        )
+    }
+}
+
+/// Parse a sync token. `room_shards` validates the vector length when
+/// known; `None` (the token-inspection helpers) accepts any.
+fn parse_token_n(s: &str, room_shards: Option<u16>) -> Result<SyncPos> {
     let body = s
         .strip_prefix('s')
         .ok_or_else(|| ApiError::invalid_param("Invalid sync token"))?;
+    if let Some((head, rooms)) = body.split_once('r') {
+        let mut parts = head.split('_').map(|p| p.parse::<u64>());
+        let (Some(Ok(user)), Some(Ok(typing)), Some(Ok(presence)), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(ApiError::invalid_param("Invalid sync token"));
+        };
+        let room: Vec<u64> = rooms
+            .split('.')
+            .map(|p| p.parse::<u64>())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| ApiError::invalid_param("Invalid sync token"))?;
+        if room_shards.is_some_and(|n| room.len() != usize::from(n)) {
+            return Err(ApiError::invalid_param("Invalid sync token"));
+        }
+        return Ok(SyncPos {
+            room,
+            user,
+            typing,
+            presence,
+        });
+    }
+    if room_shards.is_some_and(|n| n > 1) {
+        // A multi-shard cluster never minted single-seq tokens.
+        return Err(ApiError::invalid_param("Invalid sync token"));
+    }
     let mut parts = body.split('_').map(|p| p.parse::<u64>());
     match (
         parts.next(),
@@ -61,14 +122,14 @@ fn parse_token(s: &str) -> Result<SyncPos> {
     ) {
         // Three-part tokens predate the presence component; window from 0.
         (Some(Ok(room)), Some(Ok(user)), Some(Ok(typing)), None, None) => Ok(SyncPos {
-            room,
+            room: vec![room],
             user,
             typing,
             presence: 0,
         }),
         (Some(Ok(room)), Some(Ok(user)), Some(Ok(typing)), Some(Ok(presence)), None) => {
             Ok(SyncPos {
-                room,
+                room: vec![room],
                 user,
                 typing,
                 presence,
@@ -81,13 +142,14 @@ fn parse_token(s: &str) -> Result<SyncPos> {
 /// The user-shard position a sync token encodes, for endpoints that window
 /// user-shard data between two tokens (`/keys/changes`).
 pub(crate) fn token_user_seq(s: &str) -> Result<u64> {
-    Ok(parse_token(s)?.user)
+    Ok(parse_token_n(s, None)?.user)
 }
 
-/// The room-shard position a sync token encodes — clients hand `/sync`
-/// tokens to `/messages` as `from`/`to`.
-pub(crate) fn token_room_seq(s: &str) -> Result<u64> {
-    Ok(parse_token(s)?.room)
+/// The room-shard position a sync token encodes for ONE room's shard —
+/// clients hand `/sync` tokens to `/messages` as `from`/`to`, and the
+/// room in the path names the shard whose component applies.
+pub(crate) fn token_room_seq(s: &str, shard_idx: u16) -> Result<u64> {
+    Ok(parse_token_n(s, None)?.room_at(shard_idx))
 }
 
 /// Stripped-state event types served on invites.
@@ -106,7 +168,11 @@ pub async fn sync_events(
     auth: Auth,
     Ar(req): Ar<v3::Request>,
 ) -> Result<axum::response::Response> {
-    let since = req.since.as_deref().map(parse_token).transpose()?;
+    let since = req
+        .since
+        .as_deref()
+        .map(|t| parse_token_n(t, Some(state.rooms.count())))
+        .transpose()?;
     let filter = load_filter(&state, &auth, req.filter.as_ref())?;
     let timeout = req
         .timeout
@@ -123,7 +189,7 @@ pub async fn sync_events(
 
     // A since token acknowledges everything before it: drop delivered
     // to-device messages from the inbox (spec.md §5.5: drained by sync).
-    if let Some(s) = since {
+    if let Some(s) = &since {
         let inbox = state
             .users
             .store()
@@ -138,13 +204,18 @@ pub async fn sync_events(
     }
 
     // Subscribe before the first compute (no lost wakeups).
-    let mut room_rx = state.rooms.subscribe();
+    let mut room_rx: Vec<_> = state.rooms.iter().map(|(_, s)| s.subscribe()).collect();
     let mut user_rx = state.users.subscribe();
     let mut typing_rx = state.typing.subscribe();
     let mut presence_rx = state.presence.subscribe();
 
     loop {
-        let room_seq = state.rooms.shard_handle().seq().map_err(internal)?;
+        let room_seqs: Vec<u64> = state
+            .rooms
+            .iter()
+            .map(|(_, s)| s.shard_handle().seq())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(internal)?;
         // The membership index (user shard) is a projection of the room shard
         // and trails it. Classifying rooms into join/leave/invite from a stale
         // membership while showing the room-shard timeline up to `room_seq`
@@ -155,19 +226,34 @@ pub async fn sync_events(
         // so the room lands in `leave` empty and the transition is never seen.
         // Wait for the projection to reach `room_seq` first (usually already
         // there — a no-op), then read the user position after it.
-        if let Err(e) =
-            saltator_userserver::wait_for_projection(&state.users, room_seq, Duration::from_secs(5))
-                .await
-        {
-            tracing::warn!(error = %e, "sync: membership projection lagging; proceeding with stale view");
+        for (idx, seq) in room_seqs.iter().enumerate() {
+            if let Err(e) = saltator_userserver::wait_for_projection(
+                &state.users,
+                idx as u16,
+                *seq,
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                tracing::warn!(error = %e, shard = idx,
+                    "sync: membership projection lagging; proceeding with stale view");
+            }
         }
         let now_pos = SyncPos {
-            room: room_seq,
+            room: room_seqs,
             user: state.users.shard_handle().seq().map_err(internal)?,
             typing: state.typing.generation(),
             presence: state.presence.generation(),
         };
-        let resp = build_sync(&state, &auth, since, now_pos, &filter, req.full_state).await?;
+        let resp = build_sync(
+            &state,
+            &auth,
+            since.as_ref(),
+            &now_pos,
+            &filter,
+            req.full_state,
+        )
+        .await?;
         // ruma's `Rooms::is_empty` (0.24) ignores the `knock` map, so a
         // knock-only update would otherwise look empty and block the
         // long-poll until timeout — check it explicitly.
@@ -181,8 +267,10 @@ pub async fn sync_events(
         if since.is_none() || !empty || timeout.is_zero() {
             return respond(resp);
         }
+        let any_room =
+            futures_util::future::select_all(room_rx.iter_mut().map(|rx| Box::pin(rx.recv())));
         tokio::select! {
-            _ = room_rx.recv() => {}
+            _ = any_room => {}
             _ = user_rx.recv() => {}
             _ = typing_rx.recv() => {}
             _ = presence_rx.recv() => {}
@@ -349,14 +437,15 @@ fn load_filter(state: &CsState, auth: &Auth, filter: Option<&v3::Filter>) -> Res
 async fn build_sync(
     state: &CsState,
     auth: &Auth,
-    since: Option<SyncPos>,
-    now: SyncPos,
+    since: Option<&SyncPos>,
+    now: &SyncPos,
     filter: &SyncFilter,
     full_state: bool,
 ) -> Result<v3::Response> {
     let include_leave = filter.include_leave;
     let initial = since.is_none();
-    let since = since.unwrap_or_default();
+    let default_since = SyncPos::default();
+    let since = since.unwrap_or(&default_since);
     let user_id = auth.user_id.as_str();
     let store = state.users.store();
 
@@ -388,11 +477,7 @@ async fn build_sync(
                 // token (join raced the membership projection), so the
                 // window must restart from zero or the room never appears.
                 let room_initial = initial || m.seq > since.user;
-                let room_since = if room_initial {
-                    SyncPos::default()
-                } else {
-                    since
-                };
+                let room_since = if room_initial { &default_since } else { since };
                 let joined = build_joined_room(
                     state,
                     auth,
@@ -602,14 +687,15 @@ async fn build_joined_room(
     auth: &Auth,
     room_id: &ruma::RoomId,
     membership: &MembershipEntry,
-    since: SyncPos,
-    now: SyncPos,
+    since: &SyncPos,
+    now: &SyncPos,
     filter: &SyncFilter,
     full_state: bool,
     initial: bool,
 ) -> Result<v3::JoinedRoom> {
     let SyncFilter { limit, lazy, .. } = *filter;
-    let rooms = &state.rooms;
+    let shard_idx = state.rooms.index_of(room_id.as_str());
+    let rooms = state.rooms.for_room(room_id.as_str());
     let store = rooms.store();
     let Some(meta) = store.meta(room_id.as_str()).map_err(internal)? else {
         return Ok(v3::JoinedRoom::new());
@@ -620,8 +706,8 @@ async fn build_joined_room(
     let mut window = store
         .room_timeline(
             room_id.as_str(),
-            since.room,
-            Some(now.room),
+            since.room_at(shard_idx),
+            Some(now.room_at(shard_idx)),
             limit + 1,
             true,
         )
@@ -639,7 +725,7 @@ async fn build_joined_room(
             .gap_markers
             .iter()
             .copied()
-            .filter(|g| *g > since.room && *g <= now.room)
+            .filter(|g| *g > since.room_at(shard_idx) && *g <= now.room_at(shard_idx))
             .max()
         {
             window.retain(|(s, _)| *s >= gap);
@@ -652,12 +738,12 @@ async fn build_joined_room(
     if let Some((first_seq, _)) = window.first() {
         // Two-part token: window-start anchor for /messages pagination,
         // mint-time room position for /members?at= snapshots.
-        out.timeline.prev_batch = Some(format!("t{first_seq}_{}", now.room));
+        out.timeline.prev_batch = Some(format!("t{first_seq}_{}", now.room_at(shard_idx)));
     }
     let mut timeline_senders: Vec<String> = Vec::new();
     for (_, event_id) in &window {
         if let Some(mut ev) = client_event(
-            rooms,
+            &state.rooms,
             version,
             room_id.as_str(),
             event_id,
@@ -697,12 +783,12 @@ async fn build_joined_room(
             }
             at_start
         }
-        None => state_at(state, room_id.as_str(), now.room)?,
+        None => state_at(state, room_id.as_str(), now.room_at(shard_idx))?,
     };
     let base_state: StateMap = if initial || full_state {
         StateMap::new()
     } else {
-        state_at(state, room_id.as_str(), since.room)?
+        state_at(state, room_id.as_str(), since.room_at(shard_idx))?
     };
     let mut state_events = Vec::new();
     for (key, event_id) in &timeline_start_state {
@@ -716,7 +802,7 @@ async fn build_joined_room(
             continue;
         }
         if let Some(ev) = client_event(
-            rooms,
+            &state.rooms,
             version,
             room_id.as_str(),
             event_id,
@@ -733,7 +819,9 @@ async fn build_joined_room(
     let receipts = store.receipts(room_id.as_str()).map_err(internal)?;
     let mut receipt_content: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for (user, receipt_type, record) in receipts {
-        if !initial && (record.seq <= since.room || record.seq > now.room) {
+        if !initial
+            && (record.seq <= since.room_at(shard_idx) || record.seq > now.room_at(shard_idx))
+        {
             continue;
         }
         if receipt_type == "m.read.private" && user != auth.user_id.as_str() {
@@ -794,12 +882,12 @@ async fn build_joined_room(
     // Room summary: joined/invited member counts from current state.
     let mut joined_count = 0u32;
     let mut invited_count = 0u32;
-    if let Ok(current) = crate::room_util::current_state(rooms, room_id.as_str()) {
+    if let Ok(current) = crate::room_util::current_state(&state.rooms, room_id.as_str()) {
         for (event_type, state_key) in current.keys() {
             if event_type != "m.room.member" {
                 continue;
             }
-            match crate::room_util::membership_in(rooms, &current, state_key)?.as_str() {
+            match crate::room_util::membership_in_shard(rooms, &current, state_key)?.as_str() {
                 "join" => joined_count += 1,
                 "invite" => invited_count += 1,
                 _ => {}
@@ -812,8 +900,13 @@ async fn build_joined_room(
     // Unread counts: push rules evaluated over events past the user's
     // read positions. With the MSC3773 filter flag, the unthreaded total
     // narrows to the main timeline and threads report separately.
-    let unread =
-        crate::push_eval::room_unread(state, &auth.user_id, room_id.as_str(), now.room).await?;
+    let unread = crate::push_eval::room_unread(
+        state,
+        &auth.user_id,
+        room_id.as_str(),
+        now.room_at(shard_idx),
+    )
+    .await?;
     let main = if filter.unread_threads {
         unread.main
     } else {
@@ -841,7 +934,7 @@ async fn build_joined_room(
 /// The room's state map as of shard seq `at` (empty before the room
 /// existed).
 fn state_at(state: &CsState, room_id: &str, at: u64) -> Result<StateMap> {
-    let store = state.rooms.store();
+    let store = state.rooms.for_room(room_id).store();
     let Some((_, event_id)) = store
         .room_timeline(room_id, 0, Some(at), 1, true)
         .map_err(internal)?
@@ -864,7 +957,7 @@ fn build_invited_room(
     room_id: &str,
     membership: &MembershipEntry,
 ) -> Result<v3::InvitedRoom> {
-    let rooms = &state.rooms;
+    let rooms = state.rooms.for_room(room_id);
     let store = rooms.store();
     let mut events = Vec::new();
     let Some(meta) = store.meta(room_id).map_err(internal)? else {
@@ -897,7 +990,7 @@ fn build_invited_room(
     wanted.push(("m.room.member".to_owned(), membership.sender.clone()));
     for key in wanted {
         if let Some(event_id) = current.get(&key) {
-            if let Some(raw) = raw_event(rooms, event_id)? {
+            if let Some(raw) = crate::room_util::raw_event_shard(rooms, event_id)? {
                 events.push(to_raw(&stripped_event(&raw))?);
             }
         }
@@ -912,7 +1005,7 @@ fn build_invited_room(
 /// live; a remote room's stripped state was stored on the user shard by
 /// the `/send_knock` response (reusing the invite-state table).
 fn build_knocked_room(state: &CsState, auth: &Auth, room_id: &str) -> Result<v3::KnockedRoom> {
-    let rooms = &state.rooms;
+    let rooms = state.rooms.for_room(room_id);
     let store = rooms.store();
     let mut events = Vec::new();
     let Some(meta) = store.meta(room_id).map_err(internal)? else {
@@ -946,7 +1039,7 @@ fn build_knocked_room(state: &CsState, auth: &Auth, room_id: &str) -> Result<v3:
     wanted.push(("m.room.member".to_owned(), auth.user_id.to_string()));
     for key in wanted {
         if let Some(event_id) = current.get(&key) {
-            if let Some(raw) = raw_event(rooms, event_id)? {
+            if let Some(raw) = crate::room_util::raw_event_shard(rooms, event_id)? {
                 events.push(to_raw(&stripped_event(&raw))?);
             }
         }
@@ -962,12 +1055,13 @@ fn build_left_room(
     auth: &Auth,
     room_id: &str,
     membership: &MembershipEntry,
-    since: SyncPos,
-    now: SyncPos,
+    since: &SyncPos,
+    now: &SyncPos,
     filter: &SyncFilter,
     fresh: bool,
 ) -> Result<v3::LeftRoom> {
-    let rooms = &state.rooms;
+    let shard_idx = state.rooms.index_of(room_id);
+    let rooms = state.rooms.for_room(room_id);
     let store = rooms.store();
     let mut out = v3::LeftRoom::new();
     let Some(meta) = store.meta(room_id).map_err(internal)? else {
@@ -994,8 +1088,8 @@ fn build_left_room(
     let version = RoomVersion::parse(&meta.version).map_err(internal)?;
     // The timeline up to (and including) the leave event — nothing the
     // room did after the user left is theirs to see.
-    let ceiling = membership.room_seq.min(now.room);
-    let window_start = if fresh { 0 } else { since.room };
+    let ceiling = membership.room_seq.min(now.room_at(shard_idx));
+    let window_start = if fresh { 0 } else { since.room_at(shard_idx) };
     let mut window = store
         .room_timeline(room_id, window_start, Some(ceiling), filter.limit + 1, true)
         .map_err(internal)?;
@@ -1007,9 +1101,13 @@ fn build_left_room(
         out.timeline.prev_batch = Some(format!("t{first_seq}_{ceiling}"));
     }
     for (_, event_id) in &window {
-        if let Some(mut ev) =
-            client_event(rooms, version, room_id, event_id, auth.user_id.as_str())?
-        {
+        if let Some(mut ev) = client_event(
+            &state.rooms,
+            version,
+            room_id,
+            event_id,
+            auth.user_id.as_str(),
+        )? {
             let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if !type_matches(&filter.timeline_types, &filter.timeline_not_types, ty) {
                 continue;
@@ -1029,7 +1127,7 @@ fn build_left_room(
     let base_state: StateMap = if fresh {
         StateMap::new()
     } else {
-        state_at(state, room_id, since.room)?
+        state_at(state, room_id, since.room_at(shard_idx))?
     };
     let mut state_events = Vec::new();
     for (key, event_id) in &timeline_start_state {
@@ -1039,7 +1137,13 @@ fn build_left_room(
         if !type_matches(&filter.state_types, &filter.state_not_types, &key.0) {
             continue;
         }
-        if let Some(ev) = client_event(rooms, version, room_id, event_id, auth.user_id.as_str())? {
+        if let Some(ev) = client_event(
+            &state.rooms,
+            version,
+            room_id,
+            event_id,
+            auth.user_id.as_str(),
+        )? {
             state_events.push(to_raw(&ev)?);
         }
     }
@@ -1065,7 +1169,7 @@ async fn write_receipt(
     thread_id: Option<String>,
 ) -> Result<()> {
     // The receipt target must be a known event of this room.
-    let Some(raw) = raw_event(&state.rooms, event_id.as_str())? else {
+    let Some(raw) = raw_event(&state.rooms, room_id.as_str(), event_id.as_str())? else {
         return Err(ApiError::not_found("Unknown event"));
     };
     if let Some(ruma::CanonicalJsonValue::String(r)) = raw.get("room_id") {

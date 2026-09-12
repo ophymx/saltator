@@ -2,7 +2,7 @@
 # Two-node cluster smoke test (M4): start two real saltator binaries and
 # verify node 2 joins node 1's cluster and ends up hosting both shard groups.
 #
-# Node 2 only reaches "room shard ready" + "user shard ready" if node 1's
+# Node 2 only reaches "room shards ready" + "user shard ready" if node 1's
 # reconciler admitted it as a voter of the Room/0 and User/0 groups — so a
 # clean startup of node 2 proves join + placement + reconciliation end to end.
 #
@@ -76,7 +76,7 @@ for _ in $(seq 1 60); do
 done
 
 pass=1
-for marker in "metadata group ready" "room shard ready" "user shard ready"; do
+for marker in "metadata group ready" "room shards ready" "user shard ready"; do
   if ! grep -q "$marker" "$WORK/n2.log"; then
     echo "MISSING on node 2: '$marker'"; pass=0
   fi

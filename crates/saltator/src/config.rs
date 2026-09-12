@@ -226,6 +226,16 @@ pub struct ClusterConfig {
     /// default) means: bootstrap a new single-node cluster if none exists.
     #[serde(default)]
     pub seeds: Vec<String>,
+    /// Number of room shard groups, read ONLY when founding a new
+    /// cluster (default 16; power of two, 1..=1024). Immutable for the
+    /// cluster's life — the founding value is stored in cluster metadata
+    /// and shard split/merge does not exist (spec OQ-5), so a deployment
+    /// that outgrows its count migrates to a new cluster. On a joiner or
+    /// restart a differing value here is ignored with a warning: the
+    /// durable cluster config is the only truth
+    /// (docs/design-room-sharding.md).
+    #[serde(default)]
+    pub room_shards: Option<u16>,
     /// PEM certificate chain for this node's internal-RPC identity. Set
     /// together with `tls_key` and `tls_ca` to protect the control plane
     /// with mutual TLS.
@@ -318,6 +328,13 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
         let cfg: Config = toml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("parsing config {}: {e}", path.display()))?;
+        if let Some(n) = cfg.cluster.room_shards {
+            // Power of two so the hash modulus stays uniform; bounded
+            // because each group is a Raft instance on every hosting node.
+            if n == 0 || n > 1024 || !n.is_power_of_two() {
+                anyhow::bail!("cluster.room_shards must be a power of two in 1..=1024 (got {n})");
+            }
+        }
         Ok(cfg)
     }
 }
@@ -334,6 +351,11 @@ advertise = "127.0.0.1:7400"
 # Empty seeds on a fresh data dir bootstraps a new single-node cluster.
 # To join an existing cluster, list peer internal-RPC addresses here.
 seeds = []
+# Room shard groups, fixed forever at cluster creation (default 16;
+# power of two). More groups spread room-write leadership across more
+# nodes; the count can never change later (no shard split/merge), so a
+# deployment expecting to exceed 16 nodes should set 64 up front.
+# room_shards = 16
 # Mutual TLS for the internal control plane. REQUIRED for multi-node: the
 # internal listener is otherwise unauthenticated, and a node that binds it
 # to a non-loopback address refuses to start without these. Every node's
@@ -450,6 +472,7 @@ mod tests {
     fn cluster_tls(cert: bool, key: bool, ca: bool) -> ClusterConfig {
         ClusterConfig {
             seeds: vec![],
+            room_shards: None,
             tls_cert: cert.then(|| PathBuf::from("c")),
             tls_key: key.then(|| PathBuf::from("k")),
             tls_ca: ca.then(|| PathBuf::from("a")),

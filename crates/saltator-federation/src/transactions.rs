@@ -60,7 +60,7 @@ pub async fn send_transaction(
     // Trusting only the transaction origin would drop those relayed events.
     if !pdus.is_empty() {
         trust_origin_keys(&state, &auth.origin).await;
-        let rooms = state.rooms.as_ref().expect("rooms checked above");
+        let rooms = state.rooms.as_ref().expect("rooms checked above").as_ref();
         let pdu_objs: Vec<CanonicalJsonObject> = pdus
             .iter()
             .filter_map(|p| match CanonicalJsonValue::try_from(p.clone()) {
@@ -261,7 +261,7 @@ async fn apply_to_device_edu(
 /// server. `thread_id` (MSC4102) is preserved so the unthreaded-wins rule
 /// still applies at render time.
 async fn apply_receipt_edu(
-    rooms: &saltator_roomserver::RoomServer,
+    rooms: &saltator_roomserver::RoomShards,
     origin: &str,
     edu: &serde_json::Value,
 ) {
@@ -389,6 +389,13 @@ pub(crate) async fn process_pdu(
             return (None, error_result("PDU is not a JSON object"));
         }
     };
+    // Route by the PDU's own room (spec §5.4: one transaction may fan
+    // out to several room shards). A PDU that names no room and is not
+    // a v12+ create cannot be routed — or ingested — anywhere.
+    let Some((shard, _room_id)) = rooms.for_pdu(&raw) else {
+        return (None, error_result("PDU names no room"));
+    };
+    let rooms = shard.clone();
     // Best-effort event ID up front, so failures before an Outcome still
     // key into the response.
     let precomputed = rooms.pdu_event_id(&raw).map(|id| id.to_string());
@@ -511,7 +518,9 @@ async fn trust_origin_keys(state: &FedState, origin: &str) {
     let now = crate::now_ms();
     if let Ok(keys) = state.key_cache.keys_for(origin, now).await {
         if let Some(set) = keys.get(origin) {
-            rooms.trust_keys(origin, set.clone());
+            for (_, shard) in rooms.iter() {
+                shard.trust_keys(origin, set.clone());
+            }
         }
     }
 }

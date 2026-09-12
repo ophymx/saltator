@@ -324,11 +324,13 @@ async fn metrics_listener_exports_a_running_node() {
     );
     assert!(scrape.contains(r#"surface="client""#), "{scrape}");
     // Shard: both keyspaces that just took a write, labeled as spec.md §7
-    // asks — keyspace and shard.
+    // asks — keyspace and shard. A fresh cluster runs the default 16
+    // room shards and the created room hashes to one of them, so the
+    // assertion is on the label SHAPE, not a particular index.
     assert!(
-        scrape.contains(
-            r#"saltator_shard_proposals_total{keyspace="room",shard="0",outcome="local"}"#
-        ),
+        scrape.lines().any(|l| l
+            .starts_with(r#"saltator_shard_proposals_total{keyspace="room",shard=""#)
+            && l.contains(r#"outcome="local""#)),
         "{scrape}"
     );
     assert!(

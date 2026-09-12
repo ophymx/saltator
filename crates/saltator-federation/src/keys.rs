@@ -12,16 +12,16 @@ use std::sync::Mutex;
 use ruma::signatures::PublicKeyMap;
 use ruma::{CanonicalJsonObject, CanonicalJsonValue};
 
-use saltator_roomserver::RoomServer;
+use saltator_roomserver::RoomShards;
 
 /// Fetch and trust the signing keys of every server that authored one of
 /// `events`, so a following [`RoomServer::verify_pdu`] /
 /// [`RoomServer::verify_pdu_at`] can check each event's signature.
 /// Best-effort per server: a failed key fetch simply leaves that server
 /// untrusted, so its events won't verify (fail closed).
-pub async fn trust_event_servers(
+pub async fn trust_event_servers_on(
     key_cache: &KeyCache,
-    rooms: &RoomServer,
+    shard: &saltator_roomserver::RoomServer,
     events: &[CanonicalJsonObject],
 ) {
     let now = crate::now_ms();
@@ -36,7 +36,34 @@ pub async fn trust_event_servers(
     for server in &servers {
         if let Ok(keys) = key_cache.keys_for(server, now).await {
             if let Some(set) = keys.get(server.as_str()) {
-                rooms.trust_keys(server, set.clone());
+                shard.trust_keys(server, set.clone());
+            }
+        }
+    }
+}
+
+pub async fn trust_event_servers(
+    key_cache: &KeyCache,
+    rooms: &RoomShards,
+    events: &[CanonicalJsonObject],
+) {
+    let now = crate::now_ms();
+    let mut servers: BTreeSet<String> = BTreeSet::new();
+    for ev in events {
+        if let Some(CanonicalJsonValue::String(sender)) = ev.get("sender") {
+            if let Ok(uid) = ruma::UserId::parse(sender) {
+                servers.insert(uid.server_name().to_string());
+            }
+        }
+    }
+    for server in &servers {
+        if let Ok(keys) = key_cache.keys_for(server, now).await {
+            if let Some(set) = keys.get(server.as_str()) {
+                // Server keys are server-wide, but each shard verifies
+                // with its own trusted set — seed them all.
+                for (_, shard) in rooms.iter() {
+                    shard.trust_keys(server, set.clone());
+                }
             }
         }
     }

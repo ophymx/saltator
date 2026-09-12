@@ -43,6 +43,7 @@ pub async fn backfill(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
+    let rooms = rooms.for_room(&room_id).clone();
     // `v` repeats (the events to backfill from); `limit` is a single int.
     let mut start = Vec::new();
     let mut limit = 10usize;
@@ -111,6 +112,11 @@ pub async fn event(
 ) -> FedResult {
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
+    };
+    // No room in the path: probe the groups for the event (bounded
+    // point reads), then everything below is single-shard as before.
+    let Some(rooms) = rooms.for_event(&event_id).cloned() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Event not found"));
     };
     let stored = rooms
         .store()
@@ -185,6 +191,7 @@ async fn state_common(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
+    let rooms = rooms.for_room(room_id).clone();
     let internal = |e: &dyn std::fmt::Display| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -278,6 +285,7 @@ pub async fn timestamp_to_event(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
+    let rooms = rooms.for_room(&room_id).clone();
     let in_room = rooms.server_in_room(&room_id, &auth.origin).map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -341,6 +349,7 @@ pub async fn get_missing_events(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
+    let rooms = rooms.for_room(&room_id).clone();
     let body: serde_json::Value = auth.json().map_err(|_| {
         err(
             StatusCode::BAD_REQUEST,

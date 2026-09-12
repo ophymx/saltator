@@ -110,7 +110,7 @@ async fn slow_destination_does_not_stall_healthy_ones() {
     let client = Arc::new(FederationClient::with_base_url(signer.clone(), mock));
     let worker = spawn_delivery_worker(
         fedout.clone(),
-        rooms.clone(),
+        saltator_roomserver::RoomShards::single(rooms.clone()),
         client,
         hs,
         Arc::new(DeliveryBackoff::default()),

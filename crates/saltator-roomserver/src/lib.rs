@@ -25,6 +25,7 @@
 mod heal;
 pub mod hierarchy;
 mod machine;
+mod shards;
 mod signer;
 mod types;
 
@@ -52,6 +53,7 @@ use saltator_shard::{ChangeRecord, NodeId, ShardHandle, ShardId, ShardRegistry, 
 use saltator_store::Keyspace;
 
 pub use machine::{RoomApp, RoomPage, RoomStore};
+pub use shards::{shard_of, RoomShards};
 pub use signer::{ServerSigner, SignError};
 pub use types::{
     AppendEvent, ChangePayload, ReceiptCmd, ReceiptRecord, Rejected, RoomCommand, RoomMeta,
@@ -240,7 +242,9 @@ pub struct RoomServer {
 }
 
 impl RoomServer {
-    /// Start the room shard on this node and return the server handle.
+    /// Start room shard 0 — the whole server, pre-M-scale. Tests and
+    /// single-shard clusters live here; multi-shard boots call
+    /// [`RoomServer::start_shard`] once per group.
     pub async fn start(
         node_id: NodeId,
         stores: impl Into<saltator_store::Stores>,
@@ -249,8 +253,33 @@ impl RoomServer {
         bootstrap_addr: Option<String>,
         registry: Option<&ShardRegistry>,
     ) -> Result<Arc<Self>> {
-        let handle = ShardHandle::start(
+        Self::start_shard(
             ROOM_SHARD,
+            node_id,
+            stores,
+            signer,
+            network,
+            bootstrap_addr,
+            registry,
+        )
+        .await
+    }
+
+    /// Start one room shard group on this node
+    /// (docs/design-room-sharding.md): the same server, scoped to the
+    /// rooms whose ids hash to `shard.index`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_shard(
+        shard: ShardId,
+        node_id: NodeId,
+        stores: impl Into<saltator_store::Stores>,
+        signer: Arc<ServerSigner>,
+        network: impl RaftNetworkFactory<TypeConfig>,
+        bootstrap_addr: Option<String>,
+        registry: Option<&ShardRegistry>,
+    ) -> Result<Arc<Self>> {
+        let handle = ShardHandle::start(
+            shard,
             node_id,
             stores,
             Arc::new(RoomApp),
@@ -407,6 +436,20 @@ impl RoomServer {
         version: RoomVersion,
         content: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(OwnedRoomId, Outcome)> {
+        let (room_id, raw) = self.build_create(creator, version, content)?;
+        let outcome = self.apply_create(&room_id, version, raw).await?;
+        Ok((room_id, outcome))
+    }
+
+    /// Build and sign the create event, deriving the room id — shard-
+    /// agnostic (only the shared signer is touched), so the router can
+    /// build anywhere and apply on the hash home.
+    pub fn build_create(
+        &self,
+        creator: &UserId,
+        version: RoomVersion,
+        content: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(OwnedRoomId, CanonicalJsonObject)> {
         let mut content = content;
         content.insert("room_version".into(), version.as_str().into());
         // ≤v10: the create content names the creator (v11 removed it —
@@ -438,9 +481,21 @@ impl RoomServer {
             room_id_of(&raw)?
         };
 
+        Ok((room_id, raw))
+    }
+
+    /// Apply a signed create event built by [`Self::build_create`] — the
+    /// second half of room creation, run on the shard the derived room id
+    /// hashes to (a v12 room's id comes from the event, so the shard is
+    /// unknowable until the event exists).
+    pub async fn apply_create(
+        &self,
+        room_id: &OwnedRoomId,
+        version: RoomVersion,
+        raw: CanonicalJsonObject,
+    ) -> Result<Outcome> {
         let _guard = self.lock_room(room_id.as_str()).await;
-        let outcome = self.process(raw, version, &room_id, true, false).await?;
-        Ok((room_id, outcome))
+        self.process(raw, version, room_id, true, false).await
     }
 
     /// Build, sign, and send a local state event.

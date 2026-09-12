@@ -20,7 +20,6 @@
 use std::sync::Arc;
 
 use ruma::{RoomId, UserId};
-use saltator_roomserver::RoomServer;
 use saltator_userserver::UserServer;
 use serde::Serialize;
 use serde_json::Value;
@@ -50,7 +49,7 @@ const ACTIVE_MEMBERSHIPS: [&str; 3] = ["join", "invite", "knock"];
 
 pub(crate) struct RoomAdmin<'a> {
     pub users: &'a Arc<UserServer>,
-    pub rooms: &'a Arc<RoomServer>,
+    pub rooms: &'a Arc<saltator_roomserver::RoomShards>,
     pub server_name: &'a str,
 }
 
@@ -192,7 +191,7 @@ impl RoomAdmin<'_> {
             if event_type != "m.room.member" || !self.is_local(state_key) {
                 continue;
             }
-            let membership = room_util::membership_in(self.rooms, &state, state_key)?;
+            let membership = room_util::membership_in(self.rooms, room_id, &state, state_key)?;
             if ACTIVE_MEMBERSHIPS.contains(&membership.as_str()) {
                 all.push(state_key.clone());
             }
@@ -207,14 +206,16 @@ impl RoomAdmin<'_> {
     fn row(&self, room_id: &str) -> Result<Option<RoomRow>> {
         let Some(meta) = self
             .rooms
+            .for_room(room_id)
             .store()
             .meta(room_id)
             .map_err(ApiError::internal)?
         else {
             return Ok(None);
         };
-        let Some(summary) = saltator_roomserver::hierarchy::room_summary(self.rooms, room_id)
-            .map_err(ApiError::internal)?
+        let Some(summary) =
+            saltator_roomserver::hierarchy::room_summary(self.rooms.for_room(room_id), room_id)
+                .map_err(ApiError::internal)?
         else {
             return Ok(None);
         };
@@ -253,14 +254,42 @@ impl RoomAdmin<'_> {
             .count() as u64)
     }
 
-    /// One page of hosted rooms in room-id order.
+    /// One page of hosted rooms, shard by shard, room-id order within
+    /// each. Multi-shard continuation tokens are `{shard}:{room_id}` —
+    /// the single-shard form (bare room id) still parses for shard 0.
     pub fn list_rooms(&self, from: Option<&str>, limit: Option<usize>) -> Result<RoomList> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-        let (rows, next_from) = self
-            .rooms
-            .store()
-            .rooms(from, limit)
-            .map_err(ApiError::internal)?;
+        let (start_shard, mut shard_from): (u16, Option<String>) = match from {
+            None => (0, None),
+            Some(t) => match t.split_once(':') {
+                Some((idx, rest)) if idx.parse::<u16>().is_ok() => {
+                    (idx.parse().unwrap(), Some(rest.to_owned()))
+                }
+                _ => (0, Some(t.to_owned())),
+            },
+        };
+        let mut rows: Vec<(String, u16)> = Vec::new();
+        let mut next_from: Option<String> = None;
+        for (idx, shard) in self.rooms.iter().skip(usize::from(start_shard)) {
+            let want = limit + 1 - rows.len();
+            let (page, shard_next) = shard
+                .store()
+                .rooms(shard_from.take().as_deref(), want)
+                .map_err(ApiError::internal)?;
+            rows.extend(page.into_iter().map(|(room_id, _)| (room_id, idx)));
+            if let Some(n) = shard_next {
+                next_from = Some(format!("{idx}:{n}"));
+                break;
+            }
+            if rows.len() > limit {
+                break;
+            }
+        }
+        if rows.len() > limit {
+            let (over_id, over_idx) = rows[limit].clone();
+            next_from = Some(format!("{over_idx}:{over_id}"));
+            rows.truncate(limit);
+        }
         let mut out = Vec::with_capacity(rows.len());
         for (room_id, _) in rows {
             // A room row without a resolvable summary is a torn read, not
@@ -279,9 +308,10 @@ impl RoomAdmin<'_> {
         let row = self
             .row(room_id)?
             .ok_or_else(|| ApiError::not_found("This server does not host that room"))?;
-        let summary = saltator_roomserver::hierarchy::room_summary(self.rooms, room_id)
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::not_found("This server does not host that room"))?;
+        let summary =
+            saltator_roomserver::hierarchy::room_summary(self.rooms.for_room(room_id), room_id)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found("This server does not host that room"))?;
         let field = |key: &str| -> Option<String> {
             summary
                 .summary
@@ -290,8 +320,8 @@ impl RoomAdmin<'_> {
                 .map(ToOwned::to_owned)
         };
         let state = room_util::current_state(self.rooms, room_id)?;
-        let creator =
-            room_util::state_content_in(self.rooms, &state, "m.room.create")?.and_then(|c| {
+        let creator = room_util::state_content_in(self.rooms, room_id, &state, "m.room.create")?
+            .and_then(|c| {
                 c.get("creator")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
@@ -310,14 +340,19 @@ impl RoomAdmin<'_> {
 
     /// Every blocked room, hosted or not.
     pub fn list_blocked(&self) -> Result<Vec<BlockedRoomRow>> {
-        let store = self.rooms.store();
         self.users
             .store()
             .blocked_rooms()
             .map_err(ApiError::internal)?
             .into_iter()
             .map(|(room_id, b)| {
-                let hosted = store.meta(&room_id).map_err(ApiError::internal)?.is_some();
+                let hosted = self
+                    .rooms
+                    .for_room(&room_id)
+                    .store()
+                    .meta(&room_id)
+                    .map_err(ApiError::internal)?
+                    .is_some();
                 Ok(BlockedRoomRow {
                     room_id,
                     by: b.by,
@@ -361,6 +396,7 @@ impl RoomAdmin<'_> {
     ) -> Result<ShutdownReport> {
         if self
             .rooms
+            .for_room(room_id.as_str())
             .store()
             .meta(room_id.as_str())
             .map_err(ApiError::internal)?
@@ -414,6 +450,7 @@ impl RoomAdmin<'_> {
         if last_seq > 0 {
             if let Err(e) = saltator_userserver::wait_for_projection(
                 self.users,
+                self.rooms.index_of(room_id.as_str()),
                 last_seq,
                 std::time::Duration::from_secs(5),
             )

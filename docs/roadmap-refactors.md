@@ -256,6 +256,25 @@ in its layer.
 Today's `saltator-federation` is server+client fused; it splits
 mechanically once cs-api's remaining direct uses thin out.
 
+## Room sharding — M-scale phase 1 ☑ (2026-09-13)
+
+Design: docs/design-room-sharding.md (ACCEPTED, four review calls
+resolved). Landed: N room shard groups fixed at cluster founding
+(`[cluster] room_shards`, default 16 for new clusters, durable in
+cluster metadata — founding value wins over TOML with a warning);
+frozen `blake3(room_id) % N` routing with a pinned-vector test;
+`RoomShards` router with room-scoped delegates; every consumer
+generalized (sync's vector tokens — count-1 clusters keep the exact
+legacy format; per-shard membership projections with `room/{idx}`
+cursors; per-shard delivery floors over the already-shard-keyed fedout
+cursors; per-shard push gateway and AS push; multi-shard admin room
+listing with `{shard}:{room_id}` continuation tokens). The e2e,
+cluster-smoke and chaos harnesses now run the 16-shard default;
+Complement/interop stay pinned to 1 until the deliberate CI flip
+(review call 3). Phase 2 (read RPC + internal pub/sub + group
+lifecycle + checkpoint moves, the RF-floor unlock) gets its own design
+doc.
+
 ## Deferred / adjacent (not scheduled, don't lose)
 
 - **Remote-join orchestration seam**: candidate selection/failover

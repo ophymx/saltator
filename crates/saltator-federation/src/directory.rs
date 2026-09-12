@@ -23,13 +23,13 @@ type FedResult = Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<s
 /// name/topic/alias, `limit` truncates after the total count is taken.
 pub fn directory_body(
     users: &saltator_userserver::UserServer,
-    rooms: &RoomServer,
+    rooms: &saltator_roomserver::RoomShards,
     search_term: Option<&str>,
     limit: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     let mut chunks = Vec::new();
     for room_id in users.store().public_rooms().map_err(|e| e.to_string())? {
-        let Some(chunk) = public_chunk(rooms, &room_id)? else {
+        let Some(chunk) = public_chunk(rooms.for_room(&room_id), &room_id)? else {
             continue;
         };
         if let Some(term) = search_term {

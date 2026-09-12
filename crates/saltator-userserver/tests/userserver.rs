@@ -489,7 +489,10 @@ async fn membership_projection_tracks_room_shard() {
     let bob: ruma::OwnedUserId = "@bob:hs.test".try_into().unwrap();
     let remote: ruma::OwnedUserId = "@eve:elsewhere.test".try_into().unwrap();
 
-    let projection = spawn_membership_projection(env.users.clone(), env.rooms.clone());
+    let projection = spawn_membership_projection(
+        env.users.clone(),
+        saltator_roomserver::RoomShards::single(env.rooms.clone()),
+    );
 
     let (room_id, _) = env
         .rooms
@@ -517,7 +520,7 @@ async fn membership_projection_tracks_room_shard() {
         other => panic!("{other:?}"),
     };
 
-    wait_for_projection(&env.users, last, Duration::from_secs(10))
+    wait_for_projection(&env.users, 0, last, Duration::from_secs(10))
         .await
         .unwrap();
 
@@ -544,7 +547,7 @@ async fn membership_projection_tracks_room_shard() {
         Outcome::Accepted { seq, .. } => seq,
         other => panic!("{other:?}"),
     };
-    wait_for_projection(&env.users, last, Duration::from_secs(10))
+    wait_for_projection(&env.users, 0, last, Duration::from_secs(10))
         .await
         .unwrap();
     let m = env

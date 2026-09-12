@@ -520,6 +520,7 @@ async fn send_membership_with(
     // so degrade to eventual consistency rather than fail.
     if let Err(e) = saltator_userserver::wait_for_projection(
         &state.users,
+        state.rooms.index_of(room_id.as_str()),
         seq,
         std::time::Duration::from_secs(5),
     )
@@ -543,6 +544,7 @@ async fn send_membership_with(
 fn room_hosted_locally(state: &CsState, room_id: &RoomId) -> Result<(bool, bool)> {
     let meta_exists = state
         .rooms
+        .for_room(room_id.as_str())
         .store()
         .meta(room_id.as_str())
         .map_err(internal)?
@@ -608,7 +610,7 @@ async fn join_with_body(
             // one). Wait briefly, re-evaluating as room state lands,
             // before conceding; a genuine CannotGrant pays this window
             // once and then fails over exactly as before.
-            let mut changes = state.rooms.subscribe();
+            let mut changes = state.rooms.for_room(room_id.as_str()).subscribe();
             let deadline = tokio::time::Instant::now() + RESTRICTED_AUTH_RECHECK;
             loop {
                 match tokio::time::timeout_at(deadline, changes.recv()).await {
@@ -682,7 +684,13 @@ async fn local_pipeline_join(
     // Joining twice is a no-op: the existing membership event stands
     // (a fresh identical join would mint a new event ID).
     let current = current_state(&state.rooms, room_id.as_str())?;
-    if crate::room_util::membership_in(&state.rooms, &current, auth.user_id.as_str())? == "join" {
+    if crate::room_util::membership_in(
+        &state.rooms,
+        room_id.as_str(),
+        &current,
+        auth.user_id.as_str(),
+    )? == "join"
+    {
         return Ok(());
     }
     send_membership_with(
@@ -855,7 +863,12 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
         let id = saltator_core::event::event_id(ev, resp.room_version)
             .map(|i| i.to_string())
             .unwrap_or_default();
-        if critical.contains(&id) && !state.rooms.verify_pdu_at(resp.room_version, ev) {
+        if critical.contains(&id)
+            && !state
+                .rooms
+                .for_room(room_id.as_str())
+                .verify_pdu_at(resp.room_version, ev)
+        {
             return Err(ApiError::new(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "M_UNKNOWN",
@@ -867,12 +880,22 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
     let kept_state: Vec<_> = resp
         .state
         .into_iter()
-        .filter(|e| state.rooms.verify_pdu_at(resp.room_version, e))
+        .filter(|e| {
+            state
+                .rooms
+                .for_room(room_id.as_str())
+                .verify_pdu_at(resp.room_version, e)
+        })
         .collect();
     let kept_auth: Vec<_> = resp
         .auth_chain
         .into_iter()
-        .filter(|e| state.rooms.verify_pdu_at(resp.room_version, e))
+        .filter(|e| {
+            state
+                .rooms
+                .for_room(room_id.as_str())
+                .verify_pdu_at(resp.room_version, e)
+        })
         .collect();
 
     let outcome = state
@@ -884,9 +907,15 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
 
     // Read-your-writes: block until the membership projection sees the join
     // so the immediately following /sync shows the room.
-    let seq = state.rooms.shard_handle().seq().map_err(internal)?;
+    let seq = state
+        .rooms
+        .for_room(room_id.as_str())
+        .shard_handle()
+        .seq()
+        .map_err(internal)?;
     let _ = saltator_userserver::wait_for_projection(
         &state.users,
+        state.rooms.index_of(room_id.as_str()),
         seq,
         std::time::Duration::from_secs(5),
     )
@@ -919,6 +948,7 @@ pub async fn upgrade_room(
     let old_version = room_version(&room_meta(&state.rooms, &room_id)?)?;
     if !can_send_state(
         &state.rooms,
+        room_id.as_str(),
         &current,
         old_version,
         auth.user_id.as_str(),
@@ -929,10 +959,14 @@ pub async fn upgrade_room(
 
     // The replacement's create event: preserve the old room's type (and
     // other creation content) and point back at the predecessor.
-    let mut creation_content =
-        crate::room_util::state_content_in(&state.rooms, &current, "m.room.create")?
-            .and_then(|c| c.as_object().cloned())
-            .unwrap_or_default();
+    let mut creation_content = crate::room_util::state_content_in(
+        &state.rooms,
+        room_id.as_str(),
+        &current,
+        "m.room.create",
+    )?
+    .and_then(|c| c.as_object().cloned())
+    .unwrap_or_default();
     for server_managed in ["room_version", "creator", "predecessor"] {
         creation_content.remove(server_managed);
     }
@@ -983,6 +1017,7 @@ pub async fn upgrade_room(
     }
     let last_event = state
         .rooms
+        .for_room(room_id.as_str())
         .store()
         .room_timeline(&room_id, 0, None, 1, true)
         .map_err(internal)?
@@ -1030,8 +1065,12 @@ pub async fn upgrade_room(
         "m.room.server_acl",
     ];
     for event_type in TRANSFERABLE {
-        let Some(mut content) =
-            crate::room_util::state_content_in(&state.rooms, &current, event_type)?
+        let Some(mut content) = crate::room_util::state_content_in(
+            &state.rooms,
+            room_id.as_str(),
+            &current,
+            event_type,
+        )?
         else {
             continue;
         };
@@ -1108,7 +1147,7 @@ async fn project_imported_members(state: &CsState, room_id: &str, upto: u64) -> 
         if event_type != "m.room.member" {
             continue;
         }
-        let Some(raw) = crate::room_util::raw_event(&state.rooms, event_id)? else {
+        let Some(raw) = crate::room_util::raw_event(&state.rooms, room_id, event_id)? else {
             continue;
         };
         let membership = match raw.get("content") {
@@ -1409,6 +1448,7 @@ pub async fn leave_room(
     // it is a leave over federation (make_leave/send_leave).
     let hosted = state
         .rooms
+        .for_room(req.room_id.as_str())
         .store()
         .meta(req.room_id.as_str())
         .map_err(internal)?
@@ -1556,7 +1596,7 @@ fn invite_room_state(state: &CsState, room_id: &str) -> Result<Vec<serde_json::V
     let mut out = Vec::new();
     for t in TYPES {
         if let Some(event_id) = current.get(&((*t).to_owned(), String::new())) {
-            if let Some(raw) = raw_event(&state.rooms, event_id)? {
+            if let Some(raw) = raw_event(&state.rooms, room_id, event_id)? {
                 out.push(crate::room_util::stripped_event(&raw));
             }
         }
@@ -1650,8 +1690,12 @@ pub async fn kick_user(
     // that kicking someone who is not in the room (never present, or
     // already left) is forbidden.
     let current = current_state(&state.rooms, req.room_id.as_str())?;
-    let target_membership =
-        crate::room_util::membership_in(&state.rooms, &current, req.user_id.as_str())?;
+    let target_membership = crate::room_util::membership_in(
+        &state.rooms,
+        req.room_id.as_str(),
+        &current,
+        req.user_id.as_str(),
+    )?;
     if !matches!(target_membership.as_str(), "join" | "invite" | "knock") {
         return Err(ApiError::forbidden(
             "Cannot kick a user who is not in the room",
@@ -1852,7 +1896,7 @@ fn power_levels_lists_creator(
     if let Some(id) =
         current_state(&state.rooms, room_id)?.get(&("m.room.create".to_owned(), String::new()))
     {
-        if let Some(create) = raw_event(&state.rooms, id)? {
+        if let Some(create) = raw_event(&state.rooms, room_id, id)? {
             let create: serde_json::Value = serde_json::to_value(&create).map_err(internal)?;
             if let Some(s) = create.get("sender").and_then(|v| v.as_str()) {
                 creators.insert(s.to_owned());
@@ -1913,7 +1957,7 @@ pub async fn send_state_event(
     // event rather than minting a duplicate.
     if let Ok(current) = current_state(&state.rooms, req.room_id.as_str()) {
         if let Some(event_id) = current.get(&(req.event_type.to_string(), req.state_key.clone())) {
-            if let Some(raw) = raw_event(&state.rooms, event_id)? {
+            if let Some(raw) = raw_event(&state.rooms, req.room_id.as_str(), event_id)? {
                 let existing = raw
                     .get("content")
                     .and_then(|c| serde_json::to_value(c).ok())
@@ -2070,7 +2114,7 @@ pub async fn get_state_event(
         let ev = serde_json::value::to_raw_value(&ev).map_err(internal)?;
         return Ok(Ra(get_state_event_for_key::v3::Response::new(ev)));
     }
-    let raw = raw_event(&state.rooms, event_id)?
+    let raw = raw_event(&state.rooms, req.room_id.as_str(), event_id)?
         .ok_or_else(|| ApiError::not_found("State event missing"))?;
     let content = raw
         .get("content")
@@ -2194,7 +2238,7 @@ async fn remote_timestamp_to_event(
 /// returned to the client either way; this only anchors `/context`.
 async fn backfill_until_present(state: &CsState, room_id: &str, event_id: &str) {
     for _ in 0..5 {
-        match state.rooms.store().event(event_id) {
+        match state.rooms.for_room(room_id).store().event(event_id) {
             Ok(Some(_)) => return,
             Ok(None) => {}
             Err(_) => return,
@@ -2231,6 +2275,7 @@ pub async fn get_context(
     // The target must exist and belong to this room.
     let Some(target) = state
         .rooms
+        .for_room(room_id)
         .store()
         .event(req.event_id.as_str())
         .map_err(internal)?
@@ -2263,7 +2308,7 @@ pub async fn get_context(
     let total = (u64::from(req.limit) as usize).min(100);
     let before_limit = total / 2 + total % 2;
     let after_limit = total - before_limit;
-    let store = state.rooms.store();
+    let store = state.rooms.for_room(room_id).store();
 
     let mut events_before = Vec::new();
     let mut oldest = target_seq;
@@ -2330,7 +2375,7 @@ fn context_in_history(
     limit: usize,
 ) -> Result<axum::Json<serde_json::Value>> {
     let version = room_version(&room_meta(&state.rooms, room_id)?)?;
-    let store = state.rooms.store();
+    let store = state.rooms.for_room(room_id).store();
     let before_limit = limit / 2 + limit % 2;
     let after_limit = limit - before_limit;
 
@@ -2452,7 +2497,7 @@ pub async fn get_members(
     // own view ceiling).
     if let Some(at) = &req.at {
         // The token as a stream position: everything at or before it.
-        let mut seq = parse_topo_token(at)?.at_seq();
+        let mut seq = parse_topo_token(at, state.rooms.index_of(req.room_id.as_str()))?.at_seq();
         if let Some(cap) = cap {
             seq = seq.min(cap);
         }
@@ -2509,7 +2554,7 @@ pub async fn get_joined_members(
         if event_type != "m.room.member" {
             continue;
         }
-        let Some(raw) = raw_event(&state.rooms, event_id)? else {
+        let Some(raw) = raw_event(&state.rooms, req.room_id.as_str(), event_id)? else {
             continue;
         };
         let content = crate::room_util::stripped_event(&raw);
@@ -2582,8 +2627,15 @@ pub async fn get_messages(
         .transpose()?
         .unwrap_or(10)
         .clamp(1, 1000);
-    let from = query.get("from").map(|s| parse_page_pos(s)).transpose()?;
-    let to = query.get("to").map(|s| parse_page_pos(s)).transpose()?;
+    let shard_idx = state.rooms.index_of(&room_id);
+    let from = query
+        .get("from")
+        .map(|s| parse_page_pos(s, shard_idx))
+        .transpose()?;
+    let to = query
+        .get("to")
+        .map(|s| parse_page_pos(s, shard_idx))
+        .transpose()?;
     // Room event filter: `contains_url` and `lazy_load_members` are the
     // honored slices so far.
     let filter_json = query
@@ -2603,7 +2655,7 @@ pub async fn get_messages(
 
     // Tokens are exclusive bounds on the room-shard seq; history tokens
     // (`h{idx}`) address backfilled events below the local timeline floor.
-    let store = state.rooms.store();
+    let store = state.rooms.for_room(&room_id).store();
     let mut rows: Vec<(RowPos, String)> = Vec::new();
     // Set when the page ends short but more history is known to exist
     // upstream (frontier open, fetch failed or budget exhausted): the end
@@ -2807,22 +2859,26 @@ enum RowPos {
     History(u64),
 }
 
-fn parse_page_pos(token: &str) -> Result<PagePos> {
+fn parse_page_pos(token: &str, shard_idx: u16) -> Result<PagePos> {
     if let Some(idx) = token.strip_prefix('h') {
         return idx
             .parse()
             .map(PagePos::History)
             .map_err(|_| ApiError::invalid_param("Invalid pagination token"));
     }
-    parse_topo_token(token).map(PagePos::Timeline)
+    parse_topo_token(token, shard_idx).map(PagePos::Timeline)
 }
 
 /// Backfilled events predate all local state, so serving them is gated on
 /// the room's *current* history visibility rather than per-event checks.
 fn history_readable(state: &CsState, room_id: &str) -> Result<bool> {
     let current = crate::room_util::current_state(&state.rooms, room_id)?;
-    let visibility =
-        crate::room_util::state_content_in(&state.rooms, &current, "m.room.history_visibility")?;
+    let visibility = crate::room_util::state_content_in(
+        &state.rooms,
+        room_id,
+        &current,
+        "m.room.history_visibility",
+    )?;
     let visibility = visibility
         .as_ref()
         .and_then(|c| c.get("history_visibility").and_then(|v| v.as_str()))
@@ -2924,13 +2980,13 @@ impl PaginationBound {
     }
 }
 
-pub(crate) fn parse_pagination_bound(token: &str) -> Result<PaginationBound> {
-    parse_topo_token(token)
+pub(crate) fn parse_pagination_bound(token: &str, shard_idx: u16) -> Result<PaginationBound> {
+    parse_topo_token(token, shard_idx)
 }
 
-fn parse_topo_token(token: &str) -> Result<PaginationBound> {
+fn parse_topo_token(token: &str, shard_idx: u16) -> Result<PaginationBound> {
     if token.starts_with('s') {
-        let seq = crate::routes::sync::token_room_seq(token)?;
+        let seq = crate::routes::sync::token_room_seq(token, shard_idx)?;
         return Ok(PaginationBound {
             seq,
             at_event: false,
@@ -3086,15 +3142,17 @@ fn check_alias_ownership(state: &CsState, auth: &crate::extract::Auth, alias: &s
 /// creators in privileged-creator versions (v12+) always may; everyone
 /// else is measured against the power-level event.
 fn can_send_state(
-    rooms: &saltator_roomserver::RoomServer,
+    rooms: &saltator_roomserver::RoomShards,
+    room_id: &str,
     state_map: &StateMap,
     version: RoomVersion,
     user_id: &str,
     event_type: &str,
 ) -> Result<bool> {
+    let rooms = rooms.for_room(room_id);
     if version.privileged_creators() {
         if let Some(create_id) = state_map.get(&("m.room.create".to_owned(), String::new())) {
-            if let Some(raw) = raw_event(rooms, create_id)? {
+            if let Some(raw) = crate::room_util::raw_event_shard(rooms, create_id)? {
                 let sender = raw.get("sender").and_then(|v| v.as_str());
                 if sender == Some(user_id) {
                     return Ok(true);
@@ -3111,7 +3169,7 @@ fn can_send_state(
             }
         }
     }
-    let pl = state_content_in(rooms, state_map, "m.room.power_levels")?;
+    let pl = crate::room_util::state_content_in_shard(rooms, state_map, "m.room.power_levels")?;
     let Some(pl) = pl else {
         // No power-level event: auth-rule defaults (state_default 0).
         return Ok(true);
@@ -3151,6 +3209,7 @@ pub async fn delete_alias(
     if entry.creator != auth.user_id.as_str()
         && !can_send_state(
             &state.rooms,
+            &entry.room_id,
             &state_map,
             version,
             auth.user_id.as_str(),
@@ -3164,7 +3223,12 @@ pub async fn delete_alias(
     // Deleting the room's canonical alias also clears it from room state
     // (clients otherwise render a dangling alias). Best-effort: the
     // directory deletion above stands even if the state update is refused.
-    if let Some(canonical) = state_content_in(&state.rooms, &state_map, "m.room.canonical_alias")? {
+    if let Some(canonical) = state_content_in(
+        &state.rooms,
+        &entry.room_id,
+        &state_map,
+        "m.room.canonical_alias",
+    )? {
         let alias = req.room_alias.as_str();
         let mut content = canonical.as_object().cloned().unwrap_or_default();
         let was_main = content.get("alias").and_then(|a| a.as_str()) == Some(alias);
@@ -3272,6 +3336,7 @@ pub async fn set_visibility(
     let version = room_version(&meta)?;
     if !can_send_state(
         &state.rooms,
+        req.room_id.as_str(),
         &state_map,
         version,
         auth.user_id.as_str(),
