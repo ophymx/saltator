@@ -83,32 +83,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
-        run: |
-          case "$EVENT" in
-            pull_request) base="$PR_BASE" ;;
-            push)         base="$PUSH_BEFORE" ;;
-            *)            base="" ;;
-          esac
-          docs_only=false
-          if [ -n "$base" ] && git cat-file -e "$base" 2>/dev/null; then
-            # Three-dot: diff against the merge base, so a stale PR base
-            # or a fast-forward push both classify only OUR changes.
-            files=$(git diff --name-only "$base...HEAD")
-            if [ -n "$files" ]; then
-              docs_only=true
-              while IFS= read -r f; do
-                case "$f" in
-                  docs/*|*.md) ;;
-                  *) docs_only=false; break ;;
-                esac
-              done <<EOF
-          $files
-          EOF
-            fi
-            printf 'changed files:\n%s\n' "$files"
-          fi
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
-          echo "docs_only=$docs_only"
+        run: ./scripts/ci_docs_only.sh
 
   frontend:
     name: admin console (bundle)
