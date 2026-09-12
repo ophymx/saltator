@@ -987,6 +987,48 @@ impl RoomServer {
             .any(|s| s == server))
     }
 
+    /// Whether `server` has a user with a *pending invite* in the room's
+    /// current state. An invited server is not a stranger — the room
+    /// reached out to it, and it must be able to fetch the invite's
+    /// supporting events (`/event`) to ingest the invite into a copy of
+    /// the room it already hosts. Counts exactly `invite`: a ban or a
+    /// leave is not an invitation.
+    pub fn server_invited_to_room(&self, room_id: &str, server: &str) -> Result<bool> {
+        let store = self.store();
+        let Some(meta) = store
+            .meta(room_id)
+            .map_err(|e| RoomError::Storage(e.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let state = store
+            .resolve_group(room_id, meta.current_group)
+            .map_err(|e| RoomError::Storage(e.to_string()))?;
+        let suffix = format!(":{server}");
+        for ((event_type, state_key), event_id) in &state {
+            if event_type != "m.room.member" || !state_key.ends_with(&suffix) {
+                continue;
+            }
+            let Some(stored) = store
+                .event(event_id)
+                .map_err(|e| RoomError::Storage(e.to_string()))?
+            else {
+                continue;
+            };
+            let raw: serde_json::Value =
+                serde_json::from_slice(&stored.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
+            if raw
+                .get("content")
+                .and_then(|c| c.get("membership"))
+                .and_then(|m| m.as_str())
+                == Some("invite")
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Apply per-server history visibility to events about to be served
     /// over federation (`/backfill`, `/get_missing_events` — Synapse's
     /// `filter_events_for_server`): an event whose visibility at that

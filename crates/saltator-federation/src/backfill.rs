@@ -130,17 +130,23 @@ pub async fn event(
             &e.to_string(),
         )
     })?;
-    // Requester's server must be in the event's room (Synapse parity:
-    // get_persisted_pdu asserts host-in-room, then visibility-filters).
-    // A v12 create event carries no room_id on the wire; with no room to
-    // authorize against, refuse as not-found rather than leak.
+    // Requester's server must be in the event's room — or hold a pending
+    // invite into it: an invited server ingesting the invite into a room
+    // copy it already hosts fetches the invite's prev events through
+    // here, before any of its users are joined (TestUnbanViaInvite's
+    // re-invite leg). A v12 create event carries no room_id on the wire;
+    // with no room to authorize against, refuse as not-found rather than
+    // leak.
     let Some(CanonicalJsonValue::String(room_id)) = pdu.get("room_id").cloned() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Event not found"));
     };
-    if !rooms
+    let entitled = rooms
         .server_in_room(&room_id, &auth.origin)
         .unwrap_or(false)
-    {
+        || rooms
+            .server_invited_to_room(&room_id, &auth.origin)
+            .unwrap_or(false);
+    if !entitled {
         return Err(err(
             StatusCode::FORBIDDEN,
             "M_FORBIDDEN",
