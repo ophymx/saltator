@@ -1,8 +1,13 @@
 # Design: room sharding phase 2 — the data plane for unhosted shards
 
-Status: DRAFT · 2026-09-12 — five review calls open (bottom). Written
-against merged phase 1 (PR #64 + CI flip PR #65), per phase 1's review
-call 4.
+Status: ACCEPTED · 2026-09-12 — all five review calls resolved as
+recommended: land 2a (serving) then 2b (movement) separately;
+storage-level read ops under leader read-index; Subscribe carries
+server-side backfill; the `rf_cap` debug knob goes into the cluster
+harness so 2a is exercised before phase 3; leader-only remote reads
+throughout 2a (OQ-7 stays deferred, the staleness field reserved).
+Written against merged phase 1 (PR #64 + CI flip PR #65), per phase
+1's review call 4.
 
 ## Problem
 
@@ -248,7 +253,7 @@ lifecycle driver, and the reconciler (which today polls).
   the remote path in the normal test jobs via the cs_api env. The
   Complement-at-RF<N flip is phase 3's ratchet, mirroring phase 1's.
 
-## Review calls
+## Review calls (all RESOLVED as written, 2026-09-12)
 
 1. **Land as 2a → 2b, or one phase-2 PR arc?** This doc: split. 2a is
    independently verifiable (the RF floor stays either way) and 2b's

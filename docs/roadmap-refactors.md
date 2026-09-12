@@ -274,8 +274,9 @@ Complement/interop images run `room_shards = 4` (review call 3's
 ratchet — flipped in the follow-up PR once the multi-node harnesses
 were green sharded). Phase 2 (read RPC + internal pub/sub + group
 lifecycle + checkpoint moves, the RF-floor unlock) is designed in
-docs/design-room-sharding-phase2.md (DRAFT — split 2a serving / 2b
-movement; five review calls open).
+docs/design-room-sharding-phase2.md (ACCEPTED 2026-09-12, all five
+review calls resolved as recommended — lands as 2a serving, then 2b
+movement).
 
 ## Deferred / adjacent (not scheduled, don't lose)
 
