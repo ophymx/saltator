@@ -32,6 +32,13 @@ const MAX_EDUS_PER_TXN: usize = 100;
 const MAX_PDUS_PER_TXN: usize = 50;
 /// Room-timeline entries examined per scan pass.
 const SCAN_BATCH: usize = 256;
+/// Destinations sent to concurrently within one pass. Destinations are
+/// independent (their own queue, cursor, backoff entry), so the only
+/// coupling is this bound on simultaneous outbound connections. The
+/// measurement that set this: ten slow peers ahead of one healthy peer
+/// cost the healthy one 20s sequentially (tests/delivery_latency.rs) —
+/// one full slow round trip each, in destination-sort order.
+const MAX_CONCURRENT_SENDS: usize = 16;
 
 /// Per-destination retry state (in-memory: safe to lose, the durable
 /// cursors/outbox are the source of truth). Shared with the inbound
@@ -207,92 +214,127 @@ async fn deliver_pdus(
         }
     }
 
-    for (dest, queued) in queues {
-        // `acked`: the last seq durably confirmed for this destination —
-        // where the next pass must resume if we stop short.
-        let mut acked = cursors.get(&dest).copied().unwrap_or(0);
-        if !backoff.ready(&dest) {
-            new_floor = new_floor.min(acked);
-            continue;
-        }
-        let mut stopped = false;
-        for chunk in queued.chunks(MAX_PDUS_PER_TXN) {
-            let first = chunk.first().expect("non-empty chunk").0;
-            let last = chunk.last().expect("non-empty chunk").0;
-            let body = json!({
-                "origin": server_name.as_str(),
-                "origin_server_ts": crate::now_ms(),
-                "pdus": chunk.iter().map(|(_, raw)| raw).collect::<Vec<_>>(),
-            });
-            // Stable seq-range transaction id: a straight retry of the
-            // same chunk dedupes at the receiver's replay cache, while a
-            // retry that grew (new events queued behind a failure) gets a
-            // fresh id — its replay of already-ingested PDUs is idempotent
-            // by event id.
-            let txn_path = format!("/_matrix/federation/v1/send/{first}_{last}");
-            // Latency decomposition: queue_ms ≈ event creation → this PUT
-            // starting (origin apply + worker wake + any pass-in-flight
-            // wait); put_ms = the round trip (network + receiver ingest).
-            // Queue delay is taken only from events THIS server authored:
-            // a relayed event (send_join/send_leave resident) carries the
-            // remote author's origin_server_ts, and that clock's skew
-            // would poison the one histogram whose whole point is naming
-            // delays that are ours to shorten.
-            let newest_local_ots = chunk
-                .iter()
-                .rev()
-                .find(|(_, raw)| {
-                    raw.get("sender")
-                        .and_then(|s| s.as_str())
-                        .and_then(|s| ruma::UserId::parse(s).ok())
-                        .is_some_and(|u| u.server_name().as_str() == server_name.as_str())
-                })
-                .and_then(|(_, raw)| raw.get("origin_server_ts"))
-                .and_then(|t| t.as_u64());
-            let put_start = crate::now_ms();
-            match client.put(&dest, &txn_path, &body).await {
-                Ok(_) => {
-                    // Taken before the cursor advance below: put_ms claims
-                    // to be the remote round trip, and the cursor advance
-                    // is a local Raft proposal that can stall through an
-                    // election — none of that is the remote's latency.
-                    let put_ms = crate::now_ms().saturating_sub(put_start);
-                    backoff.success(&dest);
-                    acked = last;
-                    if let Err(e) = fedout.advance_pdu_cursor(room_shard, &dest, last).await {
-                        tracing::warn!(error = %e, dest, "delivery: cursor advance failed");
-                    }
-                    crate::metrics::observe_transaction("pdu", true);
-                    let queue_ms = newest_local_ots.map(|ots| put_start.saturating_sub(ots));
-                    crate::metrics::observe_pdu_transaction(
-                        queue_ms.map(Duration::from_millis),
-                        Duration::from_millis(put_ms),
-                        chunk.len(),
-                    );
-                    tracing::debug!(
-                        dest,
-                        first,
-                        last,
-                        count = chunk.len(),
-                        queue_ms,
-                        put_ms,
-                        "delivery: PDU transaction acked"
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(dest, error = %e, "delivery: PDU send failed; backing off");
-                    crate::metrics::observe_transaction("pdu", false);
-                    backoff.failure(&dest);
-                    stopped = true;
-                    break;
-                }
-            }
-        }
-        if stopped {
-            new_floor = new_floor.min(acked);
-        }
+    // Destinations fan out concurrently (bounded): they share nothing but
+    // the pass, and sequential sends made every healthy peer wait out
+    // every slow peer's round trip ahead of it — the head-of-line stall
+    // tests/delivery_latency.rs measures. Order still holds where it
+    // matters: WITHIN a destination, chunks go strictly in sequence.
+    // Each task returns `Some(acked)` when it skipped or stopped short —
+    // a floor pull-back — and `None` when its queue fully delivered.
+    use futures_util::StreamExt;
+    let pulls: Vec<Option<u64>> =
+        futures_util::stream::iter(queues.into_iter().map(|(dest, queued)| {
+            let acked = cursors.get(&dest).copied().unwrap_or(0);
+            deliver_pdus_to(
+                fedout,
+                client,
+                server_name,
+                backoff,
+                room_shard,
+                dest,
+                queued,
+                acked,
+            )
+        }))
+        .buffer_unordered(MAX_CONCURRENT_SENDS)
+        .collect()
+        .await;
+    for pull in pulls.into_iter().flatten() {
+        new_floor = new_floor.min(pull);
     }
     *scan_pos = new_floor.max(*scan_pos);
+}
+
+/// Deliver one destination's queued events, chunked, strictly in order.
+/// Returns `Some(last durably acked seq)` when delivery stopped short
+/// (backed off, or a send failed) — the pass floor must not advance past
+/// it — and `None` when everything went out.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_pdus_to(
+    fedout: &FedOutServer,
+    client: &Arc<FederationClient>,
+    server_name: &ruma::OwnedServerName,
+    backoff: &DeliveryBackoff,
+    room_shard: u16,
+    dest: String,
+    queued: Vec<(u64, serde_json::Value)>,
+    mut acked: u64,
+) -> Option<u64> {
+    if !backoff.ready(&dest) {
+        return Some(acked);
+    }
+    for chunk in queued.chunks(MAX_PDUS_PER_TXN) {
+        let first = chunk.first().expect("non-empty chunk").0;
+        let last = chunk.last().expect("non-empty chunk").0;
+        let body = json!({
+            "origin": server_name.as_str(),
+            "origin_server_ts": crate::now_ms(),
+            "pdus": chunk.iter().map(|(_, raw)| raw).collect::<Vec<_>>(),
+        });
+        // Stable seq-range transaction id: a straight retry of the
+        // same chunk dedupes at the receiver's replay cache, while a
+        // retry that grew (new events queued behind a failure) gets a
+        // fresh id — its replay of already-ingested PDUs is idempotent
+        // by event id.
+        let txn_path = format!("/_matrix/federation/v1/send/{first}_{last}");
+        // Latency decomposition: queue_ms ≈ event creation → this PUT
+        // starting (origin apply + worker wake + any pass-in-flight
+        // wait); put_ms = the round trip (network + receiver ingest).
+        // Queue delay is taken only from events THIS server authored:
+        // a relayed event (send_join/send_leave resident) carries the
+        // remote author's origin_server_ts, and that clock's skew
+        // would poison the one histogram whose whole point is naming
+        // delays that are ours to shorten.
+        let newest_local_ots = chunk
+            .iter()
+            .rev()
+            .find(|(_, raw)| {
+                raw.get("sender")
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| ruma::UserId::parse(s).ok())
+                    .is_some_and(|u| u.server_name().as_str() == server_name.as_str())
+            })
+            .and_then(|(_, raw)| raw.get("origin_server_ts"))
+            .and_then(|t| t.as_u64());
+        let put_start = crate::now_ms();
+        match client.put(&dest, &txn_path, &body).await {
+            Ok(_) => {
+                // Taken before the cursor advance below: put_ms claims
+                // to be the remote round trip, and the cursor advance
+                // is a local Raft proposal that can stall through an
+                // election — none of that is the remote's latency.
+                let put_ms = crate::now_ms().saturating_sub(put_start);
+                backoff.success(&dest);
+                acked = last;
+                if let Err(e) = fedout.advance_pdu_cursor(room_shard, &dest, last).await {
+                    tracing::warn!(error = %e, dest, "delivery: cursor advance failed");
+                }
+                crate::metrics::observe_transaction("pdu", true);
+                let queue_ms = newest_local_ots.map(|ots| put_start.saturating_sub(ots));
+                crate::metrics::observe_pdu_transaction(
+                    queue_ms.map(Duration::from_millis),
+                    Duration::from_millis(put_ms),
+                    chunk.len(),
+                );
+                tracing::debug!(
+                    dest,
+                    first,
+                    last,
+                    count = chunk.len(),
+                    queue_ms,
+                    put_ms,
+                    "delivery: PDU transaction acked"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(dest, error = %e, "delivery: PDU send failed; backing off");
+                crate::metrics::observe_transaction("pdu", false);
+                backoff.failure(&dest);
+                return Some(acked);
+            }
+        }
+    }
+    None
 }
 
 /// Resolve the destination set for one stored event — the old
@@ -374,16 +416,19 @@ async fn deliver_edus(
             return;
         }
     };
-    for dest in destinations {
+    // Same bounded fan-out as the PDU pass: destinations are independent
+    // and one slow peer must not tax the others.
+    use futures_util::StreamExt;
+    futures_util::stream::iter(destinations.into_iter().map(|dest| async move {
         if !backoff.ready(&dest) {
-            continue;
+            return;
         }
-        let batch = match store.edu_outbox(&dest, MAX_EDUS_PER_TXN) {
+        let batch = match fedout.store().edu_outbox(&dest, MAX_EDUS_PER_TXN) {
             Ok(b) if !b.is_empty() => b,
-            Ok(_) => continue,
+            Ok(_) => return,
             Err(e) => {
                 tracing::warn!(error = %e, dest, "delivery: outbox read failed");
-                continue;
+                return;
             }
         };
         let last_seq = batch.last().expect("non-empty").0;
@@ -413,5 +458,8 @@ async fn deliver_edus(
                 backoff.failure(&dest);
             }
         }
-    }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_SENDS)
+    .collect::<Vec<()>>()
+    .await;
 }
