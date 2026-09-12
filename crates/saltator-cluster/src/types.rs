@@ -21,3 +21,13 @@ pub struct MetaResponse {
     /// Previous value for the touched key, if any.
     pub previous: Option<Vec<u8>>,
 }
+
+/// The metadata group's change-stream payload (schema v2): which key a
+/// committed command touched. Watchers (placement/roster subscribers)
+/// filter on the key and re-read the current value — metadata records
+/// are latest-value, so the payload names the change rather than
+/// carrying it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetaChange {
+    pub key: String,
+}

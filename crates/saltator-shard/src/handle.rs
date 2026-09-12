@@ -111,6 +111,10 @@ pub struct ShardHandle {
     raft: Raft<TypeConfig>,
     engine: Arc<dyn KvEngine>,
     changes: broadcast::Sender<ChangeRecord>,
+    /// The command interpreter, kept for read-side replay
+    /// ([`Self::replay`]); apply runs through the state machine's own
+    /// clone.
+    app: Arc<dyn ShardApp>,
     /// The app's declared schema version (the layout this binary speaks).
     app_schema_version: u32,
     /// Set once at startup (shared across clones); absent in single-node
@@ -164,15 +168,12 @@ impl ShardHandle {
 
         let (changes, _) = broadcast::channel(CHANGE_STREAM_CAPACITY);
         let log_store = ShardLogStore::new(shard, stores.log.clone());
-        let sm = ShardStateMachine::new(shard, stores.state.clone(), app, changes.clone());
+        let sm = ShardStateMachine::new(shard, stores.state.clone(), app.clone(), changes.clone());
+        let app: Arc<dyn ShardApp> = app;
 
         let raft = Raft::new(node_id, config, network, log_store, sm)
             .await
             .map_err(raft_err)?;
-
-        if let Some(reg) = registry {
-            reg.register(shard.group(), raft.clone());
-        }
 
         let handle = Self {
             shard,
@@ -182,9 +183,14 @@ impl ShardHandle {
             // the state engine.
             engine: stores.state,
             changes,
+            app,
             app_schema_version,
             forwarder: Arc::new(std::sync::OnceLock::new()),
         };
+
+        if let Some(reg) = registry {
+            reg.register(shard.group(), handle.clone());
+        }
 
         if !handle.is_initialized().await? {
             if let Some(addr) = bootstrap_addr {
@@ -432,6 +438,22 @@ impl ShardHandle {
     /// seq-indexed applied state.
     pub fn subscribe(&self) -> broadcast::Receiver<ChangeRecord> {
         self.changes.subscribe()
+    }
+
+    /// Reconstruct change records `(from_seq, from_seq + limit]` from
+    /// applied state via the app's [`ShardApp::replay`] — the backfill
+    /// half of a gap-free subscription. Locally consistent; pair with
+    /// [`Self::ensure_linearizable`] where the caller needs it.
+    pub fn replay(&self, from_seq: u64, limit: usize) -> Result<Vec<ChangeRecord>> {
+        let ctx = self.read_ctx();
+        let records = self
+            .app
+            .replay(&ctx, from_seq, limit)
+            .map_err(|e| ShardError::Storage(e.to_string()))?;
+        Ok(records
+            .into_iter()
+            .map(|(seq, payload)| ChangeRecord { seq, payload })
+            .collect())
     }
 
     pub async fn shutdown(&self) -> Result<()> {

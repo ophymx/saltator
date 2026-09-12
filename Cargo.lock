@@ -3165,6 +3165,8 @@ name = "saltator-cluster"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-stream",
+ "futures-util",
  "openraft",
  "postcard",
  "prost",
@@ -3177,6 +3179,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tracing",

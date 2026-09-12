@@ -438,6 +438,15 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         );
     }
     saltator_shard::migrate::spawn_migration_supervisor(
+        meta.shard_handle().clone(),
+        saltator_cluster::ClusterGate::new(
+            meta.shard_handle().clone(),
+            cfg.node.id,
+            schemas.clone(),
+            internal_tls.as_ref().map(|t| t.client()),
+        ),
+    );
+    saltator_shard::migrate::spawn_migration_supervisor(
         users.shard_handle().clone(),
         UserMigrationGate {
             cluster: saltator_cluster::ClusterGate::new(

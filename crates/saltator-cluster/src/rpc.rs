@@ -12,8 +12,8 @@ use saltator_shard::{ShardRegistry, TypeConfig};
 use crate::proto::control_service_server::ControlService;
 use crate::proto::raft_service_server::RaftService;
 use crate::proto::{
-    JoinRequest, JoinResponse, ProposeRequest, ProposeResponse, RaftPayload, StatusRequest,
-    StatusResponse,
+    ChangeFrame, JoinRequest, JoinResponse, ProposeRequest, ProposeResponse, RaftPayload,
+    ReadRequest, ReadResponse, StatusRequest, StatusResponse, SubscribeRequest,
 };
 use crate::types::CODEC_VERSION;
 use crate::MetadataHandle;
@@ -53,6 +53,7 @@ impl InternalRpc {
         }
         self.registry
             .get(p.group)
+            .map(|h| h.raft().clone())
             .ok_or_else(|| Status::not_found(format!("no shard group {} on this node", p.group)))
     }
 }
@@ -171,9 +172,13 @@ impl ControlService for InternalRpc {
     ) -> Result<Response<ProposeResponse>, Status> {
         use openraft::error::{ClientWriteError, RaftError};
         let req = request.into_inner();
-        let raft = self.registry.get(req.group).ok_or_else(|| {
-            Status::not_found(format!("no shard group {} on this node", req.group))
-        })?;
+        let raft = self
+            .registry
+            .get(req.group)
+            .map(|h| h.raft().clone())
+            .ok_or_else(|| {
+                Status::not_found(format!("no shard group {} on this node", req.group))
+            })?;
         match raft.client_write(req.command).await {
             Ok(resp) => Ok(Response::new(ProposeResponse {
                 applied: true,
@@ -193,5 +198,192 @@ impl ControlService for InternalRpc {
             }
             Err(e) => Err(Status::internal(format!("propose: {e}"))),
         }
+    }
+
+    /// A storage-level read against a shard's applied state
+    /// (docs/design-room-sharding-phase2.md): served only at the group's
+    /// leader, after a read-index barrier — linearizable, and
+    /// read-your-writes for any client that just forwarded a proposal to
+    /// the same leader. Non-leaders answer with a hint, like Propose.
+    async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
+        let req = request.into_inner();
+        let handle = self.registry.get(req.group).ok_or_else(|| {
+            Status::not_found(format!("no shard group {} on this node", req.group))
+        })?;
+        if handle.ensure_linearizable().await.is_err() || !handle.is_leader() {
+            // Not the leader (or lost leadership under the barrier):
+            // point the caller at the believed leader.
+            let leader_id = handle.current_leader();
+            let leader_addr = leader_id.and_then(|id| handle.node_addr(id));
+            return Ok(Response::new(ReadResponse {
+                served: false,
+                result: Vec::new(),
+                leader_id,
+                leader_addr,
+            }));
+        }
+        let op: saltator_shard::ReadOp = postcard::from_bytes(&req.op)
+            .map_err(|e| Status::invalid_argument(format!("read op decode: {e}")))?;
+        let seq = handle
+            .seq()
+            .map_err(|e| Status::internal(format!("seq: {e}")))?;
+        let value = saltator_shard::read::execute(&handle.read_ctx(), seq, &op)
+            .map_err(|e| Status::invalid_argument(format!("read: {e}")))?;
+        Ok(Response::new(ReadResponse {
+            served: true,
+            result: postcard::to_stdvec(&value)
+                .map_err(|e| Status::internal(format!("read result encode: {e}")))?,
+            leader_id: None,
+            leader_addr: None,
+        }))
+    }
+
+    type SubscribeStream =
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<ChangeFrame, Status>> + Send>>;
+
+    /// A change-stream subscription with server-side backfill: replay
+    /// `(from_seq, applied]` from seq-indexed state, then splice into the
+    /// live broadcast — gap-free at the seam, because the broadcast is
+    /// subscribed BEFORE the final replay batch and frames at or below
+    /// the last replayed seq are dropped. Served by any replica.
+    async fn subscribe(
+        &self,
+        request: Request<SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        const REPLAY_BATCH: usize = 256;
+        let req = request.into_inner();
+        let handle = self.registry.get(req.group).ok_or_else(|| {
+            Status::not_found(format!("no shard group {} on this node", req.group))
+        })?;
+        // Refuse an unreplayable app AT ACCEPT TIME: a mid-stream error is
+        // indistinguishable from a dropped connection to the client (which
+        // reconnects forever), while an accept-time refusal is terminal.
+        handle
+            .replay(req.from_seq, 1)
+            .map_err(|e| Status::failed_precondition(format!("replay: {e}")))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ChangeFrame, Status>>(64);
+        tokio::spawn(async move {
+            let mut last = req.from_seq;
+            // Live first, then backfill up to and past the subscription
+            // point: anything the broadcast buffers meanwhile is deduped
+            // by the `seq > last` filter below.
+            let mut live = handle.subscribe();
+            loop {
+                let batch = match handle.replay(last, REPLAY_BATCH) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::failed_precondition(format!("replay: {e}"))))
+                            .await;
+                        return;
+                    }
+                };
+                let done = batch.len() < REPLAY_BATCH;
+                for rec in batch {
+                    last = rec.seq;
+                    if tx
+                        .send(Ok(ChangeFrame {
+                            seq: rec.seq,
+                            payload: rec.payload.to_vec(),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return; // subscriber went away
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            loop {
+                match live.recv().await {
+                    Ok(rec) => {
+                        if rec.seq <= last {
+                            continue; // already replayed
+                        }
+                        // A hole here means the broadcast dropped records
+                        // while we drained the backfill; fill from state.
+                        if rec.seq > last + 1 {
+                            match handle.replay(last, (rec.seq - last) as usize) {
+                                Ok(batch) => {
+                                    for r in batch {
+                                        if r.seq >= rec.seq {
+                                            break;
+                                        }
+                                        if tx
+                                            .send(Ok(ChangeFrame {
+                                                seq: r.seq,
+                                                payload: r.payload.to_vec(),
+                                            }))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(Status::internal(format!("gap replay: {e}"))))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        }
+                        last = rec.seq;
+                        if tx
+                            .send(Ok(ChangeFrame {
+                                seq: rec.seq,
+                                payload: rec.payload.to_vec(),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Fall back to replay from the last delivered seq;
+                        // the next loop iteration resumes live.
+                        live = live.resubscribe();
+                        loop {
+                            let batch = match handle.replay(last, REPLAY_BATCH) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(Status::internal(format!("lag replay: {e}"))))
+                                        .await;
+                                    return;
+                                }
+                            };
+                            let done = batch.len() < REPLAY_BATCH;
+                            for r in batch {
+                                last = r.seq;
+                                if tx
+                                    .send(Ok(ChangeFrame {
+                                        seq: r.seq,
+                                        payload: r.payload.to_vec(),
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            if done {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 }
