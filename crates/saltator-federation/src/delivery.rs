@@ -293,8 +293,11 @@ async fn deliver_pdus_to(
         // same chunk dedupes at the receiver's replay cache, while a
         // retry that grew (new events queued behind a failure) gets a
         // fresh id — its replay of already-ingested PDUs is idempotent
-        // by event id.
-        let txn_path = format!("/_matrix/federation/v1/send/{first}_{last}");
+        // by event id. Shard-qualified: seqs restart per room shard, so
+        // two shards' chunks to one destination can share a seq range,
+        // and the receiver's (origin, txn_id) replay cache would swallow
+        // the second — an acked-but-never-ingested event with no retry.
+        let txn_path = format!("/_matrix/federation/v1/send/{room_shard}_{first}_{last}");
         // Latency decomposition: queue_ms ≈ event creation → this PUT
         // starting (origin apply + worker wake + any pass-in-flight
         // wait); put_ms = the round trip (network + receiver ingest).
