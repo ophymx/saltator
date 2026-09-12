@@ -273,14 +273,16 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         .await?;
     }
     // Everyone — founder, joiner, restart — takes the topology from the
-    // durable cluster config, never from their own TOML. A joiner may
-    // race metadata replication, so poll briefly.
+    // durable cluster config, never from their own TOML. The read is from
+    // this node's applied state: a joiner is a follower here and cannot
+    // serve a linearizable read; it polls until the founding record
+    // replicates over.
     let cluster_cfg = {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
-            match meta.cluster_config().await {
+            match meta.cluster_config_local() {
                 Ok(Some(c)) => break c,
-                Ok(None) | Err(_) if std::time::Instant::now() < deadline => {
+                Ok(None) if std::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 Ok(None) => anyhow::bail!("cluster config never appeared in metadata"),

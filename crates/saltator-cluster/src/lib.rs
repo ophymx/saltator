@@ -347,6 +347,15 @@ impl MetadataHandle {
         Ok(self.get_blob_local(K_ROSTER)?.unwrap_or_default())
     }
 
+    /// The cluster topology from this node's applied state (see
+    /// [`placement_local`](Self::placement_local)). `None` until the
+    /// founder's bootstrap record has replicated to this node; the
+    /// record is immutable after founding, so a stale read cannot
+    /// return a wrong value, only a not-yet one.
+    pub fn cluster_config_local(&self) -> Result<Option<ClusterConfig>> {
+        self.get_blob_local(K_CONFIG)
+    }
+
     async fn get_blob<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         decode_blob(self.read(key).await?)
     }
