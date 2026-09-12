@@ -84,8 +84,47 @@ message ProposeResponse {
   optional string leader_addr = 5;
 }
 
+// A storage-level read against a shard's applied state, executed at the
+// group's leader after a read-index barrier (linearizable; spec.md §4.2
+// — a bounded-staleness field may be added for follower reads later,
+// OQ-7). Shaped like Propose: opaque versioned op bytes, leader hint
+// when not served (docs/design-room-sharding-phase2.md).
+message ReadRequest {
+  uint64 group = 1;
+  // postcard-encoded saltator_shard::ReadOp.
+  bytes op = 2;
+}
+
+message ReadResponse {
+  bool served = 1;
+  // Set when served: postcard-encoded saltator_shard::ReadValue.
+  bytes result = 2;
+  // Set when not served: where the leader is believed to be.
+  optional uint64 leader_id = 3;
+  optional string leader_addr = 4;
+}
+
+// A change-stream subscription with server-side backfill: the stream
+// replays `(from_seq, applied]` from seq-indexed state, then splices
+// into the live broadcast, gap-free. Served by ANY replica of the group
+// (tailing consumers tolerate replication lag); resuming after a
+// disconnect is a new Subscribe from the last seen seq.
+message SubscribeRequest {
+  uint64 group = 1;
+  // Exclusive: the first frame has seq > from_seq. 0 = everything.
+  uint64 from_seq = 2;
+}
+
+message ChangeFrame {
+  uint64 seq = 1;
+  // The app's change payload, byte-identical to the local broadcast.
+  bytes payload = 2;
+}
+
 service ControlService {
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc Join(JoinRequest) returns (JoinResponse);
   rpc Propose(ProposeRequest) returns (ProposeResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream ChangeFrame);
 }

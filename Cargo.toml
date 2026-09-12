@@ -116,6 +116,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 http = "1"
 bytes = "1"
 futures-util = "0.3"
+tokio-stream = "0.1"
+async-stream = "0.3"
 sha2 = "0.10"
 # ID-token validation for the OIDC login slice: JWKS parsing and
 # RS256/ES256 signature checks. Rides on `ring`, already in the tree.

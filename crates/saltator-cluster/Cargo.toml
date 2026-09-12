@@ -18,6 +18,9 @@ tracing.workspace = true
 openraft.workspace = true
 tonic.workspace = true
 prost.workspace = true
+futures-util.workspace = true
+tokio-stream.workspace = true
+async-stream.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

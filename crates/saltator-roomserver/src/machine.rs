@@ -96,6 +96,34 @@ impl ShardApp for RoomApp {
         };
         enc("room response encode", &resp)
     }
+
+    /// Change-stream backfill for remote subscribers: every emit writes a
+    /// `T_SEQ` row in the same apply, so the payload at any seq is
+    /// re-derivable — byte-identical, since [`SeqEntry`] carries a
+    /// superset of [`ChangePayload`]'s fields and postcard is
+    /// deterministic.
+    fn replay(
+        &self,
+        ctx: &saltator_shard::ReadCtx,
+        from_seq: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<(u64, std::sync::Arc<[u8]>)>> {
+        let start = (from_seq + 1).to_be_bytes();
+        let mut out = Vec::new();
+        for (k, v) in ctx.scan(T_SEQ, &start, &[], limit, false)? {
+            let seq = u64::from_be_bytes(
+                k.as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Engine("seq key width".into()))?,
+            );
+            let payload = match dec::<SeqEntry>("seq entry decode", &v)? {
+                SeqEntry::Event { room_id, event_id } => ChangePayload::Event { room_id, event_id },
+                SeqEntry::Receipt { room_id, .. } => ChangePayload::Receipt { room_id },
+            };
+            out.push((seq, enc("change payload encode", &payload)?.into()));
+        }
+        Ok(out)
+    }
 }
 
 fn apply_receipt(ctx: &mut ApplyCtx<'_>, cmd: &ReceiptCmd) -> StoreResult<RoomResponse> {

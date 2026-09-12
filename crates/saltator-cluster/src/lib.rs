@@ -11,6 +11,7 @@ pub mod join;
 pub mod network;
 pub mod placement;
 pub mod reconcile;
+pub mod remote;
 mod rpc;
 pub mod tls;
 
@@ -67,11 +68,18 @@ impl From<saltator_shard::ShardError> for ClusterError {
     }
 }
 
-/// The metadata group's command interpreter: a linearizable KV store.
+/// The metadata group's command interpreter: a linearizable KV store
+/// which, from schema v2, also emits a change stream (the placement
+/// watch: `Subscribe(group 0)`, docs/design-room-sharding-phase2.md).
 pub struct MetaApp;
 
 /// The metadata group's schema version (see docs/design-schema-migrations.md).
-pub const META_SCHEMA_VERSION: u32 = 1;
+/// v2: every committed Set/Delete emits a [`MetaChange`] and journals it
+/// under its seq (`T_CHANGES`) for subscription backfill.
+pub const META_SCHEMA_VERSION: u32 = 2;
+
+/// Seq-indexed change journal (v2): `seq (u64 BE) → postcard(MetaChange)`.
+const T_CHANGES: u8 = APP_TABLE_FIRST + 1;
 
 impl ShardApp for MetaApp {
     fn schema_version(&self) -> u32 {
@@ -83,27 +91,82 @@ impl ShardApp for MetaApp {
         // a broken upgrade — fatal, not skippable.
         let cmd: MetaCommand = postcard::from_bytes(command)
             .map_err(|e| StoreError::Engine(format!("meta command decode: {e}")))?;
-        let previous = match cmd {
+        let (key, previous) = match cmd {
             MetaCommand::Set { key, value } => {
                 let prev = ctx.get(T_KV, key.as_bytes())?;
                 ctx.put(T_KV, key.as_bytes(), value);
-                prev
+                (key, prev)
             }
             MetaCommand::Delete { key } => {
                 let prev = ctx.get(T_KV, key.as_bytes())?;
                 ctx.delete(T_KV, key.as_bytes());
-                prev
+                (key, prev)
             }
         };
+        // Emit + journal, gated on the STORED schema version: apply must
+        // stay deterministic across binaries replaying the same log, so
+        // the behavior turns on only once the migration to v2 committed
+        // (which the ClusterGate holds until every voter runs a v2-aware
+        // binary).
+        if stored_meta_schema(ctx)? >= 2 {
+            let payload = postcard::to_stdvec(&types::MetaChange { key })
+                .map_err(|e| StoreError::Engine(format!("meta change encode: {e}")))?;
+            let seq = ctx.emit(payload.clone());
+            ctx.put(T_CHANGES, &seq.to_be_bytes(), payload);
+        }
         postcard::to_stdvec(&MetaResponse { previous })
             .map_err(|e| StoreError::Engine(format!("meta response encode: {e}")))
     }
+
+    fn migrate(&self, _ctx: &mut ApplyCtx<'_>, to: u32) -> StoreResult<()> {
+        match to {
+            // v2 adds the change journal going forward; no existing data
+            // transforms. Pre-v2 history is simply not replayable, which
+            // watchers tolerate: metadata is latest-value, and they
+            // subscribe from the current seq.
+            2 => Ok(()),
+            other => Err(StoreError::Engine(format!(
+                "no migration registered for meta schema step v{other}"
+            ))),
+        }
+    }
+
+    fn replay(
+        &self,
+        ctx: &saltator_shard::ReadCtx,
+        from_seq: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<(u64, Arc<[u8]>)>> {
+        let start = (from_seq + 1).to_be_bytes();
+        Ok(ctx
+            .scan(T_CHANGES, &start, &[], limit, false)?
+            .into_iter()
+            .map(|(k, v)| {
+                let mut seq_bytes = [0u8; 8];
+                seq_bytes.copy_from_slice(&k[..8]);
+                (
+                    u64::from_be_bytes(seq_bytes),
+                    Arc::from(v.into_boxed_slice()),
+                )
+            })
+            .collect())
+    }
+}
+
+/// The stored (not binary) meta schema version, seen through the apply
+/// context so a migration in the same batch is visible.
+fn stored_meta_schema(ctx: &ApplyCtx<'_>) -> StoreResult<u32> {
+    Ok(match ctx.get(saltator_shard::T_SCHEMA, b"version")? {
+        Some(b) => postcard::from_bytes(&b)
+            .map_err(|e| StoreError::Engine(format!("schema cell decode: {e}")))?,
+        None => 1,
+    })
 }
 
 /// Metadata keys for the cluster control-plane records (spec.md §4.2).
-const K_CONFIG: &str = "cluster/config";
-const K_ROSTER: &str = "cluster/roster";
-const K_PLACEMENT: &str = "cluster/placement";
+pub const K_CONFIG: &str = "cluster/config";
+pub const K_ROSTER: &str = "cluster/roster";
+pub const K_PLACEMENT: &str = "cluster/placement";
 
 /// postcard-decode an optional metadata value.
 fn decode_blob<T: serde::de::DeserializeOwned>(bytes: Option<Vec<u8>>) -> Result<Option<T>> {
@@ -175,6 +238,20 @@ impl MetadataHandle {
 
     pub fn raft(&self) -> &openraft::Raft<types::TypeConfig> {
         self.inner.raft()
+    }
+
+    /// The underlying shard handle (migration supervisor wiring, change
+    /// subscription).
+    pub fn shard_handle(&self) -> &saltator_shard::ShardHandle {
+        &self.inner
+    }
+
+    /// Subscribe to the metadata change stream from now (schema v2:
+    /// every committed Set/Delete emits a [`types::MetaChange`]). The
+    /// local half of the placement watch; remote watchers use
+    /// `Subscribe(group 0)`.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<saltator_shard::ChangeRecord> {
+        self.inner.subscribe()
     }
 
     /// Wait until this node has a leader (itself, single-node).

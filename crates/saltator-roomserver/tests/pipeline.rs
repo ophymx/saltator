@@ -908,3 +908,82 @@ async fn restricted_join_authoriser_selects_and_denies() {
 
     env.server.shutdown().await.unwrap();
 }
+
+/// The replay hook's contract (docs/design-room-sharding-phase2.md): the
+/// records reconstructed from applied state are BYTE-IDENTICAL to what
+/// the live broadcast carried at those seqs — the property that makes a
+/// remote subscription's backfill→live splice gap-free.
+#[tokio::test]
+async fn replay_matches_the_live_change_stream() {
+    let env = start_env().await;
+    let alice = user("alice");
+    let mut live = env.server.shard_handle().subscribe();
+
+    let room = bootstrap_room(&env, RoomVersion::V11).await;
+    let room_ref = RoomId::parse(room.as_str()).unwrap();
+    for i in 0..3 {
+        env.server
+            .send_message(
+                &room_ref,
+                &alice,
+                "m.room.message",
+                json!({"msgtype": "m.text", "body": format!("m{i}")}),
+            )
+            .await
+            .unwrap();
+    }
+    // A receipt too: the two SeqEntry→ChangePayload arms both replay.
+    let last = env
+        .server
+        .store()
+        .timeline(0, 100)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find_map(|(_, e)| match e {
+            SeqEntry::Event { event_id, .. } => Some(event_id),
+            _ => None,
+        })
+        .unwrap();
+    env.server
+        .write_receipt(
+            &room_ref,
+            &alice,
+            "m.read",
+            ruma::EventId::parse(&last).unwrap().as_ref(),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+
+    let mut broadcast = Vec::new();
+    while let Ok(rec) = live.try_recv() {
+        broadcast.push(rec);
+    }
+    assert!(
+        broadcast.len() >= 5,
+        "expected setup+3 messages+receipt, got {}",
+        broadcast.len()
+    );
+
+    let replayed = env.server.shard_handle().replay(0, 100).unwrap();
+    assert_eq!(replayed.len(), broadcast.len(), "replay covers every emit");
+    for (r, b) in replayed.iter().zip(&broadcast) {
+        assert_eq!(r.seq, b.seq);
+        assert_eq!(
+            r.payload, b.payload,
+            "payload bytes differ at seq {}",
+            r.seq
+        );
+    }
+    // Resume-from-mid: strictly the records after `from`.
+    let tail = env
+        .server
+        .shard_handle()
+        .replay(broadcast[1].seq, 100)
+        .unwrap();
+    assert_eq!(tail.first().unwrap().seq, broadcast[2].seq);
+
+    env.server.shutdown().await.unwrap();
+}

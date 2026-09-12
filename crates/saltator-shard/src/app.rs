@@ -72,6 +72,28 @@ pub trait ShardApp: Send + Sync + 'static {
             "no migration registered for schema step v{to}"
         )))
     }
+
+    /// Reconstruct the change-stream records for `(from_seq, from_seq +
+    /// limit]` from applied state — byte-identical payloads to what
+    /// [`ApplyCtx::emit`] published at those seqs. Backs the remote
+    /// Subscribe RPC's server-side backfill
+    /// (docs/design-room-sharding-phase2.md): a subscriber resuming from
+    /// seq N gets `replay` until it reaches the live broadcast, gap-free.
+    ///
+    /// Only apps whose shards are remotely subscribed need this (room,
+    /// metadata); the default refuses, which surfaces as a subscribe
+    /// error rather than a silent gap.
+    fn replay(
+        &self,
+        ctx: &ReadCtx,
+        from_seq: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<(u64, Arc<[u8]>)>> {
+        let _ = (ctx, from_seq, limit);
+        Err(saltator_store::StoreError::Engine(
+            "this shard app does not support change replay".into(),
+        ))
+    }
 }
 
 /// Context for one command application.
