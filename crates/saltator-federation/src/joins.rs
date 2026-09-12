@@ -354,12 +354,42 @@ fn to_array(events: Vec<CanonicalJsonObject>) -> serde_json::Value {
 /// chain of an event (spec "Retrieving events").
 pub async fn event_auth(
     State(state): State<Arc<FedState>>,
-    Path((_room_id, event_id)): Path<(String, String)>,
-    _auth: Authenticated,
+    Path((room_id, event_id)): Path<(String, String)>,
+    auth: Authenticated,
 ) -> FedResult {
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
+    // Requester's server must be in the room (Synapse parity) — the auth
+    // chain names members, power levels and the room's whole authority
+    // structure. And the event must actually belong to the path's room,
+    // or the room check authorizes a cross-room probe.
+    if !rooms
+        .server_in_room(&room_id, &auth.origin)
+        .unwrap_or(false)
+    {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "Requesting server is not in the room",
+        ));
+    }
+    let in_this_room = rooms
+        .store()
+        .event(&event_id)
+        .ok()
+        .flatten()
+        .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.raw).ok())
+        .is_some_and(|pdu| match pdu.get("room_id") {
+            Some(serde_json::Value::String(r)) => *r == room_id,
+            // v12 create events carry no room_id; their auth chain is
+            // empty, so serving it discloses nothing.
+            None => true,
+            _ => false,
+        });
+    if !in_this_room {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown event"));
+    }
     match rooms.event_auth_chain(&event_id) {
         Ok(Some(chain)) => Ok(axum::Json(serde_json::json!({
             "auth_chain": to_array(chain),

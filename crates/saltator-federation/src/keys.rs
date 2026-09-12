@@ -259,9 +259,34 @@ fn parse_and_verify(
     }
     keys.insert(server.to_owned(), key_set);
 
-    // The response must be signed by a key it publishes.
+    // The response must be signed by a key it publishes — a *current*
+    // one: the map holds only `verify_keys` at this point.
     ruma::signatures::verify_json(&keys, &object)
         .map_err(|e| KeyError::BadSelfSignature(e.to_string()))?;
+
+    // Rotated-out keys still verify the events they signed back then
+    // (security review 2026-08-02, L8 — failing closed here breaks
+    // backfill/import of history signed before a rotation). Folded in
+    // strictly AFTER the self-signature check, so an expired key can
+    // never vouch for a fresh key response; and never displacing a
+    // current key id. Malformed entries are skipped, not fatal: old keys
+    // are an availability improvement, strictness stays on the current
+    // set.
+    if let Some(CanonicalJsonValue::Object(old)) = object.get("old_verify_keys") {
+        let set = keys.get_mut(server).expect("inserted above");
+        for (key_id, val) in old {
+            let Some(b64) = val
+                .as_object()
+                .and_then(|o| o.get("key"))
+                .and_then(|k| k.as_str())
+            else {
+                continue;
+            };
+            if let Ok(parsed) = ruma::serde::Base64::parse(b64) {
+                set.entry(key_id.clone()).or_insert(parsed);
+            }
+        }
+    }
 
     let advertised = object
         .get("valid_until_ts")
@@ -361,6 +386,64 @@ mod tests {
         let cached = parse_and_verify("keys.test", body, 1_000).unwrap();
         assert!(cached.keys.contains_key("keys.test"));
         assert_eq!(cached.valid_until_ms, 5_000);
+    }
+
+    /// `old_verify_keys` join the usable set (events signed before a
+    /// rotation must still verify), but never displace a current key id
+    /// and never vouch for the response itself.
+    #[test]
+    fn old_verify_keys_are_ingested_but_cannot_self_sign() {
+        let name: ruma::OwnedServerName = "keys.test".try_into().unwrap();
+        let (signer, _) = ServerSigner::generate(name.clone(), "1".to_owned());
+        let (old_signer, _) = ServerSigner::generate(name, "0".to_owned());
+
+        // old_verify_keys is inside the signed content, so it has to be
+        // present BEFORE the self-signature is minted.
+        let with_old_keys = |old: serde_json::Value, sign_with: &ServerSigner| {
+            let mut obj: CanonicalJsonObject =
+                match CanonicalJsonValue::try_from(signed_key_response(&signer, 5_000)).unwrap() {
+                    CanonicalJsonValue::Object(mut o) => {
+                        o.remove("signatures");
+                        o.insert(
+                            "old_verify_keys".to_owned(),
+                            CanonicalJsonValue::try_from(old).unwrap(),
+                        );
+                        o
+                    }
+                    _ => unreachable!(),
+                };
+            sign_with.sign_json(&mut obj).unwrap();
+            serde_json::to_value(&obj).unwrap()
+        };
+
+        let body = with_old_keys(
+            serde_json::json!({
+                "ed25519:0": { "expired_ts": 500, "key": old_signer.public_key_b64() },
+                "ed25519:junk": { "expired_ts": 500 },
+            }),
+            &signer,
+        );
+        let cached = parse_and_verify("keys.test", body, 1_000).unwrap();
+        let set = &cached.keys["keys.test"];
+        assert!(set.contains_key("ed25519:1"), "current key present");
+        assert!(set.contains_key("ed25519:0"), "old key ingested");
+        assert!(!set.contains_key("ed25519:junk"), "malformed entry skipped");
+
+        // A response signed ONLY by a key advertised in old_verify_keys
+        // must still be refused: the self-signature check runs before old
+        // keys join the map. Signing with `old_signer` (ed25519:0) while
+        // verify_keys carries only ed25519:1 models exactly that.
+        let body = with_old_keys(
+            serde_json::json!({
+                "ed25519:0": { "expired_ts": 500, "key": old_signer.public_key_b64() },
+            }),
+            &old_signer,
+        );
+        let err = parse_and_verify("keys.test", body, 1_000);
+        assert!(
+            matches!(err, Err(KeyError::BadSelfSignature(_))),
+            "old key must not self-sign"
+        );
     }
 
     #[test]

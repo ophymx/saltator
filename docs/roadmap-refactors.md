@@ -302,8 +302,15 @@ mechanically once cs-api's remaining direct uses thin out.
   the histograms show dominant: parallel per-destination sends,
   PDU-before-EDU priority. Measure first — batching per txn already
   landed.
-- Security-review follow-ups (see memory: resolver private-IP M2,
-  cross-signing sig L1, L6/L8).
+- ~~Security-review follow-ups~~ CLOSED (security-followups branch,
+  2026-09-11): L1 cross-signing subkeys must chain to the master key
+  (`M_INVALID_SIGNATURE` otherwise); L8 `old_verify_keys` ingested into
+  the KeyCache after (never before) the self-signature check; plus
+  host-in-room enforcement on `/backfill`, `/event` (with
+  history-visibility filtering) and `/event_auth` — `/hierarchy` already
+  had per-room accessibility from the spaces work, and M2 closed in
+  PR #49. L6 (remote-media SSRF via client `server_name`) is wontfix:
+  TLS-gated and inherent to Matrix media fetching.
 - PDU sender: `deliver_to` gives up after 3 attempts per pass —
   subsumed by Step 4's durable cursors, but worth remembering if Step 4
   slips.

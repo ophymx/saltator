@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
-use ruma::CanonicalJsonValue;
+use ruma::{CanonicalJsonObject, CanonicalJsonValue};
 
 use crate::inbound::Authenticated;
 use crate::FedState;
@@ -60,6 +60,19 @@ pub async fn backfill(
     if start.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "missing v"));
     }
+    // Requester's server must be in the room (Synapse parity): history —
+    // event IDs, senders, content — must not be readable by strangers.
+    // The visibility filter below is the second fence, not the first.
+    if !rooms
+        .server_in_room(&room_id, &auth.origin)
+        .unwrap_or(false)
+    {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "Requesting server is not in the room",
+        ));
+    }
     let limit = limit.clamp(1, 100);
     let pdus = rooms.backfill(&start, limit).map_err(|e| {
         err(
@@ -94,7 +107,7 @@ pub async fn backfill(
 pub async fn event(
     State(state): State<Arc<FedState>>,
     Path(event_id): Path<String>,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> FedResult {
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
@@ -110,17 +123,50 @@ pub async fn event(
             )
         })?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Event not found"))?;
-    let pdu: serde_json::Value = serde_json::from_slice(&stored.raw).map_err(|e| {
+    let pdu: CanonicalJsonObject = serde_json::from_slice(&stored.raw).map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
             &e.to_string(),
         )
     })?;
+    // Requester's server must be in the event's room — or hold a pending
+    // invite into it: an invited server ingesting the invite into a room
+    // copy it already hosts fetches the invite's prev events through
+    // here, before any of its users are joined (TestUnbanViaInvite's
+    // re-invite leg). A v12 create event carries no room_id on the wire;
+    // with no room to authorize against, refuse as not-found rather than
+    // leak.
+    let Some(CanonicalJsonValue::String(room_id)) = pdu.get("room_id").cloned() else {
+        return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Event not found"));
+    };
+    let entitled = rooms
+        .server_in_room(&room_id, &auth.origin)
+        .unwrap_or(false)
+        || rooms
+            .server_invited_to_room(&room_id, &auth.origin)
+            .unwrap_or(false);
+    if !entitled {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "Requesting server is not in the room",
+        ));
+    }
+    // Same per-server history-visibility redaction /backfill applies.
+    let pdus = rooms
+        .filter_events_for_server(&room_id, &auth.origin, vec![pdu])
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            )
+        })?;
     Ok(axum::Json(serde_json::json!({
         "origin": state.server_name.as_str(),
         "origin_server_ts": crate::now_ms(),
-        "pdus": [pdu],
+        "pdus": pdu_array(pdus),
     })))
 }
 
