@@ -331,7 +331,15 @@ fn event_destinations(
             .get("content")
             .and_then(|c| c.get("membership"))
             .and_then(|m| m.as_str());
-        if matches!(membership, Some("leave" | "ban")) {
+        // The affected user's server must learn of a membership change
+        // even when it has no joined users: the removed server on
+        // leave/ban (PR #15), and the invited server — the /invite
+        // handshake hands it the event out-of-band, but only this fanout
+        // puts the PDU into its copy of the room's DAG. Without it, an
+        // invitee whose handshake-time ingest raced the prev events'
+        // delivery (TestUnbanViaInvite's re-invite) never converges to
+        // the invite.
+        if matches!(membership, Some("leave" | "ban" | "invite")) {
             if let Some(target) = raw
                 .get("state_key")
                 .and_then(|s| s.as_str())
