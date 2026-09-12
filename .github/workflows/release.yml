@@ -1,0 +1,94 @@
+# Tag-triggered releases: build the Debian packages, prove them, and
+# attach them to a GitHub release. Runs only on version tags — this is
+# the publish path, not CI (ci.yml owns correctness).
+#
+# amd64 builds both variants natively and runs packaging/verify.sh (the
+# six-distro install matrix + the v2 preinst CPU guard). arm64 builds
+# under QEMU emulation — slow, but this repo has no native arm64 runner
+# and a tag build can afford hours; the v2 variant is skipped there
+# (x86-only by definition) and the artifact is proven by inspection
+# (dpkg-deb) rather than the full matrix, which would multiply the
+# emulation cost by six distros.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  debs-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build packages (baseline + x86-64-v2)
+        run: |
+          docker buildx build -f packaging/Dockerfile --target export \
+            -o type=local,dest=dist .
+      - name: Verify (install matrix + CPU guard)
+        run: packaging/verify.sh dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: debs-amd64
+          path: dist/*.deb
+          if-no-files-found: error
+
+  debs-arm64:
+    runs-on: ubuntu-latest
+    # QEMU-emulated RocksDB C++ is the slow part; well under this in
+    # practice, but leave headroom over the 6h default-job thinking.
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+      - name: Build package (baseline only; v2 is x86-only)
+        run: |
+          docker buildx build -f packaging/Dockerfile --target export \
+            --platform linux/arm64 --build-arg BUILD_V2=0 \
+            -o type=local,dest=dist .
+      - name: Inspect the artifact
+        # cargo-deb fails silently in exactly the ways a green build
+        # hides (docs/packaging.md), so assert what matters: the right
+        # architecture, a declared glibc floor, the systemd unit, and
+        # the service-user tooling in Pre-Depends/Depends.
+        run: |
+          set -eux
+          deb=$(ls dist/saltator_*_arm64.deb)
+          dpkg-deb -f "$deb" Package Architecture Depends Provides Conflicts
+          test "$(dpkg-deb -f "$deb" Architecture)" = "arm64"
+          dpkg-deb -f "$deb" Depends | grep -q 'libc6 (>= 2\.'
+          dpkg-deb -c "$deb" | grep -q 'lib/systemd/system/saltator.service'
+          dpkg-deb -c "$deb" | grep -q 'usr/bin/saltator'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: debs-arm64
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: [debs-amd64, debs-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.deb > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.deb dist/SHA256SUMS

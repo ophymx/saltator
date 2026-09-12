@@ -78,6 +78,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 COPY . .
 
+# BUILD_V2=0 skips the x86-64-v2 variant: it is meaningless off x86, and
+# the arm64 release build sets it.
+ARG BUILD_V2=1
+
 # Two full builds, because the variants differ in RUSTFLAGS and that
 # invalidates every crate. Both happen in one RUN so the target/ cache mount
 # is still alive for the second, and so the .debs get copied to /out before
@@ -107,13 +111,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     \
     cargo deb -p saltator --profile dist --no-build --variant baseline --output /out; \
     \
-    echo '=== x86-64-v2 (hardware CRC32c) ==='; \
-    RUSTFLAGS="$STATIC_CXX -C target-cpu=x86-64-v2 -C target-feature=+pclmulqdq" \
-        cargo build --profile dist -p saltator --bin saltator; \
-    \
-    ! ldd target/dist/saltator | grep -q libstdc++; \
-    \
-    cargo deb -p saltator --profile dist --no-build --variant v2 --output /out; \
+    if [ "$BUILD_V2" = "1" ]; then \
+        echo '=== x86-64-v2 (hardware CRC32c) ==='; \
+        RUSTFLAGS="$STATIC_CXX -C target-cpu=x86-64-v2 -C target-feature=+pclmulqdq" \
+            cargo build --profile dist -p saltator --bin saltator; \
+        \
+        ! ldd target/dist/saltator | grep -q libstdc++; \
+        \
+        cargo deb -p saltator --profile dist --no-build --variant v2 --output /out; \
+    fi; \
     \
     ls -la /out
 
