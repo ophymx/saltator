@@ -273,8 +273,9 @@ cluster-smoke and chaos harnesses now run the 16-shard default; the
 Complement/interop images run `room_shards = 4` (review call 3's
 ratchet — flipped in the follow-up PR once the multi-node harnesses
 were green sharded). Phase 2 (read RPC + internal pub/sub + group
-lifecycle + checkpoint moves, the RF-floor unlock) gets its own design
-doc.
+lifecycle + checkpoint moves, the RF-floor unlock) is designed in
+docs/design-room-sharding-phase2.md (DRAFT — split 2a serving / 2b
+movement; five review calls open).
 
 ## Deferred / adjacent (not scheduled, don't lose)
 
