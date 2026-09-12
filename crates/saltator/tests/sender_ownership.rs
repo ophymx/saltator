@@ -227,7 +227,13 @@ async fn only_the_shard_leader_delivers_outbound() {
     let remote: OwnedServerName = "remote.test".try_into().unwrap();
     let (rsigner, _) = ServerSigner::generate(remote.clone(), "0".to_owned());
     let bob = ruma::UserId::parse("@bob:remote.test").unwrap();
-    let (version, template) = rooms1.make_join_template(&room_id, &bob).unwrap();
+    let (version, template) = rooms1
+        .make_join_template(
+            &saltator_roomserver::RoomShards::single(rooms1.clone()),
+            &room_id,
+            &bob,
+        )
+        .unwrap();
     let mut join = template;
     rsigner.hash_and_sign_event(&mut join, version).unwrap();
     if let Some(keys) = rsigner.public_key_map().get("remote.test") {

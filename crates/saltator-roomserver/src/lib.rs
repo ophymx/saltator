@@ -666,13 +666,14 @@ impl RoomServer {
     /// server fills in `origin`/`origin_server_ts`/`event_id` and signs.
     pub fn make_join_template(
         &self,
+        peers: &shards::RoomShards,
         room_id: &ruma::RoomId,
         user_id: &UserId,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
         // A restricted / knock_restricted room needs an authorising local
         // user stamped into the template; a non-restricted room yields
         // `NotNeeded`. Denials become the spec errcodes at the fed layer.
-        let authoriser = match self.restricted_join_authoriser(room_id, user_id)? {
+        let authoriser = match self.restricted_join_authoriser(peers, room_id, user_id)? {
             RestrictedAuth::NotNeeded => None,
             RestrictedAuth::Authorised(u) => Some(u),
             RestrictedAuth::FailsConditions => {
@@ -720,8 +721,14 @@ impl RoomServer {
     /// whose join rule is not restricted (so callers can invoke it
     /// unconditionally). This is only the authorising decision — the auth
     /// rules independently validate the resulting event.
+    ///
+    /// `peers` routes the allow-condition reads: an allow room usually
+    /// lives in a *different* shard than the room being joined, and
+    /// reading it from this shard's store would report it unknown —
+    /// refusing to vouch for a room the server does hold.
     pub fn restricted_join_authoriser(
         &self,
+        peers: &shards::RoomShards,
         room_id: &ruma::RoomId,
         joiner: &UserId,
     ) -> Result<RestrictedAuth> {
@@ -744,13 +751,16 @@ impl RoomServer {
             };
             Ok(Some(obj))
         };
-        let membership_of = |st: &std::collections::BTreeMap<(String, String), String>,
+        // Takes the store the state map came from: the allow room's
+        // events live in ITS shard's store, not necessarily ours.
+        let membership_of = |st_store: &RoomStore,
+                             st: &std::collections::BTreeMap<(String, String), String>,
                              user: &str|
          -> Result<String> {
             let Some(event_id) = st.get(&("m.room.member".to_owned(), user.to_owned())) else {
                 return Ok("leave".to_owned());
             };
-            let Some(obj) = self.load_raw(&store, event_id)? else {
+            let Some(obj) = self.load_raw(st_store, event_id)? else {
                 return Ok("leave".to_owned());
             };
             Ok(obj
@@ -779,7 +789,7 @@ impl RoomServer {
         // An already-joined or -invited user needs no authoriser (auth rule
         // 5.3.5.1 allows the join outright).
         if matches!(
-            membership_of(&state, joiner.as_str())?.as_str(),
+            membership_of(&store, &state, joiner.as_str())?.as_str(),
             "join" | "invite"
         ) {
             return Ok(RestrictedAuth::NotNeeded);
@@ -803,10 +813,13 @@ impl RoomServer {
             let Some(allowed_room) = o.get("room_id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            match store.meta(allowed_room).map_err(storage_err)? {
+            // The allow room routes by ITS OWN id — usually a different
+            // shard than the room being joined.
+            let allow_store = peers.for_room(allowed_room).store();
+            match allow_store.meta(allowed_room).map_err(storage_err)? {
                 None => uncheckable = true,
                 Some(m2) => {
-                    let s2 = store
+                    let s2 = allow_store
                         .resolve_group(allowed_room, m2.current_group)
                         .map_err(storage_err)?;
                     // Our copy of the allow room is authoritative only
@@ -825,14 +838,16 @@ impl RoomServer {
                         let Ok(uid) = OwnedUserId::try_from(sk.clone()) else {
                             continue;
                         };
-                        if uid.server_name() == our_name && membership_of(&s2, sk)? == "join" {
+                        if uid.server_name() == our_name
+                            && membership_of(&allow_store, &s2, sk)? == "join"
+                        {
                             participating = true;
                             break;
                         }
                     }
                     if !participating {
                         uncheckable = true;
-                    } else if membership_of(&s2, joiner.as_str())? == "join" {
+                    } else if membership_of(&allow_store, &s2, joiner.as_str())? == "join" {
                         condition_met = true;
                         break;
                     }
@@ -875,7 +890,7 @@ impl RoomServer {
             if uid.server_name() != our_name {
                 continue;
             }
-            if membership_of(&state, sk)? != "join" {
+            if membership_of(&store, &state, sk)? != "join" {
                 continue;
             }
             let level = power.user(&uid);

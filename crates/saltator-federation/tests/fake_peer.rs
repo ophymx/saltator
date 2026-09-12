@@ -987,7 +987,7 @@ async fn peer_malformed_pdu_is_rejected() {
 /// resident-side apply path — including the `relay` flag the fan-out depends
 /// on.
 async fn peer_joins_our_room(
-    rooms: &RoomServer,
+    rooms: &Arc<RoomServer>,
     room: &ruma::RoomId,
     server: &str,
     localpart: &str,
@@ -1000,7 +1000,13 @@ async fn peer_joins_our_room(
         .expect("joiner keys");
     rooms.trust_keys(server, keys);
     let user = ruma::OwnedUserId::try_from(format!("@{localpart}:{server}")).unwrap();
-    let (version, mut template) = rooms.make_join_template(room, &user).unwrap();
+    let (version, mut template) = rooms
+        .make_join_template(
+            &saltator_roomserver::RoomShards::single(rooms.clone()),
+            room,
+            &user,
+        )
+        .unwrap();
     signer.hash_and_sign_event(&mut template, version).unwrap();
     rooms.send_join(template).await.expect("send_join applies");
     user.to_string()
