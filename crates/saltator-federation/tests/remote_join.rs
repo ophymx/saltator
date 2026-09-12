@@ -81,6 +81,7 @@ async fn verify_pdu_at_accepts_only_trusted_untampered_events() {
         &rooms_a
             .store()
             .event(create_id.as_str())
+            .await
             .unwrap()
             .unwrap()
             .raw,
@@ -255,6 +256,7 @@ async fn remote_join_handshake_returns_room_state() {
     // A now counts b.test as a remote server in the room.
     let servers = rooms
         .remote_servers_in_room(room_id.as_str(), "a.test")
+        .await
         .unwrap();
     assert_eq!(servers, vec!["b.test".to_owned()]);
 }
@@ -378,14 +380,18 @@ async fn join_client_drives_the_full_handshake() {
     );
 
     // B now hosts the room: bob is joined, and a.test is a remote peer.
-    let b_state = b_rooms.make_join_template(
-        &saltator_roomserver::RoomShards::single(b_rooms.clone()),
-        &room_id,
-        &ruma::UserId::parse("@carol:c.test").unwrap(),
-    );
+    let b_shards = saltator_roomserver::RoomShards::single(b_rooms.clone());
+    let b_state = b_rooms
+        .make_join_template(
+            &b_shards,
+            &room_id,
+            &ruma::UserId::parse("@carol:c.test").unwrap(),
+        )
+        .await;
     assert!(b_state.is_ok(), "B should now know the room");
     let peers = b_rooms
         .remote_servers_in_room(room_id.as_str(), "b.test")
+        .await
         .unwrap();
     assert_eq!(
         peers,
@@ -519,9 +525,16 @@ async fn foreign_origin_transaction_verifies_against_fetched_keys() {
         Outcome::Accepted { event_id, .. } => event_id,
         other => panic!("message not accepted: {other:?}"),
     };
-    let msg_pdu: serde_json::Value =
-        serde_json::from_slice(&rooms_a.store().event(msg_id.as_str()).unwrap().unwrap().raw)
-            .unwrap();
+    let msg_pdu: serde_json::Value = serde_json::from_slice(
+        &rooms_a
+            .store()
+            .event(msg_id.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .raw,
+    )
+    .unwrap();
 
     // B's federation surface: authenticates callers against A's keys and
     // routes PDUs to B's room server.
@@ -568,7 +581,12 @@ async fn foreign_origin_transaction_verifies_against_fetched_keys() {
 
     // And it actually landed in B's room.
     assert!(
-        b_rooms.store().event(msg_id.as_str()).unwrap().is_some(),
+        b_rooms
+            .store()
+            .event(msg_id.as_str())
+            .await
+            .unwrap()
+            .is_some(),
         "message not persisted on B"
     );
 }
@@ -647,6 +665,7 @@ async fn leave_client_rejects_over_federation() {
     assert_eq!(
         rooms
             .remote_servers_in_room(room_id.as_str(), "a.test")
+            .await
             .unwrap(),
         vec!["b.test".to_owned()],
         "b.test should be a member after join"
@@ -664,6 +683,7 @@ async fn leave_client_rejects_over_federation() {
     assert!(
         rooms
             .remote_servers_in_room(room_id.as_str(), "a.test")
+            .await
             .unwrap()
             .is_empty(),
         "b.test should be gone after leave"
@@ -858,6 +878,7 @@ async fn event_auth_chain_includes_the_create_event() {
 
     let chain = rooms
         .event_auth_chain(&pl_id)
+        .await
         .unwrap()
         .expect("known event has an auth chain");
     assert!(
@@ -867,7 +888,7 @@ async fn event_auth_chain_includes_the_create_event() {
         )),
         "auth chain must include the create event"
     );
-    assert!(rooms.event_auth_chain("$missing").unwrap().is_none());
+    assert!(rooms.event_auth_chain("$missing").await.unwrap().is_none());
 
     rooms.shutdown().await.unwrap();
 }

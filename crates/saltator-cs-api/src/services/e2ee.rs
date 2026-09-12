@@ -31,7 +31,7 @@ impl E2ee<'_> {
     /// and users the caller no longer shares any room with (`left`).
     /// Later log entries override earlier ones, so a leave-then-rejoin
     /// nets to `changed`.
-    pub fn device_list_deltas(
+    pub async fn device_list_deltas(
         &self,
         user_id: &str,
         my_joined_rooms: &BTreeSet<String>,
@@ -64,7 +64,9 @@ impl E2ee<'_> {
                         // to re-establish sessions with the room's members;
                         // TestDeviceListsUpdateOverFederation asserts the
                         // joiner's own id in `changed`).
-                        for member in crate::room_util::joined_member_ids(self.rooms, &room_id)? {
+                        for member in
+                            crate::room_util::joined_member_ids(self.rooms, &room_id).await?
+                        {
                             left.remove(&member);
                             changed.insert(member);
                         }
@@ -76,7 +78,9 @@ impl E2ee<'_> {
                 Some((room_id, false)) => {
                     if entry.user_id == user_id {
                         // We left: members there we share nothing else with.
-                        for member in crate::room_util::joined_member_ids(self.rooms, &room_id)? {
+                        for member in
+                            crate::room_util::joined_member_ids(self.rooms, &room_id).await?
+                        {
                             if member != user_id && !shares_room(&member)? {
                                 changed.remove(&member);
                                 left.insert(member);
@@ -94,7 +98,7 @@ impl E2ee<'_> {
 
     /// Remote servers sharing any joined room with `user_id` — the
     /// audience for that user's device-list updates (and presence).
-    pub fn sharing_servers(&self, user_id: &str) -> Vec<String> {
+    pub async fn sharing_servers(&self, user_id: &str) -> Vec<String> {
         let Ok(memberships) = self.users.store().memberships(user_id) else {
             return Vec::new();
         };
@@ -106,6 +110,7 @@ impl E2ee<'_> {
             if let Ok(remote) = self
                 .rooms
                 .remote_servers_in_room(&room_id, self.server_name)
+                .await
             {
                 servers.extend(remote);
             }
@@ -119,8 +124,8 @@ impl E2ee<'_> {
     /// spec requires these reach every sharing server, and a receiver
     /// only resyncs when it *notices* a gap, so delivery must survive
     /// destination downtime and our own restarts.
-    pub fn broadcast_update(&self, user_id: &str, device_id: &str, deleted: bool) {
-        let dests = self.sharing_servers(user_id);
+    pub async fn broadcast_update(&self, user_id: &str, device_id: &str, deleted: bool) {
+        let dests = self.sharing_servers(user_id).await;
         self.queue_update(dests, user_id, device_id, deleted, false);
     }
 
@@ -131,10 +136,11 @@ impl E2ee<'_> {
     /// receivers dedupe (`changed` is a set), so narrowing to
     /// strictly-new servers is an optimisation, not a correctness
     /// requirement. Marked as a replay — an introduction, not a change.
-    pub fn announce_on_join(&self, user_id: &str, room_id: &str) {
+    pub async fn announce_on_join(&self, user_id: &str, room_id: &str) {
         let dests = self
             .rooms
             .remote_servers_in_room(room_id, self.server_name)
+            .await
             .unwrap_or_default();
         if dests.is_empty() {
             return;
@@ -373,6 +379,7 @@ mod tests {
             [room_id.to_string()].into_iter().collect();
         let (changed, _left) = svc
             .device_list_deltas(bob.as_str(), &my_rooms, 0, upto)
+            .await
             .unwrap();
         assert!(changed.contains(bob.as_str()), "self missing: {changed:?}");
         assert!(

@@ -320,12 +320,12 @@ impl RoomServer {
     /// membership event include the target's prior membership (so a join's
     /// previous invite is available even in an imported room). `None` for a
     /// non-state event or when there is no prior entry.
-    pub fn prev_state_content(
+    pub async fn prev_state_content(
         &self,
         event_id: &str,
     ) -> Result<Option<(serde_json::Value, String)>> {
         let store = self.store();
-        let Some(stored) = store.event(event_id).map_err(storage_err)? else {
+        let Some(stored) = store.event(event_id).await.map_err(storage_err)? else {
             return Ok(None);
         };
         let raw: serde_json::Value =
@@ -342,7 +342,7 @@ impl RoomServer {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
         for auth_id in auth_ids {
-            let Some(ae) = store.event(auth_id).map_err(storage_err)? else {
+            let Some(ae) = store.event(auth_id).await.map_err(storage_err)? else {
                 continue;
             };
             let aev: serde_json::Value =
@@ -365,16 +365,22 @@ impl RoomServer {
         Ok(None)
     }
 
-    pub fn remote_servers_in_room(&self, room_id: &str, exclude: &str) -> Result<Vec<String>> {
+    pub async fn remote_servers_in_room(
+        &self,
+        room_id: &str,
+        exclude: &str,
+    ) -> Result<Vec<String>> {
         let store = self.store();
         let Some(meta) = store
             .meta(room_id)
+            .await
             .map_err(|e| RoomError::Storage(e.to_string()))?
         else {
             return Ok(Vec::new());
         };
         let state = store
             .resolve_group(room_id, meta.current_group)
+            .await
             .map_err(|e| RoomError::Storage(e.to_string()))?;
         let mut servers = BTreeSet::new();
         for ((event_type, state_key), event_id) in &state {
@@ -383,6 +389,7 @@ impl RoomServer {
             }
             let Some(stored) = store
                 .event(event_id)
+                .await
                 .map_err(|e| RoomError::Storage(e.to_string()))?
             else {
                 continue;
@@ -564,7 +571,7 @@ impl RoomServer {
     /// Ingest a complete PDU (the federation-shaped entry point): raw
     /// canonical JSON, signatures and hashes included.
     pub async fn ingest_pdu(&self, raw: CanonicalJsonObject) -> Result<Outcome> {
-        let (version, room_id, is_create) = self.classify(&raw)?;
+        let (version, room_id, is_create) = self.classify(&raw).await?;
         let _guard = self.lock_room(room_id.as_str()).await;
         // Ordinary inbound PDU: its origin is responsible for distributing it,
         // so we do not relay it onward.
@@ -584,7 +591,7 @@ impl RoomServer {
         &self,
         raw: CanonicalJsonObject,
     ) -> Result<Outcome> {
-        let (version, room_id, is_create) = self.classify(&raw)?;
+        let (version, room_id, is_create) = self.classify(&raw).await?;
         let _guard = self.lock_room(room_id.as_str()).await;
         self.process_inner(raw, version, &room_id, is_create, false, true)
             .await
@@ -598,8 +605,8 @@ impl RoomServer {
     /// Looks the room version up from stored meta; use
     /// [`Self::verify_pdu_at`] when the room does not exist locally yet
     /// (a fresh send_join).
-    pub fn verify_pdu(&self, room_id: &str, raw: &CanonicalJsonObject) -> bool {
-        let Ok(Some(meta)) = self.store().meta(room_id) else {
+    pub async fn verify_pdu(&self, room_id: &str, raw: &CanonicalJsonObject) -> bool {
+        let Ok(Some(meta)) = self.store().meta(room_id).await else {
             return false;
         };
         let Ok(version) = RoomVersion::parse(&meta.version) else {
@@ -629,8 +636,8 @@ impl RoomServer {
     /// The event ID a PDU will have, without ingesting it. Lets the
     /// `/send` handler key per-PDU results even when ingest fails before an
     /// [`Outcome`] exists. `None` if the PDU is too malformed to classify.
-    pub fn pdu_event_id(&self, raw: &CanonicalJsonObject) -> Option<OwnedEventId> {
-        let (version, _room_id, _is_create) = self.classify(raw).ok()?;
+    pub async fn pdu_event_id(&self, raw: &CanonicalJsonObject) -> Option<OwnedEventId> {
+        let (version, _room_id, _is_create) = self.classify(raw).await.ok()?;
         event::event_id(raw, version).ok()
     }
 
@@ -649,14 +656,16 @@ impl RoomServer {
         // `membership: invite` is authoritative; extra content (e.g. the
         // `is_direct` flag) rides along on the invite member event.
         content.insert("membership".to_owned(), "invite".into());
-        let (raw, version) = self.build_local(
-            room_id,
-            sender,
-            "m.room.member",
-            Some(target.as_str()),
-            serde_json::Value::Object(content),
-            None,
-        )?;
+        let (raw, version) = self
+            .build_local(
+                room_id,
+                sender,
+                "m.room.member",
+                Some(target.as_str()),
+                serde_json::Value::Object(content),
+                None,
+            )
+            .await?;
         Ok((version, raw))
     }
 
@@ -664,7 +673,7 @@ impl RoomServer {
     /// user on another server) — the `GET /make_join` response. prev/auth
     /// events and depth are computed from current room state; the joining
     /// server fills in `origin`/`origin_server_ts`/`event_id` and signs.
-    pub fn make_join_template(
+    pub async fn make_join_template(
         &self,
         peers: &shards::RoomShards,
         room_id: &ruma::RoomId,
@@ -673,7 +682,10 @@ impl RoomServer {
         // A restricted / knock_restricted room needs an authorising local
         // user stamped into the template; a non-restricted room yields
         // `NotNeeded`. Denials become the spec errcodes at the fed layer.
-        let authoriser = match self.restricted_join_authoriser(peers, room_id, user_id)? {
+        let authoriser = match self
+            .restricted_join_authoriser(peers, room_id, user_id)
+            .await?
+        {
             RestrictedAuth::NotNeeded => None,
             RestrictedAuth::Authorised(u) => Some(u),
             RestrictedAuth::FailsConditions => {
@@ -691,28 +703,69 @@ impl RoomServer {
             }
         };
         self.make_membership_template(room_id, user_id, "join", authoriser.as_deref())
+            .await
     }
 
     /// Build an unsigned `m.room.member` leave template — the `GET
     /// /make_leave` response (used to reject a remote invite or leave a
     /// remote room).
-    pub fn make_leave_template(
+    pub async fn make_leave_template(
         &self,
         room_id: &ruma::RoomId,
         user_id: &UserId,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
         self.make_membership_template(room_id, user_id, "leave", None)
+            .await
     }
 
     /// Build an unsigned `m.room.member` knock template — the `GET
     /// /make_knock` response. The knocking server fills in
     /// `origin`/`origin_server_ts`/`reason`/`event_id` and signs.
-    pub fn make_knock_template(
+    pub async fn make_knock_template(
         &self,
         room_id: &ruma::RoomId,
         user_id: &UserId,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
         self.make_membership_template(room_id, user_id, "knock", None)
+            .await
+    }
+
+    /// The raw content-bearing event for `(ty, sk)` in a resolved state
+    /// map, loaded from the store that map came from.
+    async fn state_event_content(
+        &self,
+        store: &RoomStore,
+        state: &std::collections::BTreeMap<(String, String), String>,
+        ty: &str,
+        sk: &str,
+    ) -> Result<Option<CanonicalJsonObject>> {
+        let Some(event_id) = state.get(&(ty.to_owned(), sk.to_owned())) else {
+            return Ok(None);
+        };
+        self.load_raw(store, event_id).await
+    }
+
+    /// `user`'s membership in a resolved state map — read from the store
+    /// the map came from (an allow room's events live in ITS shard).
+    async fn membership_in(
+        &self,
+        store: &RoomStore,
+        state: &std::collections::BTreeMap<(String, String), String>,
+        user: &str,
+    ) -> Result<String> {
+        let Some(event_id) = state.get(&("m.room.member".to_owned(), user.to_owned())) else {
+            return Ok("leave".to_owned());
+        };
+        let Some(obj) = self.load_raw(store, event_id).await? else {
+            return Ok("leave".to_owned());
+        };
+        Ok(obj
+            .get("content")
+            .and_then(|c| c.as_object())
+            .and_then(|c| c.get("membership"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("leave")
+            .to_owned())
     }
 
     /// Decide whether `joiner` may join the restricted / `knock_restricted`
@@ -726,54 +779,27 @@ impl RoomServer {
     /// lives in a *different* shard than the room being joined, and
     /// reading it from this shard's store would report it unknown —
     /// refusing to vouch for a room the server does hold.
-    pub fn restricted_join_authoriser(
+    pub async fn restricted_join_authoriser(
         &self,
         peers: &shards::RoomShards,
         room_id: &ruma::RoomId,
         joiner: &UserId,
     ) -> Result<RestrictedAuth> {
         let store = self.store();
-        let Some(meta) = store.meta(room_id.as_str()).map_err(storage_err)? else {
+        let Some(meta) = store.meta(room_id.as_str()).await.map_err(storage_err)? else {
             // We don't hold the room — nothing to authorise locally.
             return Ok(RestrictedAuth::NotNeeded);
         };
         let version = RoomVersion::parse(&meta.version)?;
         let state = store
             .resolve_group(room_id.as_str(), meta.current_group)
+            .await
             .map_err(storage_err)?;
 
-        let content_of = |ty: &str, sk: &str| -> Result<Option<CanonicalJsonObject>> {
-            let Some(event_id) = state.get(&(ty.to_owned(), sk.to_owned())) else {
-                return Ok(None);
-            };
-            let Some(obj) = self.load_raw(&store, event_id)? else {
-                return Ok(None);
-            };
-            Ok(Some(obj))
-        };
-        // Takes the store the state map came from: the allow room's
-        // events live in ITS shard's store, not necessarily ours.
-        let membership_of = |st_store: &RoomStore,
-                             st: &std::collections::BTreeMap<(String, String), String>,
-                             user: &str|
-         -> Result<String> {
-            let Some(event_id) = st.get(&("m.room.member".to_owned(), user.to_owned())) else {
-                return Ok("leave".to_owned());
-            };
-            let Some(obj) = self.load_raw(st_store, event_id)? else {
-                return Ok("leave".to_owned());
-            };
-            Ok(obj
-                .get("content")
-                .and_then(|c| c.as_object())
-                .and_then(|c| c.get("membership"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("leave")
-                .to_owned())
-        };
-
         // Join rule + allow list (both live in the join_rules event content).
-        let join_rules_ev = content_of("m.room.join_rules", "")?;
+        let join_rules_ev = self
+            .state_event_content(&store, &state, "m.room.join_rules", "")
+            .await?;
         let jr_content = join_rules_ev
             .as_ref()
             .and_then(|e| e.get("content"))
@@ -789,7 +815,9 @@ impl RoomServer {
         // An already-joined or -invited user needs no authoriser (auth rule
         // 5.3.5.1 allows the join outright).
         if matches!(
-            membership_of(&store, &state, joiner.as_str())?.as_str(),
+            self.membership_in(&store, &state, joiner.as_str())
+                .await?
+                .as_str(),
             "join" | "invite"
         ) {
             return Ok(RestrictedAuth::NotNeeded);
@@ -816,11 +844,12 @@ impl RoomServer {
             // The allow room routes by ITS OWN id — usually a different
             // shard than the room being joined.
             let allow_store = peers.for_room(allowed_room).store();
-            match allow_store.meta(allowed_room).map_err(storage_err)? {
+            match allow_store.meta(allowed_room).await.map_err(storage_err)? {
                 None => uncheckable = true,
                 Some(m2) => {
                     let s2 = allow_store
                         .resolve_group(allowed_room, m2.current_group)
+                        .await
                         .map_err(storage_err)?;
                     // Our copy of the allow room is authoritative only
                     // while one of our users is joined to it — once the
@@ -839,7 +868,7 @@ impl RoomServer {
                             continue;
                         };
                         if uid.server_name() == our_name
-                            && membership_of(&allow_store, &s2, sk)? == "join"
+                            && self.membership_in(&allow_store, &s2, sk).await? == "join"
                         {
                             participating = true;
                             break;
@@ -847,7 +876,11 @@ impl RoomServer {
                     }
                     if !participating {
                         uncheckable = true;
-                    } else if membership_of(&allow_store, &s2, joiner.as_str())? == "join" {
+                    } else if self
+                        .membership_in(&allow_store, &s2, joiner.as_str())
+                        .await?
+                        == "join"
+                    {
                         condition_met = true;
                         break;
                     }
@@ -866,12 +899,17 @@ impl RoomServer {
         // the authorising user. Any powered local member works (MSC3083 does
         // not require a room *creator*); prefer the highest power for a
         // stable, unambiguous choice.
-        let Some(create_raw) = content_of("m.room.create", "")? else {
+        let Some(create_raw) = self
+            .state_event_content(&store, &state, "m.room.create", "")
+            .await?
+        else {
             return Err(RoomError::Malformed("room has no create event".into()));
         };
         let create = IdentifiedPdu::from_canonical(&create_raw, version)
             .map_err(|e| RoomError::Malformed(e.to_string()))?;
-        let pl = content_of("m.room.power_levels", "")?
+        let pl = self
+            .state_event_content(&store, &state, "m.room.power_levels", "")
+            .await?
             .map(|raw| IdentifiedPdu::from_canonical(&raw, version))
             .transpose()
             .map_err(|e| RoomError::Malformed(e.to_string()))?;
@@ -890,7 +928,7 @@ impl RoomServer {
             if uid.server_name() != our_name {
                 continue;
             }
-            if membership_of(&store, &state, sk)? != "join" {
+            if self.membership_in(&store, &state, sk).await? != "join" {
                 continue;
             }
             let level = power.user(&uid);
@@ -904,7 +942,7 @@ impl RoomServer {
         })
     }
 
-    fn make_membership_template(
+    async fn make_membership_template(
         &self,
         room_id: &ruma::RoomId,
         user_id: &UserId,
@@ -914,17 +952,20 @@ impl RoomServer {
         let store = self.store();
         let meta = store
             .meta(room_id.as_str())
+            .await
             .map_err(storage_err)?
             .ok_or_else(|| RoomError::UnknownRoom(room_id.to_string()))?;
         let version = RoomVersion::parse(&meta.version)?;
         let current = store
             .resolve_group(room_id.as_str(), meta.current_group)
+            .await
             .map_err(storage_err)?;
 
         let mut depth: u64 = 0;
         for id in &meta.extremities {
             let prev = store
                 .event(id)
+                .await
                 .map_err(storage_err)?
                 .ok_or_else(|| RoomError::MissingEvents(vec![id.clone()]))?;
             depth = depth.max(prev.depth);
@@ -966,7 +1007,7 @@ impl RoomServer {
     /// (the outbound sender distributes it). The caller must have trusted
     /// the origin's keys.
     pub async fn send_leave(&self, raw: CanonicalJsonObject) -> Result<Outcome> {
-        let (version, room_id, _is_create) = self.classify(&raw)?;
+        let (version, room_id, _is_create) = self.classify(&raw).await?;
         let _guard = self.lock_room(room_id.as_str()).await;
         // We are the resident servicing this leave/reject handshake: flag the
         // membership so the outbound sender relays it to the room's other
@@ -977,10 +1018,11 @@ impl RoomServer {
     /// The room's current forward extremities (the DAG leaves). Empty if
     /// the room is unknown. Used as `earliest_events` when requesting a
     /// gap fill, so the peer walks back only to what we already have.
-    pub fn room_extremities(&self, room_id: &str) -> Result<Vec<String>> {
+    pub async fn room_extremities(&self, room_id: &str) -> Result<Vec<String>> {
         Ok(self
             .store()
             .meta(room_id)
+            .await
             .map_err(storage_err)?
             .map(|m| m.extremities)
             .unwrap_or_default())
@@ -995,7 +1037,7 @@ impl RoomServer {
     /// history when `include_history` (the CS route gates that on the
     /// room's history visibility, like `/messages`); chasing history we
     /// don't hold yet (the federated fallback) is the caller's concern.
-    pub fn timestamp_to_event(
+    pub async fn timestamp_to_event(
         &self,
         room_id: &str,
         ts: u64,
@@ -1007,12 +1049,14 @@ impl RoomServer {
         // below the whole timeline, and its indexes grow *older*.
         let timeline = store
             .room_timeline(room_id, 0, None, usize::MAX, false)
+            .await
             .map_err(storage_err)?
             .into_iter()
             .map(|(seq, id)| ((1u64, seq), id));
         let history = if include_history {
             store
                 .room_history(room_id, 0, None, usize::MAX, false)
+                .await
                 .map_err(storage_err)?
         } else {
             Vec::new()
@@ -1021,7 +1065,7 @@ impl RoomServer {
         .map(|(idx, id)| ((0u64, u64::MAX - idx), id));
         let mut best: Option<(u64, (u64, u64), String)> = None;
         for (pos, id) in timeline.chain(history) {
-            let Some(stored) = store.event(&id).map_err(storage_err)? else {
+            let Some(stored) = store.event(&id).await.map_err(storage_err)? else {
                 continue;
             };
             let raw: serde_json::Value = match serde_json::from_slice(&stored.raw) {
@@ -1050,9 +1094,10 @@ impl RoomServer {
     /// Whether `server` currently has a joined user in the room — the
     /// membership check inbound federation endpoints apply before serving
     /// room data (state, timestamps) to a caller.
-    pub fn server_in_room(&self, room_id: &str, server: &str) -> Result<bool> {
+    pub async fn server_in_room(&self, room_id: &str, server: &str) -> Result<bool> {
         Ok(self
-            .remote_servers_in_room(room_id, "")?
+            .remote_servers_in_room(room_id, "")
+            .await?
             .iter()
             .any(|s| s == server))
     }
@@ -1063,16 +1108,18 @@ impl RoomServer {
     /// supporting events (`/event`) to ingest the invite into a copy of
     /// the room it already hosts. Counts exactly `invite`: a ban or a
     /// leave is not an invitation.
-    pub fn server_invited_to_room(&self, room_id: &str, server: &str) -> Result<bool> {
+    pub async fn server_invited_to_room(&self, room_id: &str, server: &str) -> Result<bool> {
         let store = self.store();
         let Some(meta) = store
             .meta(room_id)
+            .await
             .map_err(|e| RoomError::Storage(e.to_string()))?
         else {
             return Ok(false);
         };
         let state = store
             .resolve_group(room_id, meta.current_group)
+            .await
             .map_err(|e| RoomError::Storage(e.to_string()))?;
         let suffix = format!(":{server}");
         for ((event_type, state_key), event_id) in &state {
@@ -1081,6 +1128,7 @@ impl RoomServer {
             }
             let Some(stored) = store
                 .event(event_id)
+                .await
                 .map_err(|e| RoomError::Storage(e.to_string()))?
             else {
                 continue;
@@ -1106,24 +1154,24 @@ impl RoomServer {
     /// the required membership, is replaced by its redacted copy. Events
     /// under `shared`/`world_readable` (and events whose state we cannot
     /// resolve — outliers, rejected) pass through unchanged.
-    pub fn filter_events_for_server(
+    pub async fn filter_events_for_server(
         &self,
         room_id: &str,
         server: &str,
         events: Vec<CanonicalJsonObject>,
     ) -> Result<Vec<CanonicalJsonObject>> {
         let store = self.store();
-        let Some(meta) = store.meta(room_id).map_err(storage_err)? else {
+        let Some(meta) = store.meta(room_id).await.map_err(storage_err)? else {
             return Ok(events);
         };
         let version = RoomVersion::parse(&meta.version)?;
         let mut out = Vec::with_capacity(events.len());
         for raw in events {
-            let visible = (|| -> Result<bool> {
-                let Some(id) = self.pdu_event_id(&raw) else {
-                    return Ok(true);
+            let visible = async {
+                let Some(id) = self.pdu_event_id(&raw).await else {
+                    return Ok::<bool, RoomError>(true);
                 };
-                let Some(stored) = store.event(id.as_str()).map_err(storage_err)? else {
+                let Some(stored) = store.event(id.as_str()).await.map_err(storage_err)? else {
                     return Ok(true);
                 };
                 if stored.state_group_after == 0 {
@@ -1131,11 +1179,16 @@ impl RoomServer {
                 }
                 let state = store
                     .resolve_group(room_id, stored.state_group_after)
+                    .await
                     .map_err(storage_err)?;
-                let load = |eid: &String| self.load_raw(&store, eid);
-                let vis = state
+                let vis_eid = state
                     .get(&("m.room.history_visibility".to_owned(), String::new()))
-                    .and_then(|eid| load(eid).ok().flatten())
+                    .cloned();
+                let vis_ev = match &vis_eid {
+                    Some(eid) => self.load_raw(&store, eid).await.ok().flatten(),
+                    None => None,
+                };
+                let vis = vis_ev
                     .and_then(|ev| {
                         ev.get("content")
                             .and_then(|c| c.as_object())
@@ -1159,7 +1212,7 @@ impl RoomServer {
                     if uid.server_name() != server {
                         continue;
                     }
-                    let membership = load(eid)?.and_then(|ev| {
+                    let membership = self.load_raw(&store, eid).await?.and_then(|ev| {
                         ev.get("content")
                             .and_then(|c| c.as_object())
                             .and_then(|c| c.get("membership"))
@@ -1171,7 +1224,8 @@ impl RoomServer {
                     }
                 }
                 Ok(false)
-            })()?;
+            }
+            .await?;
             if visible {
                 out.push(raw);
             } else {
@@ -1185,18 +1239,19 @@ impl RoomServer {
     }
 
     /// The room's current `m.room.server_acl`, if any is set.
-    pub fn server_acl(&self, room_id: &str) -> Result<Option<saltator_core::acl::ServerAcl>> {
+    pub async fn server_acl(&self, room_id: &str) -> Result<Option<saltator_core::acl::ServerAcl>> {
         let store = self.store();
-        let Some(meta) = store.meta(room_id).map_err(storage_err)? else {
+        let Some(meta) = store.meta(room_id).await.map_err(storage_err)? else {
             return Ok(None);
         };
         let current = store
             .resolve_group(room_id, meta.current_group)
+            .await
             .map_err(storage_err)?;
         let Some(event_id) = current.get(&("m.room.server_acl".to_owned(), String::new())) else {
             return Ok(None);
         };
-        let Some(stored) = store.event(event_id).map_err(storage_err)? else {
+        let Some(stored) = store.event(event_id).await.map_err(storage_err)? else {
             return Ok(None);
         };
         let raw: CanonicalJsonObject =
@@ -1212,8 +1267,8 @@ impl RoomServer {
     /// Whether the room's server ACL denies `server` from participating.
     /// False when the room is unknown or has no ACL (fail open — an ACL must
     /// be present to deny).
-    pub fn server_acl_denies(&self, room_id: &str, server: &str) -> bool {
-        matches!(self.server_acl(room_id), Ok(Some(acl)) if !acl.is_allowed(server))
+    pub async fn server_acl_denies(&self, room_id: &str, server: &str) -> bool {
+        matches!(self.server_acl(room_id).await, Ok(Some(acl)) if !acl.is_allowed(server))
     }
 
     /// Walk the room DAG backward from `start` event IDs along
@@ -1221,8 +1276,13 @@ impl RoomServer {
     /// response). The `start` events are included; highest-depth (most
     /// recent) first. Unknown start IDs are skipped; rejected events are
     /// not returned.
-    pub fn backfill(&self, start: &[String], limit: usize) -> Result<Vec<CanonicalJsonObject>> {
+    pub async fn backfill(
+        &self,
+        start: &[String],
+        limit: usize,
+    ) -> Result<Vec<CanonicalJsonObject>> {
         self.walk_back(start.to_vec(), &BTreeSet::new(), limit, 0)
+            .await
     }
 
     /// `POST /get_missing_events`: return the ancestors of `latest`
@@ -1230,7 +1290,7 @@ impl RoomServer {
     /// and excluding `earliest`, up to `limit` events at depth ≥
     /// `min_depth`. Oldest (lowest-depth) first — the order a requester
     /// applies them in.
-    pub fn get_missing_events(
+    pub async fn get_missing_events(
         &self,
         earliest: &[String],
         latest: &[String],
@@ -1244,13 +1304,13 @@ impl RoomServer {
         let mut seed = Vec::new();
         for id in latest {
             stop.insert(id.clone());
-            if let Some(stored) = store.event(id).map_err(storage_err)? {
+            if let Some(stored) = store.event(id).await.map_err(storage_err)? {
                 let raw: CanonicalJsonObject = serde_json::from_slice(&stored.raw)
                     .map_err(|e| RoomError::Codec(e.to_string()))?;
                 seed.extend(prev_event_ids(&raw));
             }
         }
-        let mut events = self.walk_back(seed, &stop, limit, min_depth)?;
+        let mut events = self.walk_back(seed, &stop, limit, min_depth).await?;
         events.reverse(); // newest-first walk → oldest-first response
         Ok(events)
     }
@@ -1258,7 +1318,7 @@ impl RoomServer {
     /// Shared backward DAG walk: BFS over `prev_events` from `seed`,
     /// skipping `stop` IDs, collecting non-rejected events at depth ≥
     /// `min_depth`, newest (highest depth) first, capped at `limit`.
-    fn walk_back(
+    async fn walk_back(
         &self,
         seed: Vec<String>,
         stop: &BTreeSet<String>,
@@ -1273,7 +1333,7 @@ impl RoomServer {
             if seen.contains(id) {
                 continue;
             }
-            if let Some(ev) = store.event(id).map_err(storage_err)? {
+            if let Some(ev) = store.event(id).await.map_err(storage_err)? {
                 if ev.rejected.is_none() {
                     frontier.insert((ev.depth, id.clone()));
                 }
@@ -1289,7 +1349,7 @@ impl RoomServer {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            let Some(stored) = store.event(&id).map_err(storage_err)? else {
+            let Some(stored) = store.event(&id).await.map_err(storage_err)? else {
                 continue;
             };
             if stored.rejected.is_some() || stored.depth < min_depth {
@@ -1299,7 +1359,7 @@ impl RoomServer {
                 serde_json::from_slice(&stored.raw).map_err(|e| RoomError::Codec(e.to_string()))?;
             for prev in prev_event_ids(&raw) {
                 if !seen.contains(&prev) {
-                    if let Some(pv) = store.event(&prev).map_err(storage_err)? {
+                    if let Some(pv) = store.event(&prev).await.map_err(storage_err)? {
                         if pv.rejected.is_none() {
                             frontier.insert((pv.depth, prev));
                         }
@@ -1315,7 +1375,7 @@ impl RoomServer {
     /// return the room's current state and its auth chain, plus the join
     /// co-signed by us. The caller must have trusted the origin's keys.
     pub async fn send_join(&self, raw: CanonicalJsonObject) -> Result<SendJoinResult> {
-        let (version, room_id, _is_create) = self.classify(&raw)?;
+        let (version, room_id, _is_create) = self.classify(&raw).await?;
         // Co-sign BEFORE validating/persisting. A restricted join names an
         // authorising user on THIS server, and auth rule 4.2 requires the
         // event to be signed by that user's homeserver (us) — so our
@@ -1349,22 +1409,24 @@ impl RoomServer {
         // Current room state, and the transitive auth chain behind it.
         let meta = store
             .meta(room_id.as_str())
+            .await
             .map_err(storage_err)?
             .ok_or_else(|| RoomError::UnknownRoom(room_id.to_string()))?;
         let state_map = store
             .resolve_group(room_id.as_str(), meta.current_group)
+            .await
             .map_err(storage_err)?;
         let mut state = Vec::new();
         let mut auth_seed = BTreeSet::new();
         for event_id in state_map.values() {
-            if let Some(obj) = self.load_raw(&store, event_id)? {
+            if let Some(obj) = self.load_raw(&store, event_id).await? {
                 for auth_id in auth_event_ids(&obj) {
                     auth_seed.insert(auth_id);
                 }
                 state.push(obj);
             }
         }
-        let auth_chain = self.collect_auth_chain(&store, auth_seed)?;
+        let auth_chain = self.collect_auth_chain(&store, auth_seed).await?;
 
         Ok(SendJoinResult {
             event: signed,
@@ -1380,7 +1442,7 @@ impl RoomServer {
     /// room's other servers. Returns the stripped current room state for
     /// the knocking server to show its user (spec "Knocking Rooms").
     pub async fn send_knock(&self, raw: CanonicalJsonObject) -> Result<SendKnockResult> {
-        let (version, room_id, _is_create) = self.classify(&raw)?;
+        let (version, room_id, _is_create) = self.classify(&raw).await?;
         let knocker = str_of(&raw, "state_key")?.to_owned();
         let outcome = {
             let _guard = self.lock_room(room_id.as_str()).await;
@@ -1398,10 +1460,12 @@ impl RoomServer {
         let store = self.store();
         let meta = store
             .meta(room_id.as_str())
+            .await
             .map_err(storage_err)?
             .ok_or_else(|| RoomError::UnknownRoom(room_id.to_string()))?;
         let state_map = store
             .resolve_group(room_id.as_str(), meta.current_group)
+            .await
             .map_err(storage_err)?;
         let mut wanted: Vec<(String, String)> = KNOCK_STATE_TYPES
             .iter()
@@ -1411,7 +1475,7 @@ impl RoomServer {
         let mut knock_room_state = Vec::new();
         for key in wanted {
             if let Some(event_id) = state_map.get(&key) {
-                if let Some(obj) = self.load_raw(&store, event_id)? {
+                if let Some(obj) = self.load_raw(&store, event_id).await? {
                     knock_room_state.push(stripped_state_event(&obj));
                 }
             }
@@ -1534,6 +1598,7 @@ impl RoomServer {
         let meta = self
             .store()
             .meta(room_id)
+            .await
             .map_err(storage_err)?
             .ok_or_else(|| {
                 RoomError::Malformed(format!("history import: unknown room {room_id}"))
@@ -1600,6 +1665,7 @@ impl RoomServer {
         let meta = self
             .store()
             .meta(room_id)
+            .await
             .map_err(storage_err)?
             .ok_or_else(|| {
                 RoomError::Malformed(format!("segment import: unknown room {room_id}"))
@@ -1622,7 +1688,14 @@ impl RoomServer {
             }
         }
         let mut verdict: BTreeMap<String, bool> = BTreeMap::new();
-        let mut resolvable = |seed: &str| -> bool {
+        // (An inner fn rather than a closure: the walk awaits store
+        // reads, and async closures capturing &mut state aren't a thing.)
+        async fn resolvable(
+            store: &RoomStore,
+            fetched_auth: &BTreeMap<String, Vec<String>>,
+            verdict: &mut BTreeMap<String, bool>,
+            seed: &str,
+        ) -> bool {
             let mut pending = vec![seed.to_owned()];
             let mut visiting = BTreeSet::new();
             while let Some(id) = pending.pop() {
@@ -1637,7 +1710,7 @@ impl RoomServer {
                     Some(refs) => refs.clone(),
                     // Not part of this fetch: it must already be ours
                     // (its own chain was checked when it was stored).
-                    None => match store.event(&id) {
+                    None => match store.event(&id).await {
                         Ok(Some(_)) => {
                             verdict.insert(id, true);
                             continue;
@@ -1655,7 +1728,7 @@ impl RoomServer {
                 verdict.insert(id, true);
             }
             true
-        };
+        }
 
         let mut events = Vec::new();
         let mut seen = BTreeSet::new();
@@ -1682,7 +1755,7 @@ impl RoomServer {
             let Some(ev) = import_event(obj) else {
                 continue;
             };
-            if !resolvable(&ev.event_id) {
+            if !resolvable(&store, &fetched_auth, &mut verdict, &ev.event_id).await {
                 dropped += 1;
                 continue;
             }
@@ -1739,17 +1812,22 @@ impl RoomServer {
 
     /// The room's backward-extremity frontier: event ids known to precede
     /// our history that we do not hold (empty = history complete).
-    pub fn history_frontier(&self, room_id: &str) -> Result<Vec<String>> {
+    pub async fn history_frontier(&self, room_id: &str) -> Result<Vec<String>> {
         Ok(self
             .store()
             .meta(room_id)
+            .await
             .map_err(storage_err)?
             .map(|m| m.history_frontier)
             .unwrap_or_default())
     }
 
-    fn load_raw(&self, store: &RoomStore, event_id: &str) -> Result<Option<CanonicalJsonObject>> {
-        let Some(stored) = store.event(event_id).map_err(storage_err)? else {
+    async fn load_raw(
+        &self,
+        store: &RoomStore,
+        event_id: &str,
+    ) -> Result<Option<CanonicalJsonObject>> {
+        let Some(stored) = store.event(event_id).await.map_err(storage_err)? else {
             return Ok(None);
         };
         Ok(Some(
@@ -1762,13 +1840,16 @@ impl RoomServer {
     /// `auth_events` (not the event itself), as raw objects. Serves the
     /// federation `/event_auth` endpoint. `Ok(None)` if we don't hold the
     /// event.
-    pub fn event_auth_chain(&self, event_id: &str) -> Result<Option<Vec<CanonicalJsonObject>>> {
+    pub async fn event_auth_chain(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<Vec<CanonicalJsonObject>>> {
         let store = self.store();
-        let Some(event) = self.load_raw(&store, event_id)? else {
+        let Some(event) = self.load_raw(&store, event_id).await? else {
             return Ok(None);
         };
         let seed: BTreeSet<String> = auth_event_ids(&event).into_iter().collect();
-        Ok(Some(self.collect_auth_chain(&store, seed)?))
+        Ok(Some(self.collect_auth_chain(&store, seed).await?))
     }
 
     /// The resolved room state *before* `event_id` and that state's auth
@@ -1780,7 +1861,7 @@ impl RoomServer {
     /// `Ok(None)` when we don't hold the event, it is rejected, or it
     /// belongs to another room.
     #[allow(clippy::type_complexity)]
-    pub fn state_before_event(
+    pub async fn state_before_event(
         &self,
         room_id: &str,
         event_id: &str,
@@ -1791,7 +1872,7 @@ impl RoomServer {
         )>,
     > {
         let store = self.store();
-        let Some(stored) = store.event(event_id).map_err(storage_err)? else {
+        let Some(stored) = store.event(event_id).await.map_err(storage_err)? else {
             return Ok(None);
         };
         if stored.state_group_after == 0 {
@@ -1804,6 +1885,7 @@ impl RoomServer {
         }
         let mut state = store
             .resolve_group(room_id, stored.state_group_after)
+            .await
             .map_err(storage_err)?;
 
         // `state_group_after` includes a state event itself — back it out.
@@ -1813,20 +1895,26 @@ impl RoomServer {
         ) {
             let key = (etype.to_owned(), skey.to_owned());
             let mut replaced = false;
-            for auth_id in raw
+            // Materialized before the loop: an iterator of borrowing
+            // closures held across an await trips rustc's higher-ranked
+            // lifetime inference (rust-lang/rust#89976).
+            let auth_ids: Vec<String> = raw
                 .get("auth_events")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str()))
-                .into_iter()
-                .flatten()
-            {
-                let Some(ae) = self.load_raw(&store, auth_id)? else {
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for auth_id in &auth_ids {
+                let Some(ae) = self.load_raw(&store, auth_id).await? else {
                     continue;
                 };
                 if ae.get("type").and_then(|v| v.as_str()) == Some(etype)
                     && ae.get("state_key").and_then(|v| v.as_str()) == Some(skey)
                 {
-                    state.insert(key.clone(), auth_id.to_owned());
+                    state.insert(key.clone(), auth_id.clone());
                     replaced = true;
                     break;
                 }
@@ -1839,21 +1927,23 @@ impl RoomServer {
         let mut pdus = Vec::new();
         let mut auth_seed = BTreeSet::new();
         for id in state.values() {
-            let Some(obj) = self.load_raw(&store, id)? else {
+            let Some(obj) = self.load_raw(&store, id).await? else {
                 continue;
             };
             auth_seed.extend(auth_event_ids(&obj));
             pdus.push((id.clone(), obj));
         }
-        let auth_chain = self
-            .collect_auth_chain(&store, auth_seed)?
-            .into_iter()
-            .filter_map(|obj| self.pdu_event_id(&obj).map(|id| (id.to_string(), obj)))
-            .collect();
+        let mut auth_chain_pairs = Vec::new();
+        for obj in self.collect_auth_chain(&store, auth_seed).await? {
+            if let Some(id) = self.pdu_event_id(&obj).await {
+                auth_chain_pairs.push((id.to_string(), obj));
+            }
+        }
+        let auth_chain = auth_chain_pairs.into_iter().collect();
         Ok(Some((pdus, auth_chain)))
     }
 
-    fn collect_auth_chain(
+    async fn collect_auth_chain(
         &self,
         store: &RoomStore,
         seed: BTreeSet<String>,
@@ -1865,7 +1955,7 @@ impl RoomServer {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            if let Some(obj) = self.load_raw(store, &id)? {
+            if let Some(obj) = self.load_raw(store, &id).await? {
                 for auth_id in auth_event_ids(&obj) {
                     if !seen.contains(&auth_id) {
                         queue.push(auth_id);
@@ -1921,15 +2011,19 @@ impl RoomServer {
         // The lock spans build + process: prev_events/auth_events read
         // here must still be the room's tip when the proposal lands.
         let _guard = self.lock_room(room_id.as_str()).await;
-        let (raw, version) =
-            self.build_local(room_id, sender, event_type, state_key, content, ts_override)?;
+        let (raw, version) = self
+            .build_local(room_id, sender, event_type, state_key, content, ts_override)
+            .await?;
         // Locally authored: the sender's `is_local` check fans it out already.
         self.process(raw, version, &room_id.to_owned(), false, false)
             .await
     }
 
     /// Determine room version and room ID of a PDU prior to validation.
-    fn classify(&self, raw: &CanonicalJsonObject) -> Result<(RoomVersion, OwnedRoomId, bool)> {
+    async fn classify(
+        &self,
+        raw: &CanonicalJsonObject,
+    ) -> Result<(RoomVersion, OwnedRoomId, bool)> {
         let event_type = str_of(raw, "type")?;
         let is_create = event_type == "m.room.create"
             && matches!(raw.get("state_key"), Some(CanonicalJsonValue::String(s)) if s.is_empty());
@@ -1954,6 +2048,7 @@ impl RoomServer {
         let meta = self
             .store()
             .meta(room_id.as_str())
+            .await
             .map_err(storage_err)?
             .ok_or_else(|| RoomError::UnknownRoom(room_id.to_string()))?;
         Ok((RoomVersion::parse(&meta.version)?, room_id, false))
@@ -1962,7 +2057,7 @@ impl RoomServer {
     /// Build and sign a local event on the room's current tip.
     /// `ts_override` replaces the `origin_server_ts` stamp (appservice
     /// timestamp massaging).
-    fn build_local(
+    async fn build_local(
         &self,
         room_id: &ruma::RoomId,
         sender: &UserId,
@@ -1974,11 +2069,13 @@ impl RoomServer {
         let store = self.store();
         let meta = store
             .meta(room_id.as_str())
+            .await
             .map_err(storage_err)?
             .ok_or_else(|| RoomError::UnknownRoom(room_id.to_string()))?;
         let version = RoomVersion::parse(&meta.version)?;
         let current = store
             .resolve_group(room_id.as_str(), meta.current_group)
+            .await
             .map_err(storage_err)?;
 
         // prev_events = the forward extremities; depth = max(prev) + 1.
@@ -1986,6 +2083,7 @@ impl RoomServer {
         for id in &meta.extremities {
             let prev = store
                 .event(id)
+                .await
                 .map_err(storage_err)?
                 .ok_or_else(|| RoomError::MissingEvents(vec![id.clone()]))?;
             depth = depth.max(prev.depth);
@@ -2035,7 +2133,7 @@ impl RoomServer {
     /// `prev_events` (transitively through further rejected events, bounded)
     /// collecting the first state group on each branch. Empty when nothing
     /// in reach carries state.
-    fn groups_behind_rejected(&self, store: &RoomStore, id: &str) -> BTreeSet<u64> {
+    async fn groups_behind_rejected(&self, store: &RoomStore, id: &str) -> BTreeSet<u64> {
         let mut groups = BTreeSet::new();
         let mut queue = vec![(id.to_owned(), 0usize)];
         let mut seen = BTreeSet::new();
@@ -2043,11 +2141,11 @@ impl RoomServer {
             if depth > 8 || !seen.insert(id.clone()) {
                 continue;
             }
-            let Ok(Some(obj)) = self.load_raw(store, &id) else {
+            let Ok(Some(obj)) = self.load_raw(store, &id).await else {
                 continue;
             };
             for prev in prev_event_ids(&obj) {
-                match store.event(&prev) {
+                match store.event(&prev).await {
                     Ok(Some(se)) if se.state_group_after != 0 => {
                         groups.insert(se.state_group_after);
                     }
@@ -2113,12 +2211,13 @@ impl RoomServer {
         let store = self.store();
         if store
             .event(event_id.as_str())
+            .await
             .map_err(storage_err)?
             .is_some()
         {
             return Ok(Outcome::Duplicate { event_id });
         }
-        let meta = store.meta(room_id.as_str()).map_err(storage_err)?;
+        let meta = store.meta(room_id.as_str()).await.map_err(storage_err)?;
         if !is_create && meta.is_none() {
             return Err(RoomError::UnknownRoom(room_id.to_string()));
         }
@@ -2128,7 +2227,7 @@ impl RoomServer {
         let mut missing_auth: Vec<String> = Vec::new();
         let mut auth_events: Vec<(IdentifiedPdu, bool)> = Vec::new();
         for id in event.auth_events() {
-            match store.event(id.as_str()).map_err(storage_err)? {
+            match store.event(id.as_str()).await.map_err(storage_err)? {
                 Some(se) => {
                     let rejected = se.rejected.is_some();
                     auth_events.push((parse_stored(id.clone(), &se)?, rejected));
@@ -2138,7 +2237,7 @@ impl RoomServer {
         }
         let mut prev_groups: BTreeSet<u64> = BTreeSet::new();
         for id in event.prev_events() {
-            match store.event(id.as_str()).map_err(storage_err)? {
+            match store.event(id.as_str()).await.map_err(storage_err)? {
                 // An auth-chain-rejected prev (no state group of its own)
                 // is still a legitimate prev — rejected events stay in the
                 // DAG, and refusing them here would sink every later event
@@ -2148,7 +2247,7 @@ impl RoomServer {
                 // prevs' state stands in; only a chain with no resolvable
                 // ancestor is genuinely missing.
                 Some(se) if se.state_group_after == 0 => {
-                    let groups = self.groups_behind_rejected(&store, id.as_str());
+                    let groups = self.groups_behind_rejected(&store, id.as_str()).await;
                     if groups.is_empty() {
                         missing.push(id.to_string());
                     } else {
@@ -2188,7 +2287,7 @@ impl RoomServer {
             if id == event.event_id {
                 return Some(event.clone());
             }
-            let se = store.event(id.as_str()).ok().flatten()?;
+            let se = store.event_sync(id.as_str()).ok().flatten()?;
             if matches!(se.rejected, Some(Rejected::AuthChain(_))) {
                 return None;
             }
@@ -2238,6 +2337,7 @@ impl RoomServer {
                 .expect("meta checked above for non-create events");
             let se = store
                 .event(&create_id)
+                .await
                 .map_err(storage_err)?
                 .ok_or_else(|| RoomError::MissingEvents(vec![create_id.clone()]))?;
             let create_id = OwnedEventId::try_from(create_id)
@@ -2268,11 +2368,11 @@ impl RoomServer {
             (StateIds::new(), 0)
         } else if prev_groups.len() == 1 {
             let g = *prev_groups.iter().next().expect("len checked");
-            (materialize(&store, room_id.as_str(), g)?, g)
+            (materialize(&store, room_id.as_str(), g).await?, g)
         } else {
             let mut sets = Vec::with_capacity(prev_groups.len());
             for g in &prev_groups {
-                sets.push(materialize(&store, room_id.as_str(), *g)?);
+                sets.push(materialize(&store, room_id.as_str(), *g).await?);
             }
             let resolved = state_res::resolve(version, &sets, &fetch)?;
             let g = alloc_full(&mut next_group, &mut new_groups, &resolved);
@@ -2311,6 +2411,7 @@ impl RoomServer {
                     Some(
                         store
                             .group(room_id.as_str(), before_group)
+                            .await
                             .map_err(storage_err)?
                             .ok_or_else(|| {
                                 RoomError::Storage(format!("state group {before_group} missing"))
@@ -2363,9 +2464,10 @@ impl RoomServer {
                 } else {
                     let se = store
                         .event(id)
+                        .await
                         .map_err(storage_err)?
                         .ok_or_else(|| RoomError::MissingEvents(vec![id.clone()]))?;
-                    sets.push(materialize(&store, room_id.as_str(), se.state_group_after)?);
+                    sets.push(materialize(&store, room_id.as_str(), se.state_group_after).await?);
                 }
             }
             let resolved = state_res::resolve(version, &sets, &fetch)?;
@@ -2379,7 +2481,8 @@ impl RoomServer {
         // Accepted m.room.redaction: decide whether it *applies* to its
         // target (spec "Redactions": same sender, or redact power level).
         let redacts = if event.event_type() == "m.room.redaction" {
-            self.redaction_target(&store, room_id, &event, version, &state_before, &fetch)?
+            self.redaction_target(&store, room_id, &event, version, &state_before, &fetch)
+                .await?
         } else {
             None
         };
@@ -2409,7 +2512,7 @@ impl RoomServer {
     /// (evaluated against the state before the redaction). Unknown targets
     /// are dropped for now — M3 revisits out-of-order federated
     /// redactions.
-    fn redaction_target(
+    async fn redaction_target(
         &self,
         store: &RoomStore,
         room_id: &ruma::RoomId,
@@ -2424,7 +2527,7 @@ impl RoomServer {
         let Ok(target_id) = OwnedEventId::try_from(target_id.as_str()) else {
             return Ok(None);
         };
-        let Some(stored) = store.event(target_id.as_str()).map_err(storage_err)? else {
+        let Some(stored) = store.event(target_id.as_str()).await.map_err(storage_err)? else {
             return Ok(None);
         };
         if stored.rejected.is_some() {
@@ -2668,8 +2771,11 @@ fn parse_stored(event_id: OwnedEventId, stored: &StoredEvent) -> Result<Identifi
     })
 }
 
-fn materialize(store: &RoomStore, room_id: &str, group: u64) -> Result<StateIds> {
-    let map = store.resolve_group(room_id, group).map_err(storage_err)?;
+async fn materialize(store: &RoomStore, room_id: &str, group: u64) -> Result<StateIds> {
+    let map = store
+        .resolve_group(room_id, group)
+        .await
+        .map_err(storage_err)?;
     let mut out = StateIds::new();
     for (k, v) in map {
         out.insert(

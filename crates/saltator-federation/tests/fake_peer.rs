@@ -252,6 +252,7 @@ async fn our_server_joins_peer_hosted_room() {
     // Our server now hosts a copy with the peer as a remote member.
     let peers = our_rooms
         .remote_servers_in_room(&room_id, "hs.test")
+        .await
         .unwrap();
     assert_eq!(peers, vec!["peer.test".to_owned()]);
 
@@ -318,7 +319,7 @@ async fn peer_pushed_message_is_ingested() {
         "peer message should verify and ingest: {out}"
     );
     assert!(
-        our_rooms.store().event(&msg_id).unwrap().is_some(),
+        our_rooms.store().event(&msg_id).await.unwrap().is_some(),
         "message not persisted"
     );
 
@@ -641,11 +642,11 @@ async fn pdu_with_undelivered_prev_is_recovered_via_event_fetch() {
         "PDU with undelivered prev should ingest after /event recovery: {out}"
     );
     assert!(
-        our_rooms.store().event(&first_id).unwrap().is_some(),
+        our_rooms.store().event(&first_id).await.unwrap().is_some(),
         "missing prev not recovered from the origin"
     );
     assert!(
-        our_rooms.store().event(&second_id).unwrap().is_some(),
+        our_rooms.store().event(&second_id).await.unwrap().is_some(),
         "delivered PDU not persisted"
     );
 
@@ -745,21 +746,26 @@ async fn event_citing_rejected_auth_event_is_rejected() {
         .send_transaction(&our_base, "hs.test", vec![r_raw, x_raw, s_raw])
         .await;
 
-    let rejected = |id: &str| {
-        our_rooms
+    async fn rejected(rooms: &RoomServer, id: &str) -> Option<bool> {
+        rooms
             .store()
             .event(id)
+            .await
             .unwrap()
             .map(|e| e.rejected.is_some())
-    };
-    assert_eq!(rejected(&r_id), Some(true), "R must be rejected: {out}");
+    }
     assert_eq!(
-        rejected(&x_id),
+        rejected(&our_rooms, &r_id).await,
+        Some(true),
+        "R must be rejected: {out}"
+    );
+    assert_eq!(
+        rejected(&our_rooms, &x_id).await,
         Some(true),
         "X cites rejected R and must be rejected: {out}"
     );
     assert_eq!(
-        rejected(&s_id),
+        rejected(&our_rooms, &s_id).await,
         Some(false),
         "sentinel S must be accepted: {out}"
     );
@@ -973,7 +979,7 @@ async fn peer_malformed_pdu_is_rejected() {
         "an unsigned PDU must not report success: {out}"
     );
     assert!(
-        our_rooms.store().event(&msg_id).unwrap().is_none(),
+        our_rooms.store().event(&msg_id).await.unwrap().is_none(),
         "an unsigned PDU must not be persisted"
     );
 
@@ -1006,6 +1012,7 @@ async fn peer_joins_our_room(
             room,
             &user,
         )
+        .await
         .unwrap();
     signer.hash_and_sign_event(&mut template, version).unwrap();
     rooms.send_join(template).await.expect("send_join applies");
@@ -1337,7 +1344,7 @@ async fn inbound_pdu_from_acl_denied_server_is_dropped() {
             .contains("server ACL"),
         "denied PDU should be ACL-rejected: {out}"
     );
-    assert!(our_rooms.store().event(&denied_id).unwrap().is_none());
+    assert!(our_rooms.store().event(&denied_id).await.unwrap().is_none());
 
     // Allowed room: the same origin is NOT ACL-rejected (it fails ingest for
     // a different reason — missing events — proving the ACL let it through).
@@ -1534,6 +1541,7 @@ async fn room_data_endpoints_refuse_strangers() {
     let event_id = our_rooms
         .store()
         .timeline(0, 64)
+        .await
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {

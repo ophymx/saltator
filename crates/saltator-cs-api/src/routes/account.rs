@@ -423,7 +423,8 @@ pub async fn update_device(
     // /keys/query `unsigned.device_display_name`) — announce it.
     state
         .e2ee()
-        .broadcast_update(auth.user_id.as_str(), req.device_id.as_str(), false);
+        .broadcast_update(auth.user_id.as_str(), req.device_id.as_str(), false)
+        .await;
     Ok(Ra(update_device::v3::Response::new()))
 }
 
@@ -467,7 +468,8 @@ pub async fn delete_device(
         .await?;
     state
         .e2ee()
-        .broadcast_update(auth.user_id.as_str(), req.device_id.as_str(), true);
+        .broadcast_update(auth.user_id.as_str(), req.device_id.as_str(), true)
+        .await;
     Ok(Ra(delete_device::v3::Response::new()))
 }
 
@@ -506,7 +508,8 @@ pub async fn change_password(
     for device_id in others {
         state
             .e2ee()
-            .broadcast_update(auth.user_id.as_str(), &device_id, true);
+            .broadcast_update(auth.user_id.as_str(), &device_id, true)
+            .await;
     }
     Ok(Ra(change_password::v3::Response::new()))
 }
@@ -532,7 +535,8 @@ pub async fn deactivate(
     for device_id in devices {
         state
             .e2ee()
-            .broadcast_update(auth.user_id.as_str(), &device_id, true);
+            .broadcast_update(auth.user_id.as_str(), &device_id, true)
+            .await;
     }
     Ok(Ra(deactivate::v3::Response::new(
         ThirdPartyIdRemovalStatus::Success,
@@ -555,7 +559,7 @@ pub async fn set_presence(
         req.status_msg.clone(),
     );
     // Forward to remote servers sharing a room with the user.
-    let dests = crate::routes::edu::presence_destinations(&state, auth.user_id.as_str());
+    let dests = crate::routes::edu::presence_destinations(&state, auth.user_id.as_str()).await;
     let edu = serde_json::json!({
         "edu_type": "m.presence",
         "content": {

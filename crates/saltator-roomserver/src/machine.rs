@@ -687,26 +687,135 @@ fn apply_import_history(ctx: &mut ApplyCtx<'_>, cmd: &ImportHistory) -> StoreRes
 // Typed reads
 // ---------------------------------------------------------------------------
 
-/// Typed read access to a room shard's applied state.
+/// Typed read access to a room shard's applied state — local (this
+/// node hosts the shard) or remote (served by a hosting replica over
+/// the Read RPC, docs/design-room-sharding-phase2.md). Every read
+/// method is async for the remote case; the local case resolves
+/// immediately.
 #[derive(Clone)]
 pub struct RoomStore {
-    read: ReadCtx,
+    backend: Backend,
+}
+
+#[derive(Clone)]
+enum Backend {
+    Local(ReadCtx),
+    Remote(std::sync::Arc<dyn saltator_shard::read::RemoteReader>),
+}
+
+fn remote_err(e: saltator_shard::ShardError) -> StoreError {
+    StoreError::Engine(format!("remote read: {e}"))
 }
 
 impl RoomStore {
     pub fn new(read: ReadCtx) -> Self {
-        Self { read }
+        Self {
+            backend: Backend::Local(read),
+        }
     }
 
-    pub fn event(&self, event_id: &str) -> StoreResult<Option<StoredEvent>> {
-        match self.read.get(T_EVENT, event_id.as_bytes())? {
+    /// A store served by a remote replica of the shard.
+    pub fn remote(reader: std::sync::Arc<dyn saltator_shard::read::RemoteReader>) -> Self {
+        Self {
+            backend: Backend::Remote(reader),
+        }
+    }
+
+    /// Synchronous point read of a stored event — for the event
+    /// pipeline's state-resolution callback, whose saltator-core API is
+    /// deliberately sync and I/O-free. The pipeline only runs where the
+    /// shard is hosted (spec.md §5.2: at the room-shard leader), so a
+    /// remote store refuses.
+    pub fn event_sync(&self, event_id: &str) -> StoreResult<Option<StoredEvent>> {
+        match &self.backend {
+            Backend::Local(ctx) => match ctx.get(T_EVENT, event_id.as_bytes())? {
+                Some(b) => Ok(Some(dec("event decode", &b)?)),
+                None => Ok(None),
+            },
+            Backend::Remote(_) => Err(StoreError::Engine(
+                "event pipeline requires a hosted shard (sync read on remote store)".into(),
+            )),
+        }
+    }
+
+    // -- storage primitives, dispatched by backend --------------------
+
+    async fn kv_get(&self, table: u8, key: &[u8]) -> StoreResult<Option<Vec<u8>>> {
+        match &self.backend {
+            Backend::Local(ctx) => ctx.get(table, key),
+            Backend::Remote(r) => match r
+                .read(saltator_shard::ReadOp::Get {
+                    table,
+                    key: key.to_vec(),
+                })
+                .await
+                .map_err(remote_err)?
+            {
+                saltator_shard::ReadValue::Value(v) => Ok(v),
+                other => Err(StoreError::Engine(format!("get returned {other:?}"))),
+            },
+        }
+    }
+
+    async fn kv_scan(
+        &self,
+        table: u8,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        reverse: bool,
+    ) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        match &self.backend {
+            Backend::Local(ctx) => ctx.scan(table, start, end, limit, reverse),
+            Backend::Remote(r) => match r
+                .read(saltator_shard::ReadOp::Scan {
+                    table,
+                    start: start.to_vec(),
+                    end: end.to_vec(),
+                    limit: limit.min(u32::MAX as usize) as u32,
+                    reverse,
+                })
+                .await
+                .map_err(remote_err)?
+            {
+                saltator_shard::ReadValue::Entries(e) => Ok(e),
+                other => Err(StoreError::Engine(format!("scan returned {other:?}"))),
+            },
+        }
+    }
+
+    async fn kv_range(
+        &self,
+        table: u8,
+        start: &[u8],
+        end: &[u8],
+    ) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        match &self.backend {
+            Backend::Local(ctx) => ctx.range(table, start, end),
+            Backend::Remote(r) => match r
+                .read(saltator_shard::ReadOp::Range {
+                    table,
+                    start: start.to_vec(),
+                    end: end.to_vec(),
+                })
+                .await
+                .map_err(remote_err)?
+            {
+                saltator_shard::ReadValue::Entries(e) => Ok(e),
+                other => Err(StoreError::Engine(format!("range returned {other:?}"))),
+            },
+        }
+    }
+
+    pub async fn event(&self, event_id: &str) -> StoreResult<Option<StoredEvent>> {
+        match self.kv_get(T_EVENT, event_id.as_bytes()).await? {
             Some(b) => Ok(Some(dec("event decode", &b)?)),
             None => Ok(None),
         }
     }
 
-    pub fn meta(&self, room_id: &str) -> StoreResult<Option<RoomMeta>> {
-        match self.read.get(T_ROOM, room_id.as_bytes())? {
+    pub async fn meta(&self, room_id: &str) -> StoreResult<Option<RoomMeta>> {
+        match self.kv_get(T_ROOM, room_id.as_bytes()).await? {
             Some(b) => Ok(Some(dec("room meta decode", &b)?)),
             None => Ok(None),
         }
@@ -718,15 +827,17 @@ impl RoomStore {
     /// whole-table materialization.
     ///
     /// [`UserStore::accounts`]: saltator_userserver::UserStore::accounts
-    pub fn rooms(&self, from: Option<&str>, limit: usize) -> StoreResult<RoomPage> {
+    pub async fn rooms(&self, from: Option<&str>, limit: usize) -> StoreResult<RoomPage> {
         // The extra row is the next page's start key, not a result.
-        let rows = self.read.scan(
-            T_ROOM,
-            from.unwrap_or("").as_bytes(),
-            &[],
-            limit.saturating_add(1),
-            false,
-        )?;
+        let rows = self
+            .kv_scan(
+                T_ROOM,
+                from.unwrap_or("").as_bytes(),
+                &[],
+                limit.saturating_add(1),
+                false,
+            )
+            .await?;
         let mut out = Vec::with_capacity(rows.len().min(limit));
         let mut next = None;
         for (i, (k, v)) in rows.into_iter().enumerate() {
@@ -741,8 +852,8 @@ impl RoomStore {
         Ok((out, next))
     }
 
-    pub fn group(&self, room_id: &str, group: u64) -> StoreResult<Option<StateGroup>> {
-        match self.read.get(T_GROUP, &room_u64_key(room_id, group))? {
+    pub async fn group(&self, room_id: &str, group: u64) -> StoreResult<Option<StateGroup>> {
+        match self.kv_get(T_GROUP, &room_u64_key(room_id, group)).await? {
             Some(b) => Ok(Some(dec("state group decode", &b)?)),
             None => Ok(None),
         }
@@ -750,7 +861,7 @@ impl RoomStore {
 
     /// Materialize a state group into a full `(type, state_key) →
     /// event_id` map by walking the delta chain.
-    pub fn resolve_group(
+    pub async fn resolve_group(
         &self,
         room_id: &str,
         group: u64,
@@ -758,7 +869,7 @@ impl RoomStore {
         let mut chain = Vec::new();
         let mut cursor = Some(group);
         while let Some(id) = cursor {
-            let g = self.group(room_id, id)?.ok_or_else(|| {
+            let g = self.group(room_id, id).await?.ok_or_else(|| {
                 StoreError::Engine(format!("state group {id} missing in {room_id}"))
             })?;
             cursor = g.parent;
@@ -775,10 +886,10 @@ impl RoomStore {
 
     /// Timeline entries with `seq > from`, oldest first, across all rooms
     /// of the shard.
-    pub fn timeline(&self, from: u64, limit: usize) -> StoreResult<Vec<(u64, SeqEntry)>> {
+    pub async fn timeline(&self, from: u64, limit: usize) -> StoreResult<Vec<(u64, SeqEntry)>> {
         let start = (from + 1).to_be_bytes();
         let mut out = Vec::new();
-        for (k, v) in self.read.scan(T_SEQ, &start, &[], limit, false)? {
+        for (k, v) in self.kv_scan(T_SEQ, &start, &[], limit, false).await? {
             let seq = u64::from_be_bytes(
                 k.as_slice()
                     .try_into()
@@ -793,7 +904,7 @@ impl RoomStore {
     /// (`until` = end of time when `None`): at most `limit` of them,
     /// oldest-first — or newest-first from the top of the window when
     /// `newest_first` (backwards `/messages` pagination).
-    pub fn room_timeline(
+    pub async fn room_timeline(
         &self,
         room_id: &str,
         after: u64,
@@ -809,8 +920,8 @@ impl RoomStore {
         };
         let mut out = Vec::new();
         for (k, v) in self
-            .read
-            .scan(T_ROOM_SEQ, &start, &end, limit, newest_first)?
+            .kv_scan(T_ROOM_SEQ, &start, &end, limit, newest_first)
+            .await?
         {
             let seq = u64::from_be_bytes(
                 k[k.len() - 8..]
@@ -831,7 +942,7 @@ impl RoomStore {
     /// natural order for backwards `/messages` pagination continuing past
     /// the timeline floor) and `oldest_first: true` reads descending idx
     /// from the top of the window (older→newer, forwards pagination).
-    pub fn room_history(
+    pub async fn room_history(
         &self,
         room_id: &str,
         after: u64,
@@ -847,8 +958,8 @@ impl RoomStore {
         };
         let mut out = Vec::new();
         for (k, v) in self
-            .read
-            .scan(T_HISTORY, &start, &end, limit, oldest_first)?
+            .kv_scan(T_HISTORY, &start, &end, limit, oldest_first)
+            .await?
         {
             let idx = u64::from_be_bytes(
                 k[k.len() - 8..]
@@ -863,12 +974,15 @@ impl RoomStore {
     }
 
     /// All receipts of a room: `(user_id, receipt_type, record)`.
-    pub fn receipts(&self, room_id: &str) -> StoreResult<Vec<(String, String, ReceiptRecord)>> {
+    pub async fn receipts(
+        &self,
+        room_id: &str,
+    ) -> StoreResult<Vec<(String, String, ReceiptRecord)>> {
         let mut start = room_id.as_bytes().to_vec();
         start.push(0);
         let end = room_u64_end(room_id);
         let mut out = Vec::new();
-        for (k, v) in self.read.range(T_RECEIPT, &start, &end)? {
+        for (k, v) in self.kv_range(T_RECEIPT, &start, &end).await? {
             let rest = &k[start.len()..];
             let sep = rest
                 .iter()
@@ -891,8 +1005,8 @@ impl RoomStore {
     }
 
     /// The event that redacted `event_id`, if any.
-    pub fn redacted_by(&self, event_id: &str) -> StoreResult<Option<String>> {
-        Ok(match self.read.get(T_REDACT, event_id.as_bytes())? {
+    pub async fn redacted_by(&self, event_id: &str) -> StoreResult<Option<String>> {
+        Ok(match self.kv_get(T_REDACT, event_id.as_bytes()).await? {
             Some(v) => Some(
                 String::from_utf8(v)
                     .map_err(|_| StoreError::Engine("redact value not UTF-8".into()))?,
@@ -905,20 +1019,20 @@ impl RoomStore {
     /// room version's redaction algorithm applied (and
     /// `unsigned.redacted_because` set) if the event has been redacted.
     /// Rejected events are not served.
-    pub fn served_event(
+    pub async fn served_event(
         &self,
         event_id: &str,
         version: RoomVersion,
     ) -> StoreResult<Option<CanonicalJsonObject>> {
-        let Some(stored) = self.event(event_id)? else {
+        let Some(stored) = self.event(event_id).await? else {
             return Ok(None);
         };
         if stored.rejected.is_some() {
             return Ok(None);
         }
         let mut raw = parse_raw(&stored.raw)?;
-        if let Some(redactor_id) = self.redacted_by(event_id)? {
-            if let Some(redactor) = self.event(&redactor_id)? {
+        if let Some(redactor_id) = self.redacted_by(event_id).await? {
+            if let Some(redactor) = self.event(&redactor_id).await? {
                 raw = validation::redact(&raw, version)
                     .map_err(|e| StoreError::Engine(format!("redact: {e}")))?;
                 let because = parse_raw(&redactor.raw)?;

@@ -41,14 +41,16 @@ const SCAN_CAP: usize = 512;
 
 /// The evaluation inputs for one `(user, room)`: the user's ruleset (with
 /// the legacy mention rules injected) and the room push context.
-pub(crate) fn rule_inputs(
+pub(crate) async fn rule_inputs(
     state: &CsState,
     user_id: &UserId,
     room_id: &str,
 ) -> Result<(ruma::push::Ruleset, PushConditionRoomCtx)> {
     let mut ruleset = crate::routes::push::load_ruleset(state, user_id)?;
     add_legacy_mention_rules(&mut ruleset, user_id);
-    let member_count = room_util::joined_member_ids(&state.rooms, room_id)?.len();
+    let member_count = room_util::joined_member_ids(&state.rooms, room_id)
+        .await?
+        .len();
     let display_name = state
         .users
         .store()
@@ -57,9 +59,10 @@ pub(crate) fn rule_inputs(
         .flatten()
         .and_then(|p| p.displayname)
         .unwrap_or_else(|| user_id.localpart().to_owned());
-    let current = room_util::current_state(&state.rooms, room_id)?;
+    let current = room_util::current_state(&state.rooms, room_id).await?;
     let power_levels =
-        room_util::state_content_in(&state.rooms, room_id, &current, "m.room.power_levels")?
+        room_util::state_content_in(&state.rooms, room_id, &current, "m.room.power_levels")
+            .await?
             .as_ref()
             .and_then(power_levels_ctx);
     let mut ctx = PushConditionRoomCtx::new(
@@ -84,12 +87,18 @@ pub async fn room_unread(
     // the unthreaded position plus one per thread ("main" or a root id).
     let mut unthreaded = 0u64;
     let mut thread_pos: BTreeMap<String, u64> = BTreeMap::new();
-    for (user, receipt_type, record) in store.receipts(room_id).map_err(ApiError::internal)? {
+    for (user, receipt_type, record) in store.receipts(room_id).await.map_err(ApiError::internal)? {
         if user != user_id.as_str() || !matches!(receipt_type.as_str(), "m.read" | "m.read.private")
         {
             continue;
         }
-        let Some(seq) = store.event(&record.event_id).ok().flatten().map(|s| s.seq) else {
+        let Some(seq) = store
+            .event(&record.event_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.seq)
+        else {
             continue;
         };
         match &record.thread_id {
@@ -101,17 +110,19 @@ pub async fn room_unread(
         }
     }
 
-    let (ruleset, ctx) = rule_inputs(state, user_id, room_id)?;
-    let meta = room_util::room_meta(&state.rooms, room_id)?;
+    let (ruleset, ctx) = rule_inputs(state, user_id, room_id).await?;
+    let meta = room_util::room_meta(&state.rooms, room_id).await?;
     let version = room_util::room_version(&meta)?;
 
     let mut out = RoomUnread::default();
     for (seq, event_id) in store
         .room_timeline(room_id, unthreaded, Some(upto), SCAN_CAP, false)
+        .await
         .map_err(ApiError::internal)?
     {
         let Some(ev) =
-            room_util::client_event(&state.rooms, version, room_id, &event_id, user_id.as_str())?
+            room_util::client_event(&state.rooms, version, room_id, &event_id, user_id.as_str())
+                .await?
         else {
             continue;
         };

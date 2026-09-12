@@ -16,20 +16,22 @@ type Result<T> = std::result::Result<T, ApiError>;
 
 /// Everything the scan needs: the caller's view ceiling and the room's
 /// client-format events, oldest first, as (seq, event JSON).
-fn visible_events(
+async fn visible_events(
     state: &CsState,
     auth: &Auth,
     room_id: &str,
 ) -> Result<Vec<(u64, serde_json::Value)>> {
     crate::routes::rooms::ensure_not_forgotten(state, auth.user_id.as_str(), room_id)?;
-    let (_, cap) = member_view(&state.rooms, room_id, auth.user_id.as_str()).map_err(|e| {
-        if e.status == axum::http::StatusCode::NOT_FOUND {
-            ApiError::forbidden("You aren't a member of the room")
-        } else {
-            e
-        }
-    })?;
-    let meta = room_meta(&state.rooms, room_id)?;
+    let (_, cap) = member_view(&state.rooms, room_id, auth.user_id.as_str())
+        .await
+        .map_err(|e| {
+            if e.status == axum::http::StatusCode::NOT_FOUND {
+                ApiError::forbidden("You aren't a member of the room")
+            } else {
+                e
+            }
+        })?;
+    let meta = room_meta(&state.rooms, room_id).await?;
     let version = room_version(&meta)?;
     let mut out = Vec::new();
     for (seq, event_id) in state
@@ -37,6 +39,7 @@ fn visible_events(
         .for_room(room_id)
         .store()
         .room_timeline(room_id, 0, cap, usize::MAX, false)
+        .await
         .map_err(ApiError::internal)?
     {
         if let Some(ev) = client_event(
@@ -45,7 +48,9 @@ fn visible_events(
             room_id,
             &event_id,
             auth.user_id.as_str(),
-        )? {
+        )
+        .await?
+        {
             out.push((seq, ev));
         }
     }
@@ -95,7 +100,7 @@ async fn relations_common(
         .transpose()?;
 
     let mut matches: Vec<(u64, &serde_json::Value)> = Vec::new();
-    let events = visible_events(&state, &auth, &room_id)?;
+    let events = visible_events(&state, &auth, &room_id).await?;
     for (seq, ev) in &events {
         if let Some(bound) = from {
             if backward && *seq > bound.upper() {
@@ -189,7 +194,7 @@ pub async fn get_threads(
         .and_then(|l| l.parse::<usize>().ok())
         .unwrap_or(10)
         .clamp(1, 100);
-    let events = visible_events(&state, &auth, &room_id)?;
+    let events = visible_events(&state, &auth, &room_id).await?;
     let by_id: std::collections::HashMap<&str, &serde_json::Value> = events
         .iter()
         .filter_map(|(_, ev)| ev.get("event_id")?.as_str().map(|id| (id, ev)))

@@ -95,7 +95,7 @@ pub async fn search(
         if !joined {
             continue;
         }
-        let Ok(meta) = room_meta(&state.rooms, room_id) else {
+        let Ok(meta) = room_meta(&state.rooms, room_id).await else {
             continue;
         };
         let version = room_version(&meta)?;
@@ -104,6 +104,7 @@ pub async fn search(
             .for_room(room_id)
             .store()
             .room_timeline(room_id, 0, None, usize::MAX, false)
+            .await
             .map_err(internal)?;
         for (seq, event_id) in timeline {
             let Some(ev) = client_event(
@@ -112,7 +113,8 @@ pub async fn search(
                 room_id,
                 &event_id,
                 auth.user_id.as_str(),
-            )?
+            )
+            .await?
             else {
                 continue;
             };
@@ -149,12 +151,13 @@ pub async fn search(
         result.rank = Some(1.0);
         result.result = Some(to_raw(ev)?);
 
-        let meta = room_meta(&state.rooms, room_id)?;
+        let meta = room_meta(&state.rooms, room_id).await?;
         let version = room_version(&meta)?;
         let mut context = search_events::v3::EventContextResult::default();
         let rstore = state.rooms.for_room(room_id).store();
         for (_, event_id) in rstore
             .room_timeline(room_id, 0, Some(seq.saturating_sub(1)), before_limit, true)
+            .await
             .map_err(internal)?
         {
             if let Some(ev) = client_event(
@@ -163,12 +166,15 @@ pub async fn search(
                 room_id,
                 &event_id,
                 auth.user_id.as_str(),
-            )? {
+            )
+            .await?
+            {
                 context.events_before.push(to_raw(&ev)?);
             }
         }
         for (_, event_id) in rstore
             .room_timeline(room_id, *seq, None, after_limit, false)
+            .await
             .map_err(internal)?
         {
             if let Some(ev) = client_event(
@@ -177,7 +183,9 @@ pub async fn search(
                 room_id,
                 &event_id,
                 auth.user_id.as_str(),
-            )? {
+            )
+            .await?
+            {
                 context.events_after.push(to_raw(&ev)?);
             }
         }
@@ -217,7 +225,7 @@ pub async fn user_directory(
         }
     }
     for room_id in rooms {
-        for member in crate::room_util::joined_member_ids(&state.rooms, &room_id)? {
+        for member in crate::room_util::joined_member_ids(&state.rooms, &room_id).await? {
             if member != auth.user_id.as_str() {
                 visible.insert(member);
             }

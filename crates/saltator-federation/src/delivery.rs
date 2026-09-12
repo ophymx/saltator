@@ -187,7 +187,7 @@ async fn deliver_pdus(
     scan_pos: &mut u64,
     backoff: &DeliveryBackoff,
 ) {
-    let batch = match rooms.store().timeline(*scan_pos, SCAN_BATCH) {
+    let batch = match rooms.store().timeline(*scan_pos, SCAN_BATCH).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "delivery: timeline read failed");
@@ -209,7 +209,8 @@ async fn deliver_pdus(
         let SeqEntry::Event { room_id, event_id } = entry else {
             continue;
         };
-        let Some((raw, dests)) = event_destinations(rooms, server_name, room_id, event_id) else {
+        let Some((raw, dests)) = event_destinations(rooms, server_name, room_id, event_id).await
+        else {
             continue;
         };
         for dest in dests {
@@ -363,13 +364,13 @@ async fn deliver_pdus_to(
 /// applied it as the send_join/send_leave resident (`relay`); never
 /// re-federate imported events; exclude the authoring origin; include
 /// the removed server on leave/ban.
-fn event_destinations(
+async fn event_destinations(
     rooms: &RoomServer,
     server_name: &ruma::OwnedServerName,
     room_id: &str,
     event_id: &str,
 ) -> Option<(serde_json::Value, Vec<String>)> {
-    let stored = rooms.store().event(event_id).ok().flatten()?;
+    let stored = rooms.store().event(event_id).await.ok().flatten()?;
     let raw: serde_json::Value = serde_json::from_slice(&stored.raw).ok()?;
     if stored.imported {
         return Some((raw, Vec::new()));
@@ -385,6 +386,7 @@ fn event_destinations(
     }
     let mut destinations = rooms
         .remote_servers_in_room(room_id, server_name.as_str())
+        .await
         .unwrap_or_default();
     if let Some(origin) = sender_server.as_deref() {
         destinations.retain(|d| d.as_str() != origin);

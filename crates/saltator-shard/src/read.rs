@@ -45,6 +45,18 @@ pub enum ReadValue {
     Seq(u64),
 }
 
+/// Executes [`ReadOp`]s against a shard replicated elsewhere — the
+/// remote half of a store backend (docs/design-room-sharding-phase2.md).
+/// Implemented by the cluster crate's RemoteShard over the internal
+/// ControlService; defined here so store layers (roomserver) can hold
+/// one without depending on the transport.
+pub trait RemoteReader: Send + Sync + 'static {
+    fn read(
+        &self,
+        op: ReadOp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ReadValue>> + Send + '_>>;
+}
+
 /// Execute one op against applied state. The caller owns linearizability
 /// (`ensure_linearizable` before, on the leader).
 pub fn execute(ctx: &ReadCtx, seq: u64, op: &ReadOp) -> Result<ReadValue> {

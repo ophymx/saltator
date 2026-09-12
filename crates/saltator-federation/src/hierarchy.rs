@@ -35,7 +35,7 @@ fn err(status: StatusCode, errcode: &str, msg: &str) -> (StatusCode, axum::Json<
 /// otherwise), so an unverifiable restriction fails closed: the room goes
 /// to `inaccessible_children` and the requester may try another server
 /// (TestRestrictedRoomsSpacesSummaryFederation's initial leg).
-fn accessible_to(
+async fn accessible_to(
     rooms: &saltator_roomserver::RoomShards,
     our_name: &str,
     origin: &str,
@@ -50,13 +50,16 @@ fn accessible_to(
     {
         return true;
     }
-    if rooms.server_in_room(room_id, origin).unwrap_or(false) {
+    if rooms.server_in_room(room_id, origin).await.unwrap_or(false) {
         return true;
     }
     if summary.join_rule == "restricted" {
         for allowed in &summary.allowed_room_ids {
-            if rooms.server_in_room(allowed, our_name).unwrap_or(false)
-                && rooms.server_in_room(allowed, origin).unwrap_or(false)
+            if rooms
+                .server_in_room(allowed, our_name)
+                .await
+                .unwrap_or(false)
+                && rooms.server_in_room(allowed, origin).await.unwrap_or(false)
             {
                 return true;
             }
@@ -97,6 +100,7 @@ pub async fn serve_hierarchy(
     let our_name = state.server_name.as_str();
 
     let summary = room_summary(rooms.for_room(&room_id), &room_id)
+        .await
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -108,7 +112,7 @@ pub async fn serve_hierarchy(
     // The requested room itself is subject to the same accessibility rule
     // as children — a summary the origin may not feasibly see is a 404,
     // not a disclosure.
-    if !accessible_to(rooms, our_name, &auth.origin, &room_id, &summary) {
+    if !accessible_to(rooms, our_name, &auth.origin, &room_id, &summary).await {
         return Err(err(
             StatusCode::NOT_FOUND,
             "M_NOT_FOUND",
@@ -124,14 +128,18 @@ pub async fn serve_hierarchy(
     let mut children = Vec::new();
     let mut inaccessible = Vec::new();
     for link in ordered_children(&summary.children, suggested_only) {
-        match room_summary(rooms.for_room(&link.target), &link.target).map_err(|e| {
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "M_UNKNOWN",
-                &e.to_string(),
-            )
-        })? {
-            Some(child) if accessible_to(rooms, our_name, &auth.origin, &link.target, &child) => {
+        match room_summary(rooms.for_room(&link.target), &link.target)
+            .await
+            .map_err(|e| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "M_UNKNOWN",
+                    &e.to_string(),
+                )
+            })? {
+            Some(child)
+                if accessible_to(rooms, our_name, &auth.origin, &link.target, &child).await =>
+            {
                 children.push(chunk(&child, suggested_only))
             }
             _ => inaccessible.push(link.target.clone()),

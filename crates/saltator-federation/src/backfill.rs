@@ -66,6 +66,7 @@ pub async fn backfill(
     // The visibility filter below is the second fence, not the first.
     if !rooms
         .server_in_room(&room_id, &auth.origin)
+        .await
         .unwrap_or(false)
     {
         return Err(err(
@@ -75,7 +76,7 @@ pub async fn backfill(
         ));
     }
     let limit = limit.clamp(1, 100);
-    let pdus = rooms.backfill(&start, limit).map_err(|e| {
+    let pdus = rooms.backfill(&start, limit).await.map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "M_UNKNOWN",
@@ -86,6 +87,7 @@ pub async fn backfill(
     // redacted (spec "Server behaviour"; Synapse filter_events_for_server).
     let pdus = rooms
         .filter_events_for_server(&room_id, &auth.origin, pdus)
+        .await
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -115,12 +117,13 @@ pub async fn event(
     };
     // No room in the path: probe the groups for the event (bounded
     // point reads), then everything below is single-shard as before.
-    let Some(rooms) = rooms.for_event(&event_id).cloned() else {
+    let Some(rooms) = rooms.for_event(&event_id).await.cloned() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Event not found"));
     };
     let stored = rooms
         .store()
         .event(&event_id)
+        .await
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -148,9 +151,11 @@ pub async fn event(
     };
     let entitled = rooms
         .server_in_room(&room_id, &auth.origin)
+        .await
         .unwrap_or(false)
         || rooms
             .server_invited_to_room(&room_id, &auth.origin)
+            .await
             .unwrap_or(false);
     if !entitled {
         return Err(err(
@@ -162,6 +167,7 @@ pub async fn event(
     // Same per-server history-visibility redaction /backfill applies.
     let pdus = rooms
         .filter_events_for_server(&room_id, &auth.origin, vec![pdu])
+        .await
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -201,6 +207,7 @@ async fn state_common(
     };
     if !rooms
         .server_in_room(room_id, origin)
+        .await
         .map_err(|e| internal(&e))?
     {
         return Err(err(
@@ -226,6 +233,7 @@ async fn state_common(
     };
     let Some((pdus, auth_chain)) = rooms
         .state_before_event(room_id, &event_id)
+        .await
         .map_err(|e| internal(&e))?
     else {
         return Err(err(
@@ -286,13 +294,16 @@ pub async fn timestamp_to_event(
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
     let rooms = rooms.for_room(&room_id).clone();
-    let in_room = rooms.server_in_room(&room_id, &auth.origin).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            &e.to_string(),
-        )
-    })?;
+    let in_room = rooms
+        .server_in_room(&room_id, &auth.origin)
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "M_UNKNOWN",
+                &e.to_string(),
+            )
+        })?;
     if !in_room {
         return Err(err(
             StatusCode::FORBIDDEN,
@@ -321,6 +332,7 @@ pub async fn timestamp_to_event(
     };
     match rooms
         .timestamp_to_event(&room_id, ts, backward, true)
+        .await
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -375,6 +387,7 @@ pub async fn get_missing_events(
 
     let pdus = rooms
         .get_missing_events(&earliest, &latest, limit, min_depth)
+        .await
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -385,6 +398,7 @@ pub async fn get_missing_events(
     // Per-server history visibility, as in `backfill` above.
     let pdus = rooms
         .filter_events_for_server(&room_id, &auth.origin, pdus)
+        .await
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,

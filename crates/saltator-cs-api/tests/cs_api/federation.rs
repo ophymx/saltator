@@ -1539,20 +1539,32 @@ async fn sync_gap_sets_limited_and_truncates_window() {
     }
     let last_id = send("End".to_owned()).await;
 
-    let raw_of = |id: &str| -> Value {
-        serde_json::from_slice(&a_rooms.store().event(id).unwrap().unwrap().raw).unwrap()
-    };
+    async fn raw_of(rooms: &saltator_roomserver::RoomServer, id: &str) -> Value {
+        serde_json::from_slice(&rooms.store().event(id).await.unwrap().unwrap().raw).unwrap()
+    }
 
     // The mock origin: /get_missing_events returns only the newest two
     // gap events (a truncated response, like Synapse's default limit
     // against a 50-event gap), /state returns A's current state.
-    let a_meta = a_rooms.store().meta(room_id.as_str()).unwrap().unwrap();
+    let a_meta = a_rooms
+        .store()
+        .meta(room_id.as_str())
+        .await
+        .unwrap()
+        .unwrap();
     let state_map: std::collections::BTreeMap<(String, String), String> = a_rooms
         .store()
         .resolve_group(room_id.as_str(), a_meta.current_group)
+        .await
         .unwrap();
-    let state_pdus: Vec<Value> = state_map.values().map(|id| raw_of(id)).collect();
-    let tail: Vec<Value> = gap_ids[10..].iter().map(|id| raw_of(id)).collect();
+    let mut state_pdus: Vec<Value> = Vec::new();
+    for id in state_map.values() {
+        state_pdus.push(raw_of(&a_rooms, id).await);
+    }
+    let mut tail: Vec<Value> = Vec::new();
+    for id in &gap_ids[10..] {
+        tail.push(raw_of(&a_rooms, id).await);
+    }
     let missing_resp = json!({ "events": tail });
     let state_resp = json!({ "pdus": state_pdus, "auth_chain": [] });
     let mock = axum::Router::new()
@@ -1621,7 +1633,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
     // which B holds).
     deliver(
         "/_matrix/federation/v1/send/txnpre",
-        raw_of(&pre_id),
+        raw_of(&a_rooms, &pre_id).await,
         pre_id.clone(),
     )
     .await;
@@ -1629,18 +1641,24 @@ async fn sync_gap_sets_limited_and_truncates_window() {
     // the last two, so B must anchor them on fetched state.
     deliver(
         "/_matrix/federation/v1/send/txngap",
-        raw_of(&last_id),
+        raw_of(&a_rooms, &last_id).await,
         last_id.clone(),
     )
     .await;
 
     // The recovered tail is on B's timeline; the unfetchable span joined
     // the backfill frontier behind a gap marker.
-    let b_meta = b_rooms.store().meta(room_id.as_str()).unwrap().unwrap();
+    let b_meta = b_rooms
+        .store()
+        .meta(room_id.as_str())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(b_meta.gap_markers.len(), 1, "expected one gap marker");
     assert!(
         b_rooms
             .history_frontier(room_id.as_str())
+            .await
             .unwrap()
             .contains(&gap_ids[9]),
         "gap 10 should be on the backfill frontier"

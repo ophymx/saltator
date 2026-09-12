@@ -33,17 +33,19 @@ const RESTRICTED_AUTH_RECHECK: std::time::Duration = std::time::Duration::from_s
 /// `(hosted, meta_exists)`. A room we know (`meta_exists`) is only "hosted"
 /// while we still participate — once every local user has left, our fork of
 /// the DAG is stale and a rejoin/knock must go through a resident.
-fn room_hosted_locally(state: &CsState, room_id: &RoomId) -> Result<(bool, bool)> {
+async fn room_hosted_locally(state: &CsState, room_id: &RoomId) -> Result<(bool, bool)> {
     let meta_exists = state
         .rooms
         .for_room(room_id.as_str())
         .store()
         .meta(room_id.as_str())
+        .await
         .map_err(internal)?
         .is_some();
     let hosted = meta_exists && {
         let our_name = state.config.server_name.as_str();
-        let locally_joined = crate::room_util::joined_member_ids(&state.rooms, room_id.as_str())?
+        let locally_joined = crate::room_util::joined_member_ids(&state.rooms, room_id.as_str())
+            .await?
             .iter()
             .any(|u| u.ends_with(&format!(":{our_name}")));
         locally_joined || {
@@ -52,6 +54,7 @@ fn room_hosted_locally(state: &CsState, room_id: &RoomId) -> Result<(bool, bool)
             let no_remote_route = state
                 .rooms
                 .remote_servers_in_room(room_id.as_str(), our_name)
+                .await
                 .map(|s| s.is_empty())
                 .unwrap_or(true);
             state.federation.is_none() || we_created || no_remote_route
@@ -82,7 +85,7 @@ async fn join_with_body(
     // seeds the backfill frontier with what we missed. Local-pipeline
     // rejoin remains for rooms we still participate in and rooms with no
     // other server to join through.
-    let (hosted, meta_exists) = room_hosted_locally(state, room_id)?;
+    let (hosted, meta_exists) = room_hosted_locally(state, room_id).await?;
     if hosted {
         // A restricted / knock_restricted room needs an authorising local
         // user stamped on the join. If we hold the room but can't authorise
@@ -91,6 +94,7 @@ async fn join_with_body(
         let mut verdict = state
             .rooms
             .restricted_join_authoriser(room_id, &auth.user_id)
+            .await
             .map_err(internal)?;
         if matches!(verdict, saltator_roomserver::RestrictedAuth::CannotGrant) {
             // "No local member has invite power" is often only TRANSIENTLY
@@ -114,6 +118,7 @@ async fn join_with_body(
                         verdict = state
                             .rooms
                             .restricted_join_authoriser(room_id, &auth.user_id)
+                            .await
                             .map_err(internal)?;
                         if !matches!(verdict, saltator_roomserver::RestrictedAuth::CannotGrant) {
                             break;
@@ -159,7 +164,8 @@ async fn join_with_body(
     // and replay marking live in the e2ee service.
     state
         .e2ee()
-        .announce_on_join(auth.user_id.as_str(), room_id.as_str());
+        .announce_on_join(auth.user_id.as_str(), room_id.as_str())
+        .await;
     Ok(())
 }
 
@@ -175,13 +181,15 @@ async fn local_pipeline_join(
 ) -> Result<()> {
     // Joining twice is a no-op: the existing membership event stands
     // (a fresh identical join would mint a new event ID).
-    let current = current_state(&state.rooms, room_id.as_str())?;
+    let current = current_state(&state.rooms, room_id.as_str()).await?;
     if crate::room_util::membership_in(
         &state.rooms,
         room_id.as_str(),
         &current,
         auth.user_id.as_str(),
-    )? == "join"
+    )
+    .await?
+        == "join"
     {
         return Ok(());
     }
@@ -277,6 +285,7 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
         if let Ok(servers) = state
             .rooms
             .remote_servers_in_room(room_id.as_str(), our_name)
+            .await
         {
             for server in servers {
                 push(server, &mut candidates);
@@ -421,13 +430,13 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
 /// projection never sees them, yet device-list and presence visibility
 /// ("do they share a room?") depend on their rows existing.
 async fn project_imported_members(state: &CsState, room_id: &str, upto: u64) -> Result<()> {
-    let current = crate::room_util::current_state(&state.rooms, room_id)?;
+    let current = crate::room_util::current_state(&state.rooms, room_id).await?;
     let mut changes = Vec::new();
     for ((event_type, state_key), event_id) in &current {
         if event_type != "m.room.member" {
             continue;
         }
-        let Some(raw) = crate::room_util::raw_event(&state.rooms, room_id, event_id)? else {
+        let Some(raw) = crate::room_util::raw_event(&state.rooms, room_id, event_id).await? else {
             continue;
         };
         let membership = match raw.get("content") {
@@ -522,7 +531,7 @@ pub async fn knock_room(
         .get("reason")
         .and_then(|v| v.as_str().map(ToOwned::to_owned));
 
-    let (hosted, _) = room_hosted_locally(&state, &room_id)?;
+    let (hosted, _) = room_hosted_locally(&state, &room_id).await?;
     if hosted {
         send_membership(
             &state,
@@ -572,6 +581,7 @@ async fn knock_remote(
         if let Ok(servers) = state
             .rooms
             .remote_servers_in_room(room_id.as_str(), our_name)
+            .await
         {
             for server in servers {
                 push(server, &mut candidates);
@@ -731,6 +741,7 @@ pub async fn leave_room(
         .for_room(req.room_id.as_str())
         .store()
         .meta(req.room_id.as_str())
+        .await
         .map_err(internal)?
         .is_some();
     if !hosted {
@@ -862,7 +873,7 @@ pub async fn invite_user(
 /// Stripped current-room state to accompany a federated invite
 /// (`invite_room_state`): the create event plus the identifying state
 /// clients render on an invite.
-fn invite_room_state(state: &CsState, room_id: &str) -> Result<Vec<serde_json::Value>> {
+async fn invite_room_state(state: &CsState, room_id: &str) -> Result<Vec<serde_json::Value>> {
     const TYPES: &[&str] = &[
         "m.room.create",
         "m.room.join_rules",
@@ -872,11 +883,11 @@ fn invite_room_state(state: &CsState, room_id: &str) -> Result<Vec<serde_json::V
         "m.room.topic",
         "m.room.encryption",
     ];
-    let current = current_state(&state.rooms, room_id)?;
+    let current = current_state(&state.rooms, room_id).await?;
     let mut out = Vec::new();
     for t in TYPES {
         if let Some(event_id) = current.get(&((*t).to_owned(), String::new())) {
-            if let Some(raw) = raw_event(&state.rooms, room_id, event_id)? {
+            if let Some(raw) = raw_event(&state.rooms, room_id, event_id).await? {
                 out.push(crate::room_util::stripped_event(&raw));
             }
         }
@@ -907,7 +918,7 @@ pub(super) async fn invite_remote(
     let body = serde_json::json!({
         "room_version": version.as_str(),
         "event": ruma::CanonicalJsonValue::Object(event),
-        "invite_room_state": invite_room_state(state, room_id.as_str())?,
+        "invite_room_state": invite_room_state(state, room_id.as_str()).await?,
     });
     let path = format!(
         "/_matrix/federation/v2/invite/{}/{}",
@@ -955,13 +966,14 @@ pub async fn kick_user(
     // Auth rules alone would accept a redundant leave; the CS contract is
     // that kicking someone who is not in the room (never present, or
     // already left) is forbidden.
-    let current = current_state(&state.rooms, req.room_id.as_str())?;
+    let current = current_state(&state.rooms, req.room_id.as_str()).await?;
     let target_membership = crate::room_util::membership_in(
         &state.rooms,
         req.room_id.as_str(),
         &current,
         req.user_id.as_str(),
-    )?;
+    )
+    .await?;
     if !matches!(target_membership.as_str(), "join" | "invite" | "knock") {
         return Err(ApiError::forbidden(
             "Cannot kick a user who is not in the room",
