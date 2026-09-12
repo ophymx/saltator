@@ -258,14 +258,47 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(leader, "metadata group ready");
 
     // The founder writes the cluster control plane (topology, roster,
-    // placement); joiners read the replicated copy.
+    // placement); joiners read the replicated copy. The room-shard count
+    // is chosen HERE, once, forever (docs/design-room-sharding.md):
+    // shard split/merge does not exist, so the founding value is the
+    // cluster's value for life.
     if founding {
         meta.bootstrap_cluster(
-            saltator_cluster::ClusterConfig::default(),
+            saltator_cluster::ClusterConfig {
+                room_shards: cfg.cluster.room_shards.unwrap_or(16),
+                ..Default::default()
+            },
             cfg.node.advertise.clone(),
         )
         .await?;
     }
+    // Everyone — founder, joiner, restart — takes the topology from the
+    // durable cluster config, never from their own TOML. A joiner may
+    // race metadata replication, so poll briefly.
+    let cluster_cfg = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            match meta.cluster_config().await {
+                Ok(Some(c)) => break c,
+                Ok(None) | Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Ok(None) => anyhow::bail!("cluster config never appeared in metadata"),
+                Err(e) => return Err(anyhow::anyhow!("reading cluster config: {e}")),
+            }
+        }
+    };
+    let room_shards = cluster_cfg.room_shards.max(1);
+    if let Some(want) = cfg.cluster.room_shards {
+        if want != room_shards {
+            tracing::warn!(
+                configured = want,
+                effective = room_shards,
+                "cluster.room_shards differs from the founding value; the durable                  cluster config wins (the count is immutable for the cluster's life)"
+            );
+        }
+    }
+    tracing::info!(room_shards, "cluster topology");
 
     // Event-signing identity: versioned, encrypted at rest in the
     // metadata group (spec.md §5.4, §10).
@@ -281,21 +314,33 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // reconciliation round or two on a joining node.
     let shard_bootstrap = founding.then(|| cfg.node.advertise.clone());
     let shard_bootstrap_fedout = shard_bootstrap.clone();
-    let rooms = saltator_roomserver::RoomServer::start(
-        cfg.node.id,
-        stores.clone(),
-        signer.clone(),
-        saltator_cluster::network::GrpcRaftNetworkFactory::new(saltator_roomserver::ROOM_SHARD)
-            .with_tls(internal_tls.as_ref().map(|t| t.client())),
-        shard_bootstrap.clone(),
-        Some(&registry),
+    let mut room_shard_servers = Vec::with_capacity(usize::from(room_shards));
+    for idx in 0..room_shards {
+        let shard = saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx);
+        room_shard_servers.push(
+            saltator_roomserver::RoomServer::start_shard(
+                shard,
+                cfg.node.id,
+                stores.clone(),
+                signer.clone(),
+                saltator_cluster::network::GrpcRaftNetworkFactory::new(shard)
+                    .with_tls(internal_tls.as_ref().map(|t| t.client())),
+                shard_bootstrap.clone(),
+                Some(&registry),
+            )
+            .await?,
+        );
+    }
+    // Leadership waits run concurrently: 16 groups electing serially
+    // would stack their timeouts for no reason.
+    futures_util::future::try_join_all(
+        room_shard_servers
+            .iter()
+            .map(|r| r.shard_handle().wait_for_leader(Duration::from_secs(60))),
     )
     .await?;
-    rooms
-        .shard_handle()
-        .wait_for_leader(Duration::from_secs(60))
-        .await?;
-    tracing::info!("room shard ready");
+    let rooms = saltator_roomserver::RoomShards::new(room_shard_servers);
+    tracing::info!(count = room_shards, "room shards ready");
 
     let users = saltator_userserver::UserServer::start(
         cfg.node.id,
@@ -334,31 +379,34 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let forwarder = saltator_cluster::forward::RpcProposeForwarder::with_tls(
         internal_tls.as_ref().map(|t| t.client()),
     );
-    rooms.shard_handle().set_forwarder(forwarder.clone());
+    for (_, shard) in rooms.iter() {
+        shard.shard_handle().set_forwarder(forwarder.clone());
+    }
     users.shard_handle().set_forwarder(forwarder.clone());
     fedout.shard_handle().set_forwarder(forwarder.clone());
 
     // Drive this node's shard groups toward the placement: as a group's
     // leader it admits new replicas; a joiner's freshly-started groups become
     // voters here. Each group is reconciled by exactly its own leader.
-    let reconciler = saltator_cluster::spawn_reconciler(
-        meta.clone(),
-        vec![
+    let mut local_groups: Vec<saltator_cluster::LocalGroup> = rooms
+        .iter()
+        .map(|(idx, shard)| {
             saltator_cluster::LocalGroup::new(
-                saltator_roomserver::ROOM_SHARD.group(),
-                rooms.shard_handle().clone(),
-            ),
-            saltator_cluster::LocalGroup::new(
-                saltator_userserver::USER_SHARD.group(),
-                users.shard_handle().clone(),
-            ),
-            saltator_cluster::LocalGroup::new(
-                saltator_fedout::FED_OUT_SHARD.group(),
-                fedout.shard_handle().clone(),
-            ),
-        ],
-        Duration::from_secs(2),
-    );
+                saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx).group(),
+                shard.shard_handle().clone(),
+            )
+        })
+        .collect();
+    local_groups.push(saltator_cluster::LocalGroup::new(
+        saltator_userserver::USER_SHARD.group(),
+        users.shard_handle().clone(),
+    ));
+    local_groups.push(saltator_cluster::LocalGroup::new(
+        saltator_fedout::FED_OUT_SHARD.group(),
+        fedout.shard_handle().clone(),
+    ));
+    let reconciler =
+        saltator_cluster::spawn_reconciler(meta.clone(), local_groups, Duration::from_secs(2));
 
     // The user-outbox drain (step 4 cross-shard move): the fed-out
     // leader copies legacy rows into its own shard and advances the
@@ -372,7 +420,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // USER shard's v2 step carries an extra precondition: the fed-out
     // drain marker must cover its outbox tail (the marker-coordinated
     // cross-shard move; docs/design-federation-out.md §drain).
-    for h in [rooms.shard_handle(), fedout.shard_handle()] {
+    for h in rooms
+        .iter()
+        .map(|(_, s)| s.shard_handle())
+        .chain([fedout.shard_handle()])
+    {
         saltator_shard::migrate::spawn_migration_supervisor(
             h.clone(),
             saltator_cluster::ClusterGate::new(
@@ -612,11 +664,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         // group left out exports no gauges at all, and nothing errors
         // about the omission.
         saltator_metrics::spawn_sampler(SHARD_SAMPLE_INTERVAL, shutdown_rx.clone(), move || {
-            for h in [
-                sample_rooms.shard_handle(),
-                sample_users.shard_handle(),
-                sample_fedout.shard_handle(),
-            ] {
+            for h in sample_rooms
+                .iter()
+                .map(|(_, shard)| shard.shard_handle())
+                .chain([sample_users.shard_handle(), sample_fedout.shard_handle()])
+            {
                 // An Err from seq() is a storage failure, not "no
                 // sequence": the gauge is left alone (None), but say why,
                 // so a frozen saltator_shard_seq has an explanation.
@@ -713,7 +765,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     }
     reconciler.abort();
     projection.abort();
-    rooms.shutdown().await?;
+    for (_, shard) in rooms.iter() {
+        shard.shutdown().await?;
+    }
     users.shutdown().await?;
     meta.shutdown().await?;
     tracing::info!("saltator stopped");

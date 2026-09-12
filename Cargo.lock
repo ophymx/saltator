@@ -3111,6 +3111,7 @@ dependencies = [
  "axum-server",
  "chacha20poly1305",
  "clap",
+ "futures-util",
  "rand 0.8.7",
  "reqwest",
  "ruma",
@@ -3308,6 +3309,7 @@ name = "saltator-roomserver"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "openraft",
  "postcard",
  "ruma",

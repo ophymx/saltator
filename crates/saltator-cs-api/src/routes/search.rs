@@ -101,6 +101,7 @@ pub async fn search(
         let version = room_version(&meta)?;
         let timeline = state
             .rooms
+            .for_room(room_id)
             .store()
             .room_timeline(room_id, 0, None, usize::MAX, false)
             .map_err(internal)?;
@@ -151,7 +152,7 @@ pub async fn search(
         let meta = room_meta(&state.rooms, room_id)?;
         let version = room_version(&meta)?;
         let mut context = search_events::v3::EventContextResult::default();
-        let rstore = state.rooms.store();
+        let rstore = state.rooms.for_room(room_id).store();
         for (_, event_id) in rstore
             .room_timeline(room_id, 0, Some(seq.saturating_sub(1)), before_limit, true)
             .map_err(internal)?

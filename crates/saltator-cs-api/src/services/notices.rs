@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use ruma::{OwnedRoomId, RoomId, UserId};
 use saltator_core::RoomVersion;
-use saltator_roomserver::RoomServer;
 use saltator_userserver::{UserError, UserServer};
 use serde::Serialize;
 use serde_json::Value;
@@ -32,7 +31,7 @@ const ROOM_NAME: &str = "Server Notices";
 
 pub(crate) struct Notices<'a> {
     pub users: &'a Arc<UserServer>,
-    pub rooms: &'a Arc<RoomServer>,
+    pub rooms: &'a Arc<saltator_roomserver::RoomShards>,
     /// Localpart of the sending account; `None` disables the feature.
     pub localpart: Option<&'a str>,
     pub room_version: RoomVersion,
@@ -148,7 +147,8 @@ impl Notices<'_> {
         target: &UserId,
     ) -> Result<()> {
         let state = room_util::current_state(self.rooms, room_id.as_str())?;
-        let membership = room_util::membership_in(self.rooms, &state, target.as_str())?;
+        let membership =
+            room_util::membership_in(self.rooms, room_id.as_str(), &state, target.as_str())?;
         if matches!(membership.as_str(), "join" | "invite") {
             return Ok(());
         }
@@ -175,6 +175,7 @@ impl Notices<'_> {
         if seq > 0 {
             if let Err(e) = saltator_userserver::wait_for_projection(
                 self.users,
+                self.rooms.index_of(room_id.as_str()),
                 seq,
                 std::time::Duration::from_secs(5),
             )

@@ -1,6 +1,10 @@
 # Design: room sharding (M-scale, phase 1 of 3)
 
-Status: DRAFT · 2026-09-12 · review calls at the end
+Status: ACCEPTED · 2026-09-12 — all four review calls resolved:
+default 16 for new clusters (spec §4.1 updated); founding value wins
+with a warning on TOML mismatch; CI flips to multi-shard in a follow-up
+PR after the local 3-node harness is green; phase 2 gets its own design
+doc against merged phase 1.
 
 ## Problem
 

@@ -36,7 +36,7 @@ fn err(status: StatusCode, errcode: &str, msg: &str) -> (StatusCode, axum::Json<
 /// to `inaccessible_children` and the requester may try another server
 /// (TestRestrictedRoomsSpacesSummaryFederation's initial leg).
 fn accessible_to(
-    rooms: &saltator_roomserver::RoomServer,
+    rooms: &saltator_roomserver::RoomShards,
     our_name: &str,
     origin: &str,
     room_id: &str,
@@ -96,7 +96,7 @@ pub async fn serve_hierarchy(
         .any(|p| p == "suggested_only=true");
     let our_name = state.server_name.as_str();
 
-    let summary = room_summary(rooms, &room_id)
+    let summary = room_summary(rooms.for_room(&room_id), &room_id)
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -124,7 +124,7 @@ pub async fn serve_hierarchy(
     let mut children = Vec::new();
     let mut inaccessible = Vec::new();
     for link in ordered_children(&summary.children, suggested_only) {
-        match room_summary(rooms, &link.target).map_err(|e| {
+        match room_summary(rooms.for_room(&link.target), &link.target).map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "M_UNKNOWN",

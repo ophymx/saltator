@@ -58,9 +58,10 @@ pub(crate) fn rule_inputs(
         .and_then(|p| p.displayname)
         .unwrap_or_else(|| user_id.localpart().to_owned());
     let current = room_util::current_state(&state.rooms, room_id)?;
-    let power_levels = room_util::state_content_in(&state.rooms, &current, "m.room.power_levels")?
-        .as_ref()
-        .and_then(power_levels_ctx);
+    let power_levels =
+        room_util::state_content_in(&state.rooms, room_id, &current, "m.room.power_levels")?
+            .as_ref()
+            .and_then(power_levels_ctx);
     let mut ctx = PushConditionRoomCtx::new(
         ruma::OwnedRoomId::try_from(room_id).map_err(|e| ApiError::internal(e.to_string()))?,
         u32::try_from(member_count).unwrap_or(u32::MAX).into(),
@@ -77,7 +78,7 @@ pub async fn room_unread(
     room_id: &str,
     upto: u64,
 ) -> Result<RoomUnread> {
-    let store = state.rooms.store();
+    let store = state.rooms.for_room(room_id).store();
 
     // Receipt positions, as the shard seq of each receipt's target event:
     // the unthreaded position plus one per thread ("main" or a root id).

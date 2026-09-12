@@ -22,7 +22,7 @@ const SERVER: &str = "hs.test";
 struct Env {
     _dir: tempfile::TempDir,
     router: axum::Router,
-    rooms: Arc<RoomServer>,
+    rooms: Arc<saltator_roomserver::RoomShards>,
     users: Arc<UserServer>,
     state: Arc<CsState>,
     projection: tokio::task::JoinHandle<()>,
@@ -173,21 +173,72 @@ async fn start_env_full_fedout(
     with_cluster: bool,
     with_fedout: bool,
 ) -> Env {
+    start_env_sharded_inner(
+        rate_limits,
+        allow_internal_fetch,
+        admin_users,
+        appservices,
+        registration_requires_token,
+        server_notices_localpart,
+        with_cluster,
+        with_fedout,
+        1,
+    )
+    .await
+}
+
+/// A multi-shard env: rooms spread across `room_shards` groups
+/// (docs/design-room-sharding.md phase 1).
+async fn start_env_sharded(room_shards: u16) -> Env {
+    start_env_sharded_inner(
+        saltator_cs_api::RateLimitConfig::disabled(),
+        true,
+        Vec::new(),
+        Vec::new(),
+        false,
+        None,
+        false,
+        false,
+        room_shards,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_env_sharded_inner(
+    rate_limits: saltator_cs_api::RateLimitConfig,
+    allow_internal_fetch: bool,
+    admin_users: Vec<ruma::OwnedUserId>,
+    appservices: Vec<AppServiceRegistration>,
+    registration_requires_token: bool,
+    server_notices_localpart: Option<String>,
+    with_cluster: bool,
+    with_fedout: bool,
+    room_shards: u16,
+) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
     let server_name = ruma::OwnedServerName::try_from(SERVER).unwrap();
     let (signer, _der) =
         saltator_roomserver::ServerSigner::generate(server_name.clone(), "0".to_owned());
-    let rooms = RoomServer::start(
-        1,
-        engine.clone(),
-        Arc::new(signer),
-        NoopNetworkFactory,
-        Some("127.0.0.1:0".into()),
-        None,
-    )
-    .await
-    .unwrap();
+    let signer = Arc::new(signer);
+    let mut room_servers = Vec::new();
+    for idx in 0..room_shards.max(1) {
+        room_servers.push(
+            RoomServer::start_shard(
+                saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx),
+                1,
+                engine.clone(),
+                signer.clone(),
+                NoopNetworkFactory,
+                Some("127.0.0.1:0".into()),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let rooms = saltator_roomserver::RoomShards::new(room_servers);
     let users = UserServer::start(
         1,
         engine.clone(),
@@ -198,7 +249,11 @@ async fn start_env_full_fedout(
     )
     .await
     .unwrap();
-    for h in [rooms.shard_handle(), users.shard_handle()] {
+    for h in rooms
+        .iter()
+        .map(|(_, s)| s.shard_handle())
+        .chain([users.shard_handle()])
+    {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
     // A single-node metadata group over the same engine: a real control
@@ -376,7 +431,9 @@ impl Env {
         if let Some(meta) = &self.cluster {
             meta.shutdown().await.unwrap();
         }
-        self.rooms.shutdown().await.unwrap();
+        for (_, shard) in self.rooms.iter() {
+            shard.shutdown().await.unwrap();
+        }
         self.users.shutdown().await.unwrap();
     }
 }
@@ -409,7 +466,7 @@ async fn start_fedout_delivery(
         .unwrap();
     let worker = saltator_federation::spawn_delivery_worker(
         fedout.clone(),
-        rooms,
+        saltator_roomserver::RoomShards::single(rooms.clone()),
         client,
         ruma::OwnedServerName::try_from(server_name).unwrap(),
         Arc::new(saltator_federation::DeliveryBackoff::default()),
@@ -5298,7 +5355,7 @@ async fn spawn_fed(
         txn_replay: saltator_federation::TxnReplayCache::default(),
     };
     if let Some(r) = rooms {
-        state = state.with_rooms(r);
+        state = state.with_room_server(r);
     }
     let app = saltator_federation::router(Arc::new(state));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5399,7 +5456,10 @@ async fn client_joins_a_remote_room_via_federation() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
 
     // B's key server, so A can verify B's signed requests and join event.
     let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
@@ -5416,7 +5476,7 @@ async fn client_joins_a_remote_room_via_federation() {
     let media = MediaStore::open(b_dir.join("media")).unwrap();
     let state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         media,
         CsConfig {
             server_name: b_name,
@@ -5606,7 +5666,10 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
     for h in [hs1_rooms.shard_handle(), hs1_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let proj = spawn_membership_projection(hs1_users.clone(), hs1_rooms.clone());
+    let proj = spawn_membership_projection(
+        hs1_users.clone(),
+        saltator_roomserver::RoomShards::single(hs1_rooms.clone()),
+    );
 
     // Separate key servers break the mutual auth dependency.
     let hs1_key_base = spawn_fed("hs1", hs1_signer.clone(), None, None).await;
@@ -5630,7 +5693,7 @@ async fn federated_ban_of_local_user_surfaces_in_sync() {
     let media = MediaStore::open(hs1_dir.join("media")).unwrap();
     let cs = CsState::new(
         hs1_users.clone(),
-        hs1_rooms.clone(),
+        saltator_roomserver::RoomShards::single(hs1_rooms.clone()),
         media,
         CsConfig {
             server_name: hs1_name,
@@ -5849,7 +5912,10 @@ async fn client_joins_a_remote_room_by_remote_alias() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
 
     // B's key server, so A can verify B's signed requests and join event.
     let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
@@ -5860,7 +5926,7 @@ async fn client_joins_a_remote_room_by_remote_alias() {
         signer: a_signer.clone(),
         old_keys: Vec::<OldVerifyKey>::new(),
         key_cache: std::sync::Arc::new(KeyCache::with_base_url(b_key_base)),
-        rooms: Some(a_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(a_rooms.clone())),
         users: Some(a_users.clone()),
         client: None,
         edu_sink: None,
@@ -5881,7 +5947,7 @@ async fn client_joins_a_remote_room_by_remote_alias() {
     let media = MediaStore::open(b_dir.join("media")).unwrap();
     let state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         media,
         CsConfig {
             server_name: b_name,
@@ -6044,12 +6110,15 @@ async fn remote_join_drops_unverifiable_noncritical_state() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
 
     let media = MediaStore::open(b_dir.join("media")).unwrap();
     let state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         media,
         CsConfig {
             server_name: b_name,
@@ -6203,12 +6272,15 @@ async fn send_message_in_remote_ported_room() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
 
     let media = MediaStore::open(b_dir.join("media")).unwrap();
     let state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         media,
         CsConfig {
             server_name: b_name,
@@ -6403,7 +6475,10 @@ async fn remote_join_backfills_full_history() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
 
     let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
     let a_base = spawn_fed(
@@ -6417,7 +6492,7 @@ async fn remote_join_backfills_full_history() {
     let media = MediaStore::open(b_dir.join("media")).unwrap();
     let state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         media,
         CsConfig {
             server_name: b_name,
@@ -6689,7 +6764,10 @@ async fn sync_gap_sets_limited_and_truncates_window() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
 
     let b_key_base = spawn_fed("b.test", b_signer.clone(), None, None).await;
     let a_base = spawn_fed(
@@ -6703,7 +6781,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
     let media = MediaStore::open(b_dir.join("media")).unwrap();
     let state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         media,
         CsConfig {
             server_name: b_name.clone(),
@@ -6879,7 +6957,7 @@ async fn sync_gap_sets_limited_and_truncates_window() {
         signer: b_signer.clone(),
         old_keys: Vec::<OldVerifyKey>::new(),
         key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_base.clone())),
-        rooms: Some(b_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(b_rooms.clone())),
         users: None,
         client: Some(Arc::new(FederationClient::with_base_url(
             b_signer.clone(),
@@ -7018,13 +7096,16 @@ async fn inbound_federated_invite_appears_in_sync() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
 
     // B's CS router (for registration + /sync).
     let media = MediaStore::open(b_dir.join("media")).unwrap();
     let cs_state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         media,
         CsConfig {
             server_name: b_name.clone(),
@@ -7047,7 +7128,7 @@ async fn inbound_federated_invite_appears_in_sync() {
         signer: b_signer.clone(),
         old_keys: Vec::new(),
         key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
-        rooms: Some(b_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(b_rooms.clone())),
         users: Some(b_users.clone()),
         client: None,
         edu_sink: None,
@@ -7232,7 +7313,7 @@ async fn inbound_invite_into_a_blocked_room_is_refused() {
         signer: b_signer.clone(),
         old_keys: Vec::new(),
         key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
-        rooms: Some(b_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(b_rooms.clone())),
         users: Some(b_users.clone()),
         client: None,
         edu_sink: None,
@@ -7354,11 +7435,14 @@ async fn cs_stack(
     for h in [rooms.shard_handle(), users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let projection = spawn_membership_projection(users.clone(), rooms.clone());
+    let projection = spawn_membership_projection(
+        users.clone(),
+        saltator_roomserver::RoomShards::single(rooms.clone()),
+    );
     let media = MediaStore::open(dir.join(format!("{server}-media"))).unwrap();
     let mut cs = CsState::new(
         users.clone(),
-        rooms.clone(),
+        saltator_roomserver::RoomShards::single(rooms.clone()),
         media,
         CsConfig {
             server_name: name,
@@ -7453,7 +7537,7 @@ async fn outbound_federated_invite_round_trip() {
         signer: b_signer.clone(),
         old_keys: Vec::new(),
         key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
-        rooms: Some(b_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(b_rooms.clone())),
         users: Some(b_users.clone()),
         client: None,
         edu_sink: None,
@@ -7498,11 +7582,14 @@ async fn outbound_federated_invite_round_trip() {
     for h in [a_rooms.shard_handle(), a_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let a_proj = spawn_membership_projection(a_users.clone(), a_rooms.clone());
+    let a_proj = spawn_membership_projection(
+        a_users.clone(),
+        saltator_roomserver::RoomShards::single(a_rooms.clone()),
+    );
     let a_media = MediaStore::open(dir.path().join("a-media")).unwrap();
     let a_cs = CsState::new(
         a_users.clone(),
-        a_rooms.clone(),
+        saltator_roomserver::RoomShards::single(a_rooms.clone()),
         a_media,
         CsConfig {
             server_name: a_name,
@@ -7642,7 +7729,7 @@ async fn receipt_edu_over_federation_surfaces_in_sync() {
         signer: b_signer.clone(),
         old_keys: Vec::new(),
         key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
-        rooms: Some(b_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(b_rooms.clone())),
         users: Some(b_users.clone()),
         client: None,
         edu_sink: None,
@@ -7752,7 +7839,7 @@ async fn to_device_over_federation_round_trip() {
         signer: b_signer.clone(),
         old_keys: Vec::new(),
         key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
-        rooms: Some(b_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(b_rooms.clone())),
         users: Some(b_users.clone()),
         client: None,
         edu_sink: None,
@@ -7799,7 +7886,7 @@ async fn to_device_over_federation_round_trip() {
     let a_media = MediaStore::open(dir.path().join("a-media")).unwrap();
     let a_cs = CsState::new(
         a_users.clone(),
-        a_rooms.clone(),
+        saltator_roomserver::RoomShards::single(a_rooms.clone()),
         a_media,
         CsConfig {
             server_name: a_name,
@@ -7966,7 +8053,7 @@ async fn federated_key_query_claim_and_device_list_update() {
         signer: b_signer.clone(),
         old_keys: Vec::new(),
         key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
-        rooms: Some(b_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(b_rooms.clone())),
         users: Some(b_users.clone()),
         client: None,
         edu_sink: None,
@@ -8013,7 +8100,7 @@ async fn federated_key_query_claim_and_device_list_update() {
     let a_media = MediaStore::open(dir.path().join("a-media")).unwrap();
     let a_cs = CsState::new(
         a_users.clone(),
-        a_rooms.clone(),
+        saltator_roomserver::RoomShards::single(a_rooms.clone()),
         a_media,
         CsConfig {
             server_name: a_name,
@@ -8185,11 +8272,14 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
     let media = MediaStore::open(b_dir.join("media")).unwrap();
     let cs_state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         media,
         CsConfig {
             server_name: b_name.clone(),
@@ -8216,7 +8306,7 @@ async fn inbound_typing_and_presence_edus_reach_sync() {
         signer: b_signer.clone(),
         old_keys: Vec::new(),
         key_cache: std::sync::Arc::new(KeyCache::with_base_url(a_key_base)),
-        rooms: Some(b_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(b_rooms.clone())),
         users: Some(b_users.clone()),
         client: None,
         edu_sink: Some(sink),
@@ -8413,7 +8503,7 @@ async fn client_downloads_remote_media_over_federation() {
         signer: a_signer.clone(),
         old_keys: Vec::new(),
         key_cache: std::sync::Arc::new(KeyCache::new()),
-        rooms: Some(a_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(a_rooms.clone())),
         users: Some(a_users.clone()),
         client: None,
         edu_sink: None,
@@ -8470,11 +8560,14 @@ async fn client_downloads_remote_media_over_federation() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let b_projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let b_projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
     let b_media = MediaStore::open(b_dir.join("media")).unwrap();
     let cs_state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         b_media,
         CsConfig {
             server_name: b_name.clone(),
@@ -8653,7 +8746,7 @@ async fn client_queries_remote_profile_and_directory() {
         signer: a_signer.clone(),
         old_keys: Vec::new(),
         key_cache: std::sync::Arc::new(KeyCache::new()),
-        rooms: Some(a_rooms.clone()),
+        rooms: Some(saltator_roomserver::RoomShards::single(a_rooms.clone())),
         users: Some(a_users.clone()),
         client: None,
         edu_sink: None,
@@ -8709,11 +8802,14 @@ async fn client_queries_remote_profile_and_directory() {
     for h in [b_rooms.shard_handle(), b_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let b_projection = spawn_membership_projection(b_users.clone(), b_rooms.clone());
+    let b_projection = spawn_membership_projection(
+        b_users.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
+    );
     let b_media = MediaStore::open(b_dir.join("media")).unwrap();
     let cs_state = CsState::new(
         b_users.clone(),
-        b_rooms.clone(),
+        saltator_roomserver::RoomShards::single(b_rooms.clone()),
         b_media,
         CsConfig {
             server_name: b_name.clone(),
@@ -9163,7 +9259,7 @@ async fn imported_room_sync_includes_send_join_state() {
         other => panic!("import not accepted: {other:?}"),
     };
     // The membership projection lifts bob's join off the room timeline.
-    saltator_userserver::wait_for_projection(&env.users, seq, Duration::from_secs(10))
+    saltator_userserver::wait_for_projection(&env.users, 0, seq, Duration::from_secs(10))
         .await
         .unwrap();
 
@@ -9510,7 +9606,10 @@ async fn spaces_hierarchy_spans_federation() {
     for h in [hs1_rooms.shard_handle(), hs1_users.shard_handle()] {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }
-    let proj = spawn_membership_projection(hs1_users.clone(), hs1_rooms.clone());
+    let proj = spawn_membership_projection(
+        hs1_users.clone(),
+        saltator_roomserver::RoomShards::single(hs1_rooms.clone()),
+    );
 
     // Mutual key servers + hs2's authenticated hierarchy surface for hs1.
     let hs1_key_base = spawn_fed("hs1", hs1_signer.clone(), None, None).await;
@@ -9526,7 +9625,7 @@ async fn spaces_hierarchy_spans_federation() {
     let media = MediaStore::open(hs1_dir.join("media")).unwrap();
     let cs = CsState::new(
         hs1_users.clone(),
-        hs1_rooms.clone(),
+        saltator_roomserver::RoomShards::single(hs1_rooms.clone()),
         media,
         CsConfig {
             server_name: hs1_name,
@@ -12358,4 +12457,205 @@ mod admin_ui {
         assert_eq!(headers["x-content-type-options"], "nosniff");
         env.shutdown().await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-shard rooms (docs/design-room-sharding.md phase 1)
+// ---------------------------------------------------------------------------
+
+/// Create rooms until two land on different shards, then run the core
+/// loop against both: send, sync (vector token), incremental sync,
+/// /messages pagination — the same behavior a count-1 cluster has, with
+/// rooms living in different Raft groups.
+#[tokio::test]
+async fn multi_shard_rooms_sync_and_paginate() {
+    let env = start_env_sharded(4).await;
+    let alice = env.register("alice", "pw-12345678").await;
+
+    // Rooms on at least two distinct shards.
+    let mut by_shard: std::collections::BTreeMap<u16, String> = Default::default();
+    for _ in 0..16 {
+        let (status, body) = env
+            .req(
+                "POST",
+                "/_matrix/client/v3/createRoom",
+                Some(&alice),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let room_id = body["room_id"].as_str().unwrap().to_owned();
+        by_shard
+            .entry(env.rooms.index_of(&room_id))
+            .or_insert(room_id);
+        if by_shard.len() >= 2 {
+            break;
+        }
+    }
+    assert!(by_shard.len() >= 2, "16 rooms all hashed to one shard?");
+    let rooms: Vec<String> = by_shard.into_values().collect();
+
+    // Initial sync: both rooms joined; multi-shard token shape (the `r`
+    // vector form — never the legacy single-seq form).
+    let (status, body) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["next_batch"].as_str().unwrap().to_owned();
+    assert!(
+        token.contains('r'),
+        "multi-shard cluster must mint vector tokens: {token}"
+    );
+    for room in &rooms {
+        assert!(
+            body["rooms"]["join"].get(room).is_some(),
+            "{room} missing from initial sync"
+        );
+    }
+
+    // A message in each room; the incremental sync sees both.
+    let mut event_ids = Vec::new();
+    for (i, room) in rooms.iter().enumerate() {
+        let enc = room.replace('!', "%21").replace(':', "%3A");
+        let (status, body) = env
+            .req(
+                "PUT",
+                &format!("/_matrix/client/v3/rooms/{enc}/send/m.room.message/t{i}"),
+                Some(&alice),
+                Some(json!({"msgtype": "m.text", "body": format!("hello {i}")})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        event_ids.push(body["event_id"].as_str().unwrap().to_owned());
+    }
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/sync?since={token}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for (room, event_id) in rooms.iter().zip(&event_ids) {
+        let timeline = &body["rooms"]["join"][room]["timeline"]["events"];
+        assert!(
+            timeline
+                .as_array()
+                .is_some_and(|evs| evs.iter().any(|e| e["event_id"] == event_id.as_str())),
+            "{room}: incremental sync missing its event: {body}"
+        );
+    }
+    let token2 = body["next_batch"].as_str().unwrap().to_owned();
+
+    // /messages accepts the vector sync token as `from`, per room —
+    // each room reads its own shard's component.
+    for (room, event_id) in rooms.iter().zip(&event_ids) {
+        let enc = room.replace('!', "%21").replace(':', "%3A");
+        let (status, body) = env
+            .req(
+                "GET",
+                &format!("/_matrix/client/v3/rooms/{enc}/messages?dir=b&from={token2}"),
+                Some(&alice),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["chunk"]
+                .as_array()
+                .is_some_and(|evs| evs.iter().any(|e| e["event_id"] == event_id.as_str())),
+            "{room}: /messages missing its event: {body}"
+        );
+    }
+
+    // A legacy single-seq token is refused on a multi-shard cluster.
+    let (status, _) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/sync?since=s1_2_0_0",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Membership spans shards: invites, joins and leaves in rooms on
+/// different shards all converge through the per-shard projections into
+/// one coherent /sync.
+#[tokio::test]
+async fn multi_shard_membership_projections() {
+    let env = start_env_sharded(4).await;
+    let alice = env.register("alice", "pw-12345678").await;
+    let bob = env.register("bob", "pw-12345678").await;
+
+    let mut by_shard: std::collections::BTreeMap<u16, String> = Default::default();
+    for _ in 0..16 {
+        let (status, body) = env
+            .req(
+                "POST",
+                "/_matrix/client/v3/createRoom",
+                Some(&alice),
+                Some(json!({"invite": ["@bob:hs.test"], "preset": "public_chat"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let room_id = body["room_id"].as_str().unwrap().to_owned();
+        by_shard
+            .entry(env.rooms.index_of(&room_id))
+            .or_insert(room_id);
+        if by_shard.len() >= 2 {
+            break;
+        }
+    }
+    assert!(by_shard.len() >= 2);
+    let rooms: Vec<String> = by_shard.into_values().collect();
+
+    // Bob sees both invites, joins both, then leaves the first.
+    let (status, body) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for room in &rooms {
+        assert!(
+            body["rooms"]["invite"].get(room).is_some(),
+            "{room} invite missing: {body}"
+        );
+    }
+    for room in &rooms {
+        let enc = room.replace('!', "%21").replace(':', "%3A");
+        let (status, body) = env
+            .req(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{enc}/join"),
+                Some(&bob),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let enc = rooms[0].replace('!', "%21").replace(':', "%3A");
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/leave"),
+            Some(&bob),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = env
+        .req("GET", "/_matrix/client/v3/sync", Some(&bob), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["rooms"]["join"].get(&rooms[1]).is_some(),
+        "second room joined: {body}"
+    );
+    assert!(
+        body["rooms"]["join"].get(&rooms[0]).is_none(),
+        "left room must not be joined: {body}"
+    );
 }

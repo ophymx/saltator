@@ -25,3 +25,8 @@ ca_cert = "/certs/ca.crt"
 # The interop peers (Synapse, etc.) live on the isolated Docker network on
 # private IPs; production keeps this false (pre-auth SSRF guard).
 allow_private_ips = true
+
+[cluster]
+# CI stays single-shard until the deliberate flip
+# (docs/design-room-sharding.md review call 3).
+room_shards = 1

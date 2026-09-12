@@ -90,7 +90,7 @@ pub struct FedState {
     pub key_cache: Arc<KeyCache>,
     /// The room pipeline inbound PDUs route into. `None` in key-only
     /// deployments and auth-only tests.
-    pub rooms: Option<Arc<RoomServer>>,
+    pub rooms: Option<Arc<saltator_roomserver::RoomShards>>,
     /// The user shard, for recording pending remote invites. `None` when
     /// no user server is wired.
     pub users: Option<Arc<saltator_userserver::UserServer>>,
@@ -194,9 +194,15 @@ impl FedState {
     }
 
     /// Attach the room server so inbound transactions can be applied.
-    pub fn with_rooms(mut self, rooms: Arc<RoomServer>) -> Self {
+    pub fn with_rooms(mut self, rooms: Arc<saltator_roomserver::RoomShards>) -> Self {
         self.rooms = Some(rooms);
         self
+    }
+
+    /// Single-shard convenience for the test harnesses that construct a
+    /// bare [`RoomServer`].
+    pub fn with_room_server(self, rooms: Arc<RoomServer>) -> Self {
+        self.with_rooms(saltator_roomserver::RoomShards::single(rooms))
     }
 
     /// Attach the user shard so inbound invites can be recorded.

@@ -38,9 +38,6 @@ const IDLE_TICK: Duration = Duration::from_secs(1);
 /// the cursor is durable, so patience costs nothing but latency.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
-/// Single room shard (M1 layout) — same constant federation delivery
-/// uses; the cursor key anticipates more.
-const ROOM_SHARD: u16 = 0;
 
 /// Register metric descriptions — called once at startup from `main`,
 /// never at a measurement site (the describe macros take the recorder
@@ -87,7 +84,7 @@ async fn run(state: Arc<CsState>) -> Result<(), String> {
     // In-memory by design, like federation's DeliveryBackoff: a failover
     // retries immediately once, then re-learns the backoff.
     let mut backoff: HashMap<String, (Instant, Duration)> = HashMap::new();
-    let mut changes = state.rooms.subscribe();
+    let mut changes: Vec<_> = state.rooms.iter().map(|(_, s)| s.subscribe()).collect();
 
     loop {
         if fedout.shard_handle().is_leader() {
@@ -100,7 +97,17 @@ async fn run(state: Arc<CsState>) -> Result<(), String> {
                         continue;
                     }
                 }
-                match deliver_to(&state, &fedout, &client, reg).await {
+                // Per-shard cursors, one delivery sweep across all: the
+                // first failed transaction backs the AS off as a whole
+                // (its endpoint is down for every shard equally).
+                let mut outcome = Ok(());
+                for (idx, shard) in state.rooms.iter() {
+                    outcome = deliver_to(&state, &fedout, &client, reg, idx, shard).await;
+                    if outcome.is_err() {
+                        break;
+                    }
+                }
+                match outcome {
                     Ok(()) => {
                         backoff.remove(&reg.id);
                     }
@@ -116,13 +123,11 @@ async fn run(state: Arc<CsState>) -> Result<(), String> {
                 }
             }
         }
+        let any_change =
+            futures_util::future::select_all(changes.iter_mut().map(|rx| Box::pin(rx.recv())));
         tokio::select! {
             _ = tokio::time::sleep(IDLE_TICK) => {}
-            r = changes.recv() => match r {
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
-            },
+            _ = any_change => {}
         }
     }
 }
@@ -130,28 +135,27 @@ async fn run(state: Arc<CsState>) -> Result<(), String> {
 /// Drain everything currently pending for one appservice. Returns at the
 /// tip, or errs on the first failed transaction (the cursor then holds
 /// the retry position).
+#[allow(clippy::too_many_arguments)]
 async fn deliver_to(
     state: &CsState,
     fedout: &saltator_fedout::FedOutServer,
     client: &AppServiceClient,
     reg: &Arc<AppServiceRegistration>,
+    room_shard: u16,
+    rooms: &Arc<saltator_roomserver::RoomServer>,
 ) -> Result<(), String> {
     let store = fedout.store();
     let mut cursor = match store
-        .as_cursor(&reg.id, ROOM_SHARD)
+        .as_cursor(&reg.id, room_shard)
         .map_err(|e| e.to_string())?
     {
         Some(c) => c,
         None => {
             // First contact: seed at the current tip. History predating
             // the registration is not replayed at a bridge.
-            let tip = state
-                .rooms
-                .shard_handle()
-                .seq()
-                .map_err(|e| e.to_string())?;
+            let tip = rooms.shard_handle().seq().map_err(|e| e.to_string())?;
             fedout
-                .advance_as_cursor(&reg.id, ROOM_SHARD, tip)
+                .advance_as_cursor(&reg.id, room_shard, tip)
                 .await
                 .map_err(|e| e.to_string())?;
             tip
@@ -165,8 +169,7 @@ async fn deliver_to(
     let mut room_aliases: Option<HashMap<String, Vec<String>>> = None;
 
     loop {
-        let batch = state
-            .rooms
+        let batch = rooms
             .store()
             .timeline(cursor, SCAN_BATCH)
             .map_err(|e| e.to_string())?;
@@ -185,7 +188,7 @@ async fn deliver_to(
             // A membership event invalidates the member-list cache for
             // its room — the join that makes the AS interested must make
             // this very event interesting.
-            let raw = match room_util::raw_event(&state.rooms, event_id) {
+            let raw = match room_util::raw_event_shard(rooms, event_id) {
                 Ok(Some(raw)) => raw,
                 Ok(None) => continue,
                 Err(e) => return Err(e.message),
@@ -226,7 +229,7 @@ async fn deliver_to(
             // A boring span still advances the cursor, or an idle server
             // would rescan it forever.
             fedout
-                .advance_as_cursor(&reg.id, ROOM_SHARD, scanned_to)
+                .advance_as_cursor(&reg.id, room_shard, scanned_to)
                 .await
                 .map_err(|e| e.to_string())?;
             cursor = scanned_to;
@@ -239,7 +242,7 @@ async fn deliver_to(
         // past a short scan, interest-relevant state changed), the id
         // shifts with it — the residual corner is documented in
         // docs/design-appservices.md.
-        let txn_id = format!("s{ROOM_SHARD}_{first}_{last}_{}", events.len());
+        let txn_id = format!("s{room_shard}_{first}_{last}_{}", events.len());
         let started = Instant::now();
         let outcome = client.push_transaction(reg, &txn_id, &events).await;
         metrics::histogram!("saltator_appservice_transaction_seconds", "appservice" => reg.id.clone())
@@ -253,7 +256,7 @@ async fn deliver_to(
                     "appservice" => reg.id.clone())
                 .increment(events.len() as u64);
                 fedout
-                    .advance_as_cursor(&reg.id, ROOM_SHARD, scanned_to)
+                    .advance_as_cursor(&reg.id, room_shard, scanned_to)
                     .await
                     .map_err(|e| e.to_string())?;
                 cursor = scanned_to;

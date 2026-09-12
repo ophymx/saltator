@@ -112,6 +112,7 @@ pub async fn make_knock(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
+    let rooms = rooms.for_room(&room_id).clone();
     let room = ruma::RoomId::parse(&room_id)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad room id"))?;
     let user = ruma::UserId::parse(&user_id)
@@ -144,14 +145,8 @@ pub async fn send_knock(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
-
-    // Trust the knocking server's keys before verifying its signed event.
-    let now = crate::now_ms();
-    if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
-        if let Some(set) = keys.get(&auth.origin) {
-            rooms.trust_keys(&auth.origin, set.clone());
-        }
-    }
+    // BODY-ROUTED: resolved (and keys trusted) after the event parses.
+    let shards = rooms;
 
     let body: serde_json::Value = auth.json().map_err(|_| {
         err(
@@ -173,6 +168,22 @@ pub async fn send_knock(
     // spec: /send_knock accepts only an m.room.member knock with
     // state_key == sender; anything else is a 400.
     require_membership_event(&raw, "knock")?;
+    let Some(CanonicalJsonValue::String(event_room)) = raw.get("room_id").cloned() else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "M_BAD_JSON",
+            "event has no room_id",
+        ));
+    };
+    // Route by the EVENT's room — the path is advisory, and applying to
+    // the wrong shard on a lying path must be impossible.
+    let rooms = shards.for_room(&event_room).clone();
+    let now = crate::now_ms();
+    if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
+        if let Some(set) = keys.get(&auth.origin) {
+            rooms.trust_keys(&auth.origin, set.clone());
+        }
+    }
     // Unconditional: an event with no `room_id` must be refused, not have
     // the block silently skipped (security review 2026-08-13, Vuln 2).
     let room_id = event_room_id(&raw).ok_or_else(|| {
@@ -204,6 +215,7 @@ pub async fn make_join(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
+    let rooms = rooms.for_room(&room_id).clone();
     let room = ruma::RoomId::parse(&room_id)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad room id"))?;
     let user = ruma::UserId::parse(&user_id)
@@ -286,16 +298,8 @@ async fn send_join_apply(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
-
-    // The joining server's keys must be trusted before its signed join can
-    // be verified; the auth extractor already fetched them, so seed the
-    // room pipeline's key set from the cache.
-    let now = crate::now_ms();
-    if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
-        if let Some(set) = keys.get(&auth.origin) {
-            rooms.trust_keys(&auth.origin, set.clone());
-        }
-    }
+    // BODY-ROUTED: resolved (and keys trusted) after the event parses.
+    let shards = rooms;
 
     let body: serde_json::Value = auth.json().map_err(|_| {
         err(
@@ -315,6 +319,22 @@ async fn send_join_apply(
         }
     };
     require_membership_event(&raw, "join")?;
+    let Some(CanonicalJsonValue::String(event_room)) = raw.get("room_id").cloned() else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "M_BAD_JSON",
+            "event has no room_id",
+        ));
+    };
+    // Route by the EVENT's room — the path is advisory, and applying to
+    // the wrong shard on a lying path must be impossible.
+    let rooms = shards.for_room(&event_room).clone();
+    let now = crate::now_ms();
+    if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
+        if let Some(set) = keys.get(&auth.origin) {
+            rooms.trust_keys(&auth.origin, set.clone());
+        }
+    }
     // From the event, because the event is what gets applied. Unconditional:
     // a missing `room_id` is refused, not a silently skipped block
     // (security review 2026-08-13, Vuln 2).
@@ -360,6 +380,7 @@ pub async fn event_auth(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
+    let rooms = rooms.for_room(&room_id).clone();
     // Requester's server must be in the room (Synapse parity) — the auth
     // chain names members, power levels and the room's whole authority
     // structure. And the event must actually belong to the path's room,
@@ -413,6 +434,7 @@ pub async fn make_leave(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
+    let rooms = rooms.for_room(&room_id).clone();
     let room = ruma::RoomId::parse(&room_id)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad room id"))?;
     let user = ruma::UserId::parse(&user_id)
@@ -464,12 +486,8 @@ async fn send_leave_apply(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
-    let now = crate::now_ms();
-    if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
-        if let Some(set) = keys.get(&auth.origin) {
-            rooms.trust_keys(&auth.origin, set.clone());
-        }
-    }
+    // BODY-ROUTED: resolved (and keys trusted) after the event parses.
+    let shards = rooms;
     let body: serde_json::Value = auth.json().map_err(|_| {
         err(
             StatusCode::BAD_REQUEST,
@@ -488,6 +506,22 @@ async fn send_leave_apply(
         }
     };
     require_membership_event(&raw, "leave")?;
+    let Some(CanonicalJsonValue::String(event_room)) = raw.get("room_id").cloned() else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "M_BAD_JSON",
+            "event has no room_id",
+        ));
+    };
+    // Route by the EVENT's room — the path is advisory, and applying to
+    // the wrong shard on a lying path must be impossible.
+    let rooms = shards.for_room(&event_room).clone();
+    let now = crate::now_ms();
+    if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
+        if let Some(set) = keys.get(&auth.origin) {
+            rooms.trust_keys(&auth.origin, set.clone());
+        }
+    }
     match rooms.send_leave(raw).await {
         Ok(saltator_roomserver::Outcome::Rejected { reason, .. }) => {
             Err(err(StatusCode::FORBIDDEN, "M_FORBIDDEN", &reason))
@@ -636,7 +670,13 @@ pub async fn invite(
     let hosted = state
         .rooms
         .as_ref()
-        .and_then(|r| r.store().meta(_room_id.as_str()).ok().flatten())
+        .and_then(|r| {
+            r.for_room(_room_id.as_str())
+                .store()
+                .meta(_room_id.as_str())
+                .ok()
+                .flatten()
+        })
         .is_some();
     let mut ingested = false;
     if hosted {

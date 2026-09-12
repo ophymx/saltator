@@ -235,7 +235,7 @@ async fn start_env(opts: ProviderOpts) -> Env {
     let media = MediaStore::open(dir.path().join("media")).unwrap();
     let state = CsState::new(
         users.clone(),
-        rooms.clone(),
+        saltator_roomserver::RoomShards::single(rooms.clone()),
         media,
         CsConfig {
             server_name,
@@ -997,7 +997,7 @@ async fn sso_routes_are_absent_without_a_provider() {
     let media = MediaStore::open(dir.path().join("media")).unwrap();
     let state = CsState::new(
         users.clone(),
-        rooms,
+        saltator_roomserver::RoomShards::single(rooms.clone()),
         media,
         CsConfig {
             server_name,

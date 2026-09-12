@@ -81,6 +81,9 @@ advertise = "$_internal"
 
 [cluster]
 seeds = [$_seeds]
+# CI stays single-shard until the deliberate flip
+# (docs/design-room-sharding.md review call 3).
+room_shards = 1
 
 [listeners]
 internal = "$_internal"

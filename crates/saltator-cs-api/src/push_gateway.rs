@@ -25,16 +25,32 @@ const BATCH: usize = 128;
 /// stall the stream. Retry/backoff queues are hardening.
 const GATEWAY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Spawn the delivery loop. Runs until the returned handle is aborted.
+/// Spawn the delivery loops — one per room shard, each gated on ITS
+/// shard's leadership (spec §5.5: evaluation at the emitting shard).
+/// Aborting the returned handle tears the per-shard tasks down with it.
 pub fn spawn_push_delivery(state: Arc<CsState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run(state).await {
-            tracing::error!(error = %e, "push delivery stopped");
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, _) in state.rooms.iter() {
+            let state = state.clone();
+            set.spawn(async move {
+                if let Err(e) = run_shard(state, idx).await {
+                    tracing::error!(error = %e, shard = idx, "push delivery stopped");
+                }
+            });
         }
+        // Park on the set: dropping it (via abort of this task) aborts
+        // every per-shard loop.
+        while set.join_next().await.is_some() {}
     })
 }
 
-async fn run(state: Arc<CsState>) -> Result<(), String> {
+async fn run_shard(state: Arc<CsState>, shard_idx: u16) -> Result<(), String> {
+    let rooms = state
+        .rooms
+        .by_index(shard_idx)
+        .ok_or("unknown shard")?
+        .clone();
     // Gateway URLs come from clients; the guarded client blocks a pusher
     // pointed at an internal address (defence in depth on top of the
     // set-time check in routes/push.rs) including via DNS rebinding.
@@ -42,24 +58,19 @@ async fn run(state: Arc<CsState>) -> Result<(), String> {
         .timeout(GATEWAY_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;
-    let mut changes = state.rooms.subscribe();
-    let mut cursor = state
-        .rooms
-        .shard_handle()
-        .seq()
-        .map_err(|e| e.to_string())?;
+    let mut changes = rooms.subscribe();
+    let mut cursor = rooms.shard_handle().seq().map_err(|e| e.to_string())?;
 
     loop {
         loop {
-            let batch = state
-                .rooms
+            let batch = rooms
                 .store()
                 .timeline(cursor, BATCH)
                 .map_err(|e| e.to_string())?;
             let Some(&(last_seq, _)) = batch.last() else {
                 break;
             };
-            if state.rooms.shard_handle().is_leader() {
+            if rooms.shard_handle().is_leader() {
                 for (seq, entry) in &batch {
                     if let SeqEntry::Event { room_id, event_id } = entry {
                         notify_event(&state, &client, room_id, event_id, *seq).await;
@@ -176,13 +187,17 @@ async fn notify_user(
 
     // Optional display context from current state.
     let current = room_util::current_state(&state.rooms, room_id).map_err(|e| e.message)?;
-    let room_name = room_util::state_content_in(&state.rooms, &current, "m.room.name")
+    let room_name = room_util::state_content_in(&state.rooms, room_id, &current, "m.room.name")
         .ok()
         .flatten()
         .and_then(|c| c.get("name").and_then(|n| n.as_str()).map(str::to_owned));
     let sender_display_name = current
         .get(&("m.room.member".to_owned(), sender.to_owned()))
-        .and_then(|eid| room_util::raw_event(&state.rooms, eid).ok().flatten())
+        .and_then(|eid| {
+            room_util::raw_event(&state.rooms, room_id, eid)
+                .ok()
+                .flatten()
+        })
         .and_then(|raw| match raw.get("content") {
             Some(ruma::CanonicalJsonValue::Object(c)) => match c.get("displayname") {
                 Some(ruma::CanonicalJsonValue::String(d)) => Some(d.clone()),

@@ -34,6 +34,7 @@ fn visible_events(
     let mut out = Vec::new();
     for (seq, event_id) in state
         .rooms
+        .for_room(room_id)
         .store()
         .room_timeline(room_id, 0, cap, usize::MAX, false)
         .map_err(ApiError::internal)?
@@ -90,7 +91,7 @@ async fn relations_common(
     // tokens alike (clients hand /sync positions straight in).
     let from = query
         .get("from")
-        .map(|s| crate::routes::rooms::parse_pagination_bound(s))
+        .map(|s| crate::routes::rooms::parse_pagination_bound(s, state.rooms.index_of(&room_id)))
         .transpose()?;
 
     let mut matches: Vec<(u64, &serde_json::Value)> = Vec::new();

@@ -24,7 +24,7 @@ use ruma::{OwnedServerName, OwnedUserId};
 use saltator_core::RoomVersion;
 use saltator_federation::FederationClient;
 use saltator_media::MediaStore;
-use saltator_roomserver::{RoomServer, ServerSigner};
+use saltator_roomserver::{RoomShards, ServerSigner};
 use saltator_userserver::UserServer;
 
 pub use appservice_push::spawn_appservice_push;
@@ -80,7 +80,7 @@ pub use services::oidc::OidcProviderConfig;
 /// Shared state of every CS route.
 pub struct CsState {
     pub users: Arc<UserServer>,
-    pub rooms: Arc<RoomServer>,
+    pub rooms: Arc<RoomShards>,
     /// The federation-out shard: durable home of outbound EDUs (step 4).
     /// `None` in stacks without delivery (most tests): enqueues are
     /// dropped with a warning — nothing outbound exists to deliver them.
@@ -295,7 +295,7 @@ impl CsState {
 
     pub fn new(
         users: Arc<UserServer>,
-        rooms: Arc<RoomServer>,
+        rooms: Arc<RoomShards>,
         media: MediaStore,
         config: CsConfig,
     ) -> Arc<Self> {

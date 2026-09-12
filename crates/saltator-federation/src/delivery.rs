@@ -15,7 +15,7 @@ use serde_json::json;
 use tokio::time::Instant;
 
 use saltator_fedout::FedOutServer;
-use saltator_roomserver::{RoomServer, SeqEntry};
+use saltator_roomserver::{RoomServer, RoomShards, SeqEntry};
 
 use crate::outbound::FederationClient;
 
@@ -91,30 +91,39 @@ impl DeliveryBackoff {
 /// Spawn the delivery worker. Runs until aborted.
 pub fn spawn_delivery_worker(
     fedout: Arc<FedOutServer>,
-    rooms: Arc<RoomServer>,
+    rooms: Arc<RoomShards>,
     client: Arc<FederationClient>,
     server_name: ruma::OwnedServerName,
     backoff: Arc<DeliveryBackoff>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut room_changes = rooms.subscribe();
+        let mut room_changes: Vec<_> = rooms.iter().map(|(_, s)| s.subscribe()).collect();
         let mut fedout_changes = fedout.subscribe();
-        // In-memory PDU scan floor; re-derived from durable cursors (or
-        // the tip) whenever we (re)gain leadership.
-        let mut scan_pos: Option<u64> = None;
+        // In-memory per-shard PDU scan floors; re-derived from durable
+        // cursors (or each shard's tip) whenever we (re)gain leadership.
+        let mut scan_pos: Option<std::collections::BTreeMap<u16, u64>> = None;
 
         loop {
             if fedout.shard_handle().is_leader() {
                 if scan_pos.is_none() {
-                    scan_pos = Some(initial_scan_pos(&fedout, &rooms));
+                    scan_pos = Some(
+                        rooms
+                            .iter()
+                            .map(|(idx, shard)| (idx, initial_scan_pos(&fedout, idx, shard)))
+                            .collect(),
+                    );
                 }
-                if let Some(pos) = scan_pos.as_mut() {
-                    deliver_pdus(&fedout, &rooms, &client, &server_name, pos, &backoff).await;
+                if let Some(floors) = scan_pos.as_mut() {
+                    for (idx, shard) in rooms.iter() {
+                        let pos = floors.entry(idx).or_default();
+                        deliver_pdus(&fedout, idx, shard, &client, &server_name, pos, &backoff)
+                            .await;
+                    }
                 }
                 deliver_edus(&fedout, &client, &server_name, &backoff).await;
             } else {
-                // Leadership lost: drop the scan floor so a later
-                // re-election re-derives it from the durable cursors.
+                // Leadership lost: drop the scan floors so a later
+                // re-election re-derives them from the durable cursors.
                 scan_pos = None;
             }
             // The backed-off gauge is NOT written here: a delivery pass
@@ -124,9 +133,12 @@ pub fn spawn_delivery_worker(
             // sampled on the node's gauge tick instead
             // (`metrics::sample_delivery_gauges`), like every other
             // current-state gauge.
+            let any_room_change = futures_util::future::select_all(
+                room_changes.iter_mut().map(|rx| Box::pin(rx.recv())),
+            );
             tokio::select! {
                 _ = tokio::time::sleep(IDLE_TICK) => {}
-                _ = room_changes.recv() => {}
+                _ = any_room_change => {}
                 _ = fedout_changes.recv() => {}
             }
         }
@@ -138,9 +150,14 @@ pub fn spawn_delivery_worker(
 /// yet (first boot after the upgrade, or a quiet server): history predates
 /// the shard and re-federating it to everyone would be wrong — that was
 /// also the old sender's start-at-tip behaviour.
-fn initial_scan_pos(fedout: &FedOutServer, rooms: &RoomServer) -> u64 {
+fn initial_scan_pos(fedout: &FedOutServer, room_shard: u16, rooms: &RoomServer) -> u64 {
     let cursors = fedout.store().pdu_cursors().unwrap_or_default();
-    match cursors.iter().map(|(_, _, seq)| *seq).min() {
+    match cursors
+        .iter()
+        .filter(|(shard, _, _)| *shard == room_shard)
+        .map(|(_, _, seq)| *seq)
+        .min()
+    {
         Some(seq) => seq,
         None => rooms.shard_handle().seq().unwrap_or(0),
     }
@@ -160,15 +177,16 @@ fn initial_scan_pos(fedout: &FedOutServer, rooms: &RoomServer) -> u64 {
 /// destination has either acked or is skipping. (Seq gaps between a
 /// destination's events are NOT evidence of undelivered work — they are
 /// usually just interleaved traffic for other rooms/servers.)
+#[allow(clippy::too_many_arguments)]
 async fn deliver_pdus(
     fedout: &FedOutServer,
+    room_shard: u16,
     rooms: &RoomServer,
     client: &Arc<FederationClient>,
     server_name: &ruma::OwnedServerName,
     scan_pos: &mut u64,
     backoff: &DeliveryBackoff,
 ) {
-    let room_shard = 0u16; // single room shard (M1 layout)
     let batch = match rooms.store().timeline(*scan_pos, SCAN_BATCH) {
         Ok(b) => b,
         Err(e) => {

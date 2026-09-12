@@ -157,7 +157,8 @@ impl EventFetcher for FedFetcher {
     }
 
     async fn trust_event_servers(&self, events: &[CanonicalJsonObject]) {
-        crate::keys::trust_event_servers(&self.key_cache, &self.rooms, events).await;
+        // This fetcher serves one shard's ingest; trust lands there.
+        crate::keys::trust_event_servers_on(&self.key_cache, &self.rooms, events).await;
     }
 }
 

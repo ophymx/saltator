@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 saltator-core.workspace = true
+blake3.workspace = true
 saltator-shard.workspace = true
 saltator-store.workspace = true
 

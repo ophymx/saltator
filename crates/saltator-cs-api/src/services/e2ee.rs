@@ -8,7 +8,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use saltator_fedout::{FedOutServer, OutboundEdu};
-use saltator_roomserver::RoomServer;
 use saltator_userserver::UserServer;
 
 use crate::error::ApiError;
@@ -19,7 +18,7 @@ type Result<T> = std::result::Result<T, ApiError>;
 /// via [`crate::CsState::e2ee`].
 pub(crate) struct E2ee<'a> {
     pub users: &'a Arc<UserServer>,
-    pub rooms: &'a Arc<RoomServer>,
+    pub rooms: &'a Arc<saltator_roomserver::RoomShards>,
     /// Durable outbound home (step 4). `None` in delivery-less stacks:
     /// enqueues drop with a warning.
     pub fedout: Option<&'a Arc<FedOutServer>>,
@@ -300,7 +299,10 @@ mod tests {
             .wait_for_leader(Duration::from_secs(10))
             .await
             .unwrap();
-        let proj = spawn_membership_projection(users.clone(), rooms.clone());
+        let proj = spawn_membership_projection(
+            users.clone(),
+            saltator_roomserver::RoomShards::single(rooms.clone()),
+        );
         (dir, rooms, users, fedout, proj)
     }
 
@@ -355,14 +357,15 @@ mod tests {
             }
         }
         // Wait for the membership projection to index the last join.
-        wait_for_projection(&users, last_room_seq, Duration::from_secs(10))
+        wait_for_projection(&users, 0, last_room_seq, Duration::from_secs(10))
             .await
             .unwrap();
         let upto = users.shard_handle().seq().unwrap();
 
+        let shards = saltator_roomserver::RoomShards::single(rooms.clone());
         let svc = E2ee {
             users: &users,
-            rooms: &rooms,
+            rooms: &shards,
             fedout: Some(&fedout),
             server_name: SERVER,
         };
@@ -388,9 +391,10 @@ mod tests {
     #[tokio::test]
     async fn queue_update_reaches_outbox_with_replay_marker() {
         let (_dir, rooms, users, fedout, proj) = stack().await;
+        let shards = saltator_roomserver::RoomShards::single(rooms.clone());
         let svc = E2ee {
             users: &users,
-            rooms: &rooms,
+            rooms: &shards,
             fedout: Some(&fedout),
             server_name: SERVER,
         };
