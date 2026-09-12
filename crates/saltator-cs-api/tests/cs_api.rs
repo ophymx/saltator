@@ -12659,3 +12659,123 @@ async fn multi_shard_membership_projections() {
         "left room must not be joined: {body}"
     );
 }
+
+/// A restricted room's allow condition names a room on a DIFFERENT
+/// shard: the authoriser must route the allow-room membership read by
+/// that room's own id. Reading it from the join room's shard reports
+/// the allow room unknown, and the server refuses to vouch for a room
+/// it does hold (the whole TestRestrictedRooms* family failed this way
+/// when CI flipped to 4 shards).
+#[tokio::test]
+async fn restricted_join_allow_room_on_other_shard() {
+    let env = start_env_sharded(4).await;
+    let alice = env.register("alice", "pw-12345678").await;
+    let bob = env.register("bob", "pw-12345678").await;
+
+    // The allow room: public, joinable by bob.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            Some(&alice),
+            Some(json!({"preset": "public_chat"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let allow_room = body["room_id"].as_str().unwrap().to_owned();
+
+    // A restricted room on a DIFFERENT shard than the allow room.
+    let mut restricted = None;
+    for _ in 0..32 {
+        let (status, body) = env
+            .req(
+                "POST",
+                "/_matrix/client/v3/createRoom",
+                Some(&alice),
+                Some(json!({
+                    "preset": "public_chat",
+                    "initial_state": [{
+                        "type": "m.room.join_rules",
+                        "state_key": "",
+                        "content": {
+                            "join_rule": "restricted",
+                            "allow": [{
+                                "type": "m.room_membership",
+                                "room_id": allow_room,
+                            }],
+                        },
+                    }],
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = body["room_id"].as_str().unwrap().to_owned();
+        if env.rooms.index_of(&id) != env.rooms.index_of(&allow_room) {
+            restricted = Some(id);
+            break;
+        }
+    }
+    let restricted = restricted.expect("32 rooms all hashed to the allow room's shard?");
+    let enc_restricted = restricted.replace('!', "%21").replace(':', "%3A");
+    let enc_allow = allow_room.replace('!', "%21").replace(':', "%3A");
+
+    // Not in the allow room yet: the join is refused.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/join/{enc_restricted}"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Joined to the allow room: the cross-shard membership read must
+    // authorise the join.
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/join/{enc_allow}"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/join/{enc_restricted}"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "join via cross-shard allow room: {body}"
+    );
+
+    // Left both again: the refusal is a clean FailsConditions (403),
+    // not a can't-see-the-room CannotValidate.
+    for enc in [&enc_restricted, &enc_allow] {
+        let (status, body) = env
+            .req(
+                "POST",
+                &format!("/_matrix/client/v3/rooms/{enc}/leave"),
+                Some(&bob),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/join/{enc_restricted}"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN", "{body}");
+}

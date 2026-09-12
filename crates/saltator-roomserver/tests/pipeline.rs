@@ -787,6 +787,7 @@ async fn restricted_join_authoriser_selects_and_denies() {
     use saltator_roomserver::RestrictedAuth;
     let env = start_env().await;
     let s = &env.server;
+    let shards = saltator_roomserver::RoomShards::single(env.server.clone());
     let alice = user("alice");
     let carol = user("carol");
 
@@ -865,11 +866,12 @@ async fn restricted_join_authoriser_selects_and_denies() {
     // carol is in the allowed room -> authorised via alice (the only local
     // member of the restricted room with invite power).
     assert_eq!(
-        s.restricted_join_authoriser(&room_ref, &carol).unwrap(),
+        s.restricted_join_authoriser(&shards, &room_ref, &carol)
+            .unwrap(),
         RestrictedAuth::Authorised(alice.clone()),
     );
     // ...and make_join stamps that authoriser into the template content.
-    let (_v, template) = s.make_join_template(&room_ref, &carol).unwrap();
+    let (_v, template) = s.make_join_template(&shards, &room_ref, &carol).unwrap();
     let stamped = template
         .get("content")
         .and_then(|c| c.as_object())
@@ -880,7 +882,8 @@ async fn restricted_join_authoriser_selects_and_denies() {
     // dave is in no allowed room we hold -> fails all conditions (403).
     let dave = user("dave");
     assert_eq!(
-        s.restricted_join_authoriser(&room_ref, &dave).unwrap(),
+        s.restricted_join_authoriser(&shards, &room_ref, &dave)
+            .unwrap(),
         RestrictedAuth::FailsConditions,
     );
 
@@ -898,7 +901,8 @@ async fn restricted_join_authoriser_selects_and_denies() {
         .unwrap(),
     );
     assert_eq!(
-        s.restricted_join_authoriser(&room_ref, &carol).unwrap(),
+        s.restricted_join_authoriser(&shards, &room_ref, &carol)
+            .unwrap(),
         RestrictedAuth::CannotValidate,
     );
 

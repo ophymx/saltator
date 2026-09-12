@@ -81,9 +81,11 @@ advertise = "$_internal"
 
 [cluster]
 seeds = [$_seeds]
-# CI stays single-shard until the deliberate flip
-# (docs/design-room-sharding.md review call 3).
-room_shards = 1
+# Multi-shard CI: 4 room groups per suite server — enough to exercise the
+# vector-token/routing paths on every test without the raft overhead of
+# the 16-group production default (docs/design-room-sharding.md §open
+# question 3; e2e/cluster/chaos harnesses cover the default 16).
+room_shards = 4
 
 [listeners]
 internal = "$_internal"

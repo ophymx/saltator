@@ -260,7 +260,18 @@ impl RoomShards {
         joiner: &ruma::UserId,
     ) -> Result<RestrictedAuth> {
         self.for_room(room_id.as_str())
-            .restricted_join_authoriser(room_id, joiner)
+            .restricted_join_authoriser(self, room_id, joiner)
+    }
+
+    /// The `GET /make_join` template. Router-level because the
+    /// restricted-join allow rooms it evaluates route by their own ids.
+    pub fn make_join_template(
+        &self,
+        room_id: &ruma::RoomId,
+        user_id: &ruma::UserId,
+    ) -> Result<(CoreRoomVersion, CanonicalJsonObject)> {
+        self.for_room(room_id.as_str())
+            .make_join_template(self, room_id, user_id)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u16, &Arc<RoomServer>)> {

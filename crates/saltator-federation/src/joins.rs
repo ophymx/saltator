@@ -215,13 +215,14 @@ pub async fn make_join(
     let Some(rooms) = state.rooms.clone() else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "No room server"));
     };
-    let rooms = rooms.for_room(&room_id).clone();
     let room = ruma::RoomId::parse(&room_id)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad room id"))?;
     let user = ruma::UserId::parse(&user_id)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad user id"))?;
     refuse_if_blocked(&state, room.as_str())?;
 
+    // Router-level: the template's restricted-join check reads allow
+    // rooms, which route by their own ids.
     match rooms.make_join_template(&room, &user) {
         Ok((version, template)) => Ok(axum::Json(serde_json::json!({
             "room_version": version.as_str(),

@@ -378,8 +378,11 @@ async fn join_client_drives_the_full_handshake() {
     );
 
     // B now hosts the room: bob is joined, and a.test is a remote peer.
-    let b_state =
-        b_rooms.make_join_template(&room_id, &ruma::UserId::parse("@carol:c.test").unwrap());
+    let b_state = b_rooms.make_join_template(
+        &saltator_roomserver::RoomShards::single(b_rooms.clone()),
+        &room_id,
+        &ruma::UserId::parse("@carol:c.test").unwrap(),
+    );
     assert!(b_state.is_ok(), "B should now know the room");
     let peers = b_rooms
         .remote_servers_in_room(room_id.as_str(), "b.test")

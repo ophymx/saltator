@@ -27,6 +27,7 @@ ca_cert = "/certs/ca.crt"
 allow_private_ips = true
 
 [cluster]
-# CI stays single-shard until the deliberate flip
-# (docs/design-room-sharding.md review call 3).
-room_shards = 1
+# Multi-shard CI: 4 room groups, matching the Complement image — the
+# interop join/E2EE flows then cross real shard routing too
+# (docs/design-room-sharding.md §open question 3).
+room_shards = 4

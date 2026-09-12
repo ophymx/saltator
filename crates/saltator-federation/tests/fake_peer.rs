@@ -53,7 +53,7 @@ async fn start_rooms(
 /// Single-node fed-out shard + the unified delivery worker (step 4's
 /// replacement for the old spawn_sender in these tests).
 async fn start_delivery(
-    rooms: Arc<saltator_roomserver::RoomServer>,
+    rooms: Arc<saltator_roomserver::RoomShards>,
     client: Arc<saltator_federation::FederationClient>,
     hs: OwnedServerName,
     dir: &std::path::Path,
@@ -78,12 +78,136 @@ async fn start_delivery(
         .unwrap();
     let worker = saltator_federation::spawn_delivery_worker(
         fedout.clone(),
-        saltator_roomserver::RoomShards::single(rooms.clone()),
+        rooms,
         client,
         hs,
         Arc::new(saltator_federation::DeliveryBackoff::default()),
     );
     (fedout, worker)
+}
+
+/// Two room shards deliver to one destination: their per-shard seq
+/// streams overlap, so the transaction ids must not — the receiver
+/// replay-caches on (origin, txn_id), and a reused id gets the cached
+/// response back: the second shard's chunk is acked but never ingested,
+/// and the cursor advance means it is never retried. (Caught by the
+/// Complement multi-shard flip: TestFederationRoomsInvite lost a
+/// rescind and a join to exactly this collision.)
+#[tokio::test]
+async fn sharded_delivery_txn_ids_do_not_collide() {
+    use saltator_federation::{join_remote_room, FederationClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let hs: OwnedServerName = "hs.test".try_into().unwrap();
+    let (hs_signer, _) = ServerSigner::generate(hs.clone(), "1".to_owned());
+    let hs_signer = Arc::new(hs_signer);
+
+    let peer = MockPeer::start("peer.test").await;
+
+    // One peer-hosted room per shard of a 2-shard router.
+    let mut room_ids: [Option<String>; 2] = [None, None];
+    while room_ids.iter().any(Option::is_none) {
+        let id = peer.make_room(RoomVersion::V11, "charlie");
+        let idx = saltator_roomserver::shard_of(&id, 2) as usize;
+        room_ids[idx].get_or_insert(id);
+    }
+
+    let mut shards = Vec::new();
+    for idx in 0..2u16 {
+        let engine = Arc::new(RocksEngine::open(&dir.path().join(format!("room{idx}"))).unwrap());
+        let s = RoomServer::start_shard(
+            saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx),
+            1,
+            engine,
+            hs_signer.clone(),
+            NoopNetworkFactory,
+            Some("127.0.0.1:0".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        s.shard_handle()
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        shards.push(s);
+    }
+    let router = saltator_roomserver::RoomShards::new(shards.clone());
+
+    let (_fedout, sender) = start_delivery(
+        router.clone(),
+        Arc::new(FederationClient::with_base_url(
+            hs_signer.clone(),
+            peer.base_url.clone(),
+        )),
+        hs.clone(),
+        dir.path(),
+    )
+    .await;
+
+    // Symmetric histories — join + import + one message per shard — so
+    // the two seq streams line up: the collision-prone shape.
+    let client = FederationClient::with_base_url(hs_signer.clone(), peer.base_url.clone());
+    let alice = ruma::UserId::parse("@alice:hs.test").unwrap();
+    for room_id in room_ids.iter().flatten() {
+        let shard = router.for_room(room_id);
+        let resp = join_remote_room(&client, &hs_signer, "peer.test", room_id, "@alice:hs.test")
+            .await
+            .expect("join");
+        shard
+            .import_room(resp.room_version, resp.event, resp.state, resp.auth_chain)
+            .await
+            .expect("import");
+        let room = ruma::RoomId::parse(room_id.as_str()).unwrap();
+        shard
+            .send_message(
+                &room,
+                &alice,
+                "m.room.message",
+                json!({"msgtype": "m.text", "body": "hello"}),
+            )
+            .await
+            .expect("send");
+    }
+
+    // Both shards' messages must reach the peer (delivery is async)...
+    let mut got = 0;
+    for _ in 0..100 {
+        got =
+            peer.received()
+                .iter()
+                .filter(|txn| {
+                    txn.origin == "hs.test"
+                        && txn.pdus.iter().any(|p| {
+                            p.get("type").and_then(|t| t.as_str()) == Some("m.room.message")
+                        })
+                })
+                .count();
+        if got >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let received = peer.received();
+    assert!(
+        got >= 2,
+        "expected both shards' messages delivered; got {received:?}"
+    );
+
+    // ...and no two transactions may share an id.
+    let mut ids = std::collections::HashSet::new();
+    for txn in received.iter().filter(|t| t.origin == "hs.test") {
+        assert!(
+            ids.insert(txn.txn_id.clone()),
+            "txn id {:?} reused — a real receiver's replay cache would swallow the later chunk",
+            txn.txn_id
+        );
+    }
+
+    sender.abort();
+    for s in shards {
+        s.shutdown().await.unwrap();
+    }
 }
 
 /// The peer hosts a public room; our server drives the make_join/send_join
@@ -664,7 +788,7 @@ async fn outbound_send_reaches_remote_members() {
     // (it runs continuously). This puts the imported join within the
     // sender's window, so the co-signer-skip is actually exercised.
     let (_fedout, sender) = start_delivery(
-        our_rooms.clone(),
+        saltator_roomserver::RoomShards::single(our_rooms.clone()),
         Arc::new(FederationClient::with_base_url(
             hs_signer.clone(),
             peer.base_url.clone(),
@@ -863,7 +987,7 @@ async fn peer_malformed_pdu_is_rejected() {
 /// resident-side apply path — including the `relay` flag the fan-out depends
 /// on.
 async fn peer_joins_our_room(
-    rooms: &RoomServer,
+    rooms: &Arc<RoomServer>,
     room: &ruma::RoomId,
     server: &str,
     localpart: &str,
@@ -876,7 +1000,13 @@ async fn peer_joins_our_room(
         .expect("joiner keys");
     rooms.trust_keys(server, keys);
     let user = ruma::OwnedUserId::try_from(format!("@{localpart}:{server}")).unwrap();
-    let (version, mut template) = rooms.make_join_template(room, &user).unwrap();
+    let (version, mut template) = rooms
+        .make_join_template(
+            &saltator_roomserver::RoomShards::single(rooms.clone()),
+            room,
+            &user,
+        )
+        .unwrap();
     signer.hash_and_sign_event(&mut template, version).unwrap();
     rooms.send_join(template).await.expect("send_join applies");
     user.to_string()
@@ -929,7 +1059,7 @@ async fn resident_fans_out_send_join_membership_to_other_members() {
     // stands in for every remote member server.
     let peer = MockPeer::start("capture.test").await;
     let (_fedout, sender) = start_delivery(
-        our_rooms.clone(),
+        saltator_roomserver::RoomShards::single(our_rooms.clone()),
         Arc::new(FederationClient::with_base_url(
             hs_signer.clone(),
             peer.base_url.clone(),
@@ -1046,7 +1176,7 @@ async fn ban_of_remote_user_reaches_their_server() {
     // Capture our outbound at a single mock endpoint (destination name ignored).
     let peer = MockPeer::start("capture.test").await;
     let (_fedout, sender) = start_delivery(
-        our_rooms.clone(),
+        saltator_roomserver::RoomShards::single(our_rooms.clone()),
         Arc::new(FederationClient::with_base_url(
             hs_signer.clone(),
             peer.base_url.clone(),
@@ -1274,7 +1404,7 @@ async fn delivery_resumes_from_durable_cursor_after_restart() {
     let _bob = peer_joins_our_room(&our_rooms, &room, "peer.test", "bob").await;
 
     let (fedout, worker) = start_delivery(
-        our_rooms.clone(),
+        saltator_roomserver::RoomShards::single(our_rooms.clone()),
         Arc::new(FederationClient::with_base_url(
             hs_signer.clone(),
             peer.base_url.clone(),

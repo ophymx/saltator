@@ -471,6 +471,7 @@ impl PeerRoom {
 /// A captured inbound transaction (our server's outbound `/send`).
 #[derive(Clone, Debug)]
 pub struct ReceivedTxn {
+    pub txn_id: String,
     pub origin: String,
     pub pdus: Vec<serde_json::Value>,
     pub edus: Vec<serde_json::Value>,
@@ -701,7 +702,7 @@ async fn serve_event(
 
 async fn serve_send(
     State(inner): State<Arc<PeerInner>>,
-    Path(_txn_id): Path<String>,
+    Path(txn_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let origin = body
@@ -719,10 +720,11 @@ async fn serve_send(
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    inner
-        .received
-        .lock()
-        .unwrap()
-        .push(ReceivedTxn { origin, pdus, edus });
+    inner.received.lock().unwrap().push(ReceivedTxn {
+        txn_id,
+        origin,
+        pdus,
+        edus,
+    });
     Json(json!({ "pdus": {} }))
 }
