@@ -172,6 +172,7 @@ async fn deliver_to(
         let batch = rooms
             .store()
             .timeline(cursor, SCAN_BATCH)
+            .await
             .map_err(|e| e.to_string())?;
         if batch.is_empty() {
             return Ok(());
@@ -188,7 +189,7 @@ async fn deliver_to(
             // A membership event invalidates the member-list cache for
             // its room — the join that makes the AS interested must make
             // this very event interesting.
-            let raw = match room_util::raw_event_shard(rooms, event_id) {
+            let raw = match room_util::raw_event_shard(rooms, event_id).await {
                 Ok(Some(raw)) => raw,
                 Ok(None) => continue,
                 Err(e) => return Err(e.message),
@@ -203,14 +204,19 @@ async fn deliver_to(
                 &raw,
                 &mut member_interest,
                 &mut room_aliases,
-            )? {
+            )
+            .await?
+            {
                 continue;
             }
-            let meta = room_util::room_meta(&state.rooms, room_id).map_err(|e| e.message)?;
+            let meta = room_util::room_meta(&state.rooms, room_id)
+                .await
+                .map_err(|e| e.message)?;
             let version = room_util::room_version(&meta).map_err(|e| e.message)?;
             let sender = reg.sender_user(state.config.server_name.as_str());
             let Some(ev) =
                 room_util::client_event(&state.rooms, version, room_id, event_id, &sender)
+                    .await
                     .map_err(|e| e.message)?
             else {
                 continue;
@@ -286,7 +292,7 @@ fn raw_str<'a>(raw: &'a ruma::CanonicalJsonObject, key: &str) -> Option<&'a str>
 }
 
 /// The spec's interest predicate, cheap terms first.
-fn interested(
+async fn interested(
     state: &CsState,
     reg: &AppServiceRegistration,
     room_id: &str,
@@ -334,7 +340,9 @@ fn interested(
     if let Some(cached) = member_interest.get(room_id) {
         return Ok(*cached);
     }
-    let members = room_util::joined_member_ids(&state.rooms, room_id).map_err(|e| e.message)?;
+    let members = room_util::joined_member_ids(&state.rooms, room_id)
+        .await
+        .map_err(|e| e.message)?;
     let local_suffix = format!(":{server_name}");
     let hit = members
         .iter()

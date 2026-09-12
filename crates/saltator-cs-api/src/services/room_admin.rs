@@ -184,14 +184,15 @@ impl RoomAdmin<'_> {
 
     /// Local users with an active membership, id-ordered, and whether the
     /// list was cut short. Also the set a shutdown works through.
-    fn local_members(&self, room_id: &str, limit: usize) -> Result<(Vec<String>, usize)> {
-        let state = room_util::current_state(self.rooms, room_id)?;
+    async fn local_members(&self, room_id: &str, limit: usize) -> Result<(Vec<String>, usize)> {
+        let state = room_util::current_state(self.rooms, room_id).await?;
         let mut all = Vec::new();
         for (event_type, state_key) in state.keys() {
             if event_type != "m.room.member" || !self.is_local(state_key) {
                 continue;
             }
-            let membership = room_util::membership_in(self.rooms, room_id, &state, state_key)?;
+            let membership =
+                room_util::membership_in(self.rooms, room_id, &state, state_key).await?;
             if ACTIVE_MEMBERSHIPS.contains(&membership.as_str()) {
                 all.push(state_key.clone());
             }
@@ -203,18 +204,20 @@ impl RoomAdmin<'_> {
     }
 
     /// Summarise one hosted room. `None` when the room is not hosted here.
-    fn row(&self, room_id: &str) -> Result<Option<RoomRow>> {
+    async fn row(&self, room_id: &str) -> Result<Option<RoomRow>> {
         let Some(meta) = self
             .rooms
             .for_room(room_id)
             .store()
             .meta(room_id)
+            .await
             .map_err(ApiError::internal)?
         else {
             return Ok(None);
         };
         let Some(summary) =
             saltator_roomserver::hierarchy::room_summary(self.rooms.for_room(room_id), room_id)
+                .await
                 .map_err(ApiError::internal)?
         else {
             return Ok(None);
@@ -226,7 +229,7 @@ impl RoomAdmin<'_> {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         };
-        let local_joined = self.local_joined(room_id)?;
+        let local_joined = self.local_joined(room_id).await?;
         Ok(Some(RoomRow {
             room_id: room_id.to_owned(),
             name: field("name"),
@@ -247,8 +250,9 @@ impl RoomAdmin<'_> {
     /// How many of the room's joined members are ours — the strict `join`
     /// count, unlike [`Self::local_members`], which also includes the
     /// pending memberships a shutdown must clear.
-    fn local_joined(&self, room_id: &str) -> Result<u64> {
-        Ok(room_util::joined_member_ids(self.rooms, room_id)?
+    async fn local_joined(&self, room_id: &str) -> Result<u64> {
+        Ok(room_util::joined_member_ids(self.rooms, room_id)
+            .await?
             .into_iter()
             .filter(|u| self.is_local(u))
             .count() as u64)
@@ -257,7 +261,7 @@ impl RoomAdmin<'_> {
     /// One page of hosted rooms, shard by shard, room-id order within
     /// each. Multi-shard continuation tokens are `{shard}:{room_id}` —
     /// the single-shard form (bare room id) still parses for shard 0.
-    pub fn list_rooms(&self, from: Option<&str>, limit: Option<usize>) -> Result<RoomList> {
+    pub async fn list_rooms(&self, from: Option<&str>, limit: Option<usize>) -> Result<RoomList> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let (start_shard, mut shard_from): (u16, Option<String>) = match from {
             None => (0, None),
@@ -275,6 +279,7 @@ impl RoomAdmin<'_> {
             let (page, shard_next) = shard
                 .store()
                 .rooms(shard_from.take().as_deref(), want)
+                .await
                 .map_err(ApiError::internal)?;
             rows.extend(page.into_iter().map(|(room_id, _)| (room_id, idx)));
             if let Some(n) = shard_next {
@@ -294,7 +299,7 @@ impl RoomAdmin<'_> {
         for (room_id, _) in rows {
             // A room row without a resolvable summary is a torn read, not
             // a reason to fail the whole page.
-            if let Some(row) = self.row(&room_id)? {
+            if let Some(row) = self.row(&room_id).await? {
                 out.push(row);
             }
         }
@@ -304,12 +309,14 @@ impl RoomAdmin<'_> {
         })
     }
 
-    pub fn room_detail(&self, room_id: &str) -> Result<RoomDetail> {
+    pub async fn room_detail(&self, room_id: &str) -> Result<RoomDetail> {
         let row = self
-            .row(room_id)?
+            .row(room_id)
+            .await?
             .ok_or_else(|| ApiError::not_found("This server does not host that room"))?;
         let summary =
             saltator_roomserver::hierarchy::room_summary(self.rooms.for_room(room_id), room_id)
+                .await
                 .map_err(ApiError::internal)?
                 .ok_or_else(|| ApiError::not_found("This server does not host that room"))?;
         let field = |key: &str| -> Option<String> {
@@ -319,14 +326,15 @@ impl RoomAdmin<'_> {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         };
-        let state = room_util::current_state(self.rooms, room_id)?;
-        let creator = room_util::state_content_in(self.rooms, room_id, &state, "m.room.create")?
+        let state = room_util::current_state(self.rooms, room_id).await?;
+        let creator = room_util::state_content_in(self.rooms, room_id, &state, "m.room.create")
+            .await?
             .and_then(|c| {
                 c.get("creator")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
             });
-        let (local_members, total) = self.local_members(room_id, MAX_LISTED_MEMBERS)?;
+        let (local_members, total) = self.local_members(room_id, MAX_LISTED_MEMBERS).await?;
         Ok(RoomDetail {
             row,
             topic: field("topic"),
@@ -339,28 +347,30 @@ impl RoomAdmin<'_> {
     }
 
     /// Every blocked room, hosted or not.
-    pub fn list_blocked(&self) -> Result<Vec<BlockedRoomRow>> {
-        self.users
+    pub async fn list_blocked(&self) -> Result<Vec<BlockedRoomRow>> {
+        let mut rows = Vec::new();
+        for (room_id, b) in self
+            .users
             .store()
             .blocked_rooms()
             .map_err(ApiError::internal)?
-            .into_iter()
-            .map(|(room_id, b)| {
-                let hosted = self
-                    .rooms
-                    .for_room(&room_id)
-                    .store()
-                    .meta(&room_id)
-                    .map_err(ApiError::internal)?
-                    .is_some();
-                Ok(BlockedRoomRow {
-                    room_id,
-                    by: b.by,
-                    ts: b.ts,
-                    hosted,
-                })
-            })
-            .collect()
+        {
+            let hosted = self
+                .rooms
+                .for_room(&room_id)
+                .store()
+                .meta(&room_id)
+                .await
+                .map_err(ApiError::internal)?
+                .is_some();
+            rows.push(BlockedRoomRow {
+                room_id,
+                by: b.by,
+                ts: b.ts,
+                hosted,
+            });
+        }
+        Ok(rows)
     }
 
     /// Close a room to joins, or reopen it. Accepts any well-formed room
@@ -399,6 +409,7 @@ impl RoomAdmin<'_> {
             .for_room(room_id.as_str())
             .store()
             .meta(room_id.as_str())
+            .await
             .map_err(ApiError::internal)?
             .is_none()
         {
@@ -415,7 +426,7 @@ impl RoomAdmin<'_> {
         // Every local member, not just a page of them: a shutdown that
         // silently stopped at 200 users would report success on a room it
         // had not cleared.
-        let (members, _) = self.local_members(room_id.as_str(), usize::MAX)?;
+        let (members, _) = self.local_members(room_id.as_str(), usize::MAX).await?;
         let mut report = ShutdownReport {
             room_id: room_id.to_string(),
             kicked: Vec::new(),

@@ -122,9 +122,13 @@ pub async fn send_transaction(
                         .get("content")
                         .and_then(|c| c.get("room_id"))
                         .and_then(|v| v.as_str())
-                        .zip(state.rooms.as_ref())
-                        .map(|(room_id, rooms)| rooms.server_acl_denies(room_id, &auth.origin))
-                        .unwrap_or(false);
+                        .zip(state.rooms.as_ref());
+                    let denied = match denied {
+                        Some((room_id, rooms)) => {
+                            rooms.server_acl_denies(room_id, &auth.origin).await
+                        }
+                        None => false,
+                    };
                     if !denied {
                         if let Some(sink) = &state.edu_sink {
                             apply_edu(sink.as_ref(), &auth.origin, edu);
@@ -274,7 +278,7 @@ async fn apply_receipt_edu(
         };
         // Receipts for a room a denied server can't participate in are
         // ignored (spec "Server ACLs" — per-room EDU protection).
-        if rooms.server_acl_denies(room_id, origin) {
+        if rooms.server_acl_denies(room_id, origin).await {
             continue;
         }
         let Some(reads) = per_room.get("m.read").and_then(|v| v.as_object()) else {
@@ -398,13 +402,13 @@ pub(crate) async fn process_pdu(
     let rooms = shard.clone();
     // Best-effort event ID up front, so failures before an Outcome still
     // key into the response.
-    let precomputed = rooms.pdu_event_id(&raw).map(|id| id.to_string());
+    let precomputed = rooms.pdu_event_id(&raw).await.map(|id| id.to_string());
 
     // Server ACL: a PDU whose origin is denied by the room's
     // m.room.server_acl is ignored, with an error keyed by its event ID
     // (spec "Server ACLs" — applied per PDU on /send, before ingest).
     if let Some(CanonicalJsonValue::String(room_id)) = raw.get("room_id") {
-        if rooms.server_acl_denies(room_id, origin) {
+        if rooms.server_acl_denies(room_id, origin).await {
             return (precomputed, error_result("denied by server ACL"));
         }
     }

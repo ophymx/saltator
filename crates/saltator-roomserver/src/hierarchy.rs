@@ -62,37 +62,47 @@ fn valid_order(content: &Value) -> Option<String> {
 
 /// Build the summary of a locally-hosted room, or `None` if this server does
 /// not host it.
-pub fn room_summary(rooms: &RoomServer, room_id: &str) -> StoreResult<Option<RoomSummary>> {
+pub async fn room_summary(rooms: &RoomServer, room_id: &str) -> StoreResult<Option<RoomSummary>> {
     let store = rooms.store();
-    let Some(meta) = store.meta(room_id)? else {
+    let Some(meta) = store.meta(room_id).await? else {
         return Ok(None);
     };
-    let current = store.resolve_group(room_id, meta.current_group)?;
+    let current = store.resolve_group(room_id, meta.current_group).await?;
 
     // Content of the `(event_type, "")` state event, as JSON.
-    let content_of = |event_type: &str| -> StoreResult<Option<Value>> {
+    async fn content_of(
+        store: &crate::RoomStore,
+        current: &std::collections::BTreeMap<(String, String), String>,
+        event_type: &str,
+    ) -> StoreResult<Option<Value>> {
         let Some(event_id) = current.get(&(event_type.to_owned(), String::new())) else {
             return Ok(None);
         };
-        let Some(stored) = store.event(event_id)? else {
+        let Some(stored) = store.event(event_id).await? else {
             return Ok(None);
         };
         let v: Value = serde_json::from_slice(&stored.raw).map_err(codec)?;
         Ok(v.get("content").cloned())
-    };
-    let str_field = |event_type: &str, key: &str| -> StoreResult<Option<String>> {
-        Ok(content_of(event_type)?
+    }
+    async fn str_field(
+        store: &crate::RoomStore,
+        current: &std::collections::BTreeMap<(String, String), String>,
+        event_type: &str,
+        key: &str,
+    ) -> StoreResult<Option<String>> {
+        Ok(content_of(store, current, event_type)
+            .await?
             .as_ref()
             .and_then(|c| c.get(key))
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned))
-    };
+    }
 
     let mut joined: u64 = 0;
     let mut children: Vec<ChildLink> = Vec::new();
     for ((event_type, state_key), event_id) in &current {
         if event_type == "m.room.member" {
-            let Some(stored) = store.event(event_id)? else {
+            let Some(stored) = store.event(event_id).await? else {
                 continue;
             };
             let v: Value = serde_json::from_slice(&stored.raw).map_err(codec)?;
@@ -108,7 +118,7 @@ pub fn room_summary(rooms: &RoomServer, room_id: &str) -> StoreResult<Option<Roo
         if event_type != "m.space.child" {
             continue;
         }
-        let Some(stored) = store.event(event_id)? else {
+        let Some(stored) = store.event(event_id).await? else {
             continue;
         };
         let ev: Value = serde_json::from_slice(&stored.raw).map_err(codec)?;
@@ -140,14 +150,15 @@ pub fn room_summary(rooms: &RoomServer, room_id: &str) -> StoreResult<Option<Roo
         });
     }
 
-    let room_type = content_of("m.room.create")?
+    let room_type = content_of(&store, &current, "m.room.create")
+        .await?
         .as_ref()
         .and_then(|c| c.get("type"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let is_space = room_type.as_deref() == Some("m.space");
 
-    let join_rules = content_of("m.room.join_rules")?;
+    let join_rules = content_of(&store, &current, "m.room.join_rules").await?;
     let join_rule = join_rules
         .as_ref()
         .and_then(|c| c.get("join_rule"))
@@ -168,10 +179,19 @@ pub fn room_summary(rooms: &RoomServer, room_id: &str) -> StoreResult<Option<Roo
         })
         .unwrap_or_default();
 
-    let world_readable = str_field("m.room.history_visibility", "history_visibility")?.as_deref()
+    let world_readable = str_field(
+        &store,
+        &current,
+        "m.room.history_visibility",
+        "history_visibility",
+    )
+    .await?
+    .as_deref()
         == Some("world_readable");
-    let guest_can_join =
-        str_field("m.room.guest_access", "guest_access")?.as_deref() == Some("can_join");
+    let guest_can_join = str_field(&store, &current, "m.room.guest_access", "guest_access")
+        .await?
+        .as_deref()
+        == Some("can_join");
 
     let mut summary = json!({
         "room_id": room_id,
@@ -181,16 +201,16 @@ pub fn room_summary(rooms: &RoomServer, room_id: &str) -> StoreResult<Option<Roo
         "join_rule": join_rule,
     });
     let obj = summary.as_object_mut().expect("summary is an object");
-    if let Some(name) = str_field("m.room.name", "name")? {
+    if let Some(name) = str_field(&store, &current, "m.room.name", "name").await? {
         obj.insert("name".into(), name.into());
     }
-    if let Some(topic) = str_field("m.room.topic", "topic")? {
+    if let Some(topic) = str_field(&store, &current, "m.room.topic", "topic").await? {
         obj.insert("topic".into(), topic.into());
     }
-    if let Some(alias) = str_field("m.room.canonical_alias", "alias")? {
+    if let Some(alias) = str_field(&store, &current, "m.room.canonical_alias", "alias").await? {
         obj.insert("canonical_alias".into(), alias.into());
     }
-    if let Some(avatar) = str_field("m.room.avatar", "url")? {
+    if let Some(avatar) = str_field(&store, &current, "m.room.avatar", "url").await? {
         obj.insert("avatar_url".into(), avatar.into());
     }
     if let Some(rt) = &room_type {

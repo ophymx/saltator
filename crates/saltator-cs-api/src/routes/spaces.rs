@@ -51,13 +51,14 @@ pub async fn get_room_summary(
     };
 
     let summary = room_summary(state.rooms.for_room(&room_id), &room_id)
+        .await
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("Room not found."))?;
 
     // Accessible if the caller is a member, or the room is peekable (public /
     // knockable / world-readable) — otherwise it stays hidden (spec: 404).
-    let current = current_state(&state.rooms, &room_id)?;
-    let membership = membership_in(&state.rooms, &room_id, &current, user)?;
+    let current = current_state(&state.rooms, &room_id).await?;
+    let membership = membership_in(&state.rooms, &room_id, &current, user).await?;
     let peekable = matches!(
         summary.join_rule.as_str(),
         "public" | "knock" | "knock_restricted"
@@ -71,7 +72,7 @@ pub async fn get_room_summary(
     obj.insert("membership".into(), membership.into());
     obj.insert(
         "room_version".into(),
-        room_meta(&state.rooms, &room_id)?.version.into(),
+        room_meta(&state.rooms, &room_id).await?.version.into(),
     );
     Ok(axum::Json(out))
 }
@@ -110,7 +111,7 @@ impl Node {
 /// Whether the requesting user may see `room_id`: a member (join/invite), or
 /// the room is joinable/knockable/peekable per its join rules and history
 /// visibility (spec "GET /hierarchy", the `rooms` inclusion conditions).
-fn viewable(
+async fn viewable(
     rooms: &saltator_roomserver::RoomShards,
     room_id: &str,
     current: &crate::room_util::StateMap,
@@ -119,7 +120,10 @@ fn viewable(
     allowed_room_ids: &[String],
     user_id: &str,
 ) -> Result<bool> {
-    match membership_in(rooms, room_id, current, user_id)?.as_str() {
+    match membership_in(rooms, room_id, current, user_id)
+        .await?
+        .as_str()
+    {
         "join" | "invite" => return Ok(true),
         _ => {}
     }
@@ -129,10 +133,10 @@ fn viewable(
             // The user meets the restriction if joined to any allowed room.
             let mut met = false;
             for allowed in allowed_room_ids {
-                let Ok(st) = current_state(rooms, allowed) else {
+                let Ok(st) = current_state(rooms, allowed).await else {
                     continue;
                 };
-                if membership_in(rooms, allowed, &st, user_id)? == "join" {
+                if membership_in(rooms, allowed, &st, user_id).await? == "join" {
                     met = true;
                     break;
                 }
@@ -146,12 +150,14 @@ fn viewable(
 
 /// Build the node for a locally-hosted room, or `None` if this server does
 /// not host it (the federation fallback handles those).
-fn local_node(state: &CsState, room_id: &str, user_id: &str) -> Result<Option<Node>> {
-    let Some(summary) = room_summary(state.rooms.for_room(room_id), room_id).map_err(internal)?
+async fn local_node(state: &CsState, room_id: &str, user_id: &str) -> Result<Option<Node>> {
+    let Some(summary) = room_summary(state.rooms.for_room(room_id), room_id)
+        .await
+        .map_err(internal)?
     else {
         return Ok(None);
     };
-    let current = current_state(&state.rooms, room_id)?;
+    let current = current_state(&state.rooms, room_id).await?;
     let viewable = viewable(
         &state.rooms,
         room_id,
@@ -160,7 +166,8 @@ fn local_node(state: &CsState, room_id: &str, user_id: &str) -> Result<Option<No
         summary.world_readable,
         &summary.allowed_room_ids,
         user_id,
-    )?;
+    )
+    .await?;
     Ok(Some(Node {
         base: summary.summary,
         children: summary.children,
@@ -233,12 +240,22 @@ async fn remote_node(
             .unwrap_or_default();
         let by_rule = match join_rule {
             "public" | "knock" | "knock_restricted" => true,
-            "restricted" => allowed.iter().any(|allowed_room| {
-                current_state(&state.rooms, allowed_room).is_ok_and(|st| {
-                    membership_in(&state.rooms, allowed_room, &st, user_id)
+            "restricted" => {
+                let mut any = false;
+                for allowed_room in &allowed {
+                    let Ok(st) = current_state(&state.rooms, allowed_room).await else {
+                        continue;
+                    };
+                    if membership_in(&state.rooms, allowed_room, &st, user_id)
+                        .await
                         .is_ok_and(|m| m == "join")
-                })
-            }),
+                    {
+                        any = true;
+                        break;
+                    }
+                }
+                any
+            }
             _ => false,
         };
         return Some(Node {
@@ -360,7 +377,7 @@ pub async fn get_hierarchy(
     }
 
     // Resolve the root (local, else via the room ID's own server).
-    let root = match local_node(&state, &room_id, user)? {
+    let root = match local_node(&state, &room_id, user).await? {
         Some(n) => n,
         None => remote_node(&state, &room_id, &server_of(&room_id), suggested_only, user)
             .await
@@ -385,7 +402,7 @@ pub async fn get_hierarchy(
         }
         let node = match nodes.remove(&rid) {
             Some(n) => n,
-            None => match local_node(&state, &rid, user)? {
+            None => match local_node(&state, &rid, user).await? {
                 Some(n) => n,
                 None => match remote_node(&state, &rid, &via, suggested_only, user).await {
                     Some(n) => n,

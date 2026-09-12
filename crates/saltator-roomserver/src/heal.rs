@@ -146,7 +146,7 @@ impl RoomServer {
         origin: &str,
         pdu: &CanonicalJsonObject,
     ) -> bool {
-        let Some(pdu_id) = self.pdu_event_id(pdu) else {
+        let Some(pdu_id) = self.pdu_event_id(pdu).await else {
             return false;
         };
         let Some(room_id) = pdu.get("room_id").and_then(|v| v.as_str()) else {
@@ -154,7 +154,7 @@ impl RoomServer {
         };
         // We must know the room to fill a gap in it (a wholly-unknown
         // room needs a join, not backfill).
-        let earliest = match self.room_extremities(room_id) {
+        let earliest = match self.room_extremities(room_id).await {
             Ok(e) if !e.is_empty() => e,
             _ => return false,
         };
@@ -194,8 +194,12 @@ impl RoomServer {
         // them. Anchor them on a state snapshot at the chain's oldest
         // event instead and leave a marked gap (the sync `limited`
         // contract); the missing span joins the backfill frontier.
-        let Some(anchor) = chain.first().and_then(|e| self.pdu_event_id(e)) else {
-            return ingested > 0;
+        let anchor = match chain.first() {
+            Some(e) => match self.pdu_event_id(e).await {
+                Some(id) => id,
+                None => return ingested > 0,
+            },
+            None => return ingested > 0,
         };
         // Prefer `/state_ids` at the *prev* of the chain's oldest event
         // (the snapshot the chain then applies on top of), resolving
@@ -227,16 +231,17 @@ impl RoomServer {
         // that by prepending it to the chain, verified like everything
         // else we import.
         if snapshot.is_some() {
-            if let Some(prev) = anchor_prev
-                .as_deref()
-                .filter(|p| !matches!(self.store().event(p), Ok(Some(_))))
-            {
+            let prev_missing = match anchor_prev.as_deref() {
+                Some(p) => !matches!(self.store().event(p).await, Ok(Some(_))),
+                None => false,
+            };
+            if let Some(prev) = anchor_prev.as_deref().filter(|_| prev_missing) {
                 match fetcher.event(origin, prev).await {
                     Ok(Some(obj)) => {
                         fetcher
                             .trust_event_servers(std::slice::from_ref(&obj))
                             .await;
-                        if self.verify_pdu(room_id, &obj) {
+                        if self.verify_pdu(room_id, &obj).await {
                             chain.insert(0, obj);
                         }
                     }
@@ -273,7 +278,14 @@ impl RoomServer {
             .cloned()
             .collect();
         fetcher.trust_event_servers(&all_events).await;
-        if !all_events.iter().all(|ev| self.verify_pdu(room_id, ev)) {
+        let mut all_verified = true;
+        for ev in &all_events {
+            if !self.verify_pdu(room_id, ev).await {
+                all_verified = false;
+                break;
+            }
+        }
+        if !all_verified {
             tracing::warn!(
                 room_id,
                 "gap anchor: state snapshot failed signature verification; not importing"
@@ -322,7 +334,7 @@ impl RoomServer {
         let resolve = |ids: Vec<String>| async move {
             let mut out = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Ok(Some(stored)) = self.store().event(&id) {
+                if let Ok(Some(stored)) = self.store().event(&id).await {
                     if let Ok(CanonicalJsonValue::Object(obj)) = serde_json::from_slice::<
                         serde_json::Value,
                     >(&stored.raw)

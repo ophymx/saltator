@@ -66,6 +66,7 @@ async fn run_shard(state: Arc<CsState>, shard_idx: u16) -> Result<(), String> {
             let batch = rooms
                 .store()
                 .timeline(cursor, BATCH)
+                .await
                 .map_err(|e| e.to_string())?;
             let Some(&(last_seq, _)) = batch.last() else {
                 break;
@@ -97,7 +98,7 @@ async fn notify_event(
     event_id: &str,
     seq: u64,
 ) {
-    let members = match room_util::joined_member_ids(&state.rooms, room_id) {
+    let members = match room_util::joined_member_ids(&state.rooms, room_id).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = ?e, room_id, "push: member list");
@@ -140,11 +141,14 @@ async fn notify_user(
     user_id: &ruma::UserId,
     pushers: &[Value],
 ) -> Result<(), String> {
-    let meta = room_util::room_meta(&state.rooms, room_id).map_err(|e| e.message)?;
+    let meta = room_util::room_meta(&state.rooms, room_id)
+        .await
+        .map_err(|e| e.message)?;
     let version = room_util::room_version(&meta).map_err(|e| e.message)?;
     // Client-format event, under this user's visibility.
     let Some(ev) =
         room_util::client_event(&state.rooms, version, room_id, event_id, user_id.as_str())
+            .await
             .map_err(|e| e.message)?
     else {
         return Ok(());
@@ -154,7 +158,9 @@ async fn notify_user(
         return Ok(());
     }
 
-    let (ruleset, ctx) = push_eval::rule_inputs(state, user_id, room_id).map_err(|e| e.message)?;
+    let (ruleset, ctx) = push_eval::rule_inputs(state, user_id, room_id)
+        .await
+        .map_err(|e| e.message)?;
     let raw = ruma::serde::Raw::<Value>::from_json(
         serde_json::value::to_raw_value(&ev).map_err(|e| e.to_string())?,
     );
@@ -186,25 +192,28 @@ async fn notify_user(
         .unwrap_or(0);
 
     // Optional display context from current state.
-    let current = room_util::current_state(&state.rooms, room_id).map_err(|e| e.message)?;
+    let current = room_util::current_state(&state.rooms, room_id)
+        .await
+        .map_err(|e| e.message)?;
     let room_name = room_util::state_content_in(&state.rooms, room_id, &current, "m.room.name")
+        .await
         .ok()
         .flatten()
         .and_then(|c| c.get("name").and_then(|n| n.as_str()).map(str::to_owned));
-    let sender_display_name = current
-        .get(&("m.room.member".to_owned(), sender.to_owned()))
-        .and_then(|eid| {
-            room_util::raw_event(&state.rooms, room_id, eid)
-                .ok()
-                .flatten()
-        })
-        .and_then(|raw| match raw.get("content") {
-            Some(ruma::CanonicalJsonValue::Object(c)) => match c.get("displayname") {
-                Some(ruma::CanonicalJsonValue::String(d)) => Some(d.clone()),
-                _ => None,
-            },
+    let sender_member_raw = match current.get(&("m.room.member".to_owned(), sender.to_owned())) {
+        Some(eid) => room_util::raw_event(&state.rooms, room_id, eid)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let sender_display_name = sender_member_raw.and_then(|raw| match raw.get("content") {
+        Some(ruma::CanonicalJsonValue::Object(c)) => match c.get("displayname") {
+            Some(ruma::CanonicalJsonValue::String(d)) => Some(d.clone()),
             _ => None,
-        });
+        },
+        _ => None,
+    });
 
     for pusher in pushers {
         let url = pusher["data"]["url"].as_str().unwrap_or_default();

@@ -233,6 +233,7 @@ async fn only_the_shard_leader_delivers_outbound() {
             &room_id,
             &bob,
         )
+        .await
         .unwrap();
     let mut join = template;
     rsigner.hash_and_sign_event(&mut join, version).unwrap();
@@ -243,6 +244,7 @@ async fn only_the_shard_leader_delivers_outbound() {
     assert_eq!(
         rooms1
             .remote_servers_in_room(room_id.as_str(), "us.test")
+            .await
             .unwrap(),
         vec!["remote.test".to_owned()],
         "room should have a remote destination"

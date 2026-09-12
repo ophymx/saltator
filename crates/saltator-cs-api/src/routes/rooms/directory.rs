@@ -100,10 +100,10 @@ pub async fn create_alias(
     if req.room_alias.server_name() != state.config.server_name {
         return Err(ApiError::forbidden("Alias must be on this server"));
     }
-    room_meta(&state.rooms, req.room_id.as_str())?;
+    room_meta(&state.rooms, req.room_id.as_str()).await?;
     // The caller must be a member of the target room — otherwise anyone
     // could squat local aliases pointing at rooms they can't even see.
-    require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str()).await?;
     check_alias_ownership(&state, &auth, req.room_alias.as_str())?;
     state
         .users
@@ -155,8 +155,8 @@ pub async fn delete_alias(
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("Unknown room alias"))?;
     check_alias_ownership(&state, &auth, req.room_alias.as_str())?;
-    let state_map = current_state(&state.rooms, &entry.room_id)?;
-    let meta = room_meta(&state.rooms, &entry.room_id)?;
+    let state_map = current_state(&state.rooms, &entry.room_id).await?;
+    let meta = room_meta(&state.rooms, &entry.room_id).await?;
     let version = room_version(&meta)?;
     // The alias creator may delete their own; anyone else needs the power
     // to administer aliases (the level to send m.room.canonical_alias).
@@ -168,7 +168,8 @@ pub async fn delete_alias(
             version,
             auth.user_id.as_str(),
             "m.room.canonical_alias",
-        )?
+        )
+        .await?
     {
         return Err(ApiError::forbidden("Not allowed to delete this alias"));
     }
@@ -182,7 +183,9 @@ pub async fn delete_alias(
         &entry.room_id,
         &state_map,
         "m.room.canonical_alias",
-    )? {
+    )
+    .await?
+    {
         let alias = req.room_alias.as_str();
         let mut content = canonical.as_object().cloned().unwrap_or_default();
         let was_main = content.get("alias").and_then(|a| a.as_str()) == Some(alias);
@@ -218,7 +221,7 @@ pub async fn get_room_aliases(
     auth: Auth,
     Ar(req): Ar<room_aliases::v3::Request>,
 ) -> Result<Ra<room_aliases::v3::Response>> {
-    require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str()).await?;
     let aliases = state
         .users
         .store()
@@ -241,6 +244,7 @@ pub async fn public_rooms(
         None,
         req.limit.map(u64::from),
     )
+    .await
     .map_err(ApiError::internal)?;
     Ok(axum::Json(body).into_response())
 }
@@ -256,6 +260,7 @@ pub async fn public_rooms_filtered(
         req.filter.generic_search_term.as_deref(),
         req.limit.map(u64::from),
     )
+    .await
     .map_err(ApiError::internal)?;
     Ok(axum::Json(body).into_response())
 }
@@ -264,7 +269,7 @@ pub async fn get_visibility(
     State(state): State<Arc<CsState>>,
     Ar(req): Ar<get_room_visibility::v3::Request>,
 ) -> Result<Ra<get_room_visibility::v3::Response>> {
-    room_meta(&state.rooms, req.room_id.as_str())?;
+    room_meta(&state.rooms, req.room_id.as_str()).await?;
     let public = state
         .users
         .store()
@@ -285,8 +290,9 @@ pub async fn set_visibility(
     // Publishing to the public directory exposes room metadata to everyone
     // (and over federation), so gate it on alias-admin power rather than
     // mere membership — otherwise any member could list a private room.
-    let state_map = require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
-    let meta = room_meta(&state.rooms, req.room_id.as_str())?;
+    let state_map =
+        require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str()).await?;
+    let meta = room_meta(&state.rooms, req.room_id.as_str()).await?;
     let version = room_version(&meta)?;
     if !can_send_state(
         &state.rooms,
@@ -295,7 +301,9 @@ pub async fn set_visibility(
         version,
         auth.user_id.as_str(),
         "m.room.canonical_alias",
-    )? {
+    )
+    .await?
+    {
         return Err(ApiError::forbidden(
             "Not allowed to change this room's directory visibility",
         ));

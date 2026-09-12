@@ -80,7 +80,8 @@ pub async fn upload_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body)
     if announces {
         state
             .e2ee()
-            .broadcast_update(auth.user_id.as_str(), &auth.device_id, false);
+            .broadcast_update(auth.user_id.as_str(), &auth.device_id, false)
+            .await;
     }
 
     // The spec requires the algorithm keys the client uploaded to appear
@@ -359,7 +360,8 @@ pub async fn device_signing_upload(
             .await?;
         state
             .e2ee()
-            .broadcast_update(auth.user_id.as_str(), &auth.device_id, false);
+            .broadcast_update(auth.user_id.as_str(), &auth.device_id, false)
+            .await;
     }
     Ok(axum::Json(json!({})))
 }
@@ -441,7 +443,8 @@ pub async fn signatures_upload(
         state.users.add_signatures(&auth.user_id, targets).await?;
         state
             .e2ee()
-            .broadcast_update(auth.user_id.as_str(), &auth.device_id, false);
+            .broadcast_update(auth.user_id.as_str(), &auth.device_id, false)
+            .await;
     }
     Ok(axum::Json(json!({ "failures": {} })))
 }
@@ -472,10 +475,10 @@ pub async fn key_changes(
         .filter(|(_, m)| m.membership == "join")
         .map(|(rid, _)| rid)
         .collect();
-    let (changed, left) =
-        state
-            .e2ee()
-            .device_list_deltas(auth.user_id.as_str(), &my_rooms, from, to)?;
+    let (changed, left) = state
+        .e2ee()
+        .device_list_deltas(auth.user_id.as_str(), &my_rooms, from, to)
+        .await?;
 
     Ok(axum::Json(json!({ "changed": changed, "left": left })))
 }

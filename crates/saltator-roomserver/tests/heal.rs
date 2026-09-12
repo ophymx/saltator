@@ -148,7 +148,7 @@ fn craft_pdu(
 }
 
 /// Auth events for a crafted event, read from current room state.
-fn auth_ids_from_state(
+async fn auth_ids_from_state(
     env: &Env,
     version: RoomVersion,
     room_id: &RoomId,
@@ -158,9 +158,10 @@ fn auth_ids_from_state(
     content: &serde_json::Value,
 ) -> Vec<String> {
     let store = env.server.store();
-    let meta = store.meta(room_id.as_str()).unwrap().unwrap();
+    let meta = store.meta(room_id.as_str()).await.unwrap().unwrap();
     let current = store
         .resolve_group(room_id.as_str(), meta.current_group)
+        .await
         .unwrap();
     let content = canonical(content.clone());
     saltator_core::auth::auth_types_for_event(version, event_type, sender, state_key, &content)
@@ -169,8 +170,8 @@ fn auth_ids_from_state(
         .collect()
 }
 
-fn event_id(env: &Env, obj: &CanonicalJsonObject) -> String {
-    env.server.pdu_event_id(obj).unwrap().to_string()
+async fn event_id(env: &Env, obj: &CanonicalJsonObject) -> String {
+    env.server.pdu_event_id(obj).await.unwrap().to_string()
 }
 
 /// Mock transport: canned responses + a call log for asserting which
@@ -243,7 +244,7 @@ async fn prev_gap_heals_via_timeline_walk() {
     let version = RoomVersion::V11;
     let room_id = bootstrap_room(&env, version).await;
     let bob = user("bob");
-    let tip = env.server.room_extremities(room_id.as_str()).unwrap();
+    let tip = env.server.room_extremities(room_id.as_str()).await.unwrap();
     let auth = auth_ids_from_state(
         &env,
         version,
@@ -252,7 +253,8 @@ async fn prev_gap_heals_via_timeline_walk() {
         &bob,
         None,
         &json!({}),
-    );
+    )
+    .await;
 
     let a = craft_pdu(
         &env,
@@ -266,7 +268,7 @@ async fn prev_gap_heals_via_timeline_walk() {
         &auth,
         40,
     );
-    let a_id = event_id(&env, &a);
+    let a_id = event_id(&env, &a).await;
     let b = craft_pdu(
         &env,
         version,
@@ -290,7 +292,7 @@ async fn prev_gap_heals_via_timeline_walk() {
         .await
         .unwrap();
     accepted(&outcome);
-    assert!(env.server.store().event(&a_id).unwrap().is_some());
+    assert!(env.server.store().event(&a_id).await.unwrap().is_some());
     assert!(fetcher.calls().contains(&"get_missing_events".to_owned()));
 }
 
@@ -303,7 +305,7 @@ async fn missing_auth_fetches_outlier_never_timeline_walk() {
     let version = RoomVersion::V11;
     let room_id = bootstrap_room(&env, version).await;
     let bob = user("bob");
-    let tip = env.server.room_extremities(room_id.as_str()).unwrap();
+    let tip = env.server.room_extremities(room_id.as_str()).await.unwrap();
     let member_auth = auth_ids_from_state(
         &env,
         version,
@@ -312,7 +314,8 @@ async fn missing_auth_fetches_outlier_never_timeline_walk() {
         &bob,
         Some(bob.as_str()),
         &json!({"membership": "join"}),
-    );
+    )
+    .await;
 
     // M: a membership refresh we never ingested — cited as C's auth.
     let m = craft_pdu(
@@ -327,7 +330,7 @@ async fn missing_auth_fetches_outlier_never_timeline_walk() {
         &member_auth,
         40,
     );
-    let m_id = event_id(&env, &m);
+    let m_id = event_id(&env, &m).await;
     let msg_auth = auth_ids_from_state(
         &env,
         version,
@@ -336,29 +339,27 @@ async fn missing_auth_fetches_outlier_never_timeline_walk() {
         &bob,
         None,
         &json!({}),
-    );
+    )
+    .await;
     // C cites M in its member slot: replace bob's current member event.
-    let c_auth: Vec<String> = msg_auth
-        .iter()
-        .map(|id| {
-            let is_member = env
-                .server
-                .store()
-                .event(id)
-                .unwrap()
-                .map(|se| {
-                    serde_json::from_slice::<serde_json::Value>(&se.raw)
-                        .map(|v| v.get("type").and_then(|t| t.as_str()) == Some("m.room.member"))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if is_member {
-                m_id.clone()
-            } else {
-                id.clone()
-            }
-        })
-        .collect();
+    let msg_auth_ids = msg_auth.clone();
+    let mut swapped = Vec::new();
+    for id in &msg_auth_ids {
+        let is_member = env
+            .server
+            .store()
+            .event(id)
+            .await
+            .unwrap()
+            .map(|se| {
+                serde_json::from_slice::<serde_json::Value>(&se.raw)
+                    .map(|v| v.get("type").and_then(|t| t.as_str()) == Some("m.room.member"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        swapped.push(if is_member { m_id.clone() } else { id.clone() });
+    }
+    let c_auth = swapped;
     let c = craft_pdu(
         &env,
         version,
@@ -399,7 +400,7 @@ async fn unfetchable_auth_chain_settles_as_rejection() {
     let version = RoomVersion::V11;
     let room_id = bootstrap_room(&env, version).await;
     let bob = user("bob");
-    let tip = env.server.room_extremities(room_id.as_str()).unwrap();
+    let tip = env.server.room_extremities(room_id.as_str()).await.unwrap();
     let member_auth = auth_ids_from_state(
         &env,
         version,
@@ -408,7 +409,8 @@ async fn unfetchable_auth_chain_settles_as_rejection() {
         &bob,
         Some(bob.as_str()),
         &json!({"membership": "join"}),
-    );
+    )
+    .await;
 
     // M is never served by the origin (the deliberate 404).
     let m = craft_pdu(
@@ -423,7 +425,7 @@ async fn unfetchable_auth_chain_settles_as_rejection() {
         &member_auth,
         40,
     );
-    let m_id = event_id(&env, &m);
+    let m_id = event_id(&env, &m).await;
     let msg_auth = auth_ids_from_state(
         &env,
         version,
@@ -432,28 +434,26 @@ async fn unfetchable_auth_chain_settles_as_rejection() {
         &bob,
         None,
         &json!({}),
-    );
-    let d_auth: Vec<String> = msg_auth
-        .iter()
-        .map(|id| {
-            let is_member = env
-                .server
-                .store()
-                .event(id)
-                .unwrap()
-                .map(|se| {
-                    serde_json::from_slice::<serde_json::Value>(&se.raw)
-                        .map(|v| v.get("type").and_then(|t| t.as_str()) == Some("m.room.member"))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if is_member {
-                m_id.clone()
-            } else {
-                id.clone()
-            }
-        })
-        .collect();
+    )
+    .await;
+    let msg_auth_ids2 = msg_auth.clone();
+    let mut swapped = Vec::new();
+    for id in &msg_auth_ids2 {
+        let is_member = env
+            .server
+            .store()
+            .event(id)
+            .await
+            .unwrap()
+            .map(|se| {
+                serde_json::from_slice::<serde_json::Value>(&se.raw)
+                    .map(|v| v.get("type").and_then(|t| t.as_str()) == Some("m.room.member"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        swapped.push(if is_member { m_id.clone() } else { id.clone() });
+    }
+    let d_auth = swapped;
     let d = craft_pdu(
         &env,
         version,
@@ -466,7 +466,7 @@ async fn unfetchable_auth_chain_settles_as_rejection() {
         &d_auth,
         41,
     );
-    let d_id = event_id(&env, &d);
+    let d_id = event_id(&env, &d).await;
 
     let fetcher = MockFetcher::default(); // serves nothing
     let outcome = env

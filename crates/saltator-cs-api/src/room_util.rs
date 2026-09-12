@@ -13,11 +13,12 @@ use crate::error::ApiError;
 type Result<T> = std::result::Result<T, ApiError>;
 pub type StateMap = BTreeMap<(String, String), String>;
 
-pub fn room_meta(rooms: &RoomShards, room_id: &str) -> Result<RoomMeta> {
+pub async fn room_meta(rooms: &RoomShards, room_id: &str) -> Result<RoomMeta> {
     let rooms = rooms.for_room(room_id);
     rooms
         .store()
         .meta(room_id)
+        .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("Unknown room"))
 }
@@ -27,12 +28,13 @@ pub fn room_version(meta: &RoomMeta) -> Result<RoomVersion> {
 }
 
 /// The room's current resolved state as `(type, state_key) → event_id`.
-pub fn current_state(rooms: &RoomShards, room_id: &str) -> Result<StateMap> {
-    let meta = room_meta(rooms, room_id)?;
+pub async fn current_state(rooms: &RoomShards, room_id: &str) -> Result<StateMap> {
+    let meta = room_meta(rooms, room_id).await?;
     let rooms = rooms.for_room(room_id);
     rooms
         .store()
         .resolve_group(room_id, meta.current_group)
+        .await
         .map_err(ApiError::internal)
 }
 
@@ -40,14 +42,17 @@ pub fn current_state(rooms: &RoomShards, room_id: &str) -> Result<StateMap> {
 /// caller is entitled to see, plus (for departed users) the room-shard
 /// seq of their leave — the ceiling on any history they may read. A
 /// departed user sees the room frozen at the moment they left.
-pub fn member_view(
+pub async fn member_view(
     rooms: &RoomShards,
     room_id: &str,
     user_id: &str,
 ) -> Result<(StateMap, Option<u64>)> {
-    let current = current_state(rooms, room_id)?;
+    let current = current_state(rooms, room_id).await?;
     let rooms = rooms.for_room(room_id);
-    match membership_in_shard(rooms, &current, user_id)?.as_str() {
+    match membership_in_shard(rooms, &current, user_id)
+        .await?
+        .as_str()
+    {
         "join" => Ok((current, None)),
         "leave" | "ban" => {
             let event_id = current
@@ -56,11 +61,13 @@ pub fn member_view(
             let stored = rooms
                 .store()
                 .event(event_id)
+                .await
                 .map_err(ApiError::internal)?
                 .ok_or_else(|| ApiError::forbidden("You are not in this room"))?;
             let frozen = rooms
                 .store()
                 .resolve_group(room_id, stored.state_group_after)
+                .await
                 .map_err(ApiError::internal)?;
             Ok((frozen, Some(stored.seq)))
         }
@@ -70,34 +77,37 @@ pub fn member_view(
 
 /// The room's state map as of shard seq `at` (empty before the room
 /// existed).
-pub fn state_at_seq(rooms: &RoomShards, room_id: &str, at: u64) -> Result<StateMap> {
+pub async fn state_at_seq(rooms: &RoomShards, room_id: &str, at: u64) -> Result<StateMap> {
     let rooms = rooms.for_room(room_id);
     let store = rooms.store();
     let Some((_, event_id)) = store
         .room_timeline(room_id, 0, Some(at), 1, true)
+        .await
         .map_err(ApiError::internal)?
         .into_iter()
         .next()
     else {
         return Ok(StateMap::new());
     };
-    let Some(stored) = store.event(&event_id).map_err(ApiError::internal)? else {
+    let Some(stored) = store.event(&event_id).await.map_err(ApiError::internal)? else {
         return Ok(StateMap::new());
     };
     store
         .resolve_group(room_id, stored.state_group_after)
+        .await
         .map_err(ApiError::internal)
 }
 
 /// User IDs currently joined to `room_id` (empty if the room is unknown).
-pub fn joined_member_ids(rooms: &RoomShards, room_id: &str) -> Result<Vec<String>> {
-    let Ok(state) = current_state(rooms, room_id) else {
+pub async fn joined_member_ids(rooms: &RoomShards, room_id: &str) -> Result<Vec<String>> {
+    let Ok(state) = current_state(rooms, room_id).await else {
         return Ok(Vec::new());
     };
     let rooms = rooms.for_room(room_id);
     let mut out = Vec::new();
     for (event_type, state_key) in state.keys() {
-        if event_type == "m.room.member" && membership_in_shard(rooms, &state, state_key)? == "join"
+        if event_type == "m.room.member"
+            && membership_in_shard(rooms, &state, state_key).await? == "join"
         {
             out.push(state_key.clone());
         }
@@ -106,21 +116,30 @@ pub fn joined_member_ids(rooms: &RoomShards, room_id: &str) -> Result<Vec<String
 }
 
 /// A user's membership in the room's current state (`leave` if absent).
-pub fn membership_in(
+pub async fn membership_in(
     rooms: &RoomShards,
     room_id: &str,
     state: &StateMap,
     user_id: &str,
 ) -> Result<String> {
-    membership_in_shard(rooms.for_room(room_id), state, user_id)
+    membership_in_shard(rooms.for_room(room_id), state, user_id).await
 }
 
 /// [`membership_in`] on an already-resolved shard.
-pub fn membership_in_shard(rooms: &RoomServer, state: &StateMap, user_id: &str) -> Result<String> {
+pub async fn membership_in_shard(
+    rooms: &RoomServer,
+    state: &StateMap,
+    user_id: &str,
+) -> Result<String> {
     let Some(event_id) = state.get(&("m.room.member".to_owned(), user_id.to_owned())) else {
         return Ok("leave".to_owned());
     };
-    let Some(stored) = rooms.store().event(event_id).map_err(ApiError::internal)? else {
+    let Some(stored) = rooms
+        .store()
+        .event(event_id)
+        .await
+        .map_err(ApiError::internal)?
+    else {
         return Ok("leave".to_owned());
     };
     let raw: serde_json::Value = serde_json::from_slice(&stored.raw).map_err(ApiError::internal)?;
@@ -133,17 +152,17 @@ pub fn membership_in_shard(rooms: &RoomServer, state: &StateMap, user_id: &str) 
 }
 
 /// Content of the `(event_type, "")` event in a state map, if present.
-pub fn state_content_in(
+pub async fn state_content_in(
     rooms: &RoomShards,
     room_id: &str,
     state: &StateMap,
     event_type: &str,
 ) -> Result<Option<serde_json::Value>> {
-    state_content_in_shard(rooms.for_room(room_id), state, event_type)
+    state_content_in_shard(rooms.for_room(room_id), state, event_type).await
 }
 
 /// [`state_content_in`] on an already-resolved shard.
-pub fn state_content_in_shard(
+pub async fn state_content_in_shard(
     rooms: &RoomServer,
     state: &StateMap,
     event_type: &str,
@@ -151,7 +170,7 @@ pub fn state_content_in_shard(
     let Some(event_id) = state.get(&(event_type.to_owned(), String::new())) else {
         return Ok(None);
     };
-    let Some(raw) = raw_event_shard(rooms, event_id)? else {
+    let Some(raw) = raw_event_shard(rooms, event_id).await? else {
         return Ok(None);
     };
     Ok(raw
@@ -162,14 +181,19 @@ pub fn state_content_in_shard(
 /// History-visibility check: may `user_id` see this event? Uses the state
 /// *at the event* (spec "Room history visibility"); `shared` additionally
 /// admits anyone who is a member now.
-pub fn user_can_see_event(
+pub async fn user_can_see_event(
     rooms: &RoomShards,
     room_id: &str,
     event_id: &str,
     user_id: &str,
 ) -> Result<bool> {
     let shard = rooms.for_room(room_id);
-    let Some(stored) = shard.store().event(event_id).map_err(ApiError::internal)? else {
+    let Some(stored) = shard
+        .store()
+        .event(event_id)
+        .await
+        .map_err(ApiError::internal)?
+    else {
         return Ok(false);
     };
     if stored.rejected.is_some() || stored.state_group_after == 0 {
@@ -178,12 +202,14 @@ pub fn user_can_see_event(
     let state_at: StateMap = shard
         .store()
         .resolve_group(room_id, stored.state_group_after)
+        .await
         .map_err(ApiError::internal)?;
-    let membership_at = membership_in_shard(shard, &state_at, user_id)?;
+    let membership_at = membership_in_shard(shard, &state_at, user_id).await?;
     if membership_at == "join" {
         return Ok(true);
     }
-    let visibility = state_content_in_shard(shard, &state_at, "m.room.history_visibility")?
+    let visibility = state_content_in_shard(shard, &state_at, "m.room.history_visibility")
+        .await?
         .as_ref()
         .and_then(|c| c.get("history_visibility").and_then(|v| v.as_str()))
         .unwrap_or("shared")
@@ -191,8 +217,8 @@ pub fn user_can_see_event(
     match visibility.as_str() {
         "world_readable" => Ok(true),
         "shared" => {
-            let current = current_state(rooms, room_id)?;
-            Ok(membership_in_shard(shard, &current, user_id)? == "join")
+            let current = current_state(rooms, room_id).await?;
+            Ok(membership_in_shard(shard, &current, user_id).await? == "join")
         }
         "invited" => Ok(membership_at == "invite"),
         // "joined" and anything unrecognized: members-at-the-time only,
@@ -202,9 +228,9 @@ pub fn user_can_see_event(
 }
 
 /// 403 unless `user_id` is currently joined.
-pub fn require_joined(rooms: &RoomShards, room_id: &str, user_id: &str) -> Result<StateMap> {
-    let state = current_state(rooms, room_id)?;
-    if membership_in(rooms, room_id, &state, user_id)? != "join" {
+pub async fn require_joined(rooms: &RoomShards, room_id: &str, user_id: &str) -> Result<StateMap> {
+    let state = current_state(rooms, room_id).await?;
+    if membership_in(rooms, room_id, &state, user_id).await? != "join" {
         return Err(ApiError::forbidden("You are not joined to this room"));
     }
     Ok(state)
@@ -215,7 +241,7 @@ pub fn require_joined(rooms: &RoomShards, room_id: &str, user_id: &str) -> Resul
 /// `type`, `unsigned`. `as_user` is the requesting user, whose membership
 /// at the event is annotated as `unsigned.membership` (MSC4115 /
 /// spec v1.11+).
-pub fn client_event(
+pub async fn client_event(
     rooms: &RoomShards,
     version: RoomVersion,
     room_id: &str,
@@ -226,23 +252,30 @@ pub fn client_event(
     let Some(raw) = rooms
         .store()
         .served_event(event_id, version)
+        .await
         .map_err(ApiError::internal)?
     else {
         return Ok(None);
     };
     let mut ev = to_client_format(&raw, room_id, event_id);
-    if let Some(stored) = rooms.store().event(event_id).map_err(ApiError::internal)? {
+    if let Some(stored) = rooms
+        .store()
+        .event(event_id)
+        .await
+        .map_err(ApiError::internal)?
+    {
         if stored.state_group_after != 0 {
             let state_at: StateMap = rooms
                 .store()
                 .resolve_group(room_id, stored.state_group_after)
+                .await
                 .map_err(ApiError::internal)?;
-            let membership = membership_in_shard(rooms, &state_at, as_user)?;
+            let membership = membership_in_shard(rooms, &state_at, as_user).await?;
             // For a state event, `prev_content`/`prev_sender` describe the state
             // it replaced (spec: UnsignedData; for membership, the previous
             // transition). Absent for the first entry of a state key.
             let prev = if raw.contains_key("state_key") {
-                rooms.prev_state_content(event_id).ok().flatten()
+                rooms.prev_state_content(event_id).await.ok().flatten()
             } else {
                 None
             };
@@ -322,17 +355,25 @@ pub fn stripped_event(raw: &CanonicalJsonObject) -> serde_json::Value {
 
 /// Read one event's raw canonical JSON (no redaction handling; use
 /// [`client_event`] for servable views).
-pub fn raw_event(
+pub async fn raw_event(
     rooms: &RoomShards,
     room_id: &str,
     event_id: &str,
 ) -> Result<Option<CanonicalJsonObject>> {
-    raw_event_shard(rooms.for_room(room_id), event_id)
+    raw_event_shard(rooms.for_room(room_id), event_id).await
 }
 
 /// [`raw_event`] on an already-resolved shard.
-pub fn raw_event_shard(rooms: &RoomServer, event_id: &str) -> Result<Option<CanonicalJsonObject>> {
-    let Some(stored) = rooms.store().event(event_id).map_err(ApiError::internal)? else {
+pub async fn raw_event_shard(
+    rooms: &RoomServer,
+    event_id: &str,
+) -> Result<Option<CanonicalJsonObject>> {
+    let Some(stored) = rooms
+        .store()
+        .event(event_id)
+        .await
+        .map_err(ApiError::internal)?
+    else {
         return Ok(None);
     };
     if stored.rejected.is_some() {
@@ -366,14 +407,14 @@ pub fn accepted_event_id(
 }
 
 /// The predecessor room declared by `room_id`'s create event, if any.
-pub fn predecessor_of(rooms: &RoomShards, room_id: &str) -> Result<Option<String>> {
-    let Ok(state) = current_state(rooms, room_id) else {
+pub async fn predecessor_of(rooms: &RoomShards, room_id: &str) -> Result<Option<String>> {
+    let Ok(state) = current_state(rooms, room_id).await else {
         return Ok(None);
     };
     let Some(create_id) = state.get(&("m.room.create".to_owned(), String::new())) else {
         return Ok(None);
     };
-    let Some(raw) = raw_event(rooms, room_id, create_id)? else {
+    let Some(raw) = raw_event(rooms, room_id, create_id).await? else {
         return Ok(None);
     };
     let Some(CanonicalJsonValue::Object(content)) = raw.get("content") else {

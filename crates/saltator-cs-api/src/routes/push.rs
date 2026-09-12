@@ -306,7 +306,7 @@ pub(crate) async fn copy_rules_from_predecessor(
     {
         return Ok(());
     }
-    let Some(predecessor) = crate::room_util::predecessor_of(&state.rooms, room_id)? else {
+    let Some(predecessor) = crate::room_util::predecessor_of(&state.rooms, room_id).await? else {
         return Ok(());
     };
     let Ok(new_room_id) = ruma::OwnedRoomId::try_from(room_id.to_owned()) else {

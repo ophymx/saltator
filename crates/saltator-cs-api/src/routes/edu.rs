@@ -45,10 +45,11 @@ pub(crate) fn send_edu(state: &Arc<CsState>, destinations: Vec<String>, edu: ser
 
 /// Remote servers with a joined member in `room_id` (excluding us) — the
 /// audience for a typing notification.
-pub(crate) fn room_destinations(state: &CsState, room_id: &str) -> Vec<String> {
+pub(crate) async fn room_destinations(state: &CsState, room_id: &str) -> Vec<String> {
     state
         .rooms
         .remote_servers_in_room(room_id, state.config.server_name.as_str())
+        .await
         .unwrap_or_default()
 }
 
@@ -57,14 +58,14 @@ pub(crate) fn room_destinations(state: &CsState, room_id: &str) -> Vec<String> {
 /// federate — private receipts and fully-read markers stay local. The
 /// `thread_id` (MSC4102) rides in `data` so the receiver can honor the
 /// unthreaded-wins rule.
-pub(crate) fn broadcast_receipt(
+pub(crate) async fn broadcast_receipt(
     state: &Arc<CsState>,
     room_id: &str,
     user_id: &str,
     event_id: &str,
     thread_id: Option<&str>,
 ) {
-    let dests = room_destinations(state, room_id);
+    let dests = room_destinations(state, room_id).await;
     if dests.is_empty() {
         return;
     }
@@ -91,6 +92,6 @@ pub(crate) fn broadcast_receipt(
 /// Remote servers sharing any joined room with `user_id` — the audience
 /// for a presence update. (The membership walk lives in the e2ee
 /// service; presence shares the audience computation.)
-pub(crate) fn presence_destinations(state: &CsState, user_id: &str) -> Vec<String> {
-    state.e2ee().sharing_servers(user_id)
+pub(crate) async fn presence_destinations(state: &CsState, user_id: &str) -> Vec<String> {
+    state.e2ee().sharing_servers(user_id).await
 }

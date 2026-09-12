@@ -128,12 +128,12 @@ fn validate_canonical_alias(
 /// room creator (the `m.room.create` sender or an `additional_creators` entry)
 /// in its `users` map — which the create-event auth rule (§10.4) forbids.
 /// Pre-v12 rooms have no privileged creators, so this is always false there.
-fn power_levels_lists_creator(
+async fn power_levels_lists_creator(
     state: &CsState,
     room_id: &str,
     content: &serde_json::Value,
 ) -> Result<bool> {
-    let version = room_version(&room_meta(&state.rooms, room_id)?)?;
+    let version = room_version(&room_meta(&state.rooms, room_id).await?)?;
     if !version.privileged_creators() {
         return Ok(false);
     }
@@ -141,10 +141,11 @@ fn power_levels_lists_creator(
         return Ok(false);
     };
     let mut creators: std::collections::BTreeSet<String> = Default::default();
-    if let Some(id) =
-        current_state(&state.rooms, room_id)?.get(&("m.room.create".to_owned(), String::new()))
+    if let Some(id) = current_state(&state.rooms, room_id)
+        .await?
+        .get(&("m.room.create".to_owned(), String::new()))
     {
-        if let Some(create) = raw_event(&state.rooms, room_id, id)? {
+        if let Some(create) = raw_event(&state.rooms, room_id, id).await? {
             let create: serde_json::Value = serde_json::to_value(&create).map_err(internal)?;
             if let Some(s) = create.get("sender").and_then(|v| v.as_str()) {
                 creators.insert(s.to_owned());
@@ -195,7 +196,7 @@ pub async fn send_state_event(
     // creator is invalid (auth rule 10.4). Surface it as a bad request (400)
     // rather than the pipeline's 403.
     if req.event_type == ruma::events::StateEventType::RoomPowerLevels
-        && power_levels_lists_creator(&state, req.room_id.as_str(), &content)?
+        && power_levels_lists_creator(&state, req.room_id.as_str(), &content).await?
     {
         return Err(ApiError::bad_json(
             "power_levels.users must not contain a room creator",
@@ -203,9 +204,9 @@ pub async fn send_state_event(
     }
     // Setting identical state twice is idempotent: return the standing
     // event rather than minting a duplicate.
-    if let Ok(current) = current_state(&state.rooms, req.room_id.as_str()) {
+    if let Ok(current) = current_state(&state.rooms, req.room_id.as_str()).await {
         if let Some(event_id) = current.get(&(req.event_type.to_string(), req.state_key.clone())) {
-            if let Some(raw) = raw_event(&state.rooms, req.room_id.as_str(), event_id)? {
+            if let Some(raw) = raw_event(&state.rooms, req.room_id.as_str(), event_id).await? {
                 let existing = raw
                     .get("content")
                     .and_then(|c| serde_json::to_value(c).ok())

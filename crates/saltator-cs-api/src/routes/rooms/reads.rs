@@ -39,8 +39,9 @@ pub async fn get_state_events(
 ) -> Result<Ra<get_state_events::v3::Response>> {
     ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str())?;
     let (current, _) =
-        crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
-    let meta = room_meta(&state.rooms, req.room_id.as_str())?;
+        crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())
+            .await?;
+    let meta = room_meta(&state.rooms, req.room_id.as_str()).await?;
     let version = room_version(&meta)?;
     let mut events = Vec::new();
     for event_id in current.values() {
@@ -50,7 +51,9 @@ pub async fn get_state_events(
             req.room_id.as_str(),
             event_id,
             auth.user_id.as_str(),
-        )? {
+        )
+        .await?
+        {
             events.push(to_raw(&ev)?);
         }
     }
@@ -64,7 +67,8 @@ pub async fn get_state_event(
 ) -> Result<Ra<get_state_event_for_key::v3::Response>> {
     ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str())?;
     let (current, _) =
-        crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+        crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())
+            .await?;
     let key = (req.event_type.to_string(), req.state_key.clone());
     let event_id = current
         .get(&key)
@@ -72,7 +76,7 @@ pub async fn get_state_event(
     // ?format=event returns the whole client-format event, not just the
     // content.
     if req.format == get_state_event_for_key::v3::StateEventFormat::Event {
-        let meta = room_meta(&state.rooms, req.room_id.as_str())?;
+        let meta = room_meta(&state.rooms, req.room_id.as_str()).await?;
         let version = room_version(&meta)?;
         let ev = client_event(
             &state.rooms,
@@ -80,12 +84,14 @@ pub async fn get_state_event(
             req.room_id.as_str(),
             event_id,
             auth.user_id.as_str(),
-        )?
+        )
+        .await?
         .ok_or_else(|| ApiError::not_found("State event missing"))?;
         let ev = serde_json::value::to_raw_value(&ev).map_err(internal)?;
         return Ok(Ra(get_state_event_for_key::v3::Response::new(ev)));
     }
-    let raw = raw_event(&state.rooms, req.room_id.as_str(), event_id)?
+    let raw = raw_event(&state.rooms, req.room_id.as_str(), event_id)
+        .await?
         .ok_or_else(|| ApiError::not_found("State event missing"))?;
     let content = raw
         .get("content")
@@ -118,23 +124,28 @@ pub async fn timestamp_to_event(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<axum::Json<serde_json::Value>> {
     // Members only (do not leak event ids from rooms the caller isn't in).
-    crate::room_util::require_joined(&state.rooms, &room_id, auth.user_id.as_str())?;
+    crate::room_util::require_joined(&state.rooms, &room_id, auth.user_id.as_str()).await?;
     let ts: u64 = q
         .get("ts")
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| ApiError::invalid_param("ts: required integer (ms)"))?;
     let backward = matches!(q.get("dir").map(String::as_str), Some("b"));
 
-    let history_ok = history_readable(&state, &room_id)?;
+    let history_ok = history_readable(&state, &room_id).await?;
     let local = state
         .rooms
         .timestamp_to_event(&room_id, ts, backward, history_ok)
+        .await
         .map_err(internal)?;
 
     // Unfetched history below our floor means the true closest event may
     // be one we have never seen — ask the servers that hold it. Gated on
     // the same visibility rule as serving history.
-    let frontier = state.rooms.history_frontier(&room_id).map_err(internal)?;
+    let frontier = state
+        .rooms
+        .history_frontier(&room_id)
+        .await
+        .map_err(internal)?;
     if history_ok && !frontier.is_empty() {
         if let Some((remote_id, remote_ts)) =
             remote_timestamp_to_event(&state, &room_id, ts, backward).await
@@ -182,7 +193,12 @@ async fn remote_timestamp_to_event(
             candidates.push(resident);
         }
     }
-    for server in state.rooms.remote_servers_in_room(room_id, our_name).ok()? {
+    for server in state
+        .rooms
+        .remote_servers_in_room(room_id, our_name)
+        .await
+        .ok()?
+    {
         if !candidates.contains(&server) {
             candidates.push(server);
         }
@@ -209,12 +225,12 @@ async fn remote_timestamp_to_event(
 /// returned to the client either way; this only anchors `/context`.
 async fn backfill_until_present(state: &CsState, room_id: &str, event_id: &str) {
     for _ in 0..5 {
-        match state.rooms.for_room(room_id).store().event(event_id) {
+        match state.rooms.for_room(room_id).store().event(event_id).await {
             Ok(Some(_)) => return,
             Ok(None) => {}
             Err(_) => return,
         }
-        let Ok(frontier) = state.rooms.history_frontier(room_id) else {
+        let Ok(frontier) = state.rooms.history_frontier(room_id).await else {
             return;
         };
         if frontier.is_empty() {
@@ -239,8 +255,8 @@ pub async fn get_context(
     let user = auth.user_id.as_str();
     // The caller must be able to view the room; a departed member sees up
     // to their leave (the ceiling bounds events_after).
-    let (_view, ceiling) = crate::room_util::member_view(&state.rooms, room_id, user)?;
-    let meta = room_meta(&state.rooms, room_id)?;
+    let (_view, ceiling) = crate::room_util::member_view(&state.rooms, room_id, user).await?;
+    let meta = room_meta(&state.rooms, room_id).await?;
     let version = room_version(&meta)?;
 
     // The target must exist and belong to this room.
@@ -249,11 +265,13 @@ pub async fn get_context(
         .for_room(room_id)
         .store()
         .event(req.event_id.as_str())
+        .await
         .map_err(internal)?
     else {
         return Err(ApiError::not_found("Event not found"));
     };
-    let event = client_event(&state.rooms, version, room_id, req.event_id.as_str(), user)?
+    let event = client_event(&state.rooms, version, room_id, req.event_id.as_str(), user)
+        .await?
         .filter(|ev| ev.get("room_id").and_then(|r| r.as_str()) == Some(room_id))
         .ok_or_else(|| ApiError::not_found("Event not found"))?;
     // A backfilled-history target sits below the timeline floor: it has no
@@ -264,14 +282,16 @@ pub async fn get_context(
         let Some(hidx) = target.history_idx else {
             return Err(ApiError::not_found("Event not found"));
         };
-        if !history_readable(&state, room_id)? {
+        if !history_readable(&state, room_id).await? {
             return Err(ApiError::not_found("Event not found"));
         }
         let limit = (u64::from(req.limit) as usize).min(100);
-        return context_in_history(&state, room_id, user, event, hidx, ceiling, limit);
+        return context_in_history(&state, room_id, user, event, hidx, ceiling, limit).await;
     }
     // Timeline targets: per-event visibility.
-    if !crate::room_util::user_can_see_event(&state.rooms, room_id, req.event_id.as_str(), user)? {
+    if !crate::room_util::user_can_see_event(&state.rooms, room_id, req.event_id.as_str(), user)
+        .await?
+    {
         return Err(ApiError::not_found("Event not found"));
     }
     let target_seq = target.seq;
@@ -291,9 +311,10 @@ pub async fn get_context(
             before_limit,
             true,
         )
+        .await
         .map_err(internal)?
     {
-        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user).await? {
             oldest = seq;
             events_before.push(ev);
         }
@@ -302,19 +323,20 @@ pub async fn get_context(
     let mut newest = target_seq;
     for (seq, id) in store
         .room_timeline(room_id, target_seq, ceiling, after_limit, false)
+        .await
         .map_err(internal)?
     {
-        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user).await? {
             newest = seq;
             events_after.push(ev);
         }
     }
 
     // State at the newest event returned (spec).
-    let state_map = crate::room_util::state_at_seq(&state.rooms, room_id, newest)?;
+    let state_map = crate::room_util::state_at_seq(&state.rooms, room_id, newest).await?;
     let mut state_events = Vec::new();
     for id in state_map.values() {
-        if let Some(ev) = client_event(&state.rooms, version, room_id, id, user)? {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, id, user).await? {
             state_events.push(ev);
         }
     }
@@ -336,7 +358,7 @@ pub async fn get_context(
 /// reflects the newest timeline event returned; a response that never
 /// reaches the timeline has none (backfilled events predate every
 /// locally-known state snapshot).
-fn context_in_history(
+async fn context_in_history(
     state: &CsState,
     room_id: &str,
     user: &str,
@@ -345,7 +367,7 @@ fn context_in_history(
     ceiling: Option<u64>,
     limit: usize,
 ) -> Result<axum::Json<serde_json::Value>> {
-    let version = room_version(&room_meta(&state.rooms, room_id)?)?;
+    let version = room_version(&room_meta(&state.rooms, room_id).await?)?;
     let store = state.rooms.for_room(room_id).store();
     let before_limit = limit / 2 + limit % 2;
     let after_limit = limit - before_limit;
@@ -355,9 +377,10 @@ fn context_in_history(
     let mut oldest = hidx;
     for (idx, id) in store
         .room_history(room_id, hidx, None, before_limit, false)
+        .await
         .map_err(internal)?
     {
-        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+        if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user).await? {
             oldest = idx;
             events_before.push(ev);
         }
@@ -371,9 +394,10 @@ fn context_in_history(
     if hidx > 1 {
         for (idx, id) in store
             .room_history(room_id, 0, Some(hidx - 1), after_limit, true)
+            .await
             .map_err(internal)?
         {
-            if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+            if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user).await? {
                 newest_hist = idx;
                 events_after.push(ev);
             }
@@ -383,9 +407,10 @@ fn context_in_history(
     if remaining > 0 {
         for (seq, id) in store
             .room_timeline(room_id, 0, ceiling, remaining, false)
+            .await
             .map_err(internal)?
         {
-            if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user)? {
+            if let Some(ev) = client_event(&state.rooms, version, room_id, &id, user).await? {
                 newest_seq = Some(seq);
                 events_after.push(ev);
             }
@@ -394,9 +419,9 @@ fn context_in_history(
 
     let mut state_events = Vec::new();
     if let Some(seq) = newest_seq {
-        let state_map = crate::room_util::state_at_seq(&state.rooms, room_id, seq)?;
+        let state_map = crate::room_util::state_at_seq(&state.rooms, room_id, seq).await?;
         for id in state_map.values() {
-            if let Some(ev) = client_event(&state.rooms, version, room_id, id, user)? {
+            if let Some(ev) = client_event(&state.rooms, version, room_id, id, user).await? {
                 state_events.push(ev);
             }
         }
@@ -426,7 +451,7 @@ pub async fn get_room_event(
     auth: Auth,
     Ar(req): Ar<get_room_event::v3::Request>,
 ) -> Result<Ra<get_room_event::v3::Response>> {
-    let meta = room_meta(&state.rooms, req.room_id.as_str())?;
+    let meta = room_meta(&state.rooms, req.room_id.as_str()).await?;
     let version = room_version(&meta)?;
     // History-visibility gate; hidden events are indistinguishable from
     // absent ones (404, not 403).
@@ -435,7 +460,9 @@ pub async fn get_room_event(
         req.room_id.as_str(),
         req.event_id.as_str(),
         auth.user_id.as_str(),
-    )? {
+    )
+    .await?
+    {
         return Err(ApiError::not_found("Event not found"));
     }
     let mut ev = client_event(
@@ -444,7 +471,8 @@ pub async fn get_room_event(
         req.room_id.as_str(),
         req.event_id.as_str(),
         auth.user_id.as_str(),
-    )?
+    )
+    .await?
     .ok_or_else(|| ApiError::not_found("Event not found"))?;
     // Cross-room probing guard: the event must belong to this room.
     if ev.get("room_id").and_then(|r| r.as_str()) != Some(req.room_id.as_str()) {
@@ -463,7 +491,8 @@ pub async fn get_members(
 ) -> Result<Ra<get_member_events::v3::Response>> {
     ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str())?;
     let (mut current, cap) =
-        crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+        crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())
+            .await?;
     // `?at=`: members as of a stream position (bounded by the caller's
     // own view ceiling).
     if let Some(at) = &req.at {
@@ -472,9 +501,9 @@ pub async fn get_members(
         if let Some(cap) = cap {
             seq = seq.min(cap);
         }
-        current = crate::room_util::state_at_seq(&state.rooms, req.room_id.as_str(), seq)?;
+        current = crate::room_util::state_at_seq(&state.rooms, req.room_id.as_str(), seq).await?;
     }
-    let meta = room_meta(&state.rooms, req.room_id.as_str())?;
+    let meta = room_meta(&state.rooms, req.room_id.as_str()).await?;
     let version = room_version(&meta)?;
     let mut chunk = Vec::new();
     for ((event_type, _), event_id) in &current {
@@ -487,7 +516,8 @@ pub async fn get_members(
             req.room_id.as_str(),
             event_id,
             auth.user_id.as_str(),
-        )?
+        )
+        .await?
         else {
             continue;
         };
@@ -517,7 +547,7 @@ pub async fn get_joined_members(
     auth: Auth,
     Ar(req): Ar<joined_members::v3::Request>,
 ) -> Result<axum::Json<serde_json::Value>> {
-    let current = require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    let current = require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str()).await?;
     // Built as raw JSON: clients expect display_name/avatar_url keys to be
     // present (null when unset), which ruma's RoomMember omits.
     let mut joined = serde_json::Map::new();
@@ -525,7 +555,7 @@ pub async fn get_joined_members(
         if event_type != "m.room.member" {
             continue;
         }
-        let Some(raw) = raw_event(&state.rooms, req.room_id.as_str(), event_id)? else {
+        let Some(raw) = raw_event(&state.rooms, req.room_id.as_str(), event_id).await? else {
             continue;
         };
         let content = crate::room_util::stripped_event(&raw);
@@ -564,6 +594,7 @@ pub async fn get_messages(
     // their leave (`cap`).
     ensure_not_forgotten(&state, auth.user_id.as_str(), &room_id)?;
     let (_, cap) = crate::room_util::member_view(&state.rooms, &room_id, auth.user_id.as_str())
+        .await
         .map_err(|e| {
             if e.status == axum::http::StatusCode::NOT_FOUND {
                 ApiError::forbidden("You aren't a member of the room")
@@ -572,7 +603,7 @@ pub async fn get_messages(
             }
         })?;
     let ceiling = cap.unwrap_or(u64::MAX);
-    let meta = room_meta(&state.rooms, &room_id)?;
+    let meta = room_meta(&state.rooms, &room_id).await?;
     let version = room_version(&meta)?;
 
     let dir = match query.get("dir").map(String::as_str) {
@@ -647,6 +678,7 @@ pub async fn get_messages(
                 };
                 for (seq, id) in store
                     .room_timeline(&room_id, lower, Some(upper.min(ceiling)), limit, true)
+                    .await
                     .map_err(internal)?
                 {
                     rows.push((RowPos::Timeline(seq), id));
@@ -660,7 +692,7 @@ pub async fn get_messages(
                 Some(PagePos::History(idx)) => (true, Some(idx.saturating_sub(1))),
                 Some(PagePos::Timeline(b)) => (b.lower() == 0, None),
             };
-            if allow_history && rows.len() < limit && history_readable(&state, &room_id)? {
+            if allow_history && rows.len() < limit && history_readable(&state, &room_id).await? {
                 let mut cursor = match &from {
                     Some(PagePos::History(idx)) => *idx,
                     _ => 0,
@@ -676,6 +708,7 @@ pub async fn get_messages(
                     }
                     let page = store
                         .room_history(&room_id, cursor, hist_until, need, false)
+                        .await
                         .map_err(internal)?;
                     for (idx, id) in page {
                         cursor = idx;
@@ -684,7 +717,11 @@ pub async fn get_messages(
                     if rows.len() >= limit || hist_until.is_some() {
                         break;
                     }
-                    let frontier = state.rooms.history_frontier(&room_id).map_err(internal)?;
+                    let frontier = state
+                        .rooms
+                        .history_frontier(&room_id)
+                        .await
+                        .map_err(internal)?;
                     if frontier.is_empty() {
                         break; // history reaches the room's beginning
                     }
@@ -709,6 +746,7 @@ pub async fn get_messages(
                 };
                 for (i, id) in store
                     .room_history(&room_id, after, Some(idx.saturating_sub(1)), limit, true)
+                    .await
                     .map_err(internal)?
                 {
                     rows.push((RowPos::History(i), id));
@@ -727,6 +765,7 @@ pub async fn get_messages(
                 let need = limit - rows.len();
                 for (seq, id) in store
                     .room_timeline(&room_id, lower, upper, need, false)
+                    .await
                     .map_err(internal)?
                 {
                     rows.push((RowPos::Timeline(seq), id));
@@ -744,7 +783,9 @@ pub async fn get_messages(
             &room_id,
             event_id,
             auth.user_id.as_str(),
-        )? {
+        )
+        .await?
+        {
             if let Some(want_url) = contains_url {
                 let has_url = ev
                     .get("content")
@@ -775,7 +816,7 @@ pub async fn get_messages(
             })
             .max()
         {
-            let snapshot = crate::room_util::state_at_seq(&state.rooms, &room_id, at)?;
+            let snapshot = crate::room_util::state_at_seq(&state.rooms, &room_id, at).await?;
             for sender in senders {
                 let key = ("m.room.member".to_owned(), sender);
                 let Some(member_event_id) = snapshot.get(&key) else {
@@ -787,7 +828,9 @@ pub async fn get_messages(
                     &room_id,
                     member_event_id,
                     auth.user_id.as_str(),
-                )? {
+                )
+                .await?
+                {
                     resp.state.push(to_raw(&ev)?);
                 }
             }
@@ -842,14 +885,15 @@ fn parse_page_pos(token: &str, shard_idx: u16) -> Result<PagePos> {
 
 /// Backfilled events predate all local state, so serving them is gated on
 /// the room's *current* history visibility rather than per-event checks.
-fn history_readable(state: &CsState, room_id: &str) -> Result<bool> {
-    let current = crate::room_util::current_state(&state.rooms, room_id)?;
+async fn history_readable(state: &CsState, room_id: &str) -> Result<bool> {
+    let current = crate::room_util::current_state(&state.rooms, room_id).await?;
     let visibility = crate::room_util::state_content_in(
         &state.rooms,
         room_id,
         &current,
         "m.room.history_visibility",
-    )?;
+    )
+    .await?;
     let visibility = visibility
         .as_ref()
         .and_then(|c| c.get("history_visibility").and_then(|v| v.as_str()))
@@ -875,6 +919,7 @@ async fn fetch_history(state: &CsState, room_id: &str, frontier: &[String]) -> R
     for server in state
         .rooms
         .remote_servers_in_room(room_id, our_name)
+        .await
         .map_err(internal)?
     {
         if !candidates.contains(&server) {
@@ -890,10 +935,12 @@ async fn fetch_history(state: &CsState, room_id: &str, frontier: &[String]) -> R
                 // and drop any that fail, so a malicious member server
                 // can't inject forged-sender history we'd serve as real.
                 saltator_federation::trust_event_servers(&fed.key_cache, &state.rooms, &pdus).await;
-                let verified: Vec<ruma::CanonicalJsonObject> = pdus
-                    .into_iter()
-                    .filter(|ev| state.rooms.verify_pdu(room_id, ev))
-                    .collect();
+                let mut verified: Vec<ruma::CanonicalJsonObject> = Vec::new();
+                for ev in pdus {
+                    if state.rooms.verify_pdu(room_id, &ev).await {
+                        verified.push(ev);
+                    }
+                }
                 if verified.is_empty() {
                     continue;
                 }

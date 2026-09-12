@@ -79,27 +79,33 @@ impl RoomShards {
     /// event table — for the rare surfaces addressed by bare event id
     /// (federation `GET /event/{id}`), where no room names the shard.
     /// Bounded point reads (one per group), not a scan.
-    pub fn for_event(&self, event_id: &str) -> Option<&Arc<RoomServer>> {
-        self.shards
-            .iter()
-            .find(|s| matches!(s.store().event(event_id), Ok(Some(_))))
+    pub async fn for_event(&self, event_id: &str) -> Option<&Arc<RoomServer>> {
+        for s in &self.shards {
+            if matches!(s.store().event(event_id).await, Ok(Some(_))) {
+                return Some(s);
+            }
+        }
+        None
     }
 
     // Routed conveniences for the room-scoped calls that appear all
     // over the serving surfaces: same semantics as the underlying
     // [`RoomServer`] method, on the shard the room hashes to.
 
-    pub fn server_in_room(&self, room_id: &str, server: &str) -> crate::Result<bool> {
-        self.for_room(room_id).server_in_room(room_id, server)
+    pub async fn server_in_room(&self, room_id: &str, server: &str) -> crate::Result<bool> {
+        self.for_room(room_id).server_in_room(room_id, server).await
     }
 
-    pub fn server_invited_to_room(&self, room_id: &str, server: &str) -> crate::Result<bool> {
+    pub async fn server_invited_to_room(&self, room_id: &str, server: &str) -> crate::Result<bool> {
         self.for_room(room_id)
             .server_invited_to_room(room_id, server)
+            .await
     }
 
-    pub fn server_acl_denies(&self, room_id: &str, server: &str) -> bool {
-        self.for_room(room_id).server_acl_denies(room_id, server)
+    pub async fn server_acl_denies(&self, room_id: &str, server: &str) -> bool {
+        self.for_room(room_id)
+            .server_acl_denies(room_id, server)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -207,8 +213,8 @@ impl RoomShards {
         shard.ingest_pdu(raw).await
     }
 
-    pub fn verify_pdu(&self, room_id: &str, raw: &CanonicalJsonObject) -> bool {
-        self.for_room(room_id).verify_pdu(room_id, raw)
+    pub async fn verify_pdu(&self, room_id: &str, raw: &CanonicalJsonObject) -> bool {
+        self.for_room(room_id).verify_pdu(room_id, raw).await
     }
 
     pub async fn import_room(
@@ -234,7 +240,7 @@ impl RoomShards {
         self.for_room(room_id).import_history(room_id, pdus).await
     }
 
-    pub fn timestamp_to_event(
+    pub async fn timestamp_to_event(
         &self,
         room_id: &str,
         ts: u64,
@@ -243,35 +249,43 @@ impl RoomShards {
     ) -> Result<Option<(String, u64)>> {
         self.for_room(room_id)
             .timestamp_to_event(room_id, ts, backward, include_history)
+            .await
     }
 
-    pub fn history_frontier(&self, room_id: &str) -> Result<Vec<String>> {
-        self.for_room(room_id).history_frontier(room_id)
+    pub async fn history_frontier(&self, room_id: &str) -> Result<Vec<String>> {
+        self.for_room(room_id).history_frontier(room_id).await
     }
 
-    pub fn remote_servers_in_room(&self, room_id: &str, exclude: &str) -> Result<Vec<String>> {
+    pub async fn remote_servers_in_room(
+        &self,
+        room_id: &str,
+        exclude: &str,
+    ) -> Result<Vec<String>> {
         self.for_room(room_id)
             .remote_servers_in_room(room_id, exclude)
+            .await
     }
 
-    pub fn restricted_join_authoriser(
+    pub async fn restricted_join_authoriser(
         &self,
         room_id: &ruma::RoomId,
         joiner: &ruma::UserId,
     ) -> Result<RestrictedAuth> {
         self.for_room(room_id.as_str())
             .restricted_join_authoriser(self, room_id, joiner)
+            .await
     }
 
     /// The `GET /make_join` template. Router-level because the
     /// restricted-join allow rooms it evaluates route by their own ids.
-    pub fn make_join_template(
+    pub async fn make_join_template(
         &self,
         room_id: &ruma::RoomId,
         user_id: &ruma::UserId,
     ) -> Result<(CoreRoomVersion, CanonicalJsonObject)> {
         self.for_room(room_id.as_str())
             .make_join_template(self, room_id, user_id)
+            .await
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u16, &Arc<RoomServer>)> {

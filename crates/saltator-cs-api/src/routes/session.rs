@@ -382,7 +382,8 @@ pub async fn logout(
         .await?;
     state
         .e2ee()
-        .broadcast_update(auth.user_id.as_str(), &auth.device_id, true);
+        .broadcast_update(auth.user_id.as_str(), &auth.device_id, true)
+        .await;
     Ok(Ra(logout::v3::Response::new()))
 }
 
@@ -400,7 +401,8 @@ pub async fn logout_all(
     for (device_id, _) in devices {
         state
             .e2ee()
-            .broadcast_update(auth.user_id.as_str(), &device_id, true);
+            .broadcast_update(auth.user_id.as_str(), &device_id, true)
+            .await;
     }
     Ok(Ra(logout_all::v3::Response::new()))
 }

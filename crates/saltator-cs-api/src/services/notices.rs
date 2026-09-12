@@ -146,9 +146,9 @@ impl Notices<'_> {
         sender: &UserId,
         target: &UserId,
     ) -> Result<()> {
-        let state = room_util::current_state(self.rooms, room_id.as_str())?;
+        let state = room_util::current_state(self.rooms, room_id.as_str()).await?;
         let membership =
-            room_util::membership_in(self.rooms, room_id.as_str(), &state, target.as_str())?;
+            room_util::membership_in(self.rooms, room_id.as_str(), &state, target.as_str()).await?;
         if matches!(membership.as_str(), "join" | "invite") {
             return Ok(());
         }

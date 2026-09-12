@@ -63,6 +63,7 @@ async fn send_transaction_routes_pdus_and_reports_results() {
         &rooms
             .store()
             .event(create_id.as_str())
+            .await
             .unwrap()
             .unwrap()
             .raw,
@@ -218,11 +219,11 @@ async fn send_fills_dag_gap_via_get_missing_events() {
             o => panic!("{o:?}"),
         });
     }
-    let raw_of = |id: &str| -> serde_json::Value {
-        serde_json::from_slice(&rooms_a.store().event(id).unwrap().unwrap().raw).unwrap()
-    };
+    async fn raw_of(rooms: &saltator_roomserver::RoomServer, id: &str) -> serde_json::Value {
+        serde_json::from_slice(&rooms.store().event(id).await.unwrap().unwrap().raw).unwrap()
+    }
     // ids: [create, member, power_levels, join_rules, msg1, msg2]
-    let msg2 = raw_of(&ids[5]);
+    let msg2 = raw_of(&rooms_a, &ids[5]).await;
 
     // Standalone B key server so A can verify B's get_missing_events request.
     let b_key_base = spawn(router(Arc::new(FedState::new(
@@ -269,14 +270,14 @@ async fn send_fills_dag_gap_via_get_missing_events() {
         rooms_b.trust_keys("a.test", set.clone());
     }
     for id in ids.iter().take(4) {
-        let obj = match ruma::CanonicalJsonValue::try_from(raw_of(id)).unwrap() {
+        let obj = match ruma::CanonicalJsonValue::try_from(raw_of(&rooms_a, id).await).unwrap() {
             ruma::CanonicalJsonValue::Object(o) => o,
             _ => panic!(),
         };
         rooms_b.ingest_pdu(obj).await.unwrap();
     }
     assert_eq!(
-        rooms_b.room_extremities(room_id.as_str()).unwrap(),
+        rooms_b.room_extremities(room_id.as_str()).await.unwrap(),
         vec![ids[3].clone()],
         "B at join_rules"
     );
@@ -324,11 +325,11 @@ async fn send_fills_dag_gap_via_get_missing_events() {
     );
     // B now has msg1 and msg2.
     assert!(
-        rooms_b.store().event(&ids[4]).unwrap().is_some(),
+        rooms_b.store().event(&ids[4]).await.unwrap().is_some(),
         "B backfilled msg1"
     );
     assert!(
-        rooms_b.store().event(&ids[5]).unwrap().is_some(),
+        rooms_b.store().event(&ids[5]).await.unwrap().is_some(),
         "B has msg2"
     );
 }

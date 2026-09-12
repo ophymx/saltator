@@ -119,7 +119,7 @@ pub async fn make_knock(
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad user id"))?;
     refuse_if_blocked(&state, room.as_str())?;
 
-    match rooms.make_knock_template(&room, &user) {
+    match rooms.make_knock_template(&room, &user).await {
         Ok((version, template)) => Ok(axum::Json(serde_json::json!({
             "room_version": version.as_str(),
             "event": CanonicalJsonValue::Object(template),
@@ -223,7 +223,7 @@ pub async fn make_join(
 
     // Router-level: the template's restricted-join check reads allow
     // rooms, which route by their own ids.
-    match rooms.make_join_template(&room, &user) {
+    match rooms.make_join_template(&room, &user).await {
         Ok((version, template)) => Ok(axum::Json(serde_json::json!({
             "room_version": version.as_str(),
             "event": CanonicalJsonValue::Object(template),
@@ -388,6 +388,7 @@ pub async fn event_auth(
     // or the room check authorizes a cross-room probe.
     if !rooms
         .server_in_room(&room_id, &auth.origin)
+        .await
         .unwrap_or(false)
     {
         return Err(err(
@@ -399,6 +400,7 @@ pub async fn event_auth(
     let in_this_room = rooms
         .store()
         .event(&event_id)
+        .await
         .ok()
         .flatten()
         .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.raw).ok())
@@ -412,7 +414,7 @@ pub async fn event_auth(
     if !in_this_room {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Unknown event"));
     }
-    match rooms.event_auth_chain(&event_id) {
+    match rooms.event_auth_chain(&event_id).await {
         Ok(Some(chain)) => Ok(axum::Json(serde_json::json!({
             "auth_chain": to_array(chain),
         }))),
@@ -440,7 +442,7 @@ pub async fn make_leave(
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad room id"))?;
     let user = ruma::UserId::parse(&user_id)
         .map_err(|_| err(StatusCode::BAD_REQUEST, "M_INVALID_PARAM", "bad user id"))?;
-    match rooms.make_leave_template(&room, &user) {
+    match rooms.make_leave_template(&room, &user).await {
         Ok((version, template)) => Ok(axum::Json(serde_json::json!({
             "room_version": version.as_str(),
             "event": CanonicalJsonValue::Object(template),
@@ -668,17 +670,17 @@ pub async fn invite(
     // normal PDU path (fetching missing prev events from the origin). Only a
     // room we don't host is recorded as an out-of-band pending invite, whose
     // stripped state `build_invited_room` reads from the user shard.
-    let hosted = state
-        .rooms
-        .as_ref()
-        .and_then(|r| {
-            r.for_room(_room_id.as_str())
-                .store()
-                .meta(_room_id.as_str())
-                .ok()
-                .flatten()
-        })
-        .is_some();
+    let hosted = match state.rooms.as_ref() {
+        Some(r) => r
+            .for_room(_room_id.as_str())
+            .store()
+            .meta(_room_id.as_str())
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+        None => false,
+    };
     let mut ingested = false;
     if hosted {
         let value = serde_json::Value::from(CanonicalJsonValue::Object(signed.clone()));

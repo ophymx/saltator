@@ -1300,6 +1300,7 @@ async fn run_membership_projection(
             let batch = rooms
                 .store()
                 .timeline(cursor, PROJECTION_BATCH)
+                .await
                 .map_err(storage_err)?;
             let Some(&(upto_seq, _)) = batch.last() else {
                 break;
@@ -1309,7 +1310,8 @@ async fn run_membership_projection(
                 let SeqEntry::Event { room_id, event_id } = entry else {
                     continue;
                 };
-                if let Some(change) = membership_change(rooms, room_id, event_id, *room_seq)? {
+                if let Some(change) = membership_change(rooms, room_id, event_id, *room_seq).await?
+                {
                     changes_out.push(change);
                 }
             }
@@ -1330,13 +1332,13 @@ async fn run_membership_projection(
 /// users' memberships are indexed too — `/sync` only reads the caller's
 /// rows, but device-list and presence visibility ("do they share a
 /// room?") need every member.
-fn membership_change(
+async fn membership_change(
     rooms: &RoomServer,
     room_id: &str,
     event_id: &str,
     room_seq: u64,
 ) -> Result<Option<MembershipChange>> {
-    let Some(stored) = rooms.store().event(event_id).map_err(storage_err)? else {
+    let Some(stored) = rooms.store().event(event_id).await.map_err(storage_err)? else {
         return Ok(None);
     };
     let raw: serde_json::Value =

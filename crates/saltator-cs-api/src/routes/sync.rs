@@ -504,14 +504,16 @@ async fn build_sync(
                 if ignored.contains(&m.sender) {
                     continue;
                 }
-                resp.rooms
-                    .invite
-                    .insert(room_id, build_invited_room(state, auth, &room_id_str, &m)?);
+                resp.rooms.invite.insert(
+                    room_id,
+                    build_invited_room(state, auth, &room_id_str, &m).await?,
+                );
             }
             "knock" if initial || m.seq > since.user => {
-                resp.rooms
-                    .knock
-                    .insert(room_id, build_knocked_room(state, auth, &room_id_str)?);
+                resp.rooms.knock.insert(
+                    room_id,
+                    build_knocked_room(state, auth, &room_id_str).await?,
+                );
             }
             // Newly-left rooms ride incremental syncs — even when forgotten,
             // so other devices still learn about the leave. On initial (or
@@ -538,7 +540,8 @@ async fn build_sync(
                         now,
                         filter,
                         initial || full_state,
-                    )?,
+                    )
+                    .await?,
                 );
             }
             _ => {}
@@ -593,10 +596,10 @@ async fn build_sync(
     // "newly visible users" for the presence section below.
     let mut newly_visible: std::collections::BTreeSet<String> = Default::default();
     if !initial {
-        let (dl_changed, dl_left) =
-            state
-                .e2ee()
-                .device_list_deltas(user_id, &my_joined_rooms, since.user, now.user)?;
+        let (dl_changed, dl_left) = state
+            .e2ee()
+            .device_list_deltas(user_id, &my_joined_rooms, since.user, now.user)
+            .await?;
         for user in dl_changed {
             newly_visible.insert(user.clone());
             if let Ok(uid) = ruma::OwnedUserId::try_from(user) {
@@ -697,7 +700,7 @@ async fn build_joined_room(
     let shard_idx = state.rooms.index_of(room_id.as_str());
     let rooms = state.rooms.for_room(room_id.as_str());
     let store = rooms.store();
-    let Some(meta) = store.meta(room_id.as_str()).map_err(internal)? else {
+    let Some(meta) = store.meta(room_id.as_str()).await.map_err(internal)? else {
         return Ok(v3::JoinedRoom::new());
     };
     let version = RoomVersion::parse(&meta.version).map_err(internal)?;
@@ -711,6 +714,7 @@ async fn build_joined_room(
             limit + 1,
             true,
         )
+        .await
         .map_err(internal)?;
     let mut limited = window.len() > limit;
     window.truncate(limit);
@@ -748,7 +752,9 @@ async fn build_joined_room(
             room_id.as_str(),
             event_id,
             auth.user_id.as_str(),
-        )? {
+        )
+        .await?
+        {
             let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if !type_matches(&filter.timeline_types, &filter.timeline_not_types, ty) {
                 continue;
@@ -766,7 +772,8 @@ async fn build_joined_room(
     // State delta up to the start of the timeline.
     let timeline_start_state = match window.first() {
         Some((first_seq, first_event_id)) => {
-            let mut at_start = state_at(state, room_id.as_str(), first_seq.saturating_sub(1))?;
+            let mut at_start =
+                state_at(state, room_id.as_str(), first_seq.saturating_sub(1)).await?;
             if at_start.is_empty() {
                 // No timeline precedes the window's first event. For a
                 // send_join import that event is the co-signed join and
@@ -774,21 +781,22 @@ async fn build_joined_room(
                 // (the resident's dump is stored off-timeline) — serve
                 // that, minus the event itself, or a freshly joined
                 // federated room syncs with no state at all.
-                if let Some(stored) = store.event(first_event_id).map_err(internal)? {
+                if let Some(stored) = store.event(first_event_id).await.map_err(internal)? {
                     at_start = store
                         .resolve_group(room_id.as_str(), stored.state_group_after)
+                        .await
                         .map_err(internal)?;
                     at_start.retain(|_, id| id != first_event_id);
                 }
             }
             at_start
         }
-        None => state_at(state, room_id.as_str(), now.room_at(shard_idx))?,
+        None => state_at(state, room_id.as_str(), now.room_at(shard_idx)).await?,
     };
     let base_state: StateMap = if initial || full_state {
         StateMap::new()
     } else {
-        state_at(state, room_id.as_str(), since.room_at(shard_idx))?
+        state_at(state, room_id.as_str(), since.room_at(shard_idx)).await?
     };
     let mut state_events = Vec::new();
     for (key, event_id) in &timeline_start_state {
@@ -807,7 +815,9 @@ async fn build_joined_room(
             room_id.as_str(),
             event_id,
             auth.user_id.as_str(),
-        )? {
+        )
+        .await?
+        {
             state_events.push(to_raw(&ev)?);
         }
     }
@@ -816,7 +826,7 @@ async fn build_joined_room(
     out.state = v3::State::Before(se);
 
     // Ephemeral: receipts in the window, typing on change.
-    let receipts = store.receipts(room_id.as_str()).map_err(internal)?;
+    let receipts = store.receipts(room_id.as_str()).await.map_err(internal)?;
     let mut receipt_content: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for (user, receipt_type, record) in receipts {
         if !initial
@@ -882,12 +892,15 @@ async fn build_joined_room(
     // Room summary: joined/invited member counts from current state.
     let mut joined_count = 0u32;
     let mut invited_count = 0u32;
-    if let Ok(current) = crate::room_util::current_state(&state.rooms, room_id.as_str()) {
+    if let Ok(current) = crate::room_util::current_state(&state.rooms, room_id.as_str()).await {
         for (event_type, state_key) in current.keys() {
             if event_type != "m.room.member" {
                 continue;
             }
-            match crate::room_util::membership_in_shard(rooms, &current, state_key)?.as_str() {
+            match crate::room_util::membership_in_shard(rooms, &current, state_key)
+                .await?
+                .as_str()
+            {
                 "join" => joined_count += 1,
                 "invite" => invited_count += 1,
                 _ => {}
@@ -933,25 +946,27 @@ async fn build_joined_room(
 
 /// The room's state map as of shard seq `at` (empty before the room
 /// existed).
-fn state_at(state: &CsState, room_id: &str, at: u64) -> Result<StateMap> {
+async fn state_at(state: &CsState, room_id: &str, at: u64) -> Result<StateMap> {
     let store = state.rooms.for_room(room_id).store();
     let Some((_, event_id)) = store
         .room_timeline(room_id, 0, Some(at), 1, true)
+        .await
         .map_err(internal)?
         .into_iter()
         .next()
     else {
         return Ok(StateMap::new());
     };
-    let Some(stored) = store.event(&event_id).map_err(internal)? else {
+    let Some(stored) = store.event(&event_id).await.map_err(internal)? else {
         return Ok(StateMap::new());
     };
     store
         .resolve_group(room_id, stored.state_group_after)
+        .await
         .map_err(internal)
 }
 
-fn build_invited_room(
+async fn build_invited_room(
     state: &CsState,
     auth: &Auth,
     room_id: &str,
@@ -960,7 +975,7 @@ fn build_invited_room(
     let rooms = state.rooms.for_room(room_id);
     let store = rooms.store();
     let mut events = Vec::new();
-    let Some(meta) = store.meta(room_id).map_err(internal)? else {
+    let Some(meta) = store.meta(room_id).await.map_err(internal)? else {
         // A room we don't host: a pending invite received over federation.
         // Its stripped state was stored on the user shard.
         if let Some(stripped) = state
@@ -981,6 +996,7 @@ fn build_invited_room(
     };
     let current = store
         .resolve_group(room_id, meta.current_group)
+        .await
         .map_err(internal)?;
     let mut wanted: Vec<(String, String)> = INVITE_STATE_TYPES
         .iter()
@@ -990,7 +1006,7 @@ fn build_invited_room(
     wanted.push(("m.room.member".to_owned(), membership.sender.clone()));
     for key in wanted {
         if let Some(event_id) = current.get(&key) {
-            if let Some(raw) = crate::room_util::raw_event_shard(rooms, event_id)? {
+            if let Some(raw) = crate::room_util::raw_event_shard(rooms, event_id).await? {
                 events.push(to_raw(&stripped_event(&raw))?);
             }
         }
@@ -1004,11 +1020,15 @@ fn build_invited_room(
 /// room the caller has knocked upon. A hosted room's state is stripped
 /// live; a remote room's stripped state was stored on the user shard by
 /// the `/send_knock` response (reusing the invite-state table).
-fn build_knocked_room(state: &CsState, auth: &Auth, room_id: &str) -> Result<v3::KnockedRoom> {
+async fn build_knocked_room(
+    state: &CsState,
+    auth: &Auth,
+    room_id: &str,
+) -> Result<v3::KnockedRoom> {
     let rooms = state.rooms.for_room(room_id);
     let store = rooms.store();
     let mut events = Vec::new();
-    let Some(meta) = store.meta(room_id).map_err(internal)? else {
+    let Some(meta) = store.meta(room_id).await.map_err(internal)? else {
         // A room we don't host: a knock we placed over federation, whose
         // stripped state the /send_knock response stored on the user shard.
         if let Some(stripped) = state
@@ -1029,6 +1049,7 @@ fn build_knocked_room(state: &CsState, auth: &Auth, room_id: &str) -> Result<v3:
     };
     let current = store
         .resolve_group(room_id, meta.current_group)
+        .await
         .map_err(internal)?;
     let mut wanted: Vec<(String, String)> = INVITE_STATE_TYPES
         .iter()
@@ -1039,7 +1060,7 @@ fn build_knocked_room(state: &CsState, auth: &Auth, room_id: &str) -> Result<v3:
     wanted.push(("m.room.member".to_owned(), auth.user_id.to_string()));
     for key in wanted {
         if let Some(event_id) = current.get(&key) {
-            if let Some(raw) = crate::room_util::raw_event_shard(rooms, event_id)? {
+            if let Some(raw) = crate::room_util::raw_event_shard(rooms, event_id).await? {
                 events.push(to_raw(&stripped_event(&raw))?);
             }
         }
@@ -1050,7 +1071,7 @@ fn build_knocked_room(state: &CsState, auth: &Auth, room_id: &str) -> Result<v3:
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_left_room(
+async fn build_left_room(
     state: &CsState,
     auth: &Auth,
     room_id: &str,
@@ -1064,7 +1085,7 @@ fn build_left_room(
     let rooms = state.rooms.for_room(room_id);
     let store = rooms.store();
     let mut out = v3::LeftRoom::new();
-    let Some(meta) = store.meta(room_id).map_err(internal)? else {
+    let Some(meta) = store.meta(room_id).await.map_err(internal)? else {
         // A room we don't host that the caller left/was removed from — e.g.
         // rejecting a remote invite, or having one rescinded. We hold no room
         // DAG, so synthesize the caller's leave member event so their client
@@ -1092,6 +1113,7 @@ fn build_left_room(
     let window_start = if fresh { 0 } else { since.room_at(shard_idx) };
     let mut window = store
         .room_timeline(room_id, window_start, Some(ceiling), filter.limit + 1, true)
+        .await
         .map_err(internal)?;
     out.timeline.limited = window.len() > filter.limit;
     window.truncate(filter.limit);
@@ -1107,7 +1129,9 @@ fn build_left_room(
             room_id,
             event_id,
             auth.user_id.as_str(),
-        )? {
+        )
+        .await?
+        {
             let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if !type_matches(&filter.timeline_types, &filter.timeline_not_types, ty) {
                 continue;
@@ -1121,13 +1145,13 @@ fn build_left_room(
     // State delta up to the start of the timeline; with an empty timeline
     // that is the full state at the leave — including the leave event.
     let timeline_start_state = match window.first() {
-        Some((first_seq, _)) => state_at(state, room_id, first_seq.saturating_sub(1))?,
-        None => state_at(state, room_id, ceiling)?,
+        Some((first_seq, _)) => state_at(state, room_id, first_seq.saturating_sub(1)).await?,
+        None => state_at(state, room_id, ceiling).await?,
     };
     let base_state: StateMap = if fresh {
         StateMap::new()
     } else {
-        state_at(state, room_id, since.room_at(shard_idx))?
+        state_at(state, room_id, since.room_at(shard_idx)).await?
     };
     let mut state_events = Vec::new();
     for (key, event_id) in &timeline_start_state {
@@ -1143,7 +1167,9 @@ fn build_left_room(
             room_id,
             event_id,
             auth.user_id.as_str(),
-        )? {
+        )
+        .await?
+        {
             state_events.push(to_raw(&ev)?);
         }
     }
@@ -1169,7 +1195,7 @@ async fn write_receipt(
     thread_id: Option<String>,
 ) -> Result<()> {
     // The receipt target must be a known event of this room.
-    let Some(raw) = raw_event(&state.rooms, room_id.as_str(), event_id.as_str())? else {
+    let Some(raw) = raw_event(&state.rooms, room_id.as_str(), event_id.as_str()).await? else {
         return Err(ApiError::not_found("Unknown event"));
     };
     if let Some(ruma::CanonicalJsonValue::String(r)) = raw.get("room_id") {
@@ -1198,7 +1224,8 @@ pub async fn send_receipt(
 ) -> Result<Ra<create_receipt::v3::Response>> {
     use create_receipt::v3::ReceiptType;
     use ruma::events::receipt::ReceiptThread;
-    crate::room_util::require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    crate::room_util::require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())
+        .await?;
     let thread_id = match &req.thread {
         ReceiptThread::Unthreaded => None,
         ReceiptThread::Main => Some("main".to_owned()),
@@ -1223,7 +1250,8 @@ pub async fn send_receipt(
                 auth.user_id.as_str(),
                 req.event_id.as_str(),
                 thread_id.as_deref(),
-            );
+            )
+            .await;
         }
         ReceiptType::ReadPrivate => {
             write_receipt(
@@ -1254,7 +1282,8 @@ pub async fn set_read_markers(
     auth: Auth,
     Ar(req): Ar<set_read_marker::v3::Request>,
 ) -> Result<Ra<set_read_marker::v3::Response>> {
-    crate::room_util::require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    crate::room_util::require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())
+        .await?;
     if let Some(event_id) = &req.fully_read {
         let content =
             serde_json::to_vec(&serde_json::json!({ "event_id": event_id })).map_err(internal)?;
@@ -1282,7 +1311,8 @@ pub async fn set_read_markers(
             auth.user_id.as_str(),
             event_id.as_str(),
             None,
-        );
+        )
+        .await;
     }
     if let Some(event_id) = &req.private_read_receipt {
         write_receipt(
@@ -1309,7 +1339,8 @@ pub async fn send_typing(
             "Cannot set another user's typing state",
         ));
     }
-    crate::room_util::require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())?;
+    crate::room_util::require_joined(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())
+        .await?;
     let is_typing = match req.state {
         Typing::Yes(info) => {
             state.typing.set(
@@ -1340,6 +1371,6 @@ pub async fn send_typing(
             "typing": is_typing,
         },
     });
-    crate::routes::edu::send_edu(&state, dests, edu);
+    crate::routes::edu::send_edu(&state, dests.await, edu);
     Ok(Ra(create_typing_event::v3::Response::new()))
 }

@@ -416,8 +416,8 @@ pub async fn upgrade_room(
             "This server does not support that room version",
         )
     })?;
-    let current = require_joined(&state.rooms, &room_id, auth.user_id.as_str())?;
-    let old_version = room_version(&room_meta(&state.rooms, &room_id)?)?;
+    let current = require_joined(&state.rooms, &room_id, auth.user_id.as_str()).await?;
+    let old_version = room_version(&room_meta(&state.rooms, &room_id).await?)?;
     if !can_send_state(
         &state.rooms,
         room_id.as_str(),
@@ -425,7 +425,9 @@ pub async fn upgrade_room(
         old_version,
         auth.user_id.as_str(),
         "m.room.tombstone",
-    )? {
+    )
+    .await?
+    {
         return Err(ApiError::forbidden("Not permitted to tombstone this room"));
     }
 
@@ -436,7 +438,8 @@ pub async fn upgrade_room(
         room_id.as_str(),
         &current,
         "m.room.create",
-    )?
+    )
+    .await?
     .and_then(|c| c.as_object().cloned())
     .unwrap_or_default();
     for server_managed in ["room_version", "creator", "predecessor"] {
@@ -492,6 +495,7 @@ pub async fn upgrade_room(
         .for_room(room_id.as_str())
         .store()
         .room_timeline(&room_id, 0, None, 1, true)
+        .await
         .map_err(internal)?
         .into_iter()
         .next()
@@ -542,7 +546,8 @@ pub async fn upgrade_room(
             room_id.as_str(),
             &current,
             event_type,
-        )?
+        )
+        .await?
         else {
             continue;
         };

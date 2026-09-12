@@ -146,7 +146,7 @@ fn encode_segment(s: &str) -> String {
 /// May `user_id` send state events of `event_type` in this room? Room
 /// creators in privileged-creator versions (v12+) always may; everyone
 /// else is measured against the power-level event.
-fn can_send_state(
+async fn can_send_state(
     rooms: &saltator_roomserver::RoomShards,
     room_id: &str,
     state_map: &StateMap,
@@ -157,7 +157,7 @@ fn can_send_state(
     let rooms = rooms.for_room(room_id);
     if version.privileged_creators() {
         if let Some(create_id) = state_map.get(&("m.room.create".to_owned(), String::new())) {
-            if let Some(raw) = crate::room_util::raw_event_shard(rooms, create_id)? {
+            if let Some(raw) = crate::room_util::raw_event_shard(rooms, create_id).await? {
                 let sender = raw.get("sender").and_then(|v| v.as_str());
                 if sender == Some(user_id) {
                     return Ok(true);
@@ -174,7 +174,8 @@ fn can_send_state(
             }
         }
     }
-    let pl = crate::room_util::state_content_in_shard(rooms, state_map, "m.room.power_levels")?;
+    let pl =
+        crate::room_util::state_content_in_shard(rooms, state_map, "m.room.power_levels").await?;
     let Some(pl) = pl else {
         // No power-level event: auth-rule defaults (state_default 0).
         return Ok(true);

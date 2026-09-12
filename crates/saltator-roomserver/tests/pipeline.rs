@@ -171,7 +171,7 @@ fn craft_pdu(
 }
 
 /// The auth events a crafted event needs, read from current room state.
-fn auth_ids_from_state(
+async fn auth_ids_from_state(
     env: &Env,
     version: RoomVersion,
     room_id: &RoomId,
@@ -181,9 +181,10 @@ fn auth_ids_from_state(
     content: &serde_json::Value,
 ) -> Vec<String> {
     let store = env.server.store();
-    let meta = store.meta(room_id.as_str()).unwrap().unwrap();
+    let meta = store.meta(room_id.as_str()).await.unwrap().unwrap();
     let current = store
         .resolve_group(room_id.as_str(), meta.current_group)
+        .await
         .unwrap();
     let content = canonical(content.clone());
     saltator_core::auth::auth_types_for_event(version, event_type, sender, state_key, &content)
@@ -203,7 +204,7 @@ async fn full_pipeline(version: RoomVersion) {
     // v12 rooms derive their ID from the create event.
     if version.room_id_is_create_event_id() {
         let store = env.server.store();
-        let meta = store.meta(room_id.as_str()).unwrap().unwrap();
+        let meta = store.meta(room_id.as_str()).await.unwrap().unwrap();
         assert_eq!(&room_id.as_str()[1..], &meta.create_event_id[1..]);
     }
 
@@ -234,9 +235,10 @@ async fn full_pipeline(version: RoomVersion) {
 
     // Current state has exactly the expected keys.
     let store = env.server.store();
-    let meta = store.meta(room_id.as_str()).unwrap().unwrap();
+    let meta = store.meta(room_id.as_str()).await.unwrap().unwrap();
     let state = store
         .resolve_group(room_id.as_str(), meta.current_group)
+        .await
         .unwrap();
     let mut keys: Vec<&(String, String)> = state.keys().collect();
     keys.sort();
@@ -272,7 +274,7 @@ async fn full_pipeline(version: RoomVersion) {
     assert!(seen.windows(2).all(|w| w[0] < w[1]));
 
     // Timeline reads back the same order.
-    let timeline = store.timeline(0, 100).unwrap();
+    let timeline = store.timeline(0, 100).await.unwrap();
     assert_eq!(timeline.len(), 7);
     assert_eq!(timeline.last().unwrap().0, m2);
 
@@ -295,10 +297,10 @@ async fn full_pipeline(version: RoomVersion) {
     // The sender's non-membership is already visible in the auth-event
     // state (their member event can't be selected), so this rejects at
     // the auth-chain stage.
-    let se = store.event(rejected_id.as_str()).unwrap().unwrap();
+    let se = store.event(rejected_id.as_str()).await.unwrap().unwrap();
     assert!(matches!(se.rejected, Some(Rejected::AuthChain(_))));
-    assert_eq!(store.timeline(0, 100).unwrap().len(), 7);
-    let meta = store.meta(room_id.as_str()).unwrap().unwrap();
+    assert_eq!(store.timeline(0, 100).await.unwrap().len(), 7);
+    let meta = store.meta(room_id.as_str()).await.unwrap().unwrap();
     assert!(!meta.extremities.contains(&rejected_id.to_string()));
 
     // A PDU referencing unknown events surfaces the federation hook.
@@ -319,7 +321,8 @@ async fn full_pipeline(version: RoomVersion) {
             &alice,
             None,
             &json!({}),
-        ),
+        )
+        .await,
         50,
     );
     match env.server.ingest_pdu(missing_prev).await {
@@ -347,37 +350,46 @@ async fn fork_and_state_resolution(version: RoomVersion) {
     let room_id = bootstrap_room(&env, version).await;
 
     let store = env.server.store();
-    let meta = store.meta(room_id.as_str()).unwrap().unwrap();
+    let meta = store.meta(room_id.as_str()).await.unwrap().unwrap();
     assert_eq!(meta.extremities.len(), 1);
     let tip = meta.extremities[0].clone();
-    let tip_depth = store.event(&tip).unwrap().unwrap().depth;
+    let tip_depth = store.event(&tip).await.unwrap().unwrap().depth;
 
     // Two topic events forking off the same tip (bob is at PL 50 =
     // state_default, so both are authorized).
-    let topic = |sender: &OwnedUserId, text: &str| {
+    async fn topic(
+        env: &Env,
+        version: RoomVersion,
+        room_id: &OwnedRoomId,
+        tip: &String,
+        tip_depth: u64,
+        sender: &OwnedUserId,
+        text: &str,
+    ) -> CanonicalJsonObject {
         craft_pdu(
-            &env,
+            env,
             version,
-            &room_id,
+            room_id,
             sender.as_str(),
             "m.room.topic",
             Some(""),
             json!({"topic": text}),
-            std::slice::from_ref(&tip),
+            std::slice::from_ref(tip),
             &auth_ids_from_state(
-                &env,
+                env,
                 version,
-                &room_id,
+                room_id,
                 "m.room.topic",
                 sender,
                 Some(""),
                 &json!({}),
-            ),
+            )
+            .await,
             tip_depth + 1,
         )
-    };
-    let fork_a = topic(&alice, "alpha");
-    let fork_b = topic(&bob, "beta");
+    }
+    let fork_a = topic(&env, version, &room_id, &tip, tip_depth, &alice, "alpha").await;
+    let fork_b = topic(&env, version, &room_id, &tip, tip_depth, &bob, "beta").await;
 
     let a_id = match env.server.ingest_pdu(fork_a).await.unwrap() {
         Outcome::Accepted { event_id, .. } => event_id,
@@ -389,7 +401,7 @@ async fn fork_and_state_resolution(version: RoomVersion) {
     };
 
     // Both fork heads are extremities; current state resolved to ONE topic.
-    let meta = store.meta(room_id.as_str()).unwrap().unwrap();
+    let meta = store.meta(room_id.as_str()).await.unwrap().unwrap();
     let mut ext = meta.extremities.clone();
     ext.sort();
     let mut expect = vec![a_id.to_string(), b_id.to_string()];
@@ -397,6 +409,7 @@ async fn fork_and_state_resolution(version: RoomVersion) {
     assert_eq!(ext, expect);
     let state = store
         .resolve_group(room_id.as_str(), meta.current_group)
+        .await
         .unwrap();
     let topic_id = state
         .get(&("m.room.topic".to_owned(), String::new()))
@@ -422,14 +435,15 @@ async fn fork_and_state_resolution(version: RoomVersion) {
             .await
             .unwrap(),
     );
-    let meta = store.meta(room_id.as_str()).unwrap().unwrap();
+    let meta = store.meta(room_id.as_str()).await.unwrap().unwrap();
     assert_eq!(meta.extremities.len(), 1);
-    let merge_event = store.event(&meta.extremities[0]).unwrap().unwrap();
+    let merge_event = store.event(&meta.extremities[0]).await.unwrap().unwrap();
     assert_eq!(merge_event.seq, merge_seq);
 
     // Resolved topic survives the merge.
     let state = store
         .resolve_group(room_id.as_str(), meta.current_group)
+        .await
         .unwrap();
     assert_eq!(
         state
@@ -439,7 +453,7 @@ async fn fork_and_state_resolution(version: RoomVersion) {
     );
 
     // Re-ingesting a fork head is a duplicate, not an error.
-    let dup = topic(&alice, "alpha");
+    let dup = topic(&env, version, &room_id, &tip, tip_depth, &alice, "alpha").await;
     match env.server.ingest_pdu(dup).await.unwrap() {
         Outcome::Duplicate { event_id } => assert_eq!(event_id, a_id),
         other => panic!("expected Duplicate, got {other:?}"),
@@ -531,7 +545,7 @@ async fn restart_recovers_rooms() {
 
     assert_eq!(server.shard_handle().seq().unwrap(), seq_before);
     let store = server.store();
-    let meta = store.meta(room_id.as_str()).unwrap().unwrap();
+    let meta = store.meta(room_id.as_str()).await.unwrap().unwrap();
     assert_eq!(meta.version, "12");
 
     // The room still accepts events.
@@ -585,11 +599,13 @@ async fn receipts_redactions_room_timeline() {
     // Per-room timeline: full window, then a bounded backwards page.
     let tl = store
         .room_timeline(room_id.as_str(), 0, None, 100, false)
+        .await
         .unwrap();
     assert_eq!(tl.len(), 7); // 5 bootstrap state events + 2 messages
     assert_eq!(tl[tl.len() - 2], (m1_seq, m1_id.to_string()));
     let last_two = store
         .room_timeline(room_id.as_str(), 0, None, 2, true)
+        .await
         .unwrap();
     assert_eq!(last_two.len(), 2);
     assert_eq!(last_two[0].0, m2_seq);
@@ -608,12 +624,12 @@ async fn receipts_redactions_room_timeline() {
         .await
         .unwrap();
     assert_eq!(dup, 0);
-    let receipts = store.receipts(room_id.as_str()).unwrap();
+    let receipts = store.receipts(room_id.as_str()).await.unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].0, alice.as_str());
     assert_eq!(receipts[0].1, "m.read");
     assert_eq!(receipts[0].2.event_id, m1_id.as_str());
-    let (last_seq, last_entry) = store.timeline(0, 100).unwrap().pop().unwrap();
+    let (last_seq, last_entry) = store.timeline(0, 100).await.unwrap().pop().unwrap();
     assert_eq!(last_seq, seq);
     assert!(matches!(last_entry, SeqEntry::Receipt { .. }));
 
@@ -631,6 +647,7 @@ async fn receipts_redactions_room_timeline() {
     );
     let served = store
         .served_event(m1_id.as_str(), RoomVersion::V12)
+        .await
         .unwrap()
         .unwrap();
     let content = match served.get("content").unwrap() {
@@ -672,6 +689,7 @@ async fn remote_servers_in_room_lists_only_joined_remotes() {
     let servers = env
         .server
         .remote_servers_in_room(room_id.as_str(), SERVER)
+        .await
         .unwrap();
     assert!(
         servers.is_empty(),
@@ -696,6 +714,7 @@ async fn remote_servers_in_room_lists_only_joined_remotes() {
     let servers = env
         .server
         .remote_servers_in_room(room_id.as_str(), SERVER)
+        .await
         .unwrap();
     assert!(
         servers.is_empty(),
@@ -706,6 +725,7 @@ async fn remote_servers_in_room_lists_only_joined_remotes() {
     let none = env
         .server
         .remote_servers_in_room("!nonexistent:hs.test", SERVER)
+        .await
         .unwrap();
     assert!(none.is_empty());
 
@@ -739,7 +759,7 @@ async fn backfill_and_get_missing_events_walk_the_dag() {
 
     // Backfill from the last message, limit 3: newest-first, includes the
     // starting event.
-    let bf = env.server.backfill(&[ids[4].clone()], 3).unwrap();
+    let bf = env.server.backfill(&[ids[4].clone()], 3).await.unwrap();
     assert_eq!(bf.len(), 3, "backfill should return the limit");
     let bf_ids: Vec<String> = bf
         .iter()
@@ -759,6 +779,7 @@ async fn backfill_and_get_missing_events_walk_the_dag() {
     let gme = env
         .server
         .get_missing_events(&[ids[1].clone()], &[ids[4].clone()], 10, 0)
+        .await
         .unwrap();
     let gme_ids: Vec<String> = gme
         .iter()
@@ -867,11 +888,15 @@ async fn restricted_join_authoriser_selects_and_denies() {
     // member of the restricted room with invite power).
     assert_eq!(
         s.restricted_join_authoriser(&shards, &room_ref, &carol)
+            .await
             .unwrap(),
         RestrictedAuth::Authorised(alice.clone()),
     );
     // ...and make_join stamps that authoriser into the template content.
-    let (_v, template) = s.make_join_template(&shards, &room_ref, &carol).unwrap();
+    let (_v, template) = s
+        .make_join_template(&shards, &room_ref, &carol)
+        .await
+        .unwrap();
     let stamped = template
         .get("content")
         .and_then(|c| c.as_object())
@@ -883,6 +908,7 @@ async fn restricted_join_authoriser_selects_and_denies() {
     let dave = user("dave");
     assert_eq!(
         s.restricted_join_authoriser(&shards, &room_ref, &dave)
+            .await
             .unwrap(),
         RestrictedAuth::FailsConditions,
     );
@@ -902,6 +928,7 @@ async fn restricted_join_authoriser_selects_and_denies() {
     );
     assert_eq!(
         s.restricted_join_authoriser(&shards, &room_ref, &carol)
+            .await
             .unwrap(),
         RestrictedAuth::CannotValidate,
     );
@@ -937,6 +964,7 @@ async fn replay_matches_the_live_change_stream() {
         .server
         .store()
         .timeline(0, 100)
+        .await
         .unwrap()
         .into_iter()
         .rev()

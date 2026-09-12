@@ -392,7 +392,12 @@ pub async fn list_rooms(
     Query(q): Query<ListRoomsQuery>,
 ) -> Result<axum::Json<serde_json::Value>> {
     tracing::info!(admin = %auth.user_id(), from = ?q.from, "admin: list rooms");
-    detail_response(state.room_admin().list_rooms(q.from.as_deref(), q.limit)?)
+    detail_response(
+        state
+            .room_admin()
+            .list_rooms(q.from.as_deref(), q.limit)
+            .await?,
+    )
 }
 
 /// `GET /_saltator/admin/v1/rooms/{room_id}`
@@ -402,7 +407,7 @@ pub async fn room_detail(
     Path(room_id): Path<String>,
 ) -> Result<axum::Json<serde_json::Value>> {
     tracing::info!(admin = %auth.user_id(), room = %room_id, "admin: read room");
-    detail_response(state.room_admin().room_detail(&room_id)?)
+    detail_response(state.room_admin().room_detail(&room_id).await?)
 }
 
 /// `DELETE /_saltator/admin/v1/rooms/{room_id}` — shutdown, **not** purge:
@@ -460,7 +465,7 @@ pub async fn list_blocked_rooms(
     State(state): State<Arc<CsState>>,
     _auth: AdminAuth,
 ) -> Result<axum::Json<serde_json::Value>> {
-    let rooms = state.room_admin().list_blocked()?;
+    let rooms = state.room_admin().list_blocked().await?;
     Ok(axum::Json(serde_json::json!({ "blocked_rooms": rooms })))
 }
 
