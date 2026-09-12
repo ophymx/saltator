@@ -11,6 +11,7 @@ saltator-roomserver.workspace = true
 saltator-userserver.workspace = true
 saltator-fedout.workspace = true
 saltator-appservice.workspace = true
+futures-util.workspace = true
 saltator-media.workspace = true
 
 axum.workspace = true

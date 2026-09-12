@@ -293,15 +293,18 @@ mechanically once cs-api's remaining direct uses thin out.
   ping, AS device management + UIA exemptions, `?ts` on `/state`.
   Docs: docs/appservices.md, design in docs/design-appservices.md.
   Deferred there: receive_ephemeral, legacy routes, /thirdparty.
-- **Federation delivery latency** (task #17): the CI race that motivated
-  it was fixed at the decision level instead (PR #45 batching, PR #46
-  recheck-on-change), and the instrumentation half is now DONE — the
-  observability branch turns `deliver_pdus`' `queue_ms`/`put_ms` into
-  `saltator_federation_pdu_{queue_delay,put_duration}_seconds`
-  (docs/observability.md). What remains is the attack on whichever term
-  the histograms show dominant: parallel per-destination sends,
-  PDU-before-EDU priority. Measure first — batching per txn already
-  landed.
+- ~~**Federation delivery latency**~~ (task #17) CLOSED
+  (delivery-latency branch, 2026-09-12). History: the motivating CI race
+  was fixed at the decision level (PR #45 batching, PR #46
+  recheck-on-change); instrumentation landed with observability (the
+  `queue_delay`/`put_duration` histograms). The measured attack:
+  delivery iterated destinations *sequentially*, so every healthy peer
+  waited out every slow peer ahead of it — ten 2s-slow peers cost a
+  healthy peer 20.08s (tests/delivery_latency.rs, the measurement kept
+  as the regression guard). Both passes now fan out per destination
+  concurrently (bounded at 16; per-destination chunk order unchanged):
+  same shape, 0.08s. PDU-before-EDU priority was already the per-pass
+  order and needed nothing.
 - ~~Security-review follow-ups~~ CLOSED (security-followups branch,
   2026-09-11): L1 cross-signing subkeys must chain to the master key
   (`M_INVALID_SIGNATURE` otherwise); L8 `old_verify_keys` ingested into
