@@ -269,9 +269,10 @@ legacy format; per-shard membership projections with `room/{idx}`
 cursors; per-shard delivery floors over the already-shard-keyed fedout
 cursors; per-shard push gateway and AS push; multi-shard admin room
 listing with `{shard}:{room_id}` continuation tokens). The e2e,
-cluster-smoke and chaos harnesses now run the 16-shard default;
-Complement/interop stay pinned to 1 until the deliberate CI flip
-(review call 3). Phase 2 (read RPC + internal pub/sub + group
+cluster-smoke and chaos harnesses now run the 16-shard default; the
+Complement/interop images run `room_shards = 4` (review call 3's
+ratchet — flipped in the follow-up PR once the multi-node harnesses
+were green sharded). Phase 2 (read RPC + internal pub/sub + group
 lifecycle + checkpoint moves, the RF-floor unlock) gets its own design
 doc.
 
