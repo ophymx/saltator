@@ -63,6 +63,53 @@ env:
   RUSTFLAGS: "-C target-cpu=x86-64-v2 -C target-feature=+pclmulqdq"
 
 jobs:
+  # Classifies the push/PR diff so a docs-only change (every file under
+  # docs/ or ending in .md) skips the build-and-test machinery. Only the
+  # three ROOT jobs carry the gate — frontend, check, licenses — because
+  # everything expensive hangs off `build` (which needs frontend), and a
+  # skipped dependency skips its dependents. Fails open: schedule runs,
+  # branch creations, and anything unclassifiable run the full pipeline.
+  changes:
+    name: classify diff
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            push)         base="$PUSH_BEFORE" ;;
+            *)            base="" ;;
+          esac
+          docs_only=false
+          if [ -n "$base" ] && git cat-file -e "$base" 2>/dev/null; then
+            # Three-dot: diff against the merge base, so a stale PR base
+            # or a fast-forward push both classify only OUR changes.
+            files=$(git diff --name-only "$base...HEAD")
+            if [ -n "$files" ]; then
+              docs_only=true
+              while IFS= read -r f; do
+                case "$f" in
+                  docs/*|*.md) ;;
+                  *) docs_only=false; break ;;
+                esac
+              done <<EOF
+          $files
+          EOF
+            fi
+            printf 'changed files:\n%s\n' "$files"
+          fi
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "docs_only=$docs_only"
+
   frontend:
     name: admin console (bundle)
     # The console bundle is built here, once, and shared as an artifact —
@@ -70,6 +117,8 @@ jobs:
     # out to npm (crates/saltator-admin-ui/build.rs), so this is the only
     # place Node is required and `cargo build` keeps needing nothing but a
     # Rust toolchain. See docs/design-admin-ui.md.
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -153,6 +202,8 @@ jobs:
 
   check:
     name: fmt + clippy + test
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -389,10 +440,12 @@ jobs:
     # so a dependency bump cannot widen that set without somebody
     # deciding to; the allow-list in deny.toml is the decision record.
     #
-    # Independent of every other job on purpose: it needs no build, no
+    # Independent of the build chain on purpose: it needs no build, no
     # artifact and no Docker, so it reports in seconds and does not queue
-    # behind the release build.
+    # behind the release build (only the docs-only classifier precedes it).
     name: licenses (cargo-deny)
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
