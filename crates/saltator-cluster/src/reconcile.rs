@@ -13,6 +13,12 @@ use std::time::Duration;
 
 use saltator_shard::ShardHandle;
 
+/// Upper bound on one membership call (add_learner blocks until the
+/// learner catches up; set_voters until the change commits). Generous —
+/// a healthy catch-up is well under this — but finite, so one
+/// unreachable target cannot starve the rest of the loop.
+const MEMBERSHIP_OP_TIMEOUT: Duration = Duration::from_secs(10);
+
 use crate::types::NodeId;
 use crate::MetadataHandle;
 
@@ -87,32 +93,57 @@ pub async fn reconcile_once(meta: &MetadataHandle, groups: &[LocalGroup]) -> usi
         // Add replicas we don't yet carry as learners so they catch up before
         // promotion. add_learner is best-effort: a target that hasn't started
         // its group yet (or is already a learner) errors, and we retry next
-        // tick.
+        // tick. It is also BOUNDED: the call blocks until the learner is
+        // caught up, and a target whose group never answers (not started,
+        // node down) would otherwise starve every other group's
+        // reconciliation behind it — including folding fresh joiners into
+        // the floored user/fed-out groups, which their boot waits on.
         let current = lg.handle.voter_ids();
         for node in desired.difference(&current) {
             if let Some(info) = roster.get(node) {
-                if let Err(e) = lg
-                    .handle
-                    .add_learner(*node, info.advertise_addr.clone())
-                    .await
+                match tokio::time::timeout(
+                    MEMBERSHIP_OP_TIMEOUT,
+                    lg.handle.add_learner(*node, info.advertise_addr.clone()),
+                )
+                .await
                 {
-                    tracing::debug!(
-                        group = lg.group, node, error = %e,
-                        "reconcile: add_learner deferred",
-                    );
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            group = lg.group, node, error = %e,
+                            "reconcile: add_learner deferred",
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            group = lg.group, node,
+                            "reconcile: add_learner timed out (target group not answering); deferred",
+                        );
+                    }
                 }
             }
         }
 
         // Promote to exactly the desired voter set (also demotes departed
-        // nodes). Errors if a target isn't caught up yet — retried next tick.
-        match lg.handle.set_voters(desired.clone()).await {
-            Ok(()) => {
+        // nodes). Errors if a target isn't caught up yet — retried next
+        // tick. Bounded like add_learner: a joint config whose new quorum
+        // is unreachable would block indefinitely (the proposed change
+        // stays in the log and completes on its own if quorum returns).
+        match tokio::time::timeout(MEMBERSHIP_OP_TIMEOUT, lg.handle.set_voters(desired.clone()))
+            .await
+        {
+            Ok(Ok(())) => {
                 changed += 1;
                 tracing::info!(group = lg.group, voters = ?desired, "reconciled group membership");
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::debug!(group = lg.group, error = %e, "reconcile: set_voters deferred");
+            }
+            Err(_) => {
+                tracing::debug!(
+                    group = lg.group,
+                    "reconcile: set_voters timed out; deferred",
+                );
             }
         }
     }

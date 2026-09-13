@@ -8,7 +8,7 @@ use saltator_core::{event, RoomVersion};
 
 use saltator_core::RoomVersion as CoreRoomVersion;
 
-use crate::{Outcome, RestrictedAuth, Result, RoomServer};
+use crate::{Outcome, RestrictedAuth, Result, RoomChanges, RoomServer};
 
 /// Which shard group a room lives in. **Frozen forever**: this function
 /// is the only thing standing between a room id and its data — changing
@@ -83,6 +83,26 @@ impl RoomShards {
 
     pub fn by_index(&self, idx: u16) -> Option<Arc<RoomServer>> {
         (idx < self.count()).then(|| self.slot(idx))
+    }
+
+    /// A swap-resilient tail of one shard's change stream: like
+    /// [`RoomServer::changes`], but bound to the SLOT rather than to a
+    /// snapshot of it. When the underlying stream ends — the lifecycle
+    /// driver swapped the slot (hosted ↔ remote) and shut the old
+    /// backend down, or a remote stream gave up — it re-resolves the
+    /// current slot and resumes from the last delivered seq. This is
+    /// what long-lived consumers (delivery, projections, push) must
+    /// use: a plain `changes()` stream dies with the handle it was
+    /// created from.
+    pub fn tail(self: &Arc<Self>, idx: u16, from_seq: u64) -> ShardTail {
+        assert!(idx < self.count(), "shard index out of range");
+        ShardTail {
+            shards: self.clone(),
+            idx,
+            last: from_seq,
+            inner: None,
+            src: 0,
+        }
     }
 
     /// The shard a wire PDU belongs to, with the room id that decided
@@ -309,6 +329,62 @@ impl RoomShards {
 
     pub fn iter(&self) -> impl Iterator<Item = (u16, Arc<RoomServer>)> + '_ {
         (0..self.count()).map(|i| (i, self.slot(i)))
+    }
+}
+
+/// One shard's change stream, bound to the router slot — see
+/// [`RoomShards::tail`]. `recv` never ends: a dead underlying stream is
+/// replaced by one from the slot's current backend, resuming after the
+/// last record delivered.
+pub struct ShardTail {
+    shards: Arc<RoomShards>,
+    idx: u16,
+    last: u64,
+    inner: Option<RoomChanges>,
+    /// Identity of the slot `inner` came from (`Arc::as_ptr`), so a
+    /// swap is noticed even while the old stream is still healthy — a
+    /// remote stream outlives the gain of a local replica.
+    src: usize,
+}
+
+/// Breather between re-acquisitions, so a backend that hands out
+/// instantly-dying streams (every replica unreachable, say) does not
+/// spin the consumer hot. The common case — the slot was swapped and
+/// the fresh stream is healthy — pays it once.
+const TAIL_REACQUIRE_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl ShardTail {
+    /// The next change record at seq > the last one delivered.
+    pub async fn recv(&mut self) -> saltator_shard::ChangeRecord {
+        loop {
+            let slot = self.shards.slot(self.idx);
+            let slot_ptr = Arc::as_ptr(&slot) as usize;
+            if self.inner.is_some() && self.src != slot_ptr {
+                // Slot swapped under us: resume against the current
+                // backend from the last delivered seq. (A stream can
+                // stay healthy across a swap — a remote one keeps
+                // serving after this node gains the group locally.)
+                self.inner = None;
+            }
+            let inner = match self.inner.as_mut() {
+                Some(c) => c,
+                None => {
+                    self.src = slot_ptr;
+                    self.inner = Some(slot.changes(self.last));
+                    self.inner.as_mut().expect("just set")
+                }
+            };
+            match inner.recv().await {
+                Some(rec) => {
+                    self.last = self.last.max(rec.seq);
+                    return rec;
+                }
+                None => {
+                    self.inner = None;
+                    tokio::time::sleep(TAIL_REACQUIRE_PAUSE).await;
+                }
+            }
+        }
     }
 }
 

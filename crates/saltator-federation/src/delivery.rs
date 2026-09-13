@@ -2,10 +2,12 @@
 //! runs wherever the fed-out shard leads, and owns ALL outbound
 //! federation — PDUs against durable per-destination cursors, EDUs from
 //! the fed-out outbox — with one per-destination backoff policy and
-//! unbounded retry. Every input it needs is local applied state (the
-//! room timeline and the fed-out tables are replicated to every node);
-//! every write it makes is a proposal to the fed-out shard it leads, so
-//! proposer == leader by construction.
+//! unbounded retry. Room timelines are read through the backend-agnostic
+//! [`RoomServer`] surface — local applied state where this node hosts
+//! the shard, the Read/Subscribe RPCs where it does not (RF < node
+//! count, phase 3) — and delivery, being async, tolerates the lag of
+//! either. Every write it makes is a proposal to the fed-out shard it
+//! leads, so proposer == leader by construction.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -97,10 +99,13 @@ pub fn spawn_delivery_worker(
     backoff: Arc<DeliveryBackoff>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Slot-bound tails, not plain `changes()` streams: a stream
+        // from a snapshot dies (or goes stale) when the lifecycle
+        // driver swaps the slot; the tail re-resolves and resumes.
         let mut room_changes = Vec::new();
-        for (_, s) in rooms.iter() {
+        for (idx, s) in rooms.iter() {
             let from = s.current_seq().await.unwrap_or(0);
-            room_changes.push(s.changes(from));
+            room_changes.push(rooms.tail(idx, from));
         }
         let mut fedout_changes = fedout.subscribe();
         // In-memory per-shard PDU scan floors; re-derived from durable

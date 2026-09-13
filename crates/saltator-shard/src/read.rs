@@ -85,6 +85,11 @@ pub trait RemoteShardBackend: RemoteReader {
     ) -> std::pin::Pin<
         Box<dyn futures_util::Stream<Item = Result<crate::ChangeRecord>> + Send + 'static>,
     >;
+
+    /// The placement moved the group's replicas: point future attempts
+    /// at the new address list. Default no-op for backends whose
+    /// targets are not placement-derived (tests).
+    fn set_replicas(&self, _replicas: Vec<String>) {}
 }
 
 /// Serves [`RemoteShardBackend::execute`] for one locally-hosted group:

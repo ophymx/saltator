@@ -11,9 +11,9 @@
 //! swapping the router slot between hosted and remote, and cleaning up
 //! after a handoff.
 //!
-//! With the RF floor on (the default), the placement lists every node
-//! for every group and this task never acts — the phase-3 policy flip
-//! is what makes it routine.
+//! With `replication_factor` a real cap (phase 3), any cluster larger
+//! than RF exercises this routinely: joins and drains re-rank the
+//! rendezvous placement, and groups move accordingly.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +80,18 @@ async fn reconcile_lifecycle(ctx: &LifecycleCtx) -> anyhow::Result<()> {
             gain_group(ctx, shard).await?;
         } else if !placed_here && hosted_here {
             lose_group(ctx, shard, replicas, &roster).await?;
+        } else if !placed_here {
+            // Steady-state remote: reassert the replica addresses — the
+            // group may have moved among OTHER nodes since this slot's
+            // backend was built, and its address list would silently go
+            // stale (live streams re-read the list on reconnect).
+            let addr_of = |nid: &u64| roster.get(nid).map(|i: &NodeInfo| i.advertise_addr.clone());
+            let addrs: Vec<String> = replicas.iter().filter_map(addr_of).collect();
+            if !addrs.is_empty() {
+                if let Some(server) = ctx.rooms.by_index(idx) {
+                    server.update_remote_replicas(addrs);
+                }
+            }
         }
     }
     Ok(())

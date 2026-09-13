@@ -236,12 +236,19 @@ pub struct ClusterConfig {
     /// (docs/design-room-sharding.md).
     #[serde(default)]
     pub room_shards: Option<u16>,
+    /// Room-shard replication factor, read ONLY when founding a new
+    /// cluster (default 3; 1..=9). Immutable for the cluster's life —
+    /// stored in cluster metadata like `room_shards`. Groups place on
+    /// min(RF, node count) nodes: clusters smaller than RF replicate
+    /// everywhere and grow into the factor as nodes join
+    /// (docs/design-room-sharding-phase2.md, phase 3).
+    #[serde(default)]
+    pub replication_factor: Option<u8>,
     /// DEBUG-ONLY replication-factor cap (docs/design-room-sharding-phase2.md
-    /// review call 4): overrides the every-node-hosts-everything floor so
-    /// the cluster harness can exercise remote serving before phase 3.
-    /// UNSAFE outside tests — phase 2b's shard movement does not exist,
-    /// so a capped cluster cannot rebalance. Must be identical on every
-    /// node (it is node-local config, not cluster state).
+    /// review call 4): overrides the configured replication factor so
+    /// the cluster harness can force remote serving below RF. UNSAFE
+    /// outside tests. Must be identical on every node (it is node-local
+    /// config, not cluster state).
     pub rf_cap_unsafe: Option<u8>,
     /// PEM certificate chain for this node's internal-RPC identity. Set
     /// together with `tls_key` and `tls_ca` to protect the control plane
@@ -342,6 +349,13 @@ impl Config {
                 anyhow::bail!("cluster.room_shards must be a power of two in 1..=1024 (got {n})");
             }
         }
+        if let Some(rf) = cfg.cluster.replication_factor {
+            // Bounded: each replica is a Raft voter, and quorums past a
+            // handful of voters only slow the group down.
+            if rf == 0 || rf > 9 {
+                anyhow::bail!("cluster.replication_factor must be in 1..=9 (got {rf})");
+            }
+        }
         Ok(cfg)
     }
 }
@@ -363,6 +377,10 @@ seeds = []
 # nodes; the count can never change later (no shard split/merge), so a
 # deployment expecting to exceed 16 nodes should set 64 up front.
 # room_shards = 16
+# Room-shard replication factor, fixed forever at cluster creation
+# (default 3). Groups place on min(RF, node count) nodes; nodes beyond
+# RF serve the extra shards remotely.
+# replication_factor = 3
 # Mutual TLS for the internal control plane. REQUIRED for multi-node: the
 # internal listener is otherwise unauthenticated, and a node that binds it
 # to a non-loopback address refuses to start without these. Every node's
@@ -480,6 +498,7 @@ mod tests {
         ClusterConfig {
             seeds: vec![],
             room_shards: None,
+            replication_factor: None,
             rf_cap_unsafe: None,
             tls_cert: cert.then(|| PathBuf::from("c")),
             tls_key: key.then(|| PathBuf::from("k")),

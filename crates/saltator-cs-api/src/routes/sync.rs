@@ -207,9 +207,12 @@ pub async fn sync_events(
     // compute: anything that lands after is delivered (or replayed), so
     // no wakeup can be lost — local or remote.
     let mut room_rx = Vec::new();
-    for (_, s) in state.rooms.iter() {
+    for (idx, s) in state.rooms.iter() {
         let from = s.current_seq().await.map_err(internal)?;
-        room_rx.push(s.changes(from));
+        // Slot-bound tail: a shard swapped hosted ↔ remote mid-poll
+        // keeps waking us instead of ending (or hot-spinning) the
+        // long-poll.
+        room_rx.push(state.rooms.tail(idx, from));
     }
     let mut user_rx = state.users.subscribe();
     let mut typing_rx = state.typing.subscribe();

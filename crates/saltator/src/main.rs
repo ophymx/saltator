@@ -269,10 +269,15 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // shard split/merge does not exist, so the founding value is the
     // cluster's value for life.
     if founding {
+        let defaults = saltator_cluster::ClusterConfig::default();
         meta.bootstrap_cluster(
             saltator_cluster::ClusterConfig {
                 room_shards: cfg.cluster.room_shards.unwrap_or(16),
-                ..Default::default()
+                replication_factor: cfg
+                    .cluster
+                    .replication_factor
+                    .unwrap_or(defaults.replication_factor),
+                ..defaults
             },
             cfg.node.advertise.clone(),
         )
@@ -306,7 +311,20 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             );
         }
     }
-    tracing::info!(room_shards, "cluster topology");
+    if let Some(want) = cfg.cluster.replication_factor {
+        if want != cluster_cfg.replication_factor {
+            tracing::warn!(
+                configured = want,
+                effective = cluster_cfg.replication_factor,
+                "cluster.replication_factor differs from the founding value; the durable                  cluster config wins (the factor is immutable for the cluster's life)"
+            );
+        }
+    }
+    tracing::info!(
+        room_shards,
+        replication_factor = cluster_cfg.replication_factor,
+        "cluster topology"
+    );
 
     // Event-signing identity: versioned, encrypted at rest in the
     // metadata group (spec.md §5.4, §10).
@@ -324,10 +342,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let shard_bootstrap_fedout = shard_bootstrap.clone();
     // The placement decides which room groups THIS node hosts (runs the
     // Raft group) vs serves remotely (reads over the Read RPC, writes as
-    // intents — docs/design-room-sharding-phase2.md). With the RF floor
-    // active (the default), every group lists every node and this is
-    // exactly the old behaviour; `rf_cap_unsafe` is what makes the
-    // remote arm reachable. Poll: a joiner can race replication.
+    // intents — docs/design-room-sharding-phase2.md). With
+    // `replication_factor` a real cap (phase 3), any cluster larger
+    // than RF boots some shards down each arm; `rf_cap_unsafe` forces
+    // the remote arm even below RF (debug). Poll: a joiner can race
+    // replication.
     let (placement, roster) = {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
@@ -337,7 +356,20 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                 let g = saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx).group();
                 !placement.replicas(g).is_empty()
             });
-            if complete || founding {
+            // A joiner must not act on a placement that predates its own
+            // admission: it would start ZERO room groups (its rendezvous
+            // slots aren't there yet) while the groups' leaders try to
+            // fold it in. "Reflects us" is detectable because the USER
+            // group floors at every ACTIVE node — a fresh placement
+            // always lists an active self there. (A non-active self —
+            // rebooting while draining — takes the placement as-is.)
+            let fresh = placement
+                .replicas(saltator_userserver::USER_SHARD.group())
+                .contains(&cfg.node.id)
+                || roster
+                    .get(&cfg.node.id)
+                    .is_some_and(|i| !matches!(i.status, saltator_cluster::NodeStatus::Active));
+            if founding || (complete && fresh) {
                 break (placement, roster);
             }
             if std::time::Instant::now() > deadline {

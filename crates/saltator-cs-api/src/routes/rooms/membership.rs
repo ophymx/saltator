@@ -108,12 +108,13 @@ async fn join_with_body(
             // once and then fails over exactly as before.
             let shard = state.rooms.for_room(room_id.as_str());
             let from = shard.current_seq().await.map_err(internal)?;
-            let mut changes = shard.changes(from);
+            let mut changes = state
+                .rooms
+                .tail(state.rooms.index_of(room_id.as_str()), from);
             let deadline = tokio::time::Instant::now() + RESTRICTED_AUTH_RECHECK;
             loop {
                 match tokio::time::timeout_at(deadline, changes.recv()).await {
                     Err(_) => break, // window closed; concede
-                    Ok(None) => break,
                     // A room-shard change (or a lagged stream — state moved
                     // even faster): re-evaluate.
                     Ok(_) => {
