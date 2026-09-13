@@ -252,19 +252,44 @@ node 2 joins; the placement moves a subset; rooms and messages created
 BEFORE the move stay readable through both nodes and new writes flow
 through node 1's remote path after it stood the group down.
 
-### 2b part 2 — checkpoint transfer (pending)
+### 2b part 2 — checkpoint transfer (BUILT 2026-09-13)
 
-- A bulk-channel service (`FetchCheckpoint`, streaming), serving
-  `KvEngine::checkpoint` output filtered to
-  `shard_bounds(keyspace, shard)`. Join flow per spec §4.4:
-  add-learner → ship checkpoint → Raft catches the tail → promote →
-  demote/remove the outgoing replica. openraft's `InstallSnapshot`
-  (part 1's transport) remains the fallback when no checkpoint peer is
-  available — it is an in-memory full-state copy on the control
-  channel, correct at current scales but the wrong shape for large
-  shards, which is exactly why part 2 exists.
-- Requires the second (bulk) listener the proto file has promised
-  since M4 — the first infrastructure in the tree to use it.
+- **`BulkService.FetchCheckpoint`** (server-streaming): the serving
+  replica checkpoints its state engine (`KvEngine::checkpoint` — a
+  point-in-time RocksDB view; reading a live engine could pair state
+  from after an apply with a `last_applied` from before it, and
+  replaying the gap would double-apply, the seq counter being state),
+  reads the shard's rows + bookkeeping from the frozen view, and
+  streams the postcard payload in 1 MiB chunks. Any replica serves —
+  a lagging follower's payload just leaves a longer tail.
+- **Connection classes, resolved**: the separation spec §8 wants is
+  the CLIENT's connection discipline — `fetch_checkpoint` dials a
+  fresh channel (its own TCP connection) per attempt, so checkpoint
+  bytes never share a connection with Raft heartbeats. The server
+  listener is shared; a dedicated bulk port stays available as a later
+  hardening if listener-level isolation is ever wanted.
+- **Pre-seed install** (`saltator_shard::transfer::install`): writes a
+  PRISTINE joiner's stores to look exactly like a node that crashed
+  right after a Raft snapshot install — app rows + sm bookkeeping +
+  the stored-snapshot record (state engine, durable), then
+  `K_LAST_PURGED`/`K_COMMITTED = last_applied` in the log engine, in
+  that order (purged-past-state is the one unrecoverable shape; the
+  reverse crash merely re-replicates). The group then boots reporting
+  `last_log = last_applied`, and the leader replicates only the tail —
+  it never builds or ships a snapshot of its own.
+- **Candidate selection**: current HOLDERS, not the placement — during
+  a move the placement names the destination, so the state lives with
+  nodes the placement no longer lists. Candidates = the placement's
+  other replicas, then the rest of the roster; non-holders answer
+  NotFound and are skipped. (The first smoke run failed exactly here.)
+- Hooked at both gain sites: boot (a non-founding node hosting a group
+  with state elsewhere) and the lifecycle driver. Best-effort
+  throughout: any failure clears the partial install and falls back to
+  part 1's openraft `InstallSnapshot` path.
+- Proven by `shard_move_smoke.sh`, which now also asserts the moved
+  state arrived via `pre-seeded room shard from checkpoint` — plus a
+  crate round-trip test (fetch → install → boot → replay; double
+  install refused).
 
 ## Testing
 

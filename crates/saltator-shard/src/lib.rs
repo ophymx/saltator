@@ -20,6 +20,7 @@ pub mod migrate;
 pub mod read;
 pub mod registry;
 pub mod storage;
+pub mod transfer;
 
 #[allow(unused_imports)]
 use std::io::Cursor; // used by declare_raft_types! default SnapshotData

@@ -440,6 +440,18 @@ impl ShardHandle {
         self.changes.subscribe()
     }
 
+    /// Build a whole-shard transfer payload from a point-in-time engine
+    /// checkpoint written under `scratch` (serving side of the bulk
+    /// FetchCheckpoint stream; docs/design-room-sharding-phase2.md 2b).
+    /// Any replica may serve this — a lagging follower's payload just
+    /// leaves a longer log tail for the leader to replicate.
+    pub fn build_transfer(
+        &self,
+        scratch: &std::path::Path,
+    ) -> Result<crate::transfer::TransferSnapshot> {
+        crate::transfer::build_from_checkpoint(&*self.engine, self.shard, scratch)
+    }
+
     /// Reconstruct change records `(from_seq, from_seq + limit]` from
     /// applied state via the app's [`ShardApp::replay`] — the backfill
     /// half of a gap-free subscription. Locally consistent; pair with

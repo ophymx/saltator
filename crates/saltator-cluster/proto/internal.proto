@@ -142,6 +142,27 @@ message ExecuteResponse {
   optional string leader_addr = 4;
 }
 
+// Whole-shard state for a move (docs/design-room-sharding-phase2.md,
+// 2b part 2): a joining replica pre-seeds itself from any current
+// replica, then the Raft leader replicates only the log tail. BULK
+// traffic: clients MUST call this over a dedicated connection (its own
+// channel, hence its own TCP stream) so checkpoint bytes never share a
+// connection with Raft heartbeats (spec.md §8's connection classes —
+// the separation is the client's connection discipline; the server
+// listener is shared).
+message CheckpointRequest {
+  uint64 group = 1;
+}
+
+message CheckpointChunk {
+  // One chunk of the postcard-encoded TransferSnapshot.
+  bytes data = 1;
+}
+
+service BulkService {
+  rpc FetchCheckpoint(CheckpointRequest) returns (stream CheckpointChunk);
+}
+
 service ControlService {
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc Join(JoinRequest) returns (JoinResponse);

@@ -32,18 +32,18 @@ use crate::app::{ApplyCtx, ShardApp, APP_TABLE_MIN, T_SCHEMA};
 use crate::handle::ChangeRecord;
 use crate::{Node, NodeId, ShardId, TypeConfig};
 
-const T_LOG: u8 = 0;
-const T_RAFT: u8 = 1;
-const T_SM_META: u8 = 2;
+pub(crate) const T_LOG: u8 = 0;
+pub(crate) const T_RAFT: u8 = 1;
+pub(crate) const T_SM_META: u8 = 2;
 
-const K_VOTE: &[u8] = b"vote";
-const K_COMMITTED: &[u8] = b"committed";
-const K_LAST_PURGED: &[u8] = b"last_purged";
-const K_LAST_APPLIED: &[u8] = b"last_applied";
-const K_MEMBERSHIP: &[u8] = b"membership";
-const K_SNAPSHOT: &[u8] = b"snapshot";
+pub(crate) const K_VOTE: &[u8] = b"vote";
+pub(crate) const K_COMMITTED: &[u8] = b"committed";
+pub(crate) const K_LAST_PURGED: &[u8] = b"last_purged";
+pub(crate) const K_LAST_APPLIED: &[u8] = b"last_applied";
+pub(crate) const K_MEMBERSHIP: &[u8] = b"membership";
+pub(crate) const K_SNAPSHOT: &[u8] = b"snapshot";
 const K_SNAPSHOT_SEQ: &[u8] = b"snapshot_seq";
-const K_SEQ: &[u8] = b"seq";
+pub(crate) const K_SEQ: &[u8] = b"seq";
 
 /// Schema-version cell key within [`T_SCHEMA`].
 pub(crate) const K_SCHEMA_VERSION: &[u8] = b"version";
@@ -119,9 +119,9 @@ struct SnapshotContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredSnapshot {
-    meta: SnapshotMeta<NodeId, Node>,
-    data: Vec<u8>,
+pub(crate) struct StoredSnapshot {
+    pub(crate) meta: SnapshotMeta<NodeId, Node>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// Read a shard's current sequence number straight from the engine

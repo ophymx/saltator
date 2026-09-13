@@ -301,3 +301,57 @@ impl saltator_shard::RemoteShardBackend for RemoteShard {
         Box::pin(RemoteShard::subscribe(self, from_seq))
     }
 }
+
+/// Fetch a whole-shard transfer payload for `group` from the first
+/// candidate that serves it — over a FRESH channel per attempt, i.e. a
+/// dedicated TCP connection: bulk bytes never share a connection with
+/// control traffic (spec.md §8's connection classes, client side).
+pub async fn fetch_checkpoint(
+    group: u64,
+    candidates: &[String],
+    tls: Option<&ClientTlsConfig>,
+) -> Result<saltator_shard::transfer::TransferSnapshot> {
+    let mut last_err = None;
+    for addr in candidates {
+        let channel = match connect(addr, tls).await {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let mut client = crate::proto::bulk_service_client::BulkServiceClient::new(channel)
+            .max_decoding_message_size(usize::MAX);
+        let stream = match client
+            .fetch_checkpoint(crate::proto::CheckpointRequest { group })
+            .await
+        {
+            Ok(s) => s.into_inner(),
+            Err(e) => {
+                last_err = Some(ShardError::Raft(format!("fetch_checkpoint {addr}: {e}")));
+                continue;
+            }
+        };
+        let mut bytes = Vec::new();
+        let mut stream = stream;
+        let mut failed = false;
+        loop {
+            match stream.message().await {
+                Ok(Some(chunk)) => bytes.extend_from_slice(&chunk.data),
+                Ok(None) => break,
+                Err(e) => {
+                    last_err = Some(ShardError::Raft(format!("checkpoint stream {addr}: {e}")));
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            continue;
+        }
+        return postcard::from_bytes(&bytes)
+            .map_err(|e| ShardError::Codec(format!("transfer decode: {e}")));
+    }
+    Err(last_err
+        .unwrap_or_else(|| ShardError::Raft(format!("group {group}: no checkpoint source"))))
+}
