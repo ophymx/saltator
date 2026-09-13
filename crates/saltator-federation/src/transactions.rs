@@ -523,7 +523,7 @@ async fn trust_origin_keys(state: &FedState, origin: &str) {
     if let Ok(keys) = state.key_cache.keys_for(origin, now).await {
         if let Some(set) = keys.get(origin) {
             for (_, shard) in rooms.iter() {
-                shard.trust_keys(origin, set.clone());
+                shard.trust_keys(origin, set.clone()).await;
             }
         }
     }

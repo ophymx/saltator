@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 saltator-core.workspace = true
 saltator-roomserver.workspace = true
+saltator-shard.workspace = true
 saltator-userserver.workspace = true
 saltator-fedout.workspace = true
 saltator-appservice.workspace = true

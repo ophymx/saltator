@@ -84,7 +84,11 @@ async fn run(state: Arc<CsState>) -> Result<(), String> {
     // In-memory by design, like federation's DeliveryBackoff: a failover
     // retries immediately once, then re-learns the backoff.
     let mut backoff: HashMap<String, (Instant, Duration)> = HashMap::new();
-    let mut changes: Vec<_> = state.rooms.iter().map(|(_, s)| s.subscribe()).collect();
+    let mut changes = Vec::new();
+    for (_, s) in state.rooms.iter() {
+        let from = s.current_seq().await.map_err(|e| e.to_string())?;
+        changes.push(s.changes(from));
+    }
 
     loop {
         if fedout.shard_handle().is_leader() {
@@ -153,7 +157,7 @@ async fn deliver_to(
         None => {
             // First contact: seed at the current tip. History predating
             // the registration is not replayed at a bridge.
-            let tip = rooms.shard_handle().seq().map_err(|e| e.to_string())?;
+            let tip = rooms.current_seq().await.map_err(|e| e.to_string())?;
             fedout
                 .advance_as_cursor(&reg.id, room_shard, tip)
                 .await

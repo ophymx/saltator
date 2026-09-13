@@ -97,7 +97,11 @@ pub fn spawn_delivery_worker(
     backoff: Arc<DeliveryBackoff>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut room_changes: Vec<_> = rooms.iter().map(|(_, s)| s.subscribe()).collect();
+        let mut room_changes = Vec::new();
+        for (_, s) in rooms.iter() {
+            let from = s.current_seq().await.unwrap_or(0);
+            room_changes.push(s.changes(from));
+        }
         let mut fedout_changes = fedout.subscribe();
         // In-memory per-shard PDU scan floors; re-derived from durable
         // cursors (or each shard's tip) whenever we (re)gain leadership.
@@ -106,12 +110,11 @@ pub fn spawn_delivery_worker(
         loop {
             if fedout.shard_handle().is_leader() {
                 if scan_pos.is_none() {
-                    scan_pos = Some(
-                        rooms
-                            .iter()
-                            .map(|(idx, shard)| (idx, initial_scan_pos(&fedout, idx, shard)))
-                            .collect(),
-                    );
+                    let mut floors = std::collections::BTreeMap::new();
+                    for (idx, shard) in rooms.iter() {
+                        floors.insert(idx, initial_scan_pos(&fedout, idx, shard).await);
+                    }
+                    scan_pos = Some(floors);
                 }
                 if let Some(floors) = scan_pos.as_mut() {
                     for (idx, shard) in rooms.iter() {
@@ -150,7 +153,7 @@ pub fn spawn_delivery_worker(
 /// yet (first boot after the upgrade, or a quiet server): history predates
 /// the shard and re-federating it to everyone would be wrong — that was
 /// also the old sender's start-at-tip behaviour.
-fn initial_scan_pos(fedout: &FedOutServer, room_shard: u16, rooms: &RoomServer) -> u64 {
+async fn initial_scan_pos(fedout: &FedOutServer, room_shard: u16, rooms: &RoomServer) -> u64 {
     let cursors = fedout.store().pdu_cursors().unwrap_or_default();
     match cursors
         .iter()
@@ -159,7 +162,7 @@ fn initial_scan_pos(fedout: &FedOutServer, room_shard: u16, rooms: &RoomServer) 
         .min()
     {
         Some(seq) => seq,
-        None => rooms.shard_handle().seq().unwrap_or(0),
+        None => rooms.current_seq().await.unwrap_or(0),
     }
 }
 

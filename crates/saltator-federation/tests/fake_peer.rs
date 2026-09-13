@@ -1004,7 +1004,7 @@ async fn peer_joins_our_room(
         .get(server)
         .cloned()
         .expect("joiner keys");
-    rooms.trust_keys(server, keys);
+    rooms.trust_keys(server, keys).await;
     let user = ruma::OwnedUserId::try_from(format!("@{localpart}:{server}")).unwrap();
     let (version, mut template) = rooms
         .make_join_template(

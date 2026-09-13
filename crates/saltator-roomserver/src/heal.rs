@@ -93,6 +93,15 @@ impl RoomServer {
         origin: &str,
         raw: CanonicalJsonObject,
     ) -> Result<Outcome> {
+        if let Some(r) = self.remote_backend() {
+            let intent = crate::remote::RoomIntent::IngestPdu {
+                raw,
+                origin: Some(origin.to_owned()),
+                healing: true,
+                reject_missing_auth: false,
+            };
+            return crate::remote::want_outcome(crate::remote::call(r, &intent).await?);
+        }
         let mut tried_gap = false;
         let mut tried_auth = false;
         loop {

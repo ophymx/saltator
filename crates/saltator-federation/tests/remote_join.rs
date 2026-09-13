@@ -103,7 +103,7 @@ async fn verify_pdu_at_accepts_only_trusted_untampered_events() {
         .get("a.test")
         .cloned()
         .expect("a.test keys");
-    rooms_b.trust_keys("a.test", a_keys);
+    rooms_b.trust_keys("a.test", a_keys).await;
     assert!(
         rooms_b.verify_pdu_at(RoomVersion::V11, &raw),
         "must accept a genuinely-signed event from a trusted server"

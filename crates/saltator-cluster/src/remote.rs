@@ -15,7 +15,7 @@ use saltator_shard::{ChangeRecord, ReadOp, ReadValue, ShardError};
 
 use crate::forward::connect;
 use crate::proto::control_service_client::ControlServiceClient;
-use crate::proto::{ReadRequest, SubscribeRequest};
+use crate::proto::{ExecuteRequest, ReadRequest, SubscribeRequest};
 
 /// How many redirect/replica hops one read attempts before giving up —
 /// covers a stale leader hint plus an election.
@@ -146,6 +146,60 @@ impl RemoteShard {
         }))
     }
 
+    /// Execute one app-level intent at the group's leader — the write
+    /// path for a shard this node does not host. Same hint-following
+    /// discipline as [`Self::read`].
+    pub async fn execute(&self, intent: Vec<u8>) -> Result<Vec<u8>> {
+        let mut queue: std::collections::VecDeque<String> = self.candidates().into();
+        let mut last_err = None;
+        for _ in 0..READ_MAX_HOPS {
+            let Some(addr) = queue.pop_front() else {
+                tokio::time::sleep(READ_RETRY_PAUSE).await;
+                queue = self.candidates().into();
+                continue;
+            };
+            let channel = match self.channel(&addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let mut client = ControlServiceClient::new(channel);
+            let resp = match client
+                .execute(ExecuteRequest {
+                    group: self.group,
+                    intent: intent.clone(),
+                })
+                .await
+            {
+                Ok(r) => r.into_inner(),
+                Err(e) => {
+                    self.drop_channel(&addr);
+                    last_err = Some(ShardError::Raft(format!("execute rpc {addr}: {e}")));
+                    continue;
+                }
+            };
+            if resp.served {
+                *self.preferred.lock().expect("preferred lock") = Some(addr);
+                return Ok(resp.result);
+            }
+            if let Some(hint) = resp.leader_addr {
+                if hint != addr {
+                    queue.push_front(hint);
+                    continue;
+                }
+            }
+            tokio::time::sleep(READ_RETRY_PAUSE).await;
+        }
+        Err(last_err.unwrap_or_else(|| {
+            ShardError::Raft(format!(
+                "group {}: no replica served the intent",
+                self.group
+            ))
+        }))
+    }
+
     /// A gap-free change stream from `from_seq` (exclusive) that
     /// reconnects on stream errors, resuming from the last seen seq. Any
     /// replica serves it (tailing consumers tolerate replication lag).
@@ -216,5 +270,34 @@ impl RemoteShard {
                 }
             }
         }
+    }
+}
+
+impl saltator_shard::RemoteReader for RemoteShard {
+    fn read(
+        &self,
+        op: saltator_shard::ReadOp,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<saltator_shard::ReadValue>> + Send + '_>,
+    > {
+        Box::pin(async move { RemoteShard::read(self, &op).await })
+    }
+}
+
+impl saltator_shard::RemoteShardBackend for RemoteShard {
+    fn execute(
+        &self,
+        intent: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>> {
+        Box::pin(RemoteShard::execute(self, intent))
+    }
+
+    fn subscribe(
+        &self,
+        from_seq: u64,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<saltator_shard::ChangeRecord>> + Send + 'static>,
+    > {
+        Box::pin(RemoteShard::subscribe(self, from_seq))
     }
 }

@@ -28,7 +28,9 @@ use saltator_store::Keyspace;
 
 pub use app::{ApplyCtx, ReadCtx, ShardApp, APP_TABLE_FIRST, APP_TABLE_MIN, T_SCHEMA};
 pub use handle::{ChangeRecord, ForwardOutcome, NoopNetworkFactory, ProposeForwarder, ShardHandle};
-pub use read::{ReadOp, ReadValue};
+pub use read::{
+    ExecutorRegistry, GroupExecutor, ReadOp, ReadValue, RemoteReader, RemoteShardBackend,
+};
 pub use registry::ShardRegistry;
 
 /// Version tag for postcard-encoded internal payloads (spec.md §8).

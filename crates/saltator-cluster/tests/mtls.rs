@@ -58,6 +58,7 @@ fn spawn_serve(
     tokio::spawn(serve_internal_with_tls(
         meta,
         registry,
+        saltator_shard::ExecutorRegistry::new(),
         "hs.test".into(),
         vec![],
         addr,

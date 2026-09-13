@@ -12,6 +12,7 @@ serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+futures-util.workspace = true
 tracing.workspace = true
 metrics.workspace = true
 openraft.workspace = true

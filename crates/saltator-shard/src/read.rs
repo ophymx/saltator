@@ -57,6 +57,71 @@ pub trait RemoteReader: Send + Sync + 'static {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ReadValue>> + Send + '_>>;
 }
 
+/// The full remote face of a shard hosted elsewhere: reads, domain
+/// intents (writes — the pipeline that builds commands runs only where
+/// the shard is hosted, so the INTENT travels, not the command), and
+/// the change subscription. Implemented by the cluster crate's
+/// RemoteShard.
+pub trait RemoteShardBackend: RemoteReader {
+    /// Execute one app-level intent at the shard's leader; bytes are
+    /// the app's own (postcard) encoding on both sides.
+    fn execute(
+        &self,
+        intent: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>>;
+
+    /// A gap-free change stream from `from_seq` (exclusive), resuming
+    /// across reconnects.
+    fn subscribe(
+        &self,
+        from_seq: u64,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<crate::ChangeRecord>> + Send + 'static>,
+    >;
+}
+
+/// Serves [`RemoteShardBackend::execute`] for one locally-hosted group:
+/// decodes the app's intent and runs the corresponding domain method.
+/// Registered per group (by the daemon, which owns every layer the
+/// handlers need — e.g. the federation fetcher for healing ingests).
+pub trait GroupExecutor: Send + Sync + 'static {
+    fn execute(
+        &self,
+        intent: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>>;
+}
+
+/// Node-local registry of intent executors, keyed by group — the
+/// Execute RPC's dispatch table, mirroring [`crate::ShardRegistry`].
+/// Late-bound: the RPC server starts before the serving stack exists.
+#[derive(Clone, Default)]
+pub struct ExecutorRegistry {
+    inner: std::sync::Arc<
+        std::sync::RwLock<std::collections::HashMap<u64, std::sync::Arc<dyn GroupExecutor>>>,
+    >,
+}
+
+impl ExecutorRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, group: u64, executor: std::sync::Arc<dyn GroupExecutor>) {
+        self.inner
+            .write()
+            .expect("executor registry lock poisoned")
+            .insert(group, executor);
+    }
+
+    pub fn get(&self, group: u64) -> Option<std::sync::Arc<dyn GroupExecutor>> {
+        self.inner
+            .read()
+            .expect("executor registry lock poisoned")
+            .get(&group)
+            .cloned()
+    }
+}
+
 /// Execute one op against applied state. The caller owns linearizability
 /// (`ensure_linearizable` before, on the leader).
 pub fn execute(ctx: &ReadCtx, seq: u64, op: &ReadOp) -> Result<ReadValue> {

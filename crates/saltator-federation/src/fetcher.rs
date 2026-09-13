@@ -151,7 +151,7 @@ impl EventFetcher for FedFetcher {
         let now = crate::now_ms();
         if let Ok(keys) = self.key_cache.keys_for(origin, now).await {
             if let Some(set) = keys.get(origin) {
-                self.rooms.trust_keys(origin, set.clone());
+                self.rooms.trust_keys(origin, set.clone()).await;
             }
         }
     }
@@ -182,4 +182,43 @@ fn path_encode(s: &str) -> String {
 /// Percent-encode an event ID for use as a query-string value.
 fn query_encode(s: &str) -> String {
     s.replace('%', "%25").replace('&', "%26")
+}
+
+/// A [`saltator_shard::GroupExecutor`] for one hosted room shard: runs
+/// remote write INTENTS (docs/design-room-sharding-phase2.md, 2a part 3)
+/// through the local `RoomServer`, with this stack's federation fetcher
+/// powering healing ingests. Built by the daemon once the outbound
+/// client exists.
+pub fn room_intent_executor(
+    server: Arc<RoomServer>,
+    client: Option<Arc<FederationClient>>,
+    key_cache: Arc<KeyCache>,
+) -> Arc<dyn saltator_shard::GroupExecutor> {
+    struct Exec {
+        server: Arc<RoomServer>,
+        fetcher: FedFetcher,
+    }
+    impl saltator_shard::GroupExecutor for Exec {
+        fn execute(
+            &self,
+            intent: Vec<u8>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = saltator_shard::Result<Vec<u8>>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                Ok(saltator_roomserver::remote::apply_intent(
+                    &self.server,
+                    Some(&self.fetcher),
+                    &intent,
+                )
+                .await)
+            })
+        }
+    }
+    let fetcher = FedFetcher {
+        client,
+        key_cache,
+        rooms: server.clone(),
+    };
+    Arc::new(Exec { server, fetcher })
 }

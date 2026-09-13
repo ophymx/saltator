@@ -36,7 +36,7 @@ pub async fn trust_event_servers_on(
     for server in &servers {
         if let Ok(keys) = key_cache.keys_for(server, now).await {
             if let Some(set) = keys.get(server.as_str()) {
-                shard.trust_keys(server, set.clone());
+                shard.trust_keys(server, set.clone()).await;
             }
         }
     }
@@ -62,7 +62,7 @@ pub async fn trust_event_servers(
                 // Server keys are server-wide, but each shard verifies
                 // with its own trusted set — seed them all.
                 for (_, shard) in rooms.iter() {
-                    shard.trust_keys(server, set.clone());
+                    shard.trust_keys(server, set.clone()).await;
                 }
             }
         }

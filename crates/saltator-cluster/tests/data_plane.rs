@@ -101,6 +101,7 @@ async fn start_node(node_id: u64, bootstrap: bool) -> Node {
     tokio::spawn(serve_internal(
         meta.clone(),
         registry,
+        saltator_shard::ExecutorRegistry::new(),
         "hs.test".into(),
         vec![],
         addr,
@@ -280,6 +281,7 @@ async fn subscribe_without_replay_support_is_a_clean_error() {
     tokio::spawn(serve_internal(
         meta,
         registry,
+        saltator_shard::ExecutorRegistry::new(),
         "hs.test".into(),
         vec![],
         addr,

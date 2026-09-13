@@ -188,8 +188,13 @@ impl Placement {
 /// `replication_factor` becomes a real cap once data-plane routing for
 /// unhosted shards exists; the rendezvous ranking already yields the
 /// stable per-group orderings that cap will truncate to.
-pub fn assign(config: &ClusterConfig, nodes: &BTreeSet<NodeId>) -> Placement {
-    let rf = (config.replication_factor as usize).max(nodes.len());
+pub fn assign(config: &ClusterConfig, rf_cap: Option<u8>, nodes: &BTreeSet<NodeId>) -> Placement {
+    let rf = match rf_cap {
+        // The debug cap replaces the floor outright — the whole point is
+        // exercising nodes that do NOT host a group (phase 2a harness).
+        Some(cap) => (cap as usize).max(1),
+        None => (config.replication_factor as usize).max(nodes.len()),
+    };
     let mut groups = BTreeMap::new();
     for g in config.data_groups() {
         let mut ranked: Vec<NodeId> = nodes.iter().copied().collect();
@@ -252,7 +257,7 @@ mod tests {
         assert_eq!(after.len(), 2, "still in the roster");
         assert_eq!(after[&2].status, NodeStatus::Draining);
         assert_eq!(active_nodes(&after), nodes(&[1]));
-        for (_g, r) in assign(&big_config(), &active_nodes(&after)).iter() {
+        for (_g, r) in assign(&big_config(), None, &active_nodes(&after)).iter() {
             assert_eq!(r, [1], "a draining node hosts nothing");
         }
     }
@@ -299,7 +304,7 @@ mod tests {
     fn assignment_is_deterministic() {
         let cfg = big_config();
         let ns = nodes(&[1, 2, 3, 4, 5]);
-        assert_eq!(assign(&cfg, &ns), assign(&cfg, &ns));
+        assert_eq!(assign(&cfg, None, &ns), assign(&cfg, None, &ns));
     }
 
     #[test]
@@ -309,12 +314,12 @@ mod tests {
         // outside a replica set could neither boot nor serve.
         let cfg = big_config();
         let ns = nodes(&[1, 2, 3, 4, 5]);
-        for (_g, r) in assign(&cfg, &ns).iter() {
+        for (_g, r) in assign(&cfg, None, &ns).iter() {
             assert_eq!(r.len(), 5, "every node hosts every group");
             let uniq: BTreeSet<_> = r.iter().copied().collect();
             assert_eq!(uniq.len(), r.len(), "replicas must be distinct nodes");
         }
-        for (_g, r) in assign(&cfg, &nodes(&[1, 2])).iter() {
+        for (_g, r) in assign(&cfg, None, &nodes(&[1, 2])).iter() {
             assert_eq!(r.len(), 2);
         }
     }
@@ -322,8 +327,8 @@ mod tests {
     #[test]
     fn node_join_displaces_at_most_one_replica_per_group() {
         let cfg = big_config();
-        let before = assign(&cfg, &nodes(&[1, 2, 3]));
-        let after = assign(&cfg, &nodes(&[1, 2, 3, 4]));
+        let before = assign(&cfg, None, &nodes(&[1, 2, 3]));
+        let after = assign(&cfg, None, &nodes(&[1, 2, 3, 4]));
         // Rendezvous's minimal-churn guarantee is per group: a join adds only
         // the newcomer and evicts at most one incumbent — never a wholesale
         // remap of who hosts what.

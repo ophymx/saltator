@@ -49,7 +49,7 @@ write_config "$WORK/n2" 2 "127.0.0.1:17401" "127.0.0.1:18009" "127.0.0.1:18449" 
 wait_up() {
   local url="$1"
   for _ in $(seq 1 120); do
-    curl -fsS "$url/_matrix/client/versions" >/dev/null 2>&1 && return 0
+    curl -fsS --max-time 30 "$url/_matrix/client/versions" >/dev/null 2>&1 && return 0
     sleep 0.5
   done
   return 1
@@ -89,13 +89,13 @@ done
 if [ "$pass" = 1 ]; then
   echo "=== leader forwarding via node 2 (follower) ==="
   C2=http://127.0.0.1:18009
-  TOKEN=$(curl -fsS -X POST "$C2/_matrix/client/v3/register" \
+  TOKEN=$(curl -fsS --max-time 30 -X POST "$C2/_matrix/client/v3/register" \
     -H 'Content-Type: application/json' \
     -d '{"auth":{"type":"m.login.dummy"},"username":"fwd","password":"p"}' | jq -r .access_token 2>/dev/null)
   if [ -z "$TOKEN" ] || [ "$TOKEN" = null ]; then
     echo "FORWARDING FAIL: register via follower did not succeed"; pass=0
   else
-    ROOM=$(curl -fsS -X POST "$C2/_matrix/client/v3/createRoom" \
+    ROOM=$(curl -fsS --max-time 30 -X POST "$C2/_matrix/client/v3/createRoom" \
       -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
       -d '{"preset":"public_chat"}' | jq -r .room_id 2>/dev/null)
     if [ -z "$ROOM" ] || [ "$ROOM" = null ]; then
@@ -111,7 +111,7 @@ if [ "$pass" = 1 ]; then
       else
         # Read-your-writes: no retry loop — the ack must imply local
         # visibility on the node that served the write.
-        BODY=$(curl -fsS "$C2/_matrix/client/v3/rooms/$ROOM_ENC/messages?dir=b&limit=10" \
+        BODY=$(curl -fsS --max-time 30 "$C2/_matrix/client/v3/rooms/$ROOM_ENC/messages?dir=b&limit=10" \
           -H "Authorization: Bearer $TOKEN" | jq -r '.chunk[]?.content.body // empty')
         if ! printf '%s\n' "$BODY" | grep -qxF "forwarded-write"; then
           echo "READ-YOUR-WRITES FAIL: acked write not readable from the serving follower"; pass=0

@@ -121,10 +121,32 @@ message ChangeFrame {
   bytes payload = 2;
 }
 
+// An app-level intent executed where the group is hosted — the write
+// path for unhosted shards. The pipeline that turns an intent into a
+// Raft command (reads, auth, state resolution, signing) runs only at
+// the shard's leader (spec.md §5.2), so the INTENT travels, not the
+// command. Leader-gated with hints, like Propose/Read.
+message ExecuteRequest {
+  uint64 group = 1;
+  // postcard-encoded app intent (the app owns the meaning; rooms use
+  // saltator_roomserver::RoomIntent).
+  bytes intent = 2;
+}
+
+message ExecuteResponse {
+  bool served = 1;
+  // Set when served: the app's (postcard) response bytes.
+  bytes result = 2;
+  // Set when not served: where the leader is believed to be.
+  optional uint64 leader_id = 3;
+  optional string leader_addr = 4;
+}
+
 service ControlService {
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc Join(JoinRequest) returns (JoinResponse);
   rpc Propose(ProposeRequest) returns (ProposeResponse);
   rpc Read(ReadRequest) returns (ReadResponse);
   rpc Subscribe(SubscribeRequest) returns (stream ChangeFrame);
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
 }

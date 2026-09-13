@@ -185,6 +185,9 @@ pub struct MetadataHandle {
     /// Serializes control-plane read-modify-write updates (roster/placement)
     /// so concurrent joins on the leader can't clobber each other.
     updates: Arc<tokio::sync::Mutex<()>>,
+    /// Debug-only replication cap for placement (see
+    /// `cluster.rf_cap_unsafe`); shared across clones, set once at boot.
+    rf_cap: Arc<std::sync::OnceLock<u8>>,
 }
 
 impl MetadataHandle {
@@ -229,6 +232,7 @@ impl MetadataHandle {
         Ok(Self {
             inner,
             updates: Arc::new(tokio::sync::Mutex::new(())),
+            rf_cap: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -244,6 +248,20 @@ impl MetadataHandle {
     /// subscription).
     pub fn shard_handle(&self) -> &saltator_shard::ShardHandle {
         &self.inner
+    }
+
+    /// Set the debug-only replication cap (`cluster.rf_cap_unsafe`)
+    /// before any placement write. No-op if already set.
+    pub fn set_rf_cap_unsafe(&self, cap: u8) {
+        let _ = self.rf_cap.set(cap);
+        tracing::warn!(
+            cap,
+            "rf_cap_unsafe active: placement will EXCLUDE nodes (debug only)"
+        );
+    }
+
+    fn rf_cap(&self) -> Option<u8> {
+        self.rf_cap.get().copied()
     }
 
     /// Subscribe to the metadata change stream from now (schema v2:
@@ -370,7 +388,7 @@ impl MetadataHandle {
     /// is merely stale, and the next roster change recomputes it.
     async fn write_roster(&self, roster: &Roster) -> Result<()> {
         let config = self.cluster_config().await?.unwrap_or_default();
-        let placement = placement::assign(&config, &placement::active_nodes(roster));
+        let placement = placement::assign(&config, self.rf_cap(), &placement::active_nodes(roster));
         self.set_blob(K_ROSTER, roster).await?;
         self.set_blob(K_PLACEMENT, &placement).await?;
         Ok(())
@@ -494,6 +512,7 @@ impl MetadataHandle {
 pub async fn serve_internal(
     handle: MetadataHandle,
     registry: ShardRegistry,
+    executors: saltator_shard::ExecutorRegistry,
     server_name: String,
     schemas: Vec<(u32, u32)>,
     listen: std::net::SocketAddr,
@@ -502,6 +521,7 @@ pub async fn serve_internal(
     serve_internal_with_tls(
         handle,
         registry,
+        executors,
         server_name,
         schemas,
         listen,
@@ -520,13 +540,14 @@ pub async fn serve_internal(
 pub async fn serve_internal_with_tls(
     handle: MetadataHandle,
     registry: ShardRegistry,
+    executors: saltator_shard::ExecutorRegistry,
     server_name: String,
     schemas: Vec<(u32, u32)>,
     listen: std::net::SocketAddr,
     tls: Option<tls::InternalTls>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let svc = rpc::InternalRpc::new(handle, registry, server_name, schemas);
+    let svc = rpc::InternalRpc::new(handle, registry, executors, server_name, schemas);
     let svc = Arc::new(svc);
 
     let mut builder = tonic::transport::Server::builder();

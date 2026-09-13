@@ -203,19 +203,23 @@ pub async fn sync_events(
         }
     }
 
-    // Subscribe before the first compute (no lost wakeups).
-    let mut room_rx: Vec<_> = state.rooms.iter().map(|(_, s)| s.subscribe()).collect();
+    // Anchor each shard's stream at its current seq before the first
+    // compute: anything that lands after is delivered (or replayed), so
+    // no wakeup can be lost — local or remote.
+    let mut room_rx = Vec::new();
+    for (_, s) in state.rooms.iter() {
+        let from = s.current_seq().await.map_err(internal)?;
+        room_rx.push(s.changes(from));
+    }
     let mut user_rx = state.users.subscribe();
     let mut typing_rx = state.typing.subscribe();
     let mut presence_rx = state.presence.subscribe();
 
     loop {
-        let room_seqs: Vec<u64> = state
-            .rooms
-            .iter()
-            .map(|(_, s)| s.shard_handle().seq())
-            .collect::<std::result::Result<_, _>>()
-            .map_err(internal)?;
+        let mut room_seqs: Vec<u64> = Vec::with_capacity(state.rooms.count() as usize);
+        for (_, s) in state.rooms.iter() {
+            room_seqs.push(s.current_seq().await.map_err(internal)?);
+        }
         // The membership index (user shard) is a projection of the room shard
         // and trails it. Classifying rooms into join/leave/invite from a stale
         // membership while showing the room-shard timeline up to `room_seq`
