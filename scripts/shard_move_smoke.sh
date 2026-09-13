@@ -117,6 +117,15 @@ if [ "${moved:-0}" -lt 1 ]; then
 fi
 echo "node 1 stood down $moved group(s)"
 
+# 2b part 2: the moved state must have arrived via the bulk checkpoint
+# pre-seed, not a leader-shipped raft snapshot.
+if ! strip_ansi "$WORK/n2.log" | grep -q "pre-seeded room shard from checkpoint"; then
+  echo "FAIL: node 2 never pre-seeded from a checkpoint"
+  strip_ansi "$WORK/n2.log" | grep -iE "pre-seed|snapshot" | tail -6
+  exit 1
+fi
+echo "node 2 pre-seeded its gained shard(s) from a checkpoint"
+
 pass=1
 # Every pre-move room + message must survive, read through BOTH nodes.
 for idx in "${!ROOMS[@]}"; do

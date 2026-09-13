@@ -359,6 +359,20 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         let hosted = founding || replicas.contains(&cfg.node.id);
         if hosted {
             hosted_rooms += 1;
+            // A joiner gaining a group that already has state elsewhere
+            // pre-seeds from a replica's checkpoint over the bulk
+            // channel (2b part 2) — best-effort; the raft snapshot path
+            // covers any failure.
+            if !founding {
+                let addrs = lifecycle::seed_candidates(replicas, &roster, cfg.node.id);
+                lifecycle::pre_seed(
+                    &stores,
+                    shard,
+                    &addrs,
+                    internal_tls.as_ref().map(|t| t.client()).as_ref(),
+                )
+                .await;
+            }
             room_shard_servers.push(
                 saltator_roomserver::RoomServer::start_shard(
                     shard,

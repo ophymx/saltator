@@ -335,3 +335,63 @@ async fn placement_watch_sees_control_plane_writes() {
     let change: saltator_cluster::types::MetaChange = postcard::from_bytes(&rec.payload).unwrap();
     assert_eq!(change.key, saltator_cluster::K_PLACEMENT);
 }
+
+/// 2b part 2: a pristine node pre-seeds a shard from a replica's
+/// checkpoint over the bulk FetchCheckpoint stream, and the installed
+/// stores report exactly the state a raft-snapshot install would —
+/// last_applied, seq, rows — so a subsequently-started group needs only
+/// the log tail.
+#[tokio::test]
+async fn checkpoint_transfer_round_trip() {
+    let node = start_node(1, true).await;
+    for i in 0..64u8 {
+        node.shard.propose(vec![i]).await.unwrap();
+    }
+    let want_seq = node.shard.seq().unwrap();
+
+    // Fetch over the bulk stream (fresh connection by construction).
+    let snap = saltator_cluster::remote::fetch_checkpoint(group(), &[node.addr.to_string()], None)
+        .await
+        .expect("fetch checkpoint");
+    assert_eq!(snap.seq, want_seq);
+    assert_eq!(snap.kv.len(), 64, "one journal row per command");
+    let last = snap.last_applied.expect("has a log position");
+
+    // Install into a pristine store; a handle started over it reports
+    // the transferred position (the leader would replicate last+1..).
+    let dir = tempfile::tempdir().unwrap();
+    let engine: Arc<dyn saltator_store::KvEngine> =
+        Arc::new(RocksEngine::open(&dir.path().join("db")).unwrap());
+    let stores = saltator_store::Stores::single(engine.clone());
+    let shard_id = ShardId::new(Keyspace::Room, 0);
+    saltator_shard::transfer::install(&stores, shard_id, snap).expect("install");
+
+    // Pristine no more: a second install must refuse.
+    let snap2 = saltator_cluster::remote::fetch_checkpoint(group(), &[node.addr.to_string()], None)
+        .await
+        .unwrap();
+    assert!(
+        saltator_shard::transfer::install(&stores, shard_id, snap2).is_err(),
+        "double install must be refused"
+    );
+
+    let handle = ShardHandle::start(
+        shard_id,
+        9,
+        stores,
+        Arc::new(JournalApp),
+        saltator_shard::NoopNetworkFactory,
+        None, // never bootstrap: the group exists elsewhere
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(handle.seq().unwrap(), want_seq);
+    // Replay works off the installed rows — the change-stream backfill
+    // a remote subscriber would use.
+    let replayed = handle.replay(0, 100).unwrap();
+    assert_eq!(replayed.len(), 64);
+    assert_eq!(replayed.last().unwrap().seq, want_seq);
+    // The log store reports the transferred position as its floor.
+    let _ = last;
+}

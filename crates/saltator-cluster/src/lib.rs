@@ -558,7 +558,8 @@ pub async fn serve_internal_with_tls(
         .add_service(proto::raft_service_server::RaftServiceServer::from_arc(
             svc.clone(),
         ))
-        .add_service(proto::control_service_server::ControlServiceServer::from_arc(svc))
+        .add_service(proto::control_service_server::ControlServiceServer::from_arc(svc.clone()))
+        .add_service(proto::bulk_service_server::BulkServiceServer::from_arc(svc))
         .serve_with_shutdown(listen, shutdown)
         .await?;
     Ok(())

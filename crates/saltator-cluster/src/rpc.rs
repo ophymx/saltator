@@ -9,12 +9,13 @@ use tonic::{Request, Response, Status};
 
 use saltator_shard::{ShardRegistry, TypeConfig};
 
+use crate::proto::bulk_service_server::BulkService;
 use crate::proto::control_service_server::ControlService;
 use crate::proto::raft_service_server::RaftService;
 use crate::proto::{
-    ChangeFrame, ExecuteRequest, ExecuteResponse, JoinRequest, JoinResponse, ProposeRequest,
-    ProposeResponse, RaftPayload, ReadRequest, ReadResponse, StatusRequest, StatusResponse,
-    SubscribeRequest,
+    ChangeFrame, CheckpointChunk, CheckpointRequest, ExecuteRequest, ExecuteResponse, JoinRequest,
+    JoinResponse, ProposeRequest, ProposeResponse, RaftPayload, ReadRequest, ReadResponse,
+    StatusRequest, StatusResponse, SubscribeRequest,
 };
 use crate::types::CODEC_VERSION;
 use crate::MetadataHandle;
@@ -432,5 +433,46 @@ impl ControlService for InternalRpc {
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(rx),
         )))
+    }
+}
+
+/// Chunk size for checkpoint streaming: big enough to amortize frames,
+/// far below any gRPC message ceiling.
+const CHECKPOINT_CHUNK: usize = 1 << 20;
+
+#[tonic::async_trait]
+impl BulkService for InternalRpc {
+    type FetchCheckpointStream =
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<CheckpointChunk, Status>> + Send>>;
+
+    /// Serve a whole-shard transfer payload from a point-in-time engine
+    /// checkpoint. Any replica serves (a lagging follower just leaves a
+    /// longer tail); the checkpoint build runs on the blocking pool —
+    /// it is a full range copy of the shard.
+    async fn fetch_checkpoint(
+        &self,
+        request: Request<CheckpointRequest>,
+    ) -> Result<Response<Self::FetchCheckpointStream>, Status> {
+        let req = request.into_inner();
+        let handle = self.registry.get(req.group).ok_or_else(|| {
+            Status::not_found(format!("no shard group {} on this node", req.group))
+        })?;
+        let bytes = tokio::task::spawn_blocking(move || {
+            let scratch =
+                tempfile::tempdir().map_err(|e| format!("checkpoint scratch dir: {e}"))?;
+            let snap = handle
+                .build_transfer(&scratch.path().join("ckpt"))
+                .map_err(|e| e.to_string())?;
+            postcard::to_stdvec(&snap).map_err(|e| format!("transfer encode: {e}"))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("checkpoint task: {e}")))?
+        .map_err(Status::internal)?;
+
+        let chunks: Vec<Result<CheckpointChunk, Status>> = bytes
+            .chunks(CHECKPOINT_CHUNK)
+            .map(|c| Ok(CheckpointChunk { data: c.to_vec() }))
+            .collect();
+        Ok(Response::new(Box::pin(futures_util::stream::iter(chunks))))
     }
 }

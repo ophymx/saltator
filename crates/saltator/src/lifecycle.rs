@@ -85,11 +85,63 @@ async fn reconcile_lifecycle(ctx: &LifecycleCtx) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pre-seed a pristine local shard from a current replica's checkpoint
+/// (bulk FetchCheckpoint, 2b part 2): the group then boots looking like
+/// a node restarted after a snapshot install, and the leader replicates
+/// only the log tail — it never builds or ships a snapshot of its own.
+/// Best-effort: any failure clears the partial install and falls back
+/// to the Raft snapshot path.
+pub async fn pre_seed(
+    stores: &saltator_store::Stores,
+    shard: ShardId,
+    replica_addrs: &[String],
+    tls: Option<&saltator_cluster::tls::ClientTlsConfig>,
+) {
+    match saltator_shard::transfer::is_pristine(&*stores.state, shard) {
+        Ok(true) => {}
+        _ => return, // has history (or unreadable): the Raft path owns it
+    }
+    if replica_addrs.is_empty() {
+        return;
+    }
+    let snap =
+        match saltator_cluster::remote::fetch_checkpoint(shard.group(), replica_addrs, tls).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::info!(%shard, error = %e,
+                    "pre-seed unavailable; joining via raft snapshot");
+                return;
+            }
+        };
+    if snap.last_applied.is_none() {
+        return; // empty group: nothing to seed
+    }
+    let rows = snap.kv.len();
+    match saltator_shard::transfer::install(stores, shard, snap) {
+        Ok(()) => {
+            tracing::info!(%shard, rows, "pre-seeded room shard from checkpoint");
+        }
+        Err(e) => {
+            tracing::warn!(%shard, error = %e, "pre-seed install failed; clearing");
+            let _ = saltator_shard::transfer::clear(stores, shard);
+        }
+    }
+}
+
 /// Placement moved a group ONTO this node: start it (uninitialized —
 /// the group's leader folds us in as learner → voter), and swap the
 /// router slot to the hosted handle once we are a voter, i.e. caught up.
 async fn gain_group(ctx: &LifecycleCtx, shard: ShardId) -> anyhow::Result<()> {
     tracing::info!(%shard, "lifecycle: placement gained this group; starting it");
+    // Bulk pre-seed before the group starts (best-effort). Candidates
+    // are the CURRENT holders — during a move the placement names the
+    // destination (us), so the state lives with nodes the placement no
+    // longer lists: try the placement's other replicas first, then the
+    // rest of the roster (non-holders answer NotFound and are skipped).
+    let placement = ctx.meta.placement_local()?;
+    let roster = ctx.meta.roster_local()?;
+    let addrs = seed_candidates(placement.replicas(shard.group()), &roster, ctx.node_id);
+    pre_seed(&ctx.stores, shard, &addrs, ctx.internal_tls.as_ref()).await;
     let server = RoomServer::start_shard(
         shard,
         ctx.node_id,
@@ -137,6 +189,35 @@ async fn gain_group(ctx: &LifecycleCtx, shard: ShardId) -> anyhow::Result<()> {
         tracing::info!(%shard, "lifecycle: group hosted (caught up, promoted)");
     });
     Ok(())
+}
+
+/// Checkpoint-source candidates for one group: the placement's other
+/// replicas first (the steady-state holders), then every other roster
+/// node — during a move, the state lives with nodes the placement no
+/// longer lists.
+pub fn seed_candidates(
+    replicas: &[u64],
+    roster: &saltator_cluster::Roster,
+    self_node: u64,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |nid: &u64| {
+        if *nid == self_node {
+            return;
+        }
+        if let Some(info) = roster.get(nid) {
+            if !out.contains(&info.advertise_addr) {
+                out.push(info.advertise_addr.clone());
+            }
+        }
+    };
+    for nid in replicas {
+        push(nid);
+    }
+    for nid in roster.keys() {
+        push(nid);
+    }
+    out
 }
 
 /// Placement moved a group OFF this node: wait for the leader-confirmed
