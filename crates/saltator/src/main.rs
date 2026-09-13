@@ -366,9 +366,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             let fresh = placement
                 .replicas(saltator_userserver::USER_SHARD.group())
                 .contains(&cfg.node.id)
-                || roster.get(&cfg.node.id).is_some_and(|i| {
-                    !matches!(i.status, saltator_cluster::NodeStatus::Active)
-                });
+                || roster
+                    .get(&cfg.node.id)
+                    .is_some_and(|i| !matches!(i.status, saltator_cluster::NodeStatus::Active));
             if founding || (complete && fresh) {
                 break (placement, roster);
             }

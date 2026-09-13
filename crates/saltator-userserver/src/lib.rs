@@ -1322,7 +1322,8 @@ async fn run_membership_projection(
                 let SeqEntry::Event { room_id, event_id } = entry else {
                     continue;
                 };
-                if let Some(change) = membership_change(&rooms, room_id, event_id, *room_seq).await?
+                if let Some(change) =
+                    membership_change(&rooms, room_id, event_id, *room_seq).await?
                 {
                     changes_out.push(change);
                 }
