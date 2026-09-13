@@ -25,6 +25,7 @@
 mod heal;
 pub mod hierarchy;
 mod machine;
+pub mod remote;
 mod shards;
 mod signer;
 mod types;
@@ -115,7 +116,7 @@ pub enum RoomError {
 
 /// Why a restricted join couldn't be authorised — chooses the federation
 /// errcode (see [`RestrictedAuth`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RestrictedDenial {
     /// Fails all conditions → `403 M_FORBIDDEN`.
     Forbidden,
@@ -132,7 +133,7 @@ fn storage_err(e: impl std::fmt::Display) -> RoomError {
 }
 
 /// Pipeline outcome for one event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Outcome {
     Accepted {
         event_id: OwnedEventId,
@@ -160,6 +161,7 @@ impl Outcome {
 
 /// The `PUT /send_join` response payload: the co-signed join event, the
 /// room's current state, and the auth chain backing that state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SendJoinResult {
     pub event: CanonicalJsonObject,
     pub state: Vec<CanonicalJsonObject>,
@@ -169,6 +171,7 @@ pub struct SendJoinResult {
 /// The `PUT /send_knock` response payload: the stripped current room state
 /// (`knock_room_state`) that lets the knocking server show the room to its
 /// user while the knock is pending.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SendKnockResult {
     pub knock_room_state: Vec<serde_json::Value>,
 }
@@ -232,8 +235,91 @@ fn id_list(obj: &CanonicalJsonObject, key: &str) -> Vec<String> {
     }
 }
 
+/// Where this handle's shard lives: on this node (the full pipeline),
+/// or on other nodes (reads via the remote store, writes as intents —
+/// docs/design-room-sharding-phase2.md, 2a part 3).
+enum RoomBackend {
+    Hosted(ShardHandle),
+    Remote(Arc<dyn saltator_shard::RemoteShardBackend>),
+}
+
+/// A room shard's change stream, backend-agnostic and gap-free: the
+/// local half refills broadcast lag from seq-indexed replay; the remote
+/// half is the Subscribe RPC's stream (which backfills server-side and
+/// reconnects on its own). `None` means the shard shut down.
+pub enum RoomChanges {
+    Local {
+        rx: broadcast::Receiver<ChangeRecord>,
+        handle: ShardHandle,
+        last: u64,
+        buffer: std::collections::VecDeque<ChangeRecord>,
+    },
+    Remote(
+        std::pin::Pin<
+            Box<dyn futures_util::Stream<Item = saltator_shard::Result<ChangeRecord>> + Send>,
+        >,
+    ),
+}
+
+impl RoomChanges {
+    /// The next change record at seq > the last one delivered.
+    pub async fn recv(&mut self) -> Option<ChangeRecord> {
+        use futures_util::StreamExt;
+        match self {
+            RoomChanges::Local {
+                rx,
+                handle,
+                last,
+                buffer,
+            } => loop {
+                if let Some(rec) = buffer.pop_front() {
+                    *last = rec.seq;
+                    return Some(rec);
+                }
+                match rx.recv().await {
+                    Ok(rec) => {
+                        if rec.seq <= *last {
+                            continue;
+                        }
+                        if rec.seq > *last + 1 {
+                            // The broadcast skipped seqs we have not seen
+                            // (subscription raced emits): refill from
+                            // applied state, then deliver in order.
+                            if let Ok(batch) = handle.replay(*last, 256) {
+                                buffer.extend(batch);
+                                continue;
+                            }
+                        }
+                        *last = rec.seq;
+                        return Some(rec);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        match handle.replay(*last, 256) {
+                            Ok(batch) if !batch.is_empty() => buffer.extend(batch),
+                            // Nothing replayable (or an app without
+                            // replay): fall back to resubscribing; the
+                            // consumer's own cursor covers the gap.
+                            _ => *rx = handle.subscribe(),
+                        }
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            },
+            RoomChanges::Remote(stream) => match stream.next().await {
+                Some(Ok(rec)) => Some(rec),
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "remote change stream failed");
+                    None
+                }
+                None => None,
+            },
+        }
+    }
+}
+
 pub struct RoomServer {
-    handle: ShardHandle,
+    backend: RoomBackend,
     signer: Arc<ServerSigner>,
     /// Verification keys by entity. Seeded with our own keys; remote
     /// server keys are added explicitly until M3 brings key fetching.
@@ -290,25 +376,105 @@ impl RoomServer {
         .await?;
         let verify_keys = std::sync::RwLock::new(signer.public_key_map());
         Ok(Arc::new(Self {
-            handle,
+            backend: RoomBackend::Hosted(handle),
             signer,
             verify_keys,
             room_locks: Mutex::new(HashMap::new()),
         }))
     }
 
+    /// A handle for a shard hosted ELSEWHERE: reads through the remote
+    /// store, writes as intents at the hosting leader, subscription over
+    /// the streaming RPC. No Raft group runs here.
+    pub fn remote(
+        backend: Arc<dyn saltator_shard::RemoteShardBackend>,
+        signer: Arc<ServerSigner>,
+    ) -> Arc<Self> {
+        let verify_keys = std::sync::RwLock::new(signer.public_key_map());
+        Arc::new(Self {
+            backend: RoomBackend::Remote(backend),
+            signer,
+            verify_keys,
+            room_locks: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Whether this node hosts the shard (runs its Raft group).
+    pub fn is_hosted(&self) -> bool {
+        matches!(self.backend, RoomBackend::Hosted(_))
+    }
+
+    /// The remote backend, when unhosted.
+    fn remote_backend(&self) -> Option<&Arc<dyn saltator_shard::RemoteShardBackend>> {
+        match &self.backend {
+            RoomBackend::Hosted(_) => None,
+            RoomBackend::Remote(r) => Some(r),
+        }
+    }
+
+    /// The local shard handle. Panics on a remote handle: every caller
+    /// is a hosted-only path (boot, metrics, reconciler, the pipeline) —
+    /// reaching this on a remote room is a routing bug, not a state.
     pub fn shard_handle(&self) -> &ShardHandle {
-        &self.handle
+        match &self.backend {
+            RoomBackend::Hosted(h) => h,
+            RoomBackend::Remote(_) => {
+                panic!("shard_handle() on a remote room shard (hosted-only path)")
+            }
+        }
     }
 
-    /// Typed read access to the shard's applied state.
+    /// [`Self::shard_handle`] without the panic, for callers that
+    /// legitimately skip remote shards (boot waits, metrics).
+    pub fn hosted_handle(&self) -> Option<&ShardHandle> {
+        match &self.backend {
+            RoomBackend::Hosted(h) => Some(h),
+            RoomBackend::Remote(_) => None,
+        }
+    }
+
+    /// Typed read access to the shard's applied state (local or remote).
     pub fn store(&self) -> RoomStore {
-        RoomStore::new(self.handle.read_ctx())
+        match &self.backend {
+            RoomBackend::Hosted(h) => RoomStore::new(h.read_ctx()),
+            RoomBackend::Remote(r) => RoomStore::remote(r.clone()),
+        }
     }
 
-    /// Subscribe to the room shard's change stream.
+    /// Subscribe to the room shard's change stream (hosted shards only —
+    /// use [`Self::changes`] for backend-agnostic tailing).
     pub fn subscribe(&self) -> broadcast::Receiver<ChangeRecord> {
-        self.handle.subscribe()
+        self.shard_handle().subscribe()
+    }
+
+    /// The shard's current sequence number — the anchor for
+    /// [`Self::changes`] when a consumer wants "from now".
+    pub async fn current_seq(&self) -> Result<u64> {
+        match &self.backend {
+            RoomBackend::Hosted(h) => Ok(h.seq()?),
+            RoomBackend::Remote(r) => match r
+                .read(saltator_shard::ReadOp::Seq)
+                .await
+                .map_err(RoomError::from)?
+            {
+                saltator_shard::ReadValue::Seq(s) => Ok(s),
+                other => Err(RoomError::Codec(format!("seq read returned {other:?}"))),
+            },
+        }
+    }
+
+    /// The change stream from `from_seq` (exclusive), local or remote —
+    /// the backend-agnostic form every tailing consumer uses.
+    pub fn changes(&self, from_seq: u64) -> RoomChanges {
+        match &self.backend {
+            RoomBackend::Hosted(h) => RoomChanges::Local {
+                rx: h.subscribe(),
+                handle: h.clone(),
+                last: from_seq,
+                buffer: std::collections::VecDeque::new(),
+            },
+            RoomBackend::Remote(r) => RoomChanges::Remote(r.subscribe(from_seq)),
+        }
     }
 
     /// Server names (other than `exclude`) of users currently joined to
@@ -421,15 +587,29 @@ impl RoomServer {
 
     /// Trust verification keys for a remote entity (tests / static
     /// configuration; M3 replaces this with spec key fetching).
-    pub fn trust_keys(&self, entity: &str, keys: BTreeMap<String, ruma::serde::Base64>) {
+    pub async fn trust_keys(&self, entity: &str, keys: BTreeMap<String, ruma::serde::Base64>) {
         self.verify_keys
             .write()
             .expect("verify_keys lock poisoned")
-            .insert(entity.to_owned(), keys);
+            .insert(entity.to_owned(), keys.clone());
+        // A remote shard verifies at its hosting node: the trust must
+        // land THERE before any ingest intent that relies on it.
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::TrustKeys {
+                entity: entity.to_owned(),
+                keys,
+            };
+            if let Err(e) = remote::call(r, &intent).await {
+                tracing::warn!(entity, error = %e, "remote trust_keys failed");
+            }
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        Ok(self.handle.shutdown().await?)
+        match &self.backend {
+            RoomBackend::Hosted(h) => Ok(h.shutdown().await?),
+            RoomBackend::Remote(_) => Ok(()),
+        }
     }
 
     // -- public pipeline entry points ------------------------------------
@@ -443,6 +623,20 @@ impl RoomServer {
         version: RoomVersion,
         content: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(OwnedRoomId, Outcome)> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::CreateRoom {
+                creator: creator.to_string(),
+                version: version.as_str().to_owned(),
+                content,
+            };
+            return match remote::call(r, &intent).await? {
+                remote::RoomIntentOk::Created(id, outcome) => Ok((
+                    OwnedRoomId::try_from(id).map_err(|e| RoomError::Malformed(e.to_string()))?,
+                    outcome,
+                )),
+                other => Err(RoomError::Codec(format!("expected Created, got {other:?}"))),
+            };
+        }
         let (room_id, raw) = self.build_create(creator, version, content)?;
         let outcome = self.apply_create(&room_id, version, raw).await?;
         Ok((room_id, outcome))
@@ -501,6 +695,12 @@ impl RoomServer {
         version: RoomVersion,
         raw: CanonicalJsonObject,
     ) -> Result<Outcome> {
+        if self.remote_backend().is_some() {
+            // The create was built (and signed) HERE so the room id —
+            // and with it the owning shard — could be derived; a signed
+            // create is a complete PDU, so the hosting leader ingests it.
+            return self.ingest_pdu(raw).await;
+        }
         let _guard = self.lock_room(room_id.as_str()).await;
         self.process(raw, version, room_id, true, false).await
     }
@@ -514,6 +714,17 @@ impl RoomServer {
         state_key: &str,
         content: serde_json::Value,
     ) -> Result<Outcome> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::SendState {
+                room_id: room_id.to_string(),
+                sender: sender.to_string(),
+                event_type: event_type.to_owned(),
+                state_key: state_key.to_owned(),
+                content,
+                ts: None,
+            };
+            return remote::want_outcome(remote::call(r, &intent).await?);
+        }
         self.send_local(room_id, sender, event_type, Some(state_key), content, None)
             .await
     }
@@ -530,6 +741,17 @@ impl RoomServer {
         content: serde_json::Value,
         ts: u64,
     ) -> Result<Outcome> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::SendState {
+                room_id: room_id.to_string(),
+                sender: sender.to_string(),
+                event_type: event_type.to_owned(),
+                state_key: state_key.to_owned(),
+                content,
+                ts: Some(ts),
+            };
+            return remote::want_outcome(remote::call(r, &intent).await?);
+        }
         self.send_local(
             room_id,
             sender,
@@ -549,6 +771,16 @@ impl RoomServer {
         event_type: &str,
         content: serde_json::Value,
     ) -> Result<Outcome> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::SendMessage {
+                room_id: room_id.to_string(),
+                sender: sender.to_string(),
+                event_type: event_type.to_owned(),
+                content,
+                ts: None,
+            };
+            return remote::want_outcome(remote::call(r, &intent).await?);
+        }
         self.send_local(room_id, sender, event_type, None, content, None)
             .await
     }
@@ -564,6 +796,16 @@ impl RoomServer {
         content: serde_json::Value,
         ts: u64,
     ) -> Result<Outcome> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::SendMessage {
+                room_id: room_id.to_string(),
+                sender: sender.to_string(),
+                event_type: event_type.to_owned(),
+                content,
+                ts: Some(ts),
+            };
+            return remote::want_outcome(remote::call(r, &intent).await?);
+        }
         self.send_local(room_id, sender, event_type, None, content, Some(ts))
             .await
     }
@@ -571,6 +813,15 @@ impl RoomServer {
     /// Ingest a complete PDU (the federation-shaped entry point): raw
     /// canonical JSON, signatures and hashes included.
     pub async fn ingest_pdu(&self, raw: CanonicalJsonObject) -> Result<Outcome> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::IngestPdu {
+                raw,
+                origin: None,
+                healing: false,
+                reject_missing_auth: false,
+            };
+            return remote::want_outcome(remote::call(r, &intent).await?);
+        }
         let (version, room_id, is_create) = self.classify(&raw).await?;
         let _guard = self.lock_room(room_id.as_str()).await;
         // Ordinary inbound PDU: its origin is responsible for distributing it,
@@ -591,6 +842,15 @@ impl RoomServer {
         &self,
         raw: CanonicalJsonObject,
     ) -> Result<Outcome> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::IngestPdu {
+                raw,
+                origin: None,
+                healing: false,
+                reject_missing_auth: true,
+            };
+            return remote::want_outcome(remote::call(r, &intent).await?);
+        }
         let (version, room_id, is_create) = self.classify(&raw).await?;
         let _guard = self.lock_room(room_id.as_str()).await;
         self.process_inner(raw, version, &room_id, is_create, false, true)
@@ -652,6 +912,20 @@ impl RoomServer {
         target: &UserId,
         mut content: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(RoomVersion, CanonicalJsonObject)> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::BuildInvite {
+                room_id: room_id.to_string(),
+                sender: sender.to_string(),
+                target: target.to_string(),
+                content,
+            };
+            return match remote::call(r, &intent).await? {
+                remote::RoomIntentOk::Invite(version, raw) => {
+                    Ok((RoomVersion::parse(&version)?, raw))
+                }
+                other => Err(RoomError::Codec(format!("expected Invite, got {other:?}"))),
+            };
+        }
         let _guard = self.lock_room(room_id.as_str()).await;
         // `membership: invite` is authoritative; extra content (e.g. the
         // `is_direct` flag) rides along on the invite member event.
@@ -1007,6 +1281,11 @@ impl RoomServer {
     /// (the outbound sender distributes it). The caller must have trusted
     /// the origin's keys.
     pub async fn send_leave(&self, raw: CanonicalJsonObject) -> Result<Outcome> {
+        if let Some(r) = self.remote_backend() {
+            return remote::want_outcome(
+                remote::call(r, &remote::RoomIntent::SendLeave { raw }).await?,
+            );
+        }
         let (version, room_id, _is_create) = self.classify(&raw).await?;
         let _guard = self.lock_room(room_id.as_str()).await;
         // We are the resident servicing this leave/reject handshake: flag the
@@ -1375,6 +1654,12 @@ impl RoomServer {
     /// return the room's current state and its auth chain, plus the join
     /// co-signed by us. The caller must have trusted the origin's keys.
     pub async fn send_join(&self, raw: CanonicalJsonObject) -> Result<SendJoinResult> {
+        if let Some(r) = self.remote_backend() {
+            return match remote::call(r, &remote::RoomIntent::SendJoin { raw }).await? {
+                remote::RoomIntentOk::Join(res) => Ok(res),
+                other => Err(RoomError::Codec(format!("expected Join, got {other:?}"))),
+            };
+        }
         let (version, room_id, _is_create) = self.classify(&raw).await?;
         // Co-sign BEFORE validating/persisting. A restricted join names an
         // authorising user on THIS server, and auth rule 4.2 requires the
@@ -1442,6 +1727,12 @@ impl RoomServer {
     /// room's other servers. Returns the stripped current room state for
     /// the knocking server to show its user (spec "Knocking Rooms").
     pub async fn send_knock(&self, raw: CanonicalJsonObject) -> Result<SendKnockResult> {
+        if let Some(r) = self.remote_backend() {
+            return match remote::call(r, &remote::RoomIntent::SendKnock { raw }).await? {
+                remote::RoomIntentOk::Knock(res) => Ok(res),
+                other => Err(RoomError::Codec(format!("expected Knock, got {other:?}"))),
+            };
+        }
         let (version, room_id, _is_create) = self.classify(&raw).await?;
         let knocker = str_of(&raw, "state_key")?.to_owned();
         let outcome = {
@@ -1495,6 +1786,15 @@ impl RoomServer {
         state: Vec<CanonicalJsonObject>,
         auth_chain: Vec<CanonicalJsonObject>,
     ) -> Result<Outcome> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::ImportRoom {
+                version: version.as_str().to_owned(),
+                event: join,
+                state,
+                auth_chain,
+            };
+            return remote::want_outcome(remote::call(r, &intent).await?);
+        }
         let join_id = event::event_id(&join, version)?;
         let room_id = str_of(&join, "room_id")?.to_owned();
         let join_depth = join
@@ -1593,6 +1893,16 @@ impl RoomServer {
         room_id: &str,
         pdus: Vec<CanonicalJsonObject>,
     ) -> Result<(u64, bool)> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::ImportHistory {
+                room_id: room_id.to_owned(),
+                pdus,
+            };
+            return match remote::call(r, &intent).await? {
+                remote::RoomIntentOk::History(indexed, complete) => Ok((indexed, complete)),
+                other => Err(RoomError::Codec(format!("expected History, got {other:?}"))),
+            };
+        }
         let mut events = Vec::new();
         let mut seen = BTreeSet::new();
         let meta = self
@@ -1979,6 +2289,20 @@ impl RoomServer {
         thread_id: Option<String>,
         ts: u64,
     ) -> Result<u64> {
+        if let Some(r) = self.remote_backend() {
+            let intent = remote::RoomIntent::WriteReceipt {
+                room_id: room_id.to_string(),
+                user_id: user_id.to_string(),
+                receipt_type: receipt_type.to_owned(),
+                event_id: event_id.to_string(),
+                thread_id,
+                ts,
+            };
+            return match remote::call(r, &intent).await? {
+                remote::RoomIntentOk::Seq(seq) => Ok(seq),
+                other => Err(RoomError::Codec(format!("expected Seq, got {other:?}"))),
+            };
+        }
         let resp = self
             .propose_cmd(&RoomCommand::Receipt(ReceiptCmd {
                 room_id: room_id.to_string(),
@@ -2600,7 +2924,7 @@ impl RoomServer {
 
     async fn propose_cmd(&self, cmd: &RoomCommand) -> Result<RoomResponse> {
         let bytes = postcard::to_stdvec(cmd).map_err(|e| RoomError::Codec(e.to_string()))?;
-        let resp = self.handle.propose(bytes).await?;
+        let resp = self.shard_handle().propose(bytes).await?;
         postcard::from_bytes(&resp).map_err(|e| RoomError::Codec(e.to_string()))
     }
 

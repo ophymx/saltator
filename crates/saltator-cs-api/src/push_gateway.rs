@@ -31,7 +31,12 @@ const GATEWAY_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn spawn_push_delivery(state: Arc<CsState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut set = tokio::task::JoinSet::new();
-        for (idx, _) in state.rooms.iter() {
+        for (idx, shard) in state.rooms.iter() {
+            // Push evaluation runs at the emitting shard's leader (spec
+            // §5.5); a node that does not host the shard is never that.
+            if !shard.is_hosted() {
+                continue;
+            }
             let state = state.clone();
             set.spawn(async move {
                 if let Err(e) = run_shard(state, idx).await {
@@ -58,8 +63,8 @@ async fn run_shard(state: Arc<CsState>, shard_idx: u16) -> Result<(), String> {
         .timeout(GATEWAY_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;
-    let mut changes = rooms.subscribe();
-    let mut cursor = rooms.shard_handle().seq().map_err(|e| e.to_string())?;
+    let mut cursor = rooms.current_seq().await.map_err(|e| e.to_string())?;
+    let mut changes = rooms.changes(cursor);
 
     loop {
         loop {
@@ -81,9 +86,8 @@ async fn run_shard(state: Arc<CsState>, shard_idx: u16) -> Result<(), String> {
             cursor = last_seq;
         }
         match changes.recv().await {
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            Some(_) => {}
+            None => return Ok(()),
         }
     }
 }

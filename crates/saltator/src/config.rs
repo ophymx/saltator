@@ -236,6 +236,13 @@ pub struct ClusterConfig {
     /// (docs/design-room-sharding.md).
     #[serde(default)]
     pub room_shards: Option<u16>,
+    /// DEBUG-ONLY replication-factor cap (docs/design-room-sharding-phase2.md
+    /// review call 4): overrides the every-node-hosts-everything floor so
+    /// the cluster harness can exercise remote serving before phase 3.
+    /// UNSAFE outside tests — phase 2b's shard movement does not exist,
+    /// so a capped cluster cannot rebalance. Must be identical on every
+    /// node (it is node-local config, not cluster state).
+    pub rf_cap_unsafe: Option<u8>,
     /// PEM certificate chain for this node's internal-RPC identity. Set
     /// together with `tls_key` and `tls_ca` to protect the control plane
     /// with mutual TLS.
@@ -473,6 +480,7 @@ mod tests {
         ClusterConfig {
             seeds: vec![],
             room_shards: None,
+            rf_cap_unsafe: None,
             tls_cert: cert.then(|| PathBuf::from("c")),
             tls_key: key.then(|| PathBuf::from("k")),
             tls_ca: ca.then(|| PathBuf::from("a")),

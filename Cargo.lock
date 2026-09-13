@@ -3313,6 +3313,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "blake3",
+ "futures-util",
  "openraft",
  "postcard",
  "ruma",
@@ -3332,6 +3333,7 @@ name = "saltator-shard"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "futures-util",
  "metrics",
  "openraft",
  "postcard",

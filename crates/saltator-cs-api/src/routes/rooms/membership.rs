@@ -106,12 +106,14 @@ async fn join_with_body(
             // one). Wait briefly, re-evaluating as room state lands,
             // before conceding; a genuine CannotGrant pays this window
             // once and then fails over exactly as before.
-            let mut changes = state.rooms.for_room(room_id.as_str()).subscribe();
+            let shard = state.rooms.for_room(room_id.as_str());
+            let from = shard.current_seq().await.map_err(internal)?;
+            let mut changes = shard.changes(from);
             let deadline = tokio::time::Instant::now() + RESTRICTED_AUTH_RECHECK;
             loop {
                 match tokio::time::timeout_at(deadline, changes.recv()).await {
                     Err(_) => break, // window closed; concede
-                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                    Ok(None) => break,
                     // A room-shard change (or a lagged stream — state moved
                     // even faster): re-evaluate.
                     Ok(_) => {
@@ -411,8 +413,8 @@ async fn join_remote(state: &CsState, auth: &Auth, room_id: &RoomId, via: &[Stri
     let seq = state
         .rooms
         .for_room(room_id.as_str())
-        .shard_handle()
-        .seq()
+        .current_seq()
+        .await
         .map_err(internal)?;
     let _ = saltator_userserver::wait_for_projection(
         &state.users,

@@ -12,8 +12,9 @@ use saltator_shard::{ShardRegistry, TypeConfig};
 use crate::proto::control_service_server::ControlService;
 use crate::proto::raft_service_server::RaftService;
 use crate::proto::{
-    ChangeFrame, JoinRequest, JoinResponse, ProposeRequest, ProposeResponse, RaftPayload,
-    ReadRequest, ReadResponse, StatusRequest, StatusResponse, SubscribeRequest,
+    ChangeFrame, ExecuteRequest, ExecuteResponse, JoinRequest, JoinResponse, ProposeRequest,
+    ProposeResponse, RaftPayload, ReadRequest, ReadResponse, StatusRequest, StatusResponse,
+    SubscribeRequest,
 };
 use crate::types::CODEC_VERSION;
 use crate::MetadataHandle;
@@ -21,6 +22,7 @@ use crate::MetadataHandle;
 pub struct InternalRpc {
     handle: MetadataHandle,
     registry: ShardRegistry,
+    executors: saltator_shard::ExecutorRegistry,
     server_name: String,
     /// This binary's app schema versions per keyspace discriminant,
     /// reported in Status for the migration gate.
@@ -31,12 +33,14 @@ impl InternalRpc {
     pub fn new(
         handle: MetadataHandle,
         registry: ShardRegistry,
+        executors: saltator_shard::ExecutorRegistry,
         server_name: String,
         schemas: Vec<(u32, u32)>,
     ) -> Self {
         Self {
             handle,
             registry,
+            executors,
             server_name,
             schemas,
         }
@@ -233,6 +237,43 @@ impl ControlService for InternalRpc {
             served: true,
             result: postcard::to_stdvec(&value)
                 .map_err(|e| Status::internal(format!("read result encode: {e}")))?,
+            leader_id: None,
+            leader_addr: None,
+        }))
+    }
+
+    /// An app-level intent executed at this node, provided this node
+    /// leads the group (the pipeline reads current state — a follower
+    /// executing would build commands against a stale view and, worse,
+    /// bypass the leader's room-lock serialization). Non-leaders hint.
+    async fn execute(
+        &self,
+        request: Request<ExecuteRequest>,
+    ) -> Result<Response<ExecuteResponse>, Status> {
+        let req = request.into_inner();
+        let handle = self.registry.get(req.group).ok_or_else(|| {
+            Status::not_found(format!("no shard group {} on this node", req.group))
+        })?;
+        if !handle.is_leader() {
+            let leader_id = handle.current_leader();
+            let leader_addr = leader_id.and_then(|id| handle.node_addr(id));
+            return Ok(Response::new(ExecuteResponse {
+                served: false,
+                result: Vec::new(),
+                leader_id,
+                leader_addr,
+            }));
+        }
+        let executor = self.executors.get(req.group).ok_or_else(|| {
+            Status::failed_precondition(format!("no executor registered for group {}", req.group))
+        })?;
+        let result = executor
+            .execute(req.intent)
+            .await
+            .map_err(|e| Status::internal(format!("execute: {e}")))?;
+        Ok(Response::new(ExecuteResponse {
+            served: true,
+            result,
             leader_id: None,
             leader_addr: None,
         }))

@@ -52,6 +52,7 @@ async fn internal_rpc_surface() {
     let server = tokio::spawn(serve_internal(
         meta.clone(),
         registry,
+        saltator_shard::ExecutorRegistry::new(),
         "example.org".into(),
         vec![],
         addr,

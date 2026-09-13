@@ -220,11 +220,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // Serve the internal gRPC surface now (a joiner needs it to receive
     // replication; every node needs it for cross-node Raft traffic).
+    let executors = saltator_shard::ExecutorRegistry::new();
     let internal_task = {
         let mut rx = shutdown_rx.clone();
         tokio::spawn(saltator_cluster::serve_internal_with_tls(
             meta.clone(),
             registry.clone(),
+            executors.clone(),
             cfg.server_name.clone(),
             schemas.clone(),
             cfg.listeners.internal,
@@ -256,6 +258,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let leader = meta.wait_for_leader(Duration::from_secs(30)).await?;
     tracing::info!(leader, "metadata group ready");
+    if let Some(cap) = cfg.cluster.rf_cap_unsafe {
+        meta.set_rf_cap_unsafe(cap);
+    }
 
     // The founder writes the cluster control plane (topology, roster,
     // placement); joiners read the replicated copy. The room-shard count
@@ -316,33 +321,85 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // reconciliation round or two on a joining node.
     let shard_bootstrap = founding.then(|| cfg.node.advertise.clone());
     let shard_bootstrap_fedout = shard_bootstrap.clone();
+    // The placement decides which room groups THIS node hosts (runs the
+    // Raft group) vs serves remotely (reads over the Read RPC, writes as
+    // intents — docs/design-room-sharding-phase2.md). With the RF floor
+    // active (the default), every group lists every node and this is
+    // exactly the old behaviour; `rf_cap_unsafe` is what makes the
+    // remote arm reachable. Poll: a joiner can race replication.
+    let (placement, roster) = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let placement = meta.placement_local().unwrap_or_default();
+            let roster = meta.roster_local().unwrap_or_default();
+            let complete = (0..room_shards).all(|idx| {
+                let g = saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx).group();
+                !placement.replicas(g).is_empty()
+            });
+            if complete || founding {
+                break (placement, roster);
+            }
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!("placement never appeared in metadata");
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    let addr_of = |nid: u64| {
+        roster
+            .get(&nid)
+            .map(|info: &saltator_cluster::NodeInfo| info.advertise_addr.clone())
+    };
     let mut room_shard_servers = Vec::with_capacity(usize::from(room_shards));
+    let mut hosted_rooms = 0u16;
     for idx in 0..room_shards {
         let shard = saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx);
-        room_shard_servers.push(
-            saltator_roomserver::RoomServer::start_shard(
-                shard,
-                cfg.node.id,
-                stores.clone(),
+        let replicas = placement.replicas(shard.group());
+        let hosted = founding || replicas.contains(&cfg.node.id);
+        if hosted {
+            hosted_rooms += 1;
+            room_shard_servers.push(
+                saltator_roomserver::RoomServer::start_shard(
+                    shard,
+                    cfg.node.id,
+                    stores.clone(),
+                    signer.clone(),
+                    saltator_cluster::network::GrpcRaftNetworkFactory::new(shard)
+                        .with_tls(internal_tls.as_ref().map(|t| t.client())),
+                    shard_bootstrap.clone(),
+                    Some(&registry),
+                )
+                .await?,
+            );
+        } else {
+            let addrs: Vec<String> = replicas.iter().copied().filter_map(addr_of).collect();
+            let remote = saltator_cluster::remote::RemoteShard::new(
+                shard.group(),
+                addrs,
+                internal_tls.as_ref().map(|t| t.client()),
+            );
+            room_shard_servers.push(saltator_roomserver::RoomServer::remote(
+                std::sync::Arc::new(remote),
                 signer.clone(),
-                saltator_cluster::network::GrpcRaftNetworkFactory::new(shard)
-                    .with_tls(internal_tls.as_ref().map(|t| t.client())),
-                shard_bootstrap.clone(),
-                Some(&registry),
-            )
-            .await?,
-        );
+            ));
+        }
     }
     // Leadership waits run concurrently: 16 groups electing serially
-    // would stack their timeouts for no reason.
+    // would stack their timeouts for no reason. Remote groups have
+    // nothing to wait for — their replicas boot themselves.
     futures_util::future::try_join_all(
         room_shard_servers
             .iter()
-            .map(|r| r.shard_handle().wait_for_leader(Duration::from_secs(60))),
+            .filter_map(|r| r.hosted_handle())
+            .map(|h| h.wait_for_leader(Duration::from_secs(60))),
     )
     .await?;
     let rooms = saltator_roomserver::RoomShards::new(room_shard_servers);
-    tracing::info!(count = room_shards, "room shards ready");
+    tracing::info!(
+        count = room_shards,
+        hosted = hosted_rooms,
+        "room shards ready"
+    );
 
     let users = saltator_userserver::UserServer::start(
         cfg.node.id,
@@ -382,7 +439,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         internal_tls.as_ref().map(|t| t.client()),
     );
     for (_, shard) in rooms.iter() {
-        shard.shard_handle().set_forwarder(forwarder.clone());
+        if let Some(h) = shard.hosted_handle() {
+            h.set_forwarder(forwarder.clone());
+        }
     }
     users.shard_handle().set_forwarder(forwarder.clone());
     fedout.shard_handle().set_forwarder(forwarder.clone());
@@ -392,11 +451,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // voters here. Each group is reconciled by exactly its own leader.
     let mut local_groups: Vec<saltator_cluster::LocalGroup> = rooms
         .iter()
-        .map(|(idx, shard)| {
-            saltator_cluster::LocalGroup::new(
-                saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx).group(),
-                shard.shard_handle().clone(),
-            )
+        .filter_map(|(idx, shard)| {
+            shard.hosted_handle().map(|h| {
+                saltator_cluster::LocalGroup::new(
+                    saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx).group(),
+                    h.clone(),
+                )
+            })
         })
         .collect();
     local_groups.push(saltator_cluster::LocalGroup::new(
@@ -424,7 +485,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // cross-shard move; docs/design-federation-out.md §drain).
     for h in rooms
         .iter()
-        .map(|(_, s)| s.shard_handle())
+        .filter_map(|(_, s)| s.hosted_handle())
         .chain([fedout.shard_handle()])
     {
         saltator_shard::migrate::spawn_migration_supervisor(
@@ -508,6 +569,21 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("client.admin_users: {u:?} is not a user id: {e}"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // Intent executors: every HOSTED room shard serves remote writes
+    // (docs/design-room-sharding-phase2.md, 2a part 3), with this
+    // stack's federation client powering healing ingests.
+    for (idx, shard_server) in rooms.iter() {
+        if shard_server.is_hosted() {
+            executors.register(
+                saltator_shard::ShardId::new(saltator_store::Keyspace::Room, idx).group(),
+                saltator_federation::room_intent_executor(
+                    shard_server.clone(),
+                    Some(fed_client.clone()),
+                    key_cache.clone(),
+                ),
+            );
+        }
+    }
     let cs_state = saltator_cs_api::CsState::new(
         users.clone(),
         rooms.clone(),
@@ -677,7 +753,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         saltator_metrics::spawn_sampler(SHARD_SAMPLE_INTERVAL, shutdown_rx.clone(), move || {
             for h in sample_rooms
                 .iter()
-                .map(|(_, shard)| shard.shard_handle())
+                .filter_map(|(_, shard)| shard.hosted_handle())
                 .chain([sample_users.shard_handle(), sample_fedout.shard_handle()])
             {
                 // An Err from seq() is a storage failure, not "no

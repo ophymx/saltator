@@ -267,7 +267,7 @@ async fn send_fills_dag_gap_via_get_missing_events() {
         .await
         .unwrap();
     if let Some(set) = a_signer.public_key_map().get("a.test") {
-        rooms_b.trust_keys("a.test", set.clone());
+        rooms_b.trust_keys("a.test", set.clone()).await;
     }
     for id in ids.iter().take(4) {
         let obj = match ruma::CanonicalJsonValue::try_from(raw_of(&rooms_a, id).await).unwrap() {

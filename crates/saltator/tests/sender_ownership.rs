@@ -50,6 +50,7 @@ fn spawn_serve(meta: MetadataHandle, registry: ShardRegistry, addr: std::net::So
     tokio::spawn(serve_internal(
         meta,
         registry,
+        saltator_shard::ExecutorRegistry::new(),
         "us.test".into(),
         vec![],
         addr,
@@ -238,7 +239,7 @@ async fn only_the_shard_leader_delivers_outbound() {
     let mut join = template;
     rsigner.hash_and_sign_event(&mut join, version).unwrap();
     if let Some(keys) = rsigner.public_key_map().get("remote.test") {
-        rooms1.trust_keys("remote.test", keys.clone());
+        rooms1.trust_keys("remote.test", keys.clone()).await;
     }
     rooms1.send_join(join).await.unwrap();
     assert_eq!(

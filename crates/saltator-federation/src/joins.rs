@@ -181,7 +181,7 @@ pub async fn send_knock(
     let now = crate::now_ms();
     if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
         if let Some(set) = keys.get(&auth.origin) {
-            rooms.trust_keys(&auth.origin, set.clone());
+            rooms.trust_keys(&auth.origin, set.clone()).await;
         }
     }
     // Unconditional: an event with no `room_id` must be refused, not have
@@ -333,7 +333,7 @@ async fn send_join_apply(
     let now = crate::now_ms();
     if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
         if let Some(set) = keys.get(&auth.origin) {
-            rooms.trust_keys(&auth.origin, set.clone());
+            rooms.trust_keys(&auth.origin, set.clone()).await;
         }
     }
     // From the event, because the event is what gets applied. Unconditional:
@@ -522,7 +522,7 @@ async fn send_leave_apply(
     let now = crate::now_ms();
     if let Ok(keys) = state.key_cache.keys_for(&auth.origin, now).await {
         if let Some(set) = keys.get(&auth.origin) {
-            rooms.trust_keys(&auth.origin, set.clone());
+            rooms.trust_keys(&auth.origin, set.clone()).await;
         }
     }
     match rooms.send_leave(raw).await {

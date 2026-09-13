@@ -28,6 +28,7 @@ fn spawn_serve(
     tokio::spawn(serve_internal(
         meta,
         registry,
+        saltator_shard::ExecutorRegistry::new(),
         "example.org".into(),
         vec![],
         addr,

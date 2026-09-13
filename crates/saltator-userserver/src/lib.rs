@@ -1290,9 +1290,12 @@ async fn run_membership_projection(
     rooms: &RoomServer,
 ) -> Result<()> {
     let source = room_source(shard_idx);
-    // Subscribe before catching up, so nothing lands unseen between scan
-    // and subscription. Lag/overflow just triggers another catch-up.
-    let mut changes = rooms.subscribe();
+    // Anchored at the durable cursor: everything after it is delivered
+    // or replayed, local or remote — no lost wakeups, no unseen gap.
+    let mut changes = {
+        let cursor = users.store().cursor(&source).map_err(storage_err)?;
+        rooms.changes(cursor)
+    };
     loop {
         // Catch up from the persisted cursor.
         loop {
@@ -1321,9 +1324,8 @@ async fn run_membership_projection(
         }
         // Wait for more.
         match changes.recv().await {
-            Ok(_) => {}
-            Err(broadcast::error::RecvError::Lagged(_)) => {}
-            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            Some(_) => {}
+            None => return Ok(()),
         }
     }
 }
