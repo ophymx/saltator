@@ -263,6 +263,10 @@ jobs:
           path: target/release
       - run: chmod +x target/release/saltator
       - name: Three-node chaos test
+        # Bounded: the script's curls have no --max-time, so a server
+        # that accepts but never answers would otherwise hang the job
+        # for the runner's 6-hour default (bit PR #71's first run).
+        timeout-minutes: 12
         run: ./scripts/three_node_chaos.sh target/release/saltator
 
   complement:

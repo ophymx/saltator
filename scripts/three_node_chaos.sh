@@ -46,7 +46,7 @@ EOF
 
 wait_up() {
   for _ in $(seq 1 120); do
-    curl -fsS "$1/_matrix/client/versions" >/dev/null 2>&1 && return 0
+    curl -fsS --max-time 30 "$1/_matrix/client/versions" >/dev/null 2>&1 && return 0
     sleep 0.5
   done
   return 1
@@ -85,11 +85,11 @@ done
 ALIVE=("$C1" "$C2" "$C3")
 
 echo "=== register + create room (via node 1) ==="
-TOKEN=$(curl -fsS -X POST "$C1/_matrix/client/v3/register" \
+TOKEN=$(curl -fsS --max-time 30 -X POST "$C1/_matrix/client/v3/register" \
   -H 'Content-Type: application/json' \
   -d '{"auth":{"type":"m.login.dummy"},"username":"alice","password":"p"}' | jq -r .access_token)
 [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || { echo "register failed"; exit 1; }
-ROOM=$(curl -fsS -X POST "$C1/_matrix/client/v3/createRoom" \
+ROOM=$(curl -fsS --max-time 30 -X POST "$C1/_matrix/client/v3/createRoom" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"preset":"public_chat"}' | jq -r .room_id)
 [ -n "$ROOM" ] && [ "$ROOM" != null ] || { echo "createRoom failed"; exit 1; }
@@ -134,7 +134,7 @@ echo "=== verify: every acknowledged message is readable from a survivor ==="
 # Read from node 2 (a survivor). Retry briefly so its applied state settles.
 missing=1
 for _ in $(seq 1 40); do
-  BODIES=$(curl -fsS "$C2/_matrix/client/v3/rooms/$ROOM_ENC/messages?dir=b&limit=1000" \
+  BODIES=$(curl -fsS --max-time 30 "$C2/_matrix/client/v3/rooms/$ROOM_ENC/messages?dir=b&limit=1000" \
     -H "Authorization: Bearer $TOKEN" 2>/dev/null \
     | jq -r '.chunk[]?.content.body // empty' 2>/dev/null)
   missing=0

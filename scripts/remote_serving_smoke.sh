@@ -56,7 +56,7 @@ write_config "$WORK/n2" 2 "127.0.0.1:17411" "127.0.0.1:18019" "127.0.0.1:18459" 
 wait_up() {
   local url="$1"
   for _ in $(seq 1 240); do
-    curl -fsS "$url/_matrix/client/versions" >/dev/null 2>&1 && return 0
+    curl -fsS --max-time 30 "$url/_matrix/client/versions" >/dev/null 2>&1 && return 0
     sleep 0.5
   done
   return 1
@@ -83,7 +83,7 @@ fi
 
 pass=1
 C2=http://127.0.0.1:18019
-TOKEN=$(curl -fsS -X POST "$C2/_matrix/client/v3/register" \
+TOKEN=$(curl -fsS --max-time 30 -X POST "$C2/_matrix/client/v3/register" \
   -H 'Content-Type: application/json' \
   -d '{"auth":{"type":"m.login.dummy"},"username":"remote","password":"p"}' | jq -r .access_token 2>/dev/null)
 [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || { echo "FAIL: register via node 2"; exit 1; }
@@ -92,21 +92,21 @@ TOKEN=$(curl -fsS -X POST "$C2/_matrix/client/v3/register" \
 # round-trip regardless of which node hosts its shard.
 rounds=0
 for i in $(seq 1 16); do
-  ROOM=$(curl -fsS -X POST "$C2/_matrix/client/v3/createRoom" \
+  ROOM=$(curl -fsS --max-time 30 -X POST "$C2/_matrix/client/v3/createRoom" \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     -d '{"preset":"public_chat"}' | jq -r .room_id 2>/dev/null)
   if [ -z "$ROOM" ] || [ "$ROOM" = null ]; then
     echo "FAIL: createRoom #$i via node 2"; pass=0; break
   fi
   ROOM_ENC=$(printf %s "$ROOM" | jq -sRr @uri)
-  EV=$(curl -fsS -X PUT "$C2/_matrix/client/v3/rooms/$ROOM_ENC/send/m.room.message/t$i" \
+  EV=$(curl -fsS --max-time 30 -X PUT "$C2/_matrix/client/v3/rooms/$ROOM_ENC/send/m.room.message/t$i" \
     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     -d "{\"msgtype\":\"m.text\",\"body\":\"remote $i\"}" | jq -r .event_id 2>/dev/null)
   if [ -z "$EV" ] || [ "$EV" = null ]; then
     echo "FAIL: send in $ROOM via node 2"; pass=0; break
   fi
   # Read-your-writes through node 2.
-  BODY=$(curl -fsS "$C2/_matrix/client/v3/rooms/$ROOM_ENC/event/$(printf %s "$EV" | jq -sRr @uri)" \
+  BODY=$(curl -fsS --max-time 30 "$C2/_matrix/client/v3/rooms/$ROOM_ENC/event/$(printf %s "$EV" | jq -sRr @uri)" \
     -H "Authorization: Bearer $TOKEN" | jq -r .content.body 2>/dev/null)
   if [ "$BODY" != "remote $i" ]; then
     echo "FAIL: RYW read of $EV in $ROOM got '$BODY'"; pass=0; break
@@ -117,7 +117,7 @@ done
 # /sync via node 2 sees all the rooms (the long-poll holds remote
 # Subscribe streams for the unhosted shards).
 if [ "$pass" = 1 ]; then
-  JOINED=$(curl -fsS "$C2/_matrix/client/v3/sync?timeout=0" \
+  JOINED=$(curl -fsS --max-time 30 "$C2/_matrix/client/v3/sync?timeout=0" \
     -H "Authorization: Bearer $TOKEN" | jq '.rooms.join | length' 2>/dev/null)
   if [ "${JOINED:-0}" -lt "$rounds" ]; then
     echo "FAIL: sync shows $JOINED rooms, expected >= $rounds"; pass=0
