@@ -25,7 +25,8 @@
 
 use std::path::Path;
 
-use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
+pub use tonic::transport::ClientTlsConfig;
+use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 /// One loaded TLS identity for the internal mesh, cloned into every client
 /// transport and the server. Cheap to clone (both configs are `Arc`-backed

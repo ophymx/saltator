@@ -29,7 +29,7 @@ pub async fn directory_body(
 ) -> Result<serde_json::Value, String> {
     let mut chunks = Vec::new();
     for room_id in users.store().public_rooms().map_err(|e| e.to_string())? {
-        let Some(chunk) = public_chunk(rooms.for_room(&room_id), &room_id).await? else {
+        let Some(chunk) = public_chunk(&rooms.for_room(&room_id), &room_id).await? else {
             continue;
         };
         if let Some(term) = search_term {

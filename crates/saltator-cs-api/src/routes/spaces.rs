@@ -50,7 +50,7 @@ pub async fn get_room_summary(
         room_id_or_alias
     };
 
-    let summary = room_summary(state.rooms.for_room(&room_id), &room_id)
+    let summary = room_summary(&state.rooms.for_room(&room_id), &room_id)
         .await
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("Room not found."))?;
@@ -151,7 +151,7 @@ async fn viewable(
 /// Build the node for a locally-hosted room, or `None` if this server does
 /// not host it (the federation fallback handles those).
 async fn local_node(state: &CsState, room_id: &str, user_id: &str) -> Result<Option<Node>> {
-    let Some(summary) = room_summary(state.rooms.for_room(room_id), room_id)
+    let Some(summary) = room_summary(&state.rooms.for_room(room_id), room_id)
         .await
         .map_err(internal)?
     else {

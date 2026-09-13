@@ -35,6 +35,12 @@ pub enum ReadOp {
     },
     /// The shard's current sequence number.
     Seq,
+    /// The group's committed voter set — served at the leader, so it is
+    /// the authoritative membership. The lifecycle driver's removal
+    /// gate: a departing replica may never receive the log entry that
+    /// removes it, so its LOCAL membership can read stale-as-voter
+    /// forever (docs/design-room-sharding-phase2.md, 2b).
+    Voters,
 }
 
 /// A [`ReadOp`]'s result, matched by variant.
@@ -43,6 +49,7 @@ pub enum ReadValue {
     Value(Option<Vec<u8>>),
     Entries(Vec<(Vec<u8>, Vec<u8>)>),
     Seq(u64),
+    Voters(Vec<u64>),
 }
 
 /// Executes [`ReadOp`]s against a shard replicated elsewhere — the
@@ -113,6 +120,13 @@ impl ExecutorRegistry {
             .insert(group, executor);
     }
 
+    pub fn deregister(&self, group: u64) {
+        self.inner
+            .write()
+            .expect("executor registry lock poisoned")
+            .remove(&group);
+    }
+
     pub fn get(&self, group: u64) -> Option<std::sync::Arc<dyn GroupExecutor>> {
         self.inner
             .read()
@@ -152,5 +166,11 @@ pub fn execute(ctx: &ReadCtx, seq: u64, op: &ReadOp) -> Result<ReadValue> {
                 .map_err(storage)?,
         ),
         ReadOp::Seq => ReadValue::Seq(seq),
+        // Served at the RPC layer (needs the raft handle, not storage).
+        ReadOp::Voters => {
+            return Err(ShardError::Storage(
+                "Voters is served by the RPC layer".into(),
+            ))
+        }
     })
 }

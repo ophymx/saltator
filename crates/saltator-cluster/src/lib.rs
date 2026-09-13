@@ -21,7 +21,7 @@ pub mod types;
 
 pub use join::{join_cluster, join_cluster_with_tls};
 pub use placement::{ClusterConfig, NodeInfo, NodeStatus, Placement, Roster};
-pub use reconcile::{reconcile_once, spawn_reconciler, LocalGroup};
+pub use reconcile::{reconcile_once, spawn_reconciler, LocalGroup, LocalGroups};
 
 pub mod proto {
     #![allow(clippy::all)]

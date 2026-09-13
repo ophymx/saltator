@@ -211,22 +211,60 @@ lifecycle driver, and the reconciler (which today polls).
   their generalization rides the same primitives later (nothing here is
   room-specific except the router).
 
-## Phase 2b design (sketch — detailed when 2a lands)
+## Phase 2b design
 
-- **Lifecycle driver**: a per-node task on the placement watch. Gained a
-  group → `start_shard` it (registry registration, migration
-  supervisor, reconciler `LocalGroup`) as a learner; lost a group →
-  drain leadership, `ShardRegistry::deregister` (its first caller),
-  drop the engine range (`shard_bounds` delete) after the metadata
-  group records the handoff complete.
-- **Checkpoint transfer**: a bulk-channel service (`FetchCheckpoint`,
-  streaming), serving `KvEngine::checkpoint` output filtered to
+Split into two parts once 2a's shapes were real:
+
+### 2b part 1 — runtime lifecycle (BUILT 2026-09-13)
+
+The survey after 2a found that *movement mechanics already exist*: the
+reconciler converges membership toward the placement (add-learner →
+openraft snapshot catch-up → promote → demote), proven live under
+`rf_cap`. What was missing was everything AROUND a move at runtime —
+nothing started or stopped groups after boot, nothing swapped the
+router, nothing cleaned up. Part 1 is exactly those halves:
+
+- **The router hot-swaps**: `RoomShards` slots are
+  `RwLock<Arc<RoomServer>>`; callers take owned snapshots, so a request
+  in flight across a swap finishes against the handle it started with.
+- **Lifecycle driver** (`saltator::lifecycle`): a per-node task on the
+  placement watch (`meta.subscribe()`, the schema-v2 change stream).
+  Gained a group → `start_shard` uninitialized, add to the shared
+  reconciler set (`LocalGroups`, now runtime-mutable), and swap the
+  slot to hosted only once this node is a **voter** — promotion is the
+  leader's certification that it caught us up, so local reads never
+  serve an empty store. Lost a group → **departure gate** first: a
+  remote `ReadOp::Voters` read served at the remaining replicas'
+  leader must exclude us. The gate cannot use local membership — a
+  removed node may never receive its own removal entry, so its local
+  view can read stale-as-voter forever. Then: swap the slot to remote,
+  deregister (executor + registry + reconciler — `deregister`'s first
+  callers), shut the group down, and range-delete the shard from both
+  storage roles (`shard_bounds` on the log and state engines).
+- **Accepted tradeoff (part 1)**: a read in flight on the old hosted
+  handle can race the range delete across the swap window — brief,
+  rare, and bounded by the swap ordering (new requests go remote
+  before anything is torn down).
+
+Verified by `scripts/shard_move_smoke.sh` (local-only): node 1 founds
+4 shards under `rf_cap_unsafe = 1` and fills every shard with rooms;
+node 2 joins; the placement moves a subset; rooms and messages created
+BEFORE the move stay readable through both nodes and new writes flow
+through node 1's remote path after it stood the group down.
+
+### 2b part 2 — checkpoint transfer (pending)
+
+- A bulk-channel service (`FetchCheckpoint`, streaming), serving
+  `KvEngine::checkpoint` output filtered to
   `shard_bounds(keyspace, shard)`. Join flow per spec §4.4:
   add-learner → ship checkpoint → Raft catches the tail → promote →
   demote/remove the outgoing replica. openraft's `InstallSnapshot`
-  remains the fallback when no checkpoint peer is available.
-- The reconciler grows from "fold voters in" to executing these
-  transitions; it already runs leader-scoped per group.
+  (part 1's transport) remains the fallback when no checkpoint peer is
+  available — it is an in-memory full-state copy on the control
+  channel, correct at current scales but the wrong shape for large
+  shards, which is exactly why part 2 exists.
+- Requires the second (bulk) listener the proto file has promised
+  since M4 — the first infrastructure in the tree to use it.
 
 ## Testing
 

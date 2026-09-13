@@ -112,14 +112,14 @@ pub fn spawn_delivery_worker(
                 if scan_pos.is_none() {
                     let mut floors = std::collections::BTreeMap::new();
                     for (idx, shard) in rooms.iter() {
-                        floors.insert(idx, initial_scan_pos(&fedout, idx, shard).await);
+                        floors.insert(idx, initial_scan_pos(&fedout, idx, &shard).await);
                     }
                     scan_pos = Some(floors);
                 }
                 if let Some(floors) = scan_pos.as_mut() {
                     for (idx, shard) in rooms.iter() {
                         let pos = floors.entry(idx).or_default();
-                        deliver_pdus(&fedout, idx, shard, &client, &server_name, pos, &backoff)
+                        deliver_pdus(&fedout, idx, &shard, &client, &server_name, pos, &backoff)
                             .await;
                     }
                 }

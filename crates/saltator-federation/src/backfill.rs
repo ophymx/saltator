@@ -117,7 +117,7 @@ pub async fn event(
     };
     // No room in the path: probe the groups for the event (bounded
     // point reads), then everything below is single-shard as before.
-    let Some(rooms) = rooms.for_event(&event_id).await.cloned() else {
+    let Some(rooms) = rooms.for_event(&event_id).await else {
         return Err(err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "Event not found"));
     };
     let stored = rooms
