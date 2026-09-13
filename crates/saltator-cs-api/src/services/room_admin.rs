@@ -216,7 +216,7 @@ impl RoomAdmin<'_> {
             return Ok(None);
         };
         let Some(summary) =
-            saltator_roomserver::hierarchy::room_summary(self.rooms.for_room(room_id), room_id)
+            saltator_roomserver::hierarchy::room_summary(&self.rooms.for_room(room_id), room_id)
                 .await
                 .map_err(ApiError::internal)?
         else {
@@ -315,7 +315,7 @@ impl RoomAdmin<'_> {
             .await?
             .ok_or_else(|| ApiError::not_found("This server does not host that room"))?;
         let summary =
-            saltator_roomserver::hierarchy::room_summary(self.rooms.for_room(room_id), room_id)
+            saltator_roomserver::hierarchy::room_summary(&self.rooms.for_room(room_id), room_id)
                 .await
                 .map_err(ApiError::internal)?
                 .ok_or_else(|| ApiError::not_found("This server does not host that room"))?;

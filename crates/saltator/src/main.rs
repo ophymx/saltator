@@ -3,6 +3,7 @@
 
 mod config;
 mod keys;
+mod lifecycle;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -468,8 +469,12 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         saltator_fedout::FED_OUT_SHARD.group(),
         fedout.shard_handle().clone(),
     ));
-    let reconciler =
-        saltator_cluster::spawn_reconciler(meta.clone(), local_groups, Duration::from_secs(2));
+    let local_groups = saltator_cluster::LocalGroups::new(local_groups);
+    let reconciler = saltator_cluster::spawn_reconciler(
+        meta.clone(),
+        local_groups.clone(),
+        Duration::from_secs(2),
+    );
 
     // The user-outbox drain (step 4 cross-shard move): the fed-out
     // leader copies legacy rows into its own shard and advances the
@@ -485,8 +490,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // cross-shard move; docs/design-federation-out.md §drain).
     for h in rooms
         .iter()
-        .filter_map(|(_, s)| s.hosted_handle())
-        .chain([fedout.shard_handle()])
+        .filter_map(|(_, s)| s.hosted_handle().cloned())
+        .chain([fedout.shard_handle().clone()])
     {
         saltator_shard::migrate::spawn_migration_supervisor(
             h.clone(),
@@ -584,6 +589,24 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             );
         }
     }
+    // Phase 2b: react to placement changes at runtime — start groups the
+    // placement moves here, stand down groups it moves away. A no-op
+    // while the RF floor keeps every group on every node.
+    lifecycle::spawn(lifecycle::LifecycleCtx {
+        meta: meta.clone(),
+        rooms: rooms.clone(),
+        registry: registry.clone(),
+        executors: executors.clone(),
+        local_groups: local_groups.clone(),
+        signer: signer.clone(),
+        stores: stores.clone(),
+        node_id: cfg.node.id,
+        internal_tls: internal_tls.as_ref().map(|t| t.client()),
+        fed_client: fed_client.clone(),
+        key_cache: key_cache.clone(),
+        schemas: schemas.clone(),
+    });
+
     let cs_state = saltator_cs_api::CsState::new(
         users.clone(),
         rooms.clone(),
@@ -753,8 +776,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         saltator_metrics::spawn_sampler(SHARD_SAMPLE_INTERVAL, shutdown_rx.clone(), move || {
             for h in sample_rooms
                 .iter()
-                .filter_map(|(_, shard)| shard.hosted_handle())
-                .chain([sample_users.shard_handle(), sample_fedout.shard_handle()])
+                .filter_map(|(_, shard)| shard.hosted_handle().cloned())
+                .chain([
+                    sample_users.shard_handle().clone(),
+                    sample_fedout.shard_handle().clone(),
+                ])
             {
                 // An Err from seq() is a storage failure, not "no
                 // sequence": the gauge is left alone (None), but say why,

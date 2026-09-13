@@ -99,7 +99,7 @@ pub async fn serve_hierarchy(
         .any(|p| p == "suggested_only=true");
     let our_name = state.server_name.as_str();
 
-    let summary = room_summary(rooms.for_room(&room_id), &room_id)
+    let summary = room_summary(&rooms.for_room(&room_id), &room_id)
         .await
         .map_err(|e| {
             err(
@@ -128,7 +128,7 @@ pub async fn serve_hierarchy(
     let mut children = Vec::new();
     let mut inaccessible = Vec::new();
     for link in ordered_children(&summary.children, suggested_only) {
-        match room_summary(rooms.for_room(&link.target), &link.target)
+        match room_summary(&rooms.for_room(&link.target), &link.target)
             .await
             .map_err(|e| {
                 err(

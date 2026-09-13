@@ -26,12 +26,13 @@ pub fn shard_of(room_id: &str, count: u16) -> u16 {
     (u64::from_be_bytes(first8) % u64::from(count)) as u16
 }
 
-/// All room shard groups this node runs, indexed by shard number.
-/// Phase 1 of M-scale: every node hosts every group, so the router only
-/// ever hands out local handles; phase 2 teaches it about groups that
-/// live elsewhere.
+/// All room shard groups, indexed by shard number — each slot a local
+/// (hosted) handle or a remote one, and HOT-SWAPPABLE: phase 2b's
+/// lifecycle driver replaces a slot when the placement moves the group
+/// on or off this node. Callers get an owned `Arc` snapshot; a request
+/// in flight across a swap finishes against the handle it started with.
 pub struct RoomShards {
-    shards: Vec<Arc<RoomServer>>,
+    shards: Vec<std::sync::RwLock<Arc<RoomServer>>>,
 }
 
 impl RoomShards {
@@ -39,7 +40,9 @@ impl RoomShards {
     /// trusts the boot code to hand them over in index order.
     pub fn new(shards: Vec<Arc<RoomServer>>) -> Arc<Self> {
         assert!(!shards.is_empty(), "at least one room shard");
-        Arc::new(Self { shards })
+        Arc::new(Self {
+            shards: shards.into_iter().map(std::sync::RwLock::new).collect(),
+        })
     }
 
     /// A count-1 router around an existing single server (tests, and
@@ -52,9 +55,25 @@ impl RoomShards {
         self.shards.len() as u16
     }
 
+    fn slot(&self, idx: u16) -> Arc<RoomServer> {
+        self.shards[usize::from(idx)]
+            .read()
+            .expect("shard slot lock poisoned")
+            .clone()
+    }
+
+    /// Replace one shard's handle (hosted ↔ remote). The lifecycle
+    /// driver's swap point; everything already dispatched keeps the old
+    /// handle until it finishes.
+    pub fn replace(&self, idx: u16, server: Arc<RoomServer>) {
+        *self.shards[usize::from(idx)]
+            .write()
+            .expect("shard slot lock poisoned") = server;
+    }
+
     /// The shard that owns `room_id`.
-    pub fn for_room(&self, room_id: &str) -> &Arc<RoomServer> {
-        &self.shards[usize::from(shard_of(room_id, self.count()))]
+    pub fn for_room(&self, room_id: &str) -> Arc<RoomServer> {
+        self.slot(shard_of(room_id, self.count()))
     }
 
     /// The shard index that owns `room_id`.
@@ -62,15 +81,15 @@ impl RoomShards {
         shard_of(room_id, self.count())
     }
 
-    pub fn by_index(&self, idx: u16) -> Option<&Arc<RoomServer>> {
-        self.shards.get(usize::from(idx))
+    pub fn by_index(&self, idx: u16) -> Option<Arc<RoomServer>> {
+        (idx < self.count()).then(|| self.slot(idx))
     }
 
     /// The shard a wire PDU belongs to, with the room id that decided
     /// it. Reads only the PDU (no storage): the `room_id` field, or —
     /// for a v12+ create event, which carries none — the room id derived
     /// from the create event itself.
-    pub fn for_pdu(&self, raw: &CanonicalJsonObject) -> Option<(&Arc<RoomServer>, String)> {
+    pub fn for_pdu(&self, raw: &CanonicalJsonObject) -> Option<(Arc<RoomServer>, String)> {
         let room_id = pdu_room_id(raw)?;
         Some((self.for_room(&room_id), room_id))
     }
@@ -79,8 +98,8 @@ impl RoomShards {
     /// event table — for the rare surfaces addressed by bare event id
     /// (federation `GET /event/{id}`), where no room names the shard.
     /// Bounded point reads (one per group), not a scan.
-    pub async fn for_event(&self, event_id: &str) -> Option<&Arc<RoomServer>> {
-        for s in &self.shards {
+    pub async fn for_event(&self, event_id: &str) -> Option<Arc<RoomServer>> {
+        for (_, s) in self.iter() {
             if matches!(s.store().event(event_id).await, Ok(Some(_))) {
                 return Some(s);
             }
@@ -132,7 +151,7 @@ impl RoomShards {
         // Building is shard-agnostic (shared signer); the derived room id
         // names the shard that applies (a v12 room id comes from the
         // create event, so it cannot be known any earlier).
-        let (room_id, raw) = self.shards[0].build_create(creator, version, content)?;
+        let (room_id, raw) = self.slot(0).build_create(creator, version, content)?;
         let outcome = self
             .for_room(room_id.as_str())
             .apply_create(&room_id, version, raw)
@@ -288,8 +307,8 @@ impl RoomShards {
             .await
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (u16, &Arc<RoomServer>)> {
-        self.shards.iter().enumerate().map(|(i, s)| (i as u16, s))
+    pub fn iter(&self) -> impl Iterator<Item = (u16, Arc<RoomServer>)> + '_ {
+        (0..self.count()).map(|i| (i, self.slot(i)))
     }
 }
 

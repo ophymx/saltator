@@ -29,6 +29,42 @@ impl LocalGroup {
     }
 }
 
+/// A shared, runtime-mutable set of the groups this node runs — the
+/// lifecycle driver (phase 2b) adds a group when placement moves it
+/// here and removes it on handoff, and the reconciler reads the
+/// current set each tick.
+#[derive(Clone, Default)]
+pub struct LocalGroups(std::sync::Arc<std::sync::RwLock<Vec<LocalGroup>>>);
+
+impl LocalGroups {
+    pub fn new(groups: Vec<LocalGroup>) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(groups)))
+    }
+
+    pub fn add(&self, group: LocalGroup) {
+        let mut inner = self.0.write().expect("local groups lock poisoned");
+        if !inner.iter().any(|g| g.group == group.group) {
+            inner.push(group);
+        }
+    }
+
+    pub fn remove(&self, group: u64) {
+        self.0
+            .write()
+            .expect("local groups lock poisoned")
+            .retain(|g| g.group != group);
+    }
+
+    fn snapshot(&self) -> Vec<LocalGroup> {
+        self.0
+            .read()
+            .expect("local groups lock poisoned")
+            .iter()
+            .map(|g| LocalGroup::new(g.group, g.handle.clone()))
+            .collect()
+    }
+}
+
 /// Reconcile one round. For each local group this node currently leads,
 /// converge its voter set to the placement's replica set. Returns how many
 /// groups had their membership changed this round.
@@ -83,15 +119,15 @@ pub async fn reconcile_once(meta: &MetadataHandle, groups: &[LocalGroup]) -> usi
     changed
 }
 
-/// Spawn the periodic reconciliation loop for this node's groups.
+/// Spawn the periodic reconciliation loop over a live group set.
 pub fn spawn_reconciler(
     meta: MetadataHandle,
-    groups: Vec<LocalGroup>,
+    groups: LocalGroups,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            reconcile_once(&meta, &groups).await;
+            reconcile_once(&meta, &groups.snapshot()).await;
             tokio::time::sleep(interval).await;
         }
     })

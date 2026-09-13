@@ -95,9 +95,11 @@ impl Health<'_> {
                 .ok()
                 .and_then(|roster| roster.get(&meta.node_id()).map(|info| info.status))
         });
-        let shard_leaders = std::iter::once(self.users.shard_handle())
-            .chain(self.rooms.iter().filter_map(|(_, s)| s.hosted_handle()))
-            .all(|h| h.current_leader().is_some());
+        let shard_leaders = self.users.shard_handle().current_leader().is_some()
+            && self.rooms.iter().all(|(_, s)| {
+                s.hosted_handle()
+                    .is_none_or(|h| h.current_leader().is_some())
+            });
         decide(status, shard_leaders)
     }
 }

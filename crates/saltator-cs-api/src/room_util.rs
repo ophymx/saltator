@@ -49,7 +49,7 @@ pub async fn member_view(
 ) -> Result<(StateMap, Option<u64>)> {
     let current = current_state(rooms, room_id).await?;
     let rooms = rooms.for_room(room_id);
-    match membership_in_shard(rooms, &current, user_id)
+    match membership_in_shard(&rooms, &current, user_id)
         .await?
         .as_str()
     {
@@ -107,7 +107,7 @@ pub async fn joined_member_ids(rooms: &RoomShards, room_id: &str) -> Result<Vec<
     let mut out = Vec::new();
     for (event_type, state_key) in state.keys() {
         if event_type == "m.room.member"
-            && membership_in_shard(rooms, &state, state_key).await? == "join"
+            && membership_in_shard(&rooms, &state, state_key).await? == "join"
         {
             out.push(state_key.clone());
         }
@@ -122,7 +122,7 @@ pub async fn membership_in(
     state: &StateMap,
     user_id: &str,
 ) -> Result<String> {
-    membership_in_shard(rooms.for_room(room_id), state, user_id).await
+    membership_in_shard(&rooms.for_room(room_id), state, user_id).await
 }
 
 /// [`membership_in`] on an already-resolved shard.
@@ -158,7 +158,7 @@ pub async fn state_content_in(
     state: &StateMap,
     event_type: &str,
 ) -> Result<Option<serde_json::Value>> {
-    state_content_in_shard(rooms.for_room(room_id), state, event_type).await
+    state_content_in_shard(&rooms.for_room(room_id), state, event_type).await
 }
 
 /// [`state_content_in`] on an already-resolved shard.
@@ -204,11 +204,11 @@ pub async fn user_can_see_event(
         .resolve_group(room_id, stored.state_group_after)
         .await
         .map_err(ApiError::internal)?;
-    let membership_at = membership_in_shard(shard, &state_at, user_id).await?;
+    let membership_at = membership_in_shard(&shard, &state_at, user_id).await?;
     if membership_at == "join" {
         return Ok(true);
     }
-    let visibility = state_content_in_shard(shard, &state_at, "m.room.history_visibility")
+    let visibility = state_content_in_shard(&shard, &state_at, "m.room.history_visibility")
         .await?
         .as_ref()
         .and_then(|c| c.get("history_visibility").and_then(|v| v.as_str()))
@@ -218,7 +218,7 @@ pub async fn user_can_see_event(
         "world_readable" => Ok(true),
         "shared" => {
             let current = current_state(rooms, room_id).await?;
-            Ok(membership_in_shard(shard, &current, user_id).await? == "join")
+            Ok(membership_in_shard(&shard, &current, user_id).await? == "join")
         }
         "invited" => Ok(membership_at == "invite"),
         // "joined" and anything unrecognized: members-at-the-time only,
@@ -270,7 +270,7 @@ pub async fn client_event(
                 .resolve_group(room_id, stored.state_group_after)
                 .await
                 .map_err(ApiError::internal)?;
-            let membership = membership_in_shard(rooms, &state_at, as_user).await?;
+            let membership = membership_in_shard(&rooms, &state_at, as_user).await?;
             // For a state event, `prev_content`/`prev_sender` describe the state
             // it replaced (spec: UnsignedData; for membership, the previous
             // transition). Absent for the first entry of a state key.
@@ -360,7 +360,7 @@ pub async fn raw_event(
     room_id: &str,
     event_id: &str,
 ) -> Result<Option<CanonicalJsonObject>> {
-    raw_event_shard(rooms.for_room(room_id), event_id).await
+    raw_event_shard(&rooms.for_room(room_id), event_id).await
 }
 
 /// [`raw_event`] on an already-resolved shard.

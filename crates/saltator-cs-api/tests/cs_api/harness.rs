@@ -249,8 +249,8 @@ pub async fn start_env_sharded_inner(
     .unwrap();
     for h in rooms
         .iter()
-        .map(|(_, s)| s.shard_handle())
-        .chain([users.shard_handle()])
+        .map(|(_, s)| s.shard_handle().clone())
+        .chain([users.shard_handle().clone()])
     {
         h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
     }

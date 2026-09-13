@@ -901,7 +901,7 @@ async fn build_joined_room(
             if event_type != "m.room.member" {
                 continue;
             }
-            match crate::room_util::membership_in_shard(rooms, &current, state_key)
+            match crate::room_util::membership_in_shard(&rooms, &current, state_key)
                 .await?
                 .as_str()
             {
@@ -1010,7 +1010,7 @@ async fn build_invited_room(
     wanted.push(("m.room.member".to_owned(), membership.sender.clone()));
     for key in wanted {
         if let Some(event_id) = current.get(&key) {
-            if let Some(raw) = crate::room_util::raw_event_shard(rooms, event_id).await? {
+            if let Some(raw) = crate::room_util::raw_event_shard(&rooms, event_id).await? {
                 events.push(to_raw(&stripped_event(&raw))?);
             }
         }
@@ -1064,7 +1064,7 @@ async fn build_knocked_room(
     wanted.push(("m.room.member".to_owned(), auth.user_id.to_string()));
     for key in wanted {
         if let Some(event_id) = current.get(&key) {
-            if let Some(raw) = crate::room_util::raw_event_shard(rooms, event_id).await? {
+            if let Some(raw) = crate::room_util::raw_event_shard(&rooms, event_id).await? {
                 events.push(to_raw(&stripped_event(&raw))?);
             }
         }

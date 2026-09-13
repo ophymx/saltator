@@ -228,11 +228,17 @@ impl ControlService for InternalRpc {
         }
         let op: saltator_shard::ReadOp = postcard::from_bytes(&req.op)
             .map_err(|e| Status::invalid_argument(format!("read op decode: {e}")))?;
-        let seq = handle
-            .seq()
-            .map_err(|e| Status::internal(format!("seq: {e}")))?;
-        let value = saltator_shard::read::execute(&handle.read_ctx(), seq, &op)
-            .map_err(|e| Status::invalid_argument(format!("read: {e}")))?;
+        let value = if matches!(op, saltator_shard::ReadOp::Voters) {
+            // Membership lives in the raft handle, not app storage; the
+            // leader's committed view is the authoritative one.
+            saltator_shard::ReadValue::Voters(handle.voter_ids().into_iter().collect())
+        } else {
+            let seq = handle
+                .seq()
+                .map_err(|e| Status::internal(format!("seq: {e}")))?;
+            saltator_shard::read::execute(&handle.read_ctx(), seq, &op)
+                .map_err(|e| Status::invalid_argument(format!("read: {e}")))?
+        };
         Ok(Response::new(ReadResponse {
             served: true,
             result: postcard::to_stdvec(&value)

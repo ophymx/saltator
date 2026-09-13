@@ -106,7 +106,7 @@ async fn run(state: Arc<CsState>) -> Result<(), String> {
                 // (its endpoint is down for every shard equally).
                 let mut outcome = Ok(());
                 for (idx, shard) in state.rooms.iter() {
-                    outcome = deliver_to(&state, &fedout, &client, reg, idx, shard).await;
+                    outcome = deliver_to(&state, &fedout, &client, reg, idx, &shard).await;
                     if outcome.is_err() {
                         break;
                     }
