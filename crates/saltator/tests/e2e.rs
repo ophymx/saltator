@@ -79,7 +79,7 @@ fn write_config(
         .map(|p| format!("metrics = \"127.0.0.1:{p}\"\n"))
         .unwrap_or_default();
     let appservice_line = appservice_dir
-        .map(|p| format!("appservice_registration_dir = \"{}\"\n", p.display()))
+        .map(|p| format!("appservice_registration_dir = '{}'\n", p.display()))
         .unwrap_or_default();
     let config_path = dir.path().join("saltator.toml");
     std::fs::write(
@@ -87,7 +87,7 @@ fn write_config(
         format!(
             r#"
 server_name = "{server_name}"
-data_dir = "{data}"
+data_dir = '{data}'
 
 [node]
 id = 1

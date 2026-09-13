@@ -9,5 +9,16 @@ rust-version.workspace = true
 rocksdb.workspace = true
 thiserror.workspace = true
 
+# jemalloc everywhere except Windows. The workspace Cargo.toml explains why
+# it is worth having (LSM allocation patterns, one allocator for the whole
+# process); it lives here rather than in the workspace feature list because
+# tikv-jemalloc-sys builds through `sh configure` and `mingw32-make`, which
+# an MSVC host does not have. Without the feature librocksdb-sys compiles
+# RocksDB with plain `cl.exe`, and the process falls back to the system
+# allocator. Features are unioned per target, so listing rocksdb twice is
+# the intended shape, not a duplicate.
+[target.'cfg(not(windows))'.dependencies]
+rocksdb = { workspace = true, features = ["jemalloc"] }
+
 [dev-dependencies]
 tempfile.workspace = true
