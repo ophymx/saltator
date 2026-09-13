@@ -27,20 +27,24 @@ const GATEWAY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawn the delivery loops — one per room shard, each gated on ITS
 /// shard's leadership (spec §5.5: evaluation at the emitting shard).
-/// Aborting the returned handle tears the per-shard tasks down with it.
+/// Every shard gets a task even where this node does not host it: the
+/// lifecycle driver can move a group here at any time (phase 3), and
+/// the task idles cheaply until it does. Aborting the returned handle
+/// tears the per-shard tasks down with it.
 pub fn spawn_push_delivery(state: Arc<CsState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut set = tokio::task::JoinSet::new();
-        for (idx, shard) in state.rooms.iter() {
-            // Push evaluation runs at the emitting shard's leader (spec
-            // §5.5); a node that does not host the shard is never that.
-            if !shard.is_hosted() {
-                continue;
-            }
+        for (idx, _) in state.rooms.iter() {
             let state = state.clone();
             set.spawn(async move {
-                if let Err(e) = run_shard(state, idx).await {
-                    tracing::error!(error = %e, shard = idx, "push delivery stopped");
+                // Retry on error: at RF < node count some reads are
+                // remote, and a transient network failure must not
+                // silence push for this shard until restart.
+                loop {
+                    if let Err(e) = run_shard(state.clone(), idx).await {
+                        tracing::error!(error = %e, shard = idx, "push delivery errored; retrying");
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             });
         }
@@ -50,12 +54,13 @@ pub fn spawn_push_delivery(state: Arc<CsState>) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// While the shard is unhosted, how often to re-check whether the
+/// lifecycle driver moved it here. No stream is held meanwhile: tailing
+/// a shard remotely just to advance a cursor we will never push from
+/// would cost every non-hosting node a subscription per shard.
+const UNHOSTED_RECHECK: Duration = Duration::from_secs(5);
+
 async fn run_shard(state: Arc<CsState>, shard_idx: u16) -> Result<(), String> {
-    let rooms = state
-        .rooms
-        .by_index(shard_idx)
-        .ok_or("unknown shard")?
-        .clone();
     // Gateway URLs come from clients; the guarded client blocks a pusher
     // pointed at an internal address (defence in depth on top of the
     // set-time check in routes/push.rs) including via DNS rebinding.
@@ -63,31 +68,51 @@ async fn run_shard(state: Arc<CsState>, shard_idx: u16) -> Result<(), String> {
         .timeout(GATEWAY_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;
-    let mut cursor = rooms.current_seq().await.map_err(|e| e.to_string())?;
-    let mut changes = rooms.changes(cursor);
+    // `None` while the shard is unhosted; (re)anchored at the tip when
+    // hosting (re)starts — same at-most-once semantics as a process
+    // restart: missed pushes are not re-delivered.
+    let mut cursor: Option<u64> = None;
+    let mut changes: Option<saltator_roomserver::ShardTail> = None;
 
     loop {
+        // Fresh slot snapshot per pass: the lifecycle driver may swap
+        // it (hosted ↔ remote) at any time.
+        let rooms = state.rooms.by_index(shard_idx).ok_or("unknown shard")?;
+        if !rooms.is_hosted() {
+            cursor = None;
+            changes = None;
+            tokio::time::sleep(UNHOSTED_RECHECK).await;
+            continue;
+        }
+        let mut pos = match cursor {
+            Some(c) => c,
+            None => rooms.current_seq().await.map_err(|e| e.to_string())?,
+        };
         loop {
             let batch = rooms
                 .store()
-                .timeline(cursor, BATCH)
+                .timeline(pos, BATCH)
                 .await
                 .map_err(|e| e.to_string())?;
             let Some(&(last_seq, _)) = batch.last() else {
                 break;
             };
-            if rooms.shard_handle().is_leader() {
+            if rooms.hosted_handle().is_some_and(|h| h.is_leader()) {
                 for (seq, entry) in &batch {
                     if let SeqEntry::Event { room_id, event_id } = entry {
                         notify_event(&state, &client, room_id, event_id, *seq).await;
                     }
                 }
             }
-            cursor = last_seq;
+            pos = last_seq;
         }
-        match changes.recv().await {
-            Some(_) => {}
-            None => return Ok(()),
+        cursor = Some(pos);
+        let tail = changes.get_or_insert_with(|| state.rooms.tail(shard_idx, pos));
+        // The unhosted recheck doubles as the wake fallback; a lost
+        // shard is noticed at the top of the loop either way.
+        tokio::select! {
+            _ = tail.recv() => {}
+            _ = tokio::time::sleep(UNHOSTED_RECHECK) => {}
         }
     }
 }

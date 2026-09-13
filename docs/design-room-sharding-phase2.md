@@ -291,6 +291,61 @@ through node 1's remote path after it stood the group down.
   crate round-trip test (fetch → install → boot → replay; double
   install refused).
 
+### Phase 3 — the policy flip (BUILT 2026-09-13)
+
+`replication_factor` is a real cap for ROOM groups: `assign()` places
+each on its rendezvous top-`min(RF, nodes)`, configurable at founding
+(`cluster.replication_factor`, default 3, immutable like
+`room_shards`). The USER and FED-OUT groups keep the every-active-node
+floor — their serving surfaces are still local-only on every node
+(sync/auth read the user shard locally; delivery reads the fed-out
+tables under its leader), and capping them would demote nodes with no
+remote fallback. Their generalization rides the same primitives later.
+
+What the flip smoked out (all fixed with it):
+
+- **Long-lived tails died or went stale across slot swaps.** Every
+  tailing consumer (fed-out delivery, sync long-poll, membership
+  projection, appservice push, push gateway, restricted-join recheck)
+  held a `changes()` stream from a slot *snapshot*: a hosted stream
+  ends at stand-down (worse: an ended stream returned instantly,
+  hot-spinning `select_all` loops), and a remote stream outlives a
+  gain without noticing it. `RoomShards::tail` is the fix — a
+  slot-bound stream that re-resolves the current backend on stream end
+  *and* on slot-identity change, resuming after the last delivered
+  seq. Long-lived workers also retry on error now: at RF < N their
+  reads can be remote, and a transient network failure must not
+  silence them until restart.
+- **Remote slots' address lists went silently stale.** A `RemoteShard`
+  is built from the placement at construction; the group can then move
+  among OTHER nodes. The lifecycle driver now reasserts every unhosted
+  slot's replica addresses each pass (`set_replicas` — live streams
+  re-read the list on reconnect).
+- **A joiner could boot against a placement predating its own
+  admission** — starting zero room groups while every leader tried to
+  fold it in. Boot now waits for a placement that lists the node in
+  the (floored) user group, the deterministic "reflects us" signal.
+- **One unreachable target starved all reconciliation.**
+  `add_learner` blocks until the learner catches up; a group that
+  never answers (not started, node down) wedged the reconciler loop
+  ahead of every other group — including the user-group fold-in a
+  joiner's boot waits on. Both membership calls are bounded now
+  (10s; a timed-out change completes on its own if quorum returns).
+- **Push delivery only ever spawned for boot-hosted shards.** Its
+  per-shard worker now exists for every shard, idling at a cheap
+  recheck while unhosted (no remote subscription held) and re-anchoring
+  its at-most-once cursor at the tip when hosting (re)starts.
+
+Proven by `rf_policy_smoke.sh`: 3 nodes, 8 shards, RF 2 as real policy
+(no debug knob) — node 3's join re-ranks every group, stand-downs on
+nodes 1/2 balance node 3's gains (every group ends at exactly 2
+replicas), gained state arrives via checkpoint pre-seed, and all three
+nodes read, write, and sync every room afterward.
+
+Still phase 3, not yet built: dead-node re-placement (placement only
+reacts to roster changes; a crashed node's replicas stay assigned to
+it until drained) and media blob placement.
+
 ## Testing
 
 - **Unit**: Subscribe backfill/live splice (gap-free across the seam,

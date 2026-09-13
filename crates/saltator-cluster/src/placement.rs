@@ -179,24 +179,29 @@ impl Placement {
 /// Assign replicas to each data group by rendezvous hashing over the
 /// active nodes.
 ///
-/// INTERIM POLICY: every group goes to EVERY active node (RF is floored
-/// at the node count). The whole serving surface currently assumes local
-/// applied state for every shard — startup waits for each group's
-/// leadership, and CS/federation reads hit the local store directly — so
-/// a node outside a group's replica set could neither boot nor serve
-/// (found by the churn soak: a 4th node wedged at "awaiting join").
-/// `replication_factor` becomes a real cap once data-plane routing for
-/// unhosted shards exists; the rendezvous ranking already yields the
-/// stable per-group orderings that cap will truncate to.
+/// For ROOM groups, `replication_factor` is a real cap (phase 3
+/// policy): the replica set is the rendezvous top-RF, and nodes outside
+/// it serve the group remotely (Read/Subscribe RPCs, intents) — the
+/// data-plane routing phase 2 built. Clusters with fewer nodes than RF
+/// place on every node; growth past RF is what starts excluding.
+///
+/// The USER and FED-OUT groups keep the every-active-node floor: their
+/// serving surfaces are still local-only on every node (sync and auth
+/// read the user shard locally; §"One delivery worker" reads the
+/// fed-out tables under its leader) — capping them would demote nodes
+/// that have no remote path to fall back on. Their generalization rides
+/// the same primitives later (design §scope).
 pub fn assign(config: &ClusterConfig, rf_cap: Option<u8>, nodes: &BTreeSet<NodeId>) -> Placement {
-    let rf = match rf_cap {
-        // The debug cap replaces the floor outright — the whole point is
-        // exercising nodes that do NOT host a group (phase 2a harness).
+    let room_rf = match rf_cap {
+        // The debug cap overrides the configured RF outright — it forces
+        // exclusion even below `replication_factor` (2a harness).
         Some(cap) => (cap as usize).max(1),
-        None => (config.replication_factor as usize).max(nodes.len()),
+        None => (config.replication_factor as usize).min(nodes.len()).max(1),
     };
     let mut groups = BTreeMap::new();
     for g in config.data_groups() {
+        let is_room = ShardId::from_group(g).is_some_and(|s| s.keyspace == Keyspace::Room);
+        let rf = if is_room { room_rf } else { nodes.len() };
         let mut ranked: Vec<NodeId> = nodes.iter().copied().collect();
         // Highest weight first; equal weights break by ascending node id
         // (sort_by is stable and `ranked` starts id-sorted).
@@ -308,19 +313,29 @@ mod tests {
     }
 
     #[test]
-    fn interim_policy_places_every_group_on_every_node() {
-        // Until data-plane routing for unhosted shards exists, every
-        // active node must host every group (see `assign`); a node
-        // outside a replica set could neither boot nor serve.
-        let cfg = big_config();
+    fn replication_factor_caps_room_groups_only() {
+        // Phase 3 policy: RF is a real cap for ROOM groups — more nodes
+        // than RF means some nodes serve those groups remotely. The
+        // user and fed-out groups keep the every-node floor until their
+        // serving surfaces generalize.
+        let cfg = big_config(); // rf = 3
         let ns = nodes(&[1, 2, 3, 4, 5]);
-        for (_g, r) in assign(&cfg, None, &ns).iter() {
-            assert_eq!(r.len(), 5, "every node hosts every group");
+        for (g, r) in assign(&cfg, None, &ns).iter() {
+            let ks = ShardId::from_group(g).expect("known keyspace").keyspace;
+            match ks {
+                Keyspace::Room => assert_eq!(r.len(), 3, "room replica set is the top-RF"),
+                _ => assert_eq!(r.len(), 5, "user/fed-out stay on every node"),
+            }
             let uniq: BTreeSet<_> = r.iter().copied().collect();
             assert_eq!(uniq.len(), r.len(), "replicas must be distinct nodes");
         }
         for (_g, r) in assign(&cfg, None, &nodes(&[1, 2])).iter() {
-            assert_eq!(r.len(), 2);
+            assert_eq!(r.len(), 2, "below RF, every node hosts every group");
+        }
+        // Every node still takes on SOME room work at 5 nodes / RF 3.
+        let placed = assign(&cfg, None, &ns);
+        for n in &ns {
+            assert!(!placed.groups_for(*n).is_empty(), "node {n} got no groups");
         }
     }
 

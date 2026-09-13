@@ -54,7 +54,7 @@ use saltator_shard::{ChangeRecord, NodeId, ShardHandle, ShardId, ShardRegistry, 
 use saltator_store::Keyspace;
 
 pub use machine::{RoomApp, RoomPage, RoomStore};
-pub use shards::{shard_of, RoomShards};
+pub use shards::{shard_of, RoomShards, ShardTail};
 pub use signer::{ServerSigner, SignError};
 pub use types::{
     AppendEvent, ChangePayload, ReceiptCmd, ReceiptRecord, Rejected, RoomCommand, RoomMeta,
@@ -430,6 +430,15 @@ impl RoomServer {
         match &self.backend {
             RoomBackend::Hosted(h) => Some(h),
             RoomBackend::Remote(_) => None,
+        }
+    }
+
+    /// The placement moved this group's replicas: point the remote
+    /// backend at the new address list (live streams pick it up on
+    /// their next reconnect). No-op on a hosted shard.
+    pub fn update_remote_replicas(&self, addrs: Vec<String>) {
+        if let Some(r) = self.remote_backend() {
+            r.set_replicas(addrs);
         }
     }
 

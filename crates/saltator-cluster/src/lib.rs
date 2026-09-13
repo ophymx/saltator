@@ -554,13 +554,34 @@ pub async fn serve_internal_with_tls(
     if let Some(tls) = &tls {
         builder = builder.tls_config(tls.server())?;
     }
-    builder
+    // Graceful drain is BOUNDED: tonic's shutdown waits for in-flight
+    // requests, and at RF < node count peers hold Subscribe streams
+    // that never complete — an unbounded drain would hang every
+    // multi-node shutdown. Unary traffic finishes well inside the
+    // grace; then the serve future is dropped, closing the remaining
+    // (streaming) connections, whose clients reconnect elsewhere.
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown = async move {
+        shutdown.await;
+        let _ = drained_tx.send(());
+    };
+    let serve = builder
         .add_service(proto::raft_service_server::RaftServiceServer::from_arc(
             svc.clone(),
         ))
         .add_service(proto::control_service_server::ControlServiceServer::from_arc(svc.clone()))
         .add_service(proto::bulk_service_server::BulkServiceServer::from_arc(svc))
-        .serve_with_shutdown(listen, shutdown)
-        .await?;
+        .serve_with_shutdown(listen, shutdown);
+    tokio::select! {
+        r = serve => r?,
+        _ = async {
+            let _ = drained_rx.await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        } => {
+            tracing::info!(
+                "internal RPC drain grace elapsed; closing remaining (streaming) connections"
+            );
+        }
+    }
     Ok(())
 }

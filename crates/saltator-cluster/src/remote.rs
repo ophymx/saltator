@@ -300,6 +300,10 @@ impl saltator_shard::RemoteShardBackend for RemoteShard {
     > {
         Box::pin(RemoteShard::subscribe(self, from_seq))
     }
+
+    fn set_replicas(&self, replicas: Vec<String>) {
+        RemoteShard::set_replicas(self, replicas)
+    }
 }
 
 /// Fetch a whole-shard transfer payload for `group` from the first

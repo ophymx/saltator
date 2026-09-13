@@ -1258,9 +1258,10 @@ const PROJECTION_BATCH: usize = 512;
 
 /// Drive the membership projection: consume the room shard's change
 /// stream and index members' memberships (local and remote) in the user
-/// shard. Replays from the persisted cursor on startup; ends when the
-/// room shard's change stream closes (spec.md §9: eventually consistent,
-/// monotonic per source shard).
+/// shard. Replays from the persisted cursor on startup and retries on
+/// error — at RF < node count the source reads can be remote, and a
+/// transient network failure must not freeze the index until restart
+/// (spec.md §9: eventually consistent, monotonic per source shard).
 pub fn spawn_membership_projection(
     users: Arc<UserServer>,
     rooms: Arc<saltator_roomserver::RoomShards>,
@@ -1271,12 +1272,15 @@ pub fn spawn_membership_projection(
         // cursor (`room/{idx}`). Dropping the JoinSet (via abort of this
         // task) tears them all down.
         let mut set = tokio::task::JoinSet::new();
-        for (idx, shard) in rooms.iter() {
+        for (idx, _) in rooms.iter() {
             let users = users.clone();
-            let shard = shard.clone();
+            let rooms = rooms.clone();
             set.spawn(async move {
-                if let Err(e) = run_membership_projection(&users, idx, &shard).await {
-                    tracing::error!(error = %e, shard = idx, "membership projection stopped");
+                loop {
+                    if let Err(e) = run_membership_projection(&users, idx, &rooms).await {
+                        tracing::error!(error = %e, shard = idx, "membership projection errored; retrying");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             });
         }
@@ -1287,18 +1291,23 @@ pub fn spawn_membership_projection(
 async fn run_membership_projection(
     users: &UserServer,
     shard_idx: u16,
-    rooms: &RoomServer,
+    shards: &Arc<saltator_roomserver::RoomShards>,
 ) -> Result<()> {
     let source = room_source(shard_idx);
     // Anchored at the durable cursor: everything after it is delivered
     // or replayed, local or remote — no lost wakeups, no unseen gap.
+    // The tail is slot-bound: it survives the lifecycle driver swapping
+    // the source shard hosted ↔ remote.
     let mut changes = {
         let cursor = users.store().cursor(&source).map_err(storage_err)?;
-        rooms.changes(cursor)
+        shards.tail(shard_idx, cursor)
     };
     loop {
-        // Catch up from the persisted cursor.
+        // Catch up from the persisted cursor, reading through a fresh
+        // slot snapshot per pass (a stale one would read a stood-down
+        // replica's emptied store).
         loop {
+            let rooms = shards.by_index(shard_idx).expect("valid shard index");
             let cursor = users.store().cursor(&source).map_err(storage_err)?;
             let batch = rooms
                 .store()
@@ -1313,7 +1322,7 @@ async fn run_membership_projection(
                 let SeqEntry::Event { room_id, event_id } = entry else {
                     continue;
                 };
-                if let Some(change) = membership_change(rooms, room_id, event_id, *room_seq).await?
+                if let Some(change) = membership_change(&rooms, room_id, event_id, *room_seq).await?
                 {
                     changes_out.push(change);
                 }
@@ -1323,10 +1332,7 @@ async fn run_membership_projection(
                 .await?;
         }
         // Wait for more.
-        match changes.recv().await {
-            Some(_) => {}
-            None => return Ok(()),
-        }
+        changes.recv().await;
     }
 }
 

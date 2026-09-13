@@ -72,8 +72,14 @@ pub fn spawn_appservice_push(state: Arc<CsState>) -> Option<tokio::task::JoinHan
         return None;
     }
     Some(tokio::spawn(async move {
-        if let Err(e) = run(state).await {
-            tracing::error!(error = %e, "appservice push stopped");
+        // Retry on error: at RF < node count some inputs are remote
+        // reads, and a transient network failure must not silence
+        // appservice push until restart. Cursors are durable.
+        loop {
+            if let Err(e) = run(state.clone()).await {
+                tracing::error!(error = %e, "appservice push errored; retrying");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }))
 }
@@ -84,10 +90,12 @@ async fn run(state: Arc<CsState>) -> Result<(), String> {
     // In-memory by design, like federation's DeliveryBackoff: a failover
     // retries immediately once, then re-learns the backoff.
     let mut backoff: HashMap<String, (Instant, Duration)> = HashMap::new();
+    // Slot-bound tails (not snapshot streams): they survive the
+    // lifecycle driver swapping a shard hosted ↔ remote.
     let mut changes = Vec::new();
-    for (_, s) in state.rooms.iter() {
+    for (idx, s) in state.rooms.iter() {
         let from = s.current_seq().await.map_err(|e| e.to_string())?;
-        changes.push(s.changes(from));
+        changes.push(state.rooms.tail(idx, from));
     }
 
     loop {
