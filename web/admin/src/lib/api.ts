@@ -313,7 +313,7 @@ export function listBlockedRooms(): Promise<{ blocked_rooms: BlockedRoom[] }> {
 export interface ClusterNode {
   node_id: number;
   advertise_addr: string;
-  status: 'active' | 'draining';
+  status: 'active' | 'draining' | 'unreachable';
   groups: string[];
   metadata_voter: boolean;
 }

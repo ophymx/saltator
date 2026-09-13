@@ -86,7 +86,12 @@
         </td>
         <td class="mono small">{node.advertise_addr}</td>
         <td>
-          <span class="badge" class:ok={node.status === 'active'} class:warn={node.status === 'draining'}>
+          <span
+            class="badge"
+            class:ok={node.status === 'active'}
+            class:warn={node.status === 'draining'}
+            class:danger={node.status === 'unreachable'}
+          >
             {node.status}
           </span>
           {#if !node.metadata_voter}<span class="badge warn">not a voter</span>{/if}

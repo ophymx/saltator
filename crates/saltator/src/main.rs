@@ -522,6 +522,20 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         Duration::from_secs(2),
     );
 
+    // Dead-node failure detection: the metadata leader probes the roster
+    // and re-places an unanswering node's room groups after the grace
+    // period (docs/design-room-sharding-phase2.md, phase 3). Runs on
+    // every node; acts only while this node holds metadata leadership.
+    let dead_node_grace = cfg.cluster.dead_node_grace_secs.unwrap_or(30);
+    if dead_node_grace > 0 {
+        saltator_cluster::liveness::spawn(
+            meta.clone(),
+            cfg.node.id,
+            Duration::from_secs(dead_node_grace),
+            internal_tls.as_ref().map(|t| t.client()),
+        );
+    }
+
     // The user-outbox drain (step 4 cross-shard move): the fed-out
     // leader copies legacy rows into its own shard and advances the
     // durable marker; exits once the marker covers the tail.
@@ -651,6 +665,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         fed_client: fed_client.clone(),
         key_cache: key_cache.clone(),
         schemas: schemas.clone(),
+        forwarder: forwarder.clone(),
     });
 
     let cs_state = saltator_cs_api::CsState::new(

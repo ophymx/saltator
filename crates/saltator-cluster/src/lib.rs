@@ -8,6 +8,7 @@
 pub mod forward;
 pub mod gate;
 pub mod join;
+pub mod liveness;
 pub mod network;
 pub mod placement;
 pub mod reconcile;
@@ -76,7 +77,11 @@ pub struct MetaApp;
 /// The metadata group's schema version (see docs/design-schema-migrations.md).
 /// v2: every committed Set/Delete emits a [`MetaChange`] and journals it
 /// under its seq (`T_CHANGES`) for subscription backfill.
-pub const META_SCHEMA_VERSION: u32 = 2;
+/// v3: the roster may carry [`NodeStatus::Unreachable`] — a variant pre-v3
+/// binaries cannot decode, so the failure detector ([`liveness`]) only
+/// writes it once the STORED version reaches 3 (the gate guarantees every
+/// voter runs a v3-aware binary by then). No data transforms.
+pub const META_SCHEMA_VERSION: u32 = 3;
 
 /// Seq-indexed change journal (v2): `seq (u64 BE) → postcard(MetaChange)`.
 const T_CHANGES: u8 = APP_TABLE_FIRST + 1;
@@ -125,6 +130,10 @@ impl ShardApp for MetaApp {
             // watchers tolerate: metadata is latest-value, and they
             // subscribe from the current seq.
             2 => Ok(()),
+            // v3 widens the roster encoding (NodeStatus::Unreachable); the
+            // stored bytes are untouched — the step exists so the gate can
+            // hold the new variant back until every voter can decode it.
+            3 => Ok(()),
             other => Err(StoreError::Engine(format!(
                 "no migration registered for meta schema step v{other}"
             ))),
@@ -370,8 +379,32 @@ impl MetadataHandle {
         Ok(next)
     }
 
+    /// Mark `node_id` unreachable and recompute placement without it —
+    /// the failure detector's half of a drain ([`liveness`]). Must be
+    /// called on the leader. Returns whether the node is now marked
+    /// unreachable (false when the plan skipped a `Draining` node).
+    pub async fn mark_unreachable(&self, node_id: NodeId) -> Result<bool> {
+        self.update_roster(|roster| placement::plan_mark_unreachable(roster, node_id))
+            .await
+            .map(|r| r[&node_id].status == NodeStatus::Unreachable)
+    }
+
+    /// Return a recovered `node_id` to `Active` and recompute placement
+    /// with it. Must be called on the leader; returns whether the node is
+    /// now `Active`. No-op unless the node is currently `Unreachable` —
+    /// an operator's drain is never undone.
+    pub async fn mark_reachable(&self, node_id: NodeId) -> Result<bool> {
+        self.update_roster(|roster| placement::plan_mark_reachable(roster, node_id))
+            .await
+            .map(|r| r[&node_id].status == NodeStatus::Active)
+    }
+
     /// Apply a roster transition and republish the placement derived from
-    /// it, under the same lock that serializes joins.
+    /// it, under the same lock that serializes joins. A plan that returns
+    /// the roster unchanged writes nothing — transition plans are
+    /// idempotent no-ops outside their source status, and re-deriving
+    /// placement for them would spam the change stream every detector
+    /// tick.
     async fn update_roster(
         &self,
         plan: impl FnOnce(&Roster) -> std::result::Result<Roster, placement::RosterError>,
@@ -379,7 +412,9 @@ impl MetadataHandle {
         let _guard = self.updates.lock().await;
         let roster = self.roster().await?;
         let next = plan(&roster)?;
-        self.write_roster(&next).await?;
+        if next != roster {
+            self.write_roster(&next).await?;
+        }
         Ok(next)
     }
 

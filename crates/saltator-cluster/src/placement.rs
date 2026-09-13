@@ -66,6 +66,12 @@ pub enum NodeStatus {
     Active,
     /// Being removed: keeps serving but hosts no new replicas.
     Draining,
+    /// Failed liveness checks: hosts no replicas until it answers again.
+    /// Set and cleared only by the metadata leader's failure detector
+    /// ([`crate::liveness`]) — operator intent stays `Draining`. Appended
+    /// after the original variants so pre-v3 roster encodings are
+    /// byte-identical; writing it is gated on meta schema ≥ 3.
+    Unreachable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +131,45 @@ pub fn plan_drain(roster: &Roster, node: NodeId) -> Result<Roster, RosterError> 
 pub fn plan_undrain(roster: &Roster, node: NodeId) -> Result<Roster, RosterError> {
     if !roster.contains_key(&node) {
         return Err(RosterError::UnknownNode);
+    }
+    let mut next = roster.clone();
+    next.entry(node)
+        .and_modify(|i| i.status = NodeStatus::Active);
+    Ok(next)
+}
+
+/// The roster after the failure detector loses `node`: placement stops
+/// targeting it, exactly like a drain, but under a status the detector
+/// may also clear again. Only an `Active` node transitions — `Draining`
+/// is operator intent and stays put (also keeping `plan_removal`'s
+/// contract intact for a node that dies mid-drain). A no-op transition
+/// returns the roster unchanged, which callers detect to skip the write.
+pub fn plan_mark_unreachable(roster: &Roster, node: NodeId) -> Result<Roster, RosterError> {
+    let info = roster.get(&node).ok_or(RosterError::UnknownNode)?;
+    if info.status != NodeStatus::Active {
+        return Ok(roster.clone());
+    }
+    // Same floor as drain: placement must always have somewhere to put
+    // data. Beyond the floor, marking is deliberately permissive — a
+    // majority of dead data-group voters already means those groups
+    // cannot commit membership changes, and the mark never makes that
+    // worse (the node stays a metadata voter throughout).
+    if active_nodes(roster).len() <= 1 {
+        return Err(RosterError::LastActiveNode);
+    }
+    let mut next = roster.clone();
+    next.entry(node)
+        .and_modify(|i| i.status = NodeStatus::Unreachable);
+    Ok(next)
+}
+
+/// The roster after the failure detector hears from `node` again. Only
+/// an `Unreachable` node transitions — the detector must never undo an
+/// operator's drain.
+pub fn plan_mark_reachable(roster: &Roster, node: NodeId) -> Result<Roster, RosterError> {
+    let info = roster.get(&node).ok_or(RosterError::UnknownNode)?;
+    if info.status != NodeStatus::Unreachable {
+        return Ok(roster.clone());
     }
     let mut next = roster.clone();
     next.entry(node)
@@ -301,6 +346,61 @@ mod tests {
         assert_eq!(plan_removal(&live, 9), Err(RosterError::UnknownNode));
 
         let drained = plan_drain(&live, 2).unwrap();
+        let after = plan_removal(&drained, 2).unwrap();
+        assert_eq!(after.keys().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    /// The failure detector's transitions: Active ⇄ Unreachable only.
+    /// Draining is operator intent and must survive the node dying.
+    #[test]
+    fn unreachable_marks_only_active_nodes_and_back() {
+        let live = roster(&[(1, NodeStatus::Active), (2, NodeStatus::Active)]);
+        let marked = plan_mark_unreachable(&live, 2).unwrap();
+        assert_eq!(marked[&2].status, NodeStatus::Unreachable);
+        assert_eq!(active_nodes(&marked), nodes(&[1]), "out of placement");
+        for (_g, r) in assign(&big_config(), None, &active_nodes(&marked)).iter() {
+            assert_eq!(r, [1], "an unreachable node hosts nothing");
+        }
+
+        // Re-marking is a no-op (unchanged roster, so callers skip the
+        // write), and recovery restores Active.
+        assert_eq!(plan_mark_unreachable(&marked, 2).unwrap(), marked);
+        let restored = plan_mark_reachable(&marked, 2).unwrap();
+        assert_eq!(restored, live);
+        assert_eq!(plan_mark_reachable(&restored, 2).unwrap(), restored);
+
+        // A draining node is never marked, and never "recovered".
+        let draining = plan_drain(&live, 2).unwrap();
+        assert_eq!(plan_mark_unreachable(&draining, 2).unwrap(), draining);
+        assert_eq!(plan_mark_reachable(&draining, 2).unwrap(), draining);
+
+        assert_eq!(
+            plan_mark_unreachable(&live, 9),
+            Err(RosterError::UnknownNode)
+        );
+        assert_eq!(plan_mark_reachable(&live, 9), Err(RosterError::UnknownNode));
+    }
+
+    /// Same floor as drain: the detector must never leave placement with
+    /// nowhere to put data, however dead the rest of the cluster looks.
+    #[test]
+    fn the_last_active_node_cannot_be_marked_unreachable() {
+        let mixed = roster(&[(1, NodeStatus::Active), (2, NodeStatus::Unreachable)]);
+        assert_eq!(
+            plan_mark_unreachable(&mixed, 1),
+            Err(RosterError::LastActiveNode)
+        );
+    }
+
+    /// A dead node can still be retired: drain applies to an unreachable
+    /// node (skipping the Active-only floor guard correctly counts the
+    /// survivors), and removal then proceeds as usual.
+    #[test]
+    fn an_unreachable_node_can_be_drained_and_removed() {
+        let live = roster(&[(1, NodeStatus::Active), (2, NodeStatus::Active)]);
+        let marked = plan_mark_unreachable(&live, 2).unwrap();
+        let drained = plan_drain(&marked, 2).unwrap();
+        assert_eq!(drained[&2].status, NodeStatus::Draining);
         let after = plan_removal(&drained, 2).unwrap();
         assert_eq!(after.keys().copied().collect::<Vec<_>>(), [1]);
     }

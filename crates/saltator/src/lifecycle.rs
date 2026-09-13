@@ -45,6 +45,12 @@ pub struct LifecycleCtx {
     pub fed_client: Arc<saltator_federation::FederationClient>,
     pub key_cache: Arc<saltator_federation::KeyCache>,
     pub schemas: Vec<(u32, u32)>,
+    /// Proposal forwarder for gained groups. Boot-time handles get theirs
+    /// in main; a handle started here begins life as a follower, and
+    /// without a forwarder a follower can never hand a write to its
+    /// leader — every proposal spins to "no leader reachable" (found by
+    /// dead_node_smoke: a long-running node regaining a group at runtime).
+    pub forwarder: Arc<dyn saltator_shard::ProposeForwarder>,
 }
 
 /// Spawn the driver. Runs until aborted.
@@ -166,6 +172,7 @@ async fn gain_group(ctx: &LifecycleCtx, shard: ShardId) -> anyhow::Result<()> {
     )
     .await?;
     let handle = server.shard_handle().clone();
+    handle.set_forwarder(ctx.forwarder.clone());
     // Reconciler visibility FIRST: the leader learns to add us from the
     // placement, but add_learner errors until our group is running —
     // which it now is; the voter wait below is what the leader unblocks.

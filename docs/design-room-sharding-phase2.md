@@ -342,9 +342,58 @@ nodes 1/2 balance node 3's gains (every group ends at exactly 2
 replicas), gained state arrives via checkpoint pre-seed, and all three
 nodes read, write, and sync every room afterward.
 
-Still phase 3, not yet built: dead-node re-placement (placement only
-reacts to roster changes; a crashed node's replicas stay assigned to
-it until drained) and media blob placement.
+### Dead-node re-placement (built 2026-09-13)
+
+Placement previously reacted only to roster changes: a crashed node's
+replicas stayed assigned to it until an operator drained it. Now the
+metadata leader runs a failure detector (`saltator-cluster::liveness`)
+that probes every roster node's internal Status RPC. A node failing
+continuously for `cluster.dead_node_grace_secs` (default 30; 0
+disables) is marked `NodeStatus::Unreachable` — the automatic half of a
+drain: it leaves `active_nodes()`, placement recomputes without it, and
+the existing reconcile/lifecycle/checkpoint machinery moves its room
+groups onto survivors. When it answers again (three consecutive
+probes), it returns to `Active` and rendezvous hands its groups back.
+
+Deliberate limits, chosen over cleverness:
+
+- **Placement-only verdict.** The node keeps its roster entry and its
+  metadata-group vote; a false positive costs data movement, never
+  quorum. Permanent removal stays the operator's drain + remove (drain
+  applies to an unreachable node, so a truly dead machine can be
+  retired).
+- **Only the leader judges, and only Active ⇄ Unreachable.** Leadership
+  itself proves quorum contact, so the leader's view is the least
+  partitioned available; its counters reset on leadership change (a new
+  leader re-earns the grace period). `Draining` is operator intent and
+  is never touched — a node that dies mid-drain stays draining. The
+  drain floor applies: the last active node is never condemned.
+- **Healing needs a surviving quorum — RF 3 is the real minimum.** At
+  RF 2 a dead replica *is* lost quorum (2-of-2), and no placement
+  change can reconfigure a group that cannot commit. Re-placement
+  restores redundancy where a quorum survives; it cannot conjure one.
+- **Format gating.** `Unreachable` is a roster encoding pre-v3 binaries
+  cannot decode, so it rides meta schema v3: the detector holds off
+  until the STORED version reaches 3, which the migration gate only
+  commits once every voter runs a v3-aware binary.
+
+What building it smoked out: **runtime-gained groups could never
+forward writes.** Only boot-time handles got a `ProposeForwarder`; a
+handle started by the lifecycle driver began life as a follower with no
+way to hand a proposal to its leader, so every write spun to "no leader
+reachable". The earlier smokes missed it because their gaining nodes
+*booted* into their groups (join-time placement); a long-running node
+regaining a group at runtime — exactly the recovery path — hit it
+immediately. The forwarder now travels in `LifecycleCtx`.
+
+Proven by `dead_node_smoke.sh`: 4 nodes, 8 shards, RF 3, 5-second
+grace. Node 4 (hosting 5 groups) is killed -9; the detector marks it
+within the grace, survivors re-gain all 5 groups, and every room reads,
+writes, and syncs through the three survivors throughout. Node 4 then
+restarts: the detector restores it, rendezvous returns its 5 groups,
+and all four nodes serve everything.
+
+Still phase 3, not yet built: media blob placement.
 
 ## Testing
 
