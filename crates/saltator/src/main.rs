@@ -828,15 +828,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     tokio::spawn(async move {
-        // SIGTERM matters as much as ctrl-c: it's what `docker stop` (and
-        // thus Complement teardown) sends, and as PID 1 in a container the
-        // default disposition would ignore it.
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("installing SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = sigterm.recv() => {}
-        }
+        shutdown_signal().await;
         tracing::info!("shutdown signal received");
         let _ = shutdown_tx.send(true);
     });
@@ -885,5 +877,37 @@ impl saltator_shard::migrate::MigrationGate for UserMigrationGate {
             }
         }
         true
+    }
+}
+
+/// Resolve when the operating system asks the process to stop.
+///
+/// SIGTERM matters as much as ctrl-c: it's what `docker stop` (and thus
+/// Complement teardown) sends, and as PID 1 in a container the default
+/// disposition would ignore it.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("installing SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+/// Windows has no SIGTERM. The console-control events are the nearest
+/// equivalents: ctrl-c and ctrl-break from a terminal, CTRL_CLOSE when the
+/// console window goes away, CTRL_SHUTDOWN when the system does.
+#[cfg(windows)]
+async fn shutdown_signal() {
+    use tokio::signal::windows;
+    let mut ctrl_break = windows::ctrl_break().expect("installing ctrl-break handler");
+    let mut ctrl_close = windows::ctrl_close().expect("installing ctrl-close handler");
+    let mut ctrl_shutdown = windows::ctrl_shutdown().expect("installing ctrl-shutdown handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = ctrl_break.recv() => {}
+        _ = ctrl_close.recv() => {}
+        _ = ctrl_shutdown.recv() => {}
     }
 }

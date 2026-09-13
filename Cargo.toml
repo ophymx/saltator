@@ -57,16 +57,18 @@ openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 # have to be named again — it IS in rocksdb's default list, and without it
 # bindgen gets neither `runtime` nor `static`.
 #
-# `jemalloc` is the allocator, and it is the whole process's allocator, not
-# just RocksDB's. librocksdb-sys pulls tikv-jemalloc-sys with
-# `unprefixed_malloc_on_supported_platforms`, so jemalloc exports plain
-# `malloc`/`free` and interposes on everything: RocksDB's C++ `operator
-# new`, and Rust's `System` allocator, which bottoms out in the same libc
-# symbols. That is what makes it safe — the feature also defines
-# `ROCKSDB_JEMALLOC`, which lets RocksDB size heap blocks with
-# `je_malloc_usable_size`, and handing a jemalloc usable-size query a
-# system-malloc pointer would be undefined behaviour. One allocator, so
-# the question never arises, and no `#[global_allocator]` is needed.
+# `jemalloc` is the allocator on every platform but Windows, where
+# saltator-store adds it as a target-specific feature (see its Cargo.toml).
+# It is the whole process's allocator, not just RocksDB's. librocksdb-sys
+# pulls tikv-jemalloc-sys with `unprefixed_malloc_on_supported_platforms`,
+# so jemalloc exports plain `malloc`/`free` and interposes on everything:
+# RocksDB's C++ `operator new`, and Rust's `System` allocator, which
+# bottoms out in the same libc symbols. That is what makes it safe — the
+# feature also defines `ROCKSDB_JEMALLOC`, which lets RocksDB size heap
+# blocks with `je_malloc_usable_size`, and handing a jemalloc usable-size
+# query a system-malloc pointer would be undefined behaviour. One
+# allocator, so the question never arises, and no `#[global_allocator]`
+# is needed.
 #
 # The reason to want it is the LSM allocation pattern: many similarly-sized,
 # long-lived block-cache and memtable buffers, which is where glibc malloc
@@ -80,7 +82,6 @@ openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 rocksdb = { version = "0.23", default-features = false, features = [
     "lz4",
     "zstd",
-    "jemalloc",
     "bindgen-runtime",
 ] }
 tonic = { version = "0.12", features = ["tls"] }
