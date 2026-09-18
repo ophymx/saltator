@@ -244,6 +244,15 @@ pub struct ClusterConfig {
     /// (docs/design-room-sharding-phase2.md, phase 3).
     #[serde(default)]
     pub replication_factor: Option<u8>,
+    /// How long (seconds) a node must fail liveness probes continuously
+    /// before the metadata leader marks it unreachable and re-places its
+    /// room-group replicas onto surviving nodes (default 30; 0 disables
+    /// the detector). Node-local: the value the current metadata leader
+    /// runs with is the one in force. The node returns to placement
+    /// automatically once it answers again; permanent removal is still
+    /// the operator's drain + remove.
+    #[serde(default)]
+    pub dead_node_grace_secs: Option<u64>,
     /// DEBUG-ONLY replication-factor cap (docs/design-room-sharding-phase2.md
     /// review call 4): overrides the configured replication factor so
     /// the cluster harness can force remote serving below RF. UNSAFE
@@ -381,6 +390,10 @@ seeds = []
 # (default 3). Groups place on min(RF, node count) nodes; nodes beyond
 # RF serve the extra shards remotely.
 # replication_factor = 3
+# Seconds a node must fail liveness probes continuously before the
+# metadata leader re-places its room-group replicas onto surviving nodes
+# (0 disables). It rejoins placement automatically when it answers again.
+# dead_node_grace_secs = 30
 # Mutual TLS for the internal control plane. REQUIRED for multi-node: the
 # internal listener is otherwise unauthenticated, and a node that binds it
 # to a non-loopback address refuses to start without these. Every node's
@@ -499,6 +512,7 @@ mod tests {
             seeds: vec![],
             room_shards: None,
             replication_factor: None,
+            dead_node_grace_secs: None,
             rf_cap_unsafe: None,
             tls_cert: cert.then(|| PathBuf::from("c")),
             tls_key: key.then(|| PathBuf::from("k")),

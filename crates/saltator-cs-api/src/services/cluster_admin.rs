@@ -44,7 +44,8 @@ pub(crate) struct ClusterAdmin<'a> {
 pub(crate) struct NodeRow {
     pub node_id: u64,
     pub advertise_addr: String,
-    /// `active` or `draining`.
+    /// `active`, `draining`, or `unreachable` (failing liveness probes;
+    /// its groups are re-placed until it answers again).
     pub status: String,
     /// Data groups this node is assigned to host, as
     /// `Keyspace/index`. Empty on a fully drained node — which is the
@@ -69,6 +70,7 @@ fn status_name(status: NodeStatus) -> &'static str {
     match status {
         NodeStatus::Active => "active",
         NodeStatus::Draining => "draining",
+        NodeStatus::Unreachable => "unreachable",
     }
 }
 
