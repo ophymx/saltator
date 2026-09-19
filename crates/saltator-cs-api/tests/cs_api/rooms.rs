@@ -2,8 +2,7 @@
 //! surfaces (`/messages` with lazy-loaded members, `/context`,
 //! `/timestamp_to_event`), invites and their stripped state, leave and
 //! forget behaviour, threaded receipts and unread counts, and URL
-//! previews. Also carries key-backup and push-rule/pusher cases that
-//! share these fixtures.
+//! previews.
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 
@@ -1683,383 +1682,6 @@ async fn messages_accept_sync_tokens_and_hide_unknown_rooms() {
     env.shutdown().await;
 }
 
-/// E2EE key backup: version lifecycle, the replace rules (verified wins,
-/// then lower first_message_index, then lower forwarded_count), stale
-/// version refusal, and per-granularity reads.
-#[tokio::test]
-async fn e2ee_key_backup_lifecycle_and_replace_rules() {
-    let env = start_env().await;
-    let alice = env.register("alice", "alice-pw").await;
-
-    // No backup yet.
-    let (status, _) = env
-        .req(
-            "GET",
-            "/_matrix/client/v3/room_keys/version",
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-
-    let (status, body) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/room_keys/version",
-            Some(&alice),
-            Some(json!({"algorithm": "m.megolm_backup.v1", "auth_data": {"foo": "bar"}})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let v1 = body["version"].as_str().unwrap().to_owned();
-    let (status, body) = env
-        .req(
-            "GET",
-            "/_matrix/client/v3/room_keys/version",
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["version"], v1);
-    assert_eq!(body["auth_data"]["foo"], "bar");
-    assert_eq!(body["count"], 0);
-
-    // Upload a key, then confirm worse keys never replace it.
-    let key = |first: i64, fwd: i64, verified: bool| {
-        json!({
-            "first_message_index": first, "forwarded_count": fwd,
-            "is_verified": verified, "session_data": {"a": "b"},
-        })
-    };
-    let url = format!("/_matrix/client/v3/room_keys/keys/!foo:example.com/sessA?version={v1}");
-    let (status, body) = env
-        .req("PUT", &url, Some(&alice), Some(key(10, 5, false)))
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["count"], 1);
-    for worse in [key(11, 5, false), key(10, 6, false), key(11, 6, false)] {
-        let (status, body) = env.req("PUT", &url, Some(&alice), Some(worse)).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let (_, got) = env.req("GET", &url, Some(&alice), None).await;
-        assert_eq!(got["first_message_index"], 10, "worse key replaced: {got}");
-        assert_eq!(got["forwarded_count"], 5);
-        assert_eq!(got["is_verified"], false);
-    }
-    // A verified key beats an unverified one regardless of indices.
-    env.req("PUT", &url, Some(&alice), Some(key(12, 9, true)))
-        .await;
-    let (_, got) = env.req("GET", &url, Some(&alice), None).await;
-    assert_eq!(got["is_verified"], true, "{got}");
-    assert_eq!(got["first_message_index"], 12);
-
-    // A newer version exists: writes to the old one are refused and name
-    // the current version.
-    let (status, body) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/room_keys/version",
-            Some(&alice),
-            Some(json!({"algorithm": "m.megolm_backup.v1", "auth_data": {"v": 2}})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let v2 = body["version"].as_str().unwrap().to_owned();
-    assert_ne!(v1, v2);
-    let (status, body) = env
-        .req("PUT", &url, Some(&alice), Some(key(0, 0, false)))
-        .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["errcode"], "M_WRONG_ROOM_KEYS_VERSION");
-    assert_eq!(body["current_version"], v2);
-
-    // The old version's keys stay readable in bulk shape until deletion
-    // tombstones it; the latest pointer then still names v2.
-    let (status, got) = env
-        .req(
-            "GET",
-            &format!("/_matrix/client/v3/room_keys/keys?version={v1}"),
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{got}");
-    assert_eq!(
-        got["rooms"]["!foo:example.com"]["sessions"]["sessA"]["is_verified"],
-        true
-    );
-    let (status, _) = env
-        .req(
-            "DELETE",
-            &format!("/_matrix/client/v3/room_keys/version/{v1}"),
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, _) = env
-        .req(
-            "GET",
-            &format!("/_matrix/client/v3/room_keys/version/{v1}"),
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let (_, body) = env
-        .req(
-            "GET",
-            "/_matrix/client/v3/room_keys/version",
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(body["version"], v2, "{body}");
-
-    env.shutdown().await;
-}
-
-/// Push rules and pushers: defaults ride the initial sync, mutations
-/// land as `m.push_rules` account data in the next window (waking
-/// long-polls), reads are stable, and pushers die with the session that
-/// created them.
-#[tokio::test]
-async fn push_rules_and_pushers() {
-    let env = start_env().await;
-    let alice = env.register("alice", "first-pw").await;
-
-    // Server-default rules ride the initial sync.
-    let (status, sync0) = env
-        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{sync0}");
-    let pr = sync0["account_data"]["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["type"] == "m.push_rules")
-        .expect("push rules in initial sync")
-        .clone();
-    assert!(pr["content"]["global"]["underride"].is_array(), "{pr}");
-    let t1 = sync0["next_batch"].as_str().unwrap().to_owned();
-
-    // Single-rule GET: 404 for unknown rules and kinds (clients probe
-    // optional rules and take any other status as existence), 200 with the
-    // rule body for known ones.
-    for path in [
-        "/_matrix/client/v3/pushrules/global/postcontent/.io.element.msc4306.rule.subscribed_thread",
-        "/_matrix/client/v3/pushrules/global/override/.m.rule.does_not_exist",
-    ] {
-        let (status, body) = env.req("GET", path, Some(&alice), None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
-    }
-    let (status, rule) = env
-        .req(
-            "GET",
-            "/_matrix/client/v3/pushrules/global/override/.m.rule.master",
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{rule}");
-    assert_eq!(rule["rule_id"], ".m.rule.master", "{rule}");
-    let (status, attr) = env
-        .req(
-            "GET",
-            "/_matrix/client/v3/pushrules/global/override/.m.rule.master/enabled",
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{attr}");
-    assert_eq!(attr["enabled"], false, "{attr}");
-
-    // Adding a rule shows in GET /pushrules/ and in the next sync window.
-    let (status, body) = env
-        .req(
-            "PUT",
-            "/_matrix/client/v3/pushrules/global/room/!foo:example.com",
-            Some(&alice),
-            Some(json!({"actions": ["notify"]})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, rules) = env
-        .req("GET", "/_matrix/client/v3/pushrules/", Some(&alice), None)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{rules}");
-    assert_eq!(rules["global"]["room"][0]["rule_id"], "!foo:example.com");
-    let synced_rules = |resp: &Value| {
-        resp["account_data"]["events"]
-            .as_array()
-            .is_some_and(|a| a.iter().any(|e| e["type"] == "m.push_rules"))
-    };
-    let (status, resp) = env
-        .req(
-            "GET",
-            &format!("/_matrix/client/v3/sync?since={t1}&timeout=0"),
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{resp}");
-    assert!(synced_rules(&resp), "rule add missed the window: {resp}");
-    let t2 = resp["next_batch"].as_str().unwrap().to_owned();
-
-    // Disabling and setting actions both surface in the next window, and
-    // repeated reads are stable (the SYN-390 cache-health shape).
-    let (status, body) = env
-        .req(
-            "PUT",
-            "/_matrix/client/v3/pushrules/global/room/!foo:example.com/enabled",
-            Some(&alice),
-            Some(json!({"enabled": false})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = env
-        .req(
-            "PUT",
-            "/_matrix/client/v3/pushrules/global/room/!foo:example.com/actions",
-            Some(&alice),
-            Some(json!({"actions": ["dont_notify"]})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    for _ in 0..2 {
-        let (status, rules) = env
-            .req("GET", "/_matrix/client/v3/pushrules/", Some(&alice), None)
-            .await;
-        assert_eq!(status, StatusCode::OK, "{rules}");
-        assert_eq!(rules["global"]["room"][0]["enabled"], false);
-        assert_eq!(rules["global"]["room"][0]["actions"][0], "dont_notify");
-    }
-    let (status, resp) = env
-        .req(
-            "GET",
-            &format!("/_matrix/client/v3/sync?since={t2}&timeout=0"),
-            Some(&alice),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{resp}");
-    assert!(
-        synced_rules(&resp),
-        "attr changes missed the window: {resp}"
-    );
-
-    // A sender rule (the cache-health test's exact shape).
-    let (status, body) = env
-        .req(
-            "PUT",
-            &format!("/_matrix/client/v3/pushrules/global/sender/@alice:{SERVER}"),
-            Some(&alice),
-            Some(json!({"actions": ["dont_notify"]})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (_, rules) = env
-        .req("GET", "/_matrix/client/v3/pushrules/", Some(&alice), None)
-        .await;
-    assert_eq!(rules["global"]["sender"][0]["actions"][0], "dont_notify");
-
-    // Pushers: one made by another session dies on password change...
-    let (status, other) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/login",
-            None,
-            Some(json!({
-                "type": "m.login.password",
-                "identifier": {"type": "m.id.user", "user": format!("@alice:{SERVER}")},
-                "password": "first-pw",
-            })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{other}");
-    let other_session = other["access_token"].as_str().unwrap().to_owned();
-    let pusher = json!({
-        "data": {"url": "https://dummy.url/_matrix/push/v1/notify"},
-        "kind": "http", "app_id": "complement", "pushkey": "a_push_key",
-        "app_display_name": "c", "device_display_name": "d", "lang": "en",
-    });
-    let (status, body) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/pushers/set",
-            Some(&other_session),
-            Some(pusher.clone()),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let count = |resp: &Value| resp["pushers"].as_array().map(Vec::len).unwrap_or(0);
-    let (_, resp) = env
-        .req("GET", "/_matrix/client/v3/pushers", Some(&alice), None)
-        .await;
-    assert_eq!(count(&resp), 1, "{resp}");
-    let uia = |password: &str| {
-        json!({
-            "type": "m.login.password",
-            "identifier": {"type": "m.id.user", "user": format!("@alice:{SERVER}")},
-            "password": password,
-        })
-    };
-    let (status, body) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/account/password",
-            Some(&alice),
-            Some(json!({"new_password": "second-pw", "auth": uia("first-pw")})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (_, resp) = env
-        .req("GET", "/_matrix/client/v3/pushers", Some(&alice), None)
-        .await;
-    assert_eq!(count(&resp), 0, "other session's pusher survived: {resp}");
-
-    // ...while one made by the surviving session stays.
-    let (status, body) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/pushers/set",
-            Some(&alice),
-            Some(pusher.clone()),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/account/password",
-            Some(&alice),
-            Some(json!({"new_password": "third-pw", "auth": uia("second-pw")})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (_, resp) = env
-        .req("GET", "/_matrix/client/v3/pushers", Some(&alice), None)
-        .await;
-    assert_eq!(count(&resp), 1, "own pusher deleted: {resp}");
-
-    // kind: null deletes.
-    let (status, body) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/pushers/set",
-            Some(&alice),
-            Some(json!({"app_id": "complement", "pushkey": "a_push_key", "kind": null})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (_, resp) = env
-        .req("GET", "/_matrix/client/v3/pushers", Some(&alice), None)
-        .await;
-    assert_eq!(count(&resp), 0, "{resp}");
-
-    env.shutdown().await;
-}
-
 /// Kicking a non-present user is forbidden; identical state and repeated
 /// joins are idempotent (no duplicate events).
 #[tokio::test]
@@ -2273,5 +1895,227 @@ async fn room_upgrade_to_v9_and_search_across() {
         "search should span predecessor and replacement: {results}"
     );
 
+    env.shutdown().await;
+}
+
+/// `/joined_rooms` reads the membership projection rather than the room
+/// shards, so it is the endpoint that notices if that projection stops
+/// tracking leaves.
+#[tokio::test]
+async fn joined_rooms_follows_membership() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+
+    let joined = |body: &Value| -> Vec<String> {
+        body["joined_rooms"]
+            .as_array()
+            .expect("joined_rooms")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let (status, body) = env
+        .req("GET", "/_matrix/client/v3/joined_rooms", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(joined(&body).is_empty(), "{body}");
+
+    let room_id = make_room(&env, &alice, "joined-rooms").await;
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+    let (_, body) = env
+        .req("GET", "/_matrix/client/v3/joined_rooms", Some(&alice), None)
+        .await;
+    assert_eq!(joined(&body), vec![room_id.clone()], "{body}");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/leave"),
+            Some(&alice),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = env
+        .req("GET", "/_matrix/client/v3/joined_rooms", Some(&alice), None)
+        .await;
+    assert!(
+        joined(&body).is_empty(),
+        "a left room is not joined: {body}"
+    );
+    env.shutdown().await;
+}
+
+/// `/read_markers` sets two different things in one call: `m.fully_read`
+/// is per-room account data, while the receipt goes through the same path
+/// as `/receipt` (and federates). A private receipt must stay invisible to
+/// everyone else.
+///
+/// The public and private receipts deliberately point at DIFFERENT events.
+/// Pointing both at one event makes the leak untestable: the private
+/// receipt showing up is then indistinguishable from the public one, and
+/// asserting on the `m.read.private` label instead catches nothing,
+/// because a receipt leaked under the `m.read` label does not carry it.
+/// (Checked: that weaker test passes while the handler leaks.)
+#[tokio::test]
+async fn read_markers_set_fully_read_and_keep_private_receipts_private() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+    let bob = env.register("bob", "bob-pw-12345").await;
+    let user = format!("@alice:{SERVER}");
+
+    let room_id = make_room(&env, &alice, "markers").await;
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+    env.req(
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{enc}/invite"),
+        Some(&alice),
+        Some(json!({"user_id": format!("@bob:{SERVER}")})),
+    )
+    .await;
+    env.req(
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{enc}/join"),
+        Some(&bob),
+        Some(json!({})),
+    )
+    .await;
+
+    let (_, sent) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc}/send/m.room.message/rm1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "the public marker"})),
+        )
+        .await;
+    let public_at = sent["event_id"].as_str().expect("event id").to_owned();
+
+    let (_, sent) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc}/send/m.room.message/rm2"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "the private marker"})),
+        )
+        .await;
+    let private_at = sent["event_id"].as_str().expect("event id").to_owned();
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/read_markers"),
+            Some(&alice),
+            Some(json!({
+                "m.fully_read": public_at,
+                "m.read": public_at,
+                "m.read.private": private_at,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The fully-read marker is per-room account data.
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/user/{user}/rooms/{enc}/account_data/m.fully_read"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["event_id"], public_at.as_str(), "{body}");
+
+    // Bob sees the public receipt, and nothing pointing at the private one.
+    let (_, sync) = env
+        .req("GET", "/_matrix/client/v3/sync?timeout=0", Some(&bob), None)
+        .await;
+    let ephemeral = sync["rooms"]["join"][&room_id]["ephemeral"]["events"].to_string();
+    assert!(
+        ephemeral.contains(&public_at),
+        "bob should see the public receipt: {ephemeral}"
+    );
+    assert!(
+        !ephemeral.contains(&private_at),
+        "a private receipt must not reach another user: {ephemeral}"
+    );
+    env.shutdown().await;
+}
+
+/// Unban is a membership transition like any other: it writes `leave`
+/// over `ban`, which is what re-opens the room to the user. The guard
+/// worth having is that the ban really did block a join first, so a
+/// passing test cannot be a room that was never closed.
+#[tokio::test]
+async fn unban_reopens_a_banned_room() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+    let bob = env.register("bob", "bob-pw-12345").await;
+    let bob_id = format!("@bob:{SERVER}");
+
+    let room_id = make_room(&env, &alice, "unban").await;
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/ban"),
+            Some(&alice),
+            Some(json!({"user_id": bob_id, "reason": "spam"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/join"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a ban must actually close the room: {body}"
+    );
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/unban"),
+            Some(&alice),
+            Some(json!({"user_id": bob_id})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{enc}/state/m.room.member/{bob_id}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["membership"], "leave", "{body}");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/join"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unban must re-open the room: {body}"
+    );
     env.shutdown().await;
 }

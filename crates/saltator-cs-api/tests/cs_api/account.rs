@@ -1,6 +1,7 @@
 //! Registration and account identity: gated registration walking its UIA
 //! stages, one-use registration tokens and their admin CRUD, UIA session
-//! scoping, and the external-identity links the SSO path is built on.
+//! scoping, the external-identity links the SSO path is built on, and
+//! password change and deactivation.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
@@ -705,5 +706,160 @@ async fn login_flows_advertise_password() {
     let flows = body["flows"].as_array().unwrap();
     assert_eq!(flows.len(), 1, "{body}");
     assert_eq!(flows[0]["type"], "m.login.password");
+    env.shutdown().await;
+}
+
+/// Account lifecycle: password change behind a UIA password stage (other
+/// sessions die by default, optionally survive), then deactivation
+/// (permanent — all sessions dead, logins refused).
+#[tokio::test]
+async fn password_change_and_deactivation() {
+    let env = start_env().await;
+    let alice = env.register("alice", "first-pw").await;
+
+    let login = |password: &'static str| {
+        let env = &env;
+        async move {
+            env.req(
+                "POST",
+                "/_matrix/client/v3/login",
+                None,
+                Some(json!({
+                    "type": "m.login.password",
+                    "identifier": {"type": "m.id.user", "user": format!("@alice:{SERVER}")},
+                    "password": password,
+                })),
+            )
+            .await
+        }
+    };
+    let uia = |password: &str| {
+        json!({
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": format!("@alice:{SERVER}")},
+            "password": password,
+        })
+    };
+    let (status, other) = login("first-pw").await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+    let other_session = other["access_token"].as_str().unwrap().to_owned();
+
+    // No auth → UIA challenge with a password flow and no errcode.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/password",
+            Some(&alice),
+            Some(json!({"new_password": "second-pw"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["flows"][0]["stages"][0], "m.login.password");
+    assert!(body.get("errcode").is_none(), "bare challenge: {body}");
+
+    // Wrong password → 401 M_FORBIDDEN, still carrying the flows.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/password",
+            Some(&alice),
+            Some(json!({"new_password": "second-pw", "auth": uia("wrong")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["errcode"], "M_FORBIDDEN");
+    assert!(body.get("flows").is_some(), "{body}");
+
+    // Correct password: this session survives, the other dies, the old
+    // password is refused and the new one works.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/password",
+            Some(&alice),
+            Some(json!({"new_password": "second-pw", "auth": uia("first-pw")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(&other_session),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = login("first-pw").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = login("second-pw").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let kept = body["access_token"].as_str().unwrap().to_owned();
+
+    // logout_devices: false keeps the other sessions alive.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/password",
+            Some(&alice),
+            Some(json!({
+                "new_password": "third-pw", "logout_devices": false,
+                "auth": uia("second-pw"),
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(&kept),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Deactivation: challenge first, then permanent shutdown.
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/deactivate",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["flows"][0]["stages"][0], "m.login.password");
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/client/v3/account/deactivate",
+            Some(&alice),
+            Some(json!({"auth": uia("third-pw")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id_server_unbind_result"], "success");
+    let (status, _) = env
+        .req(
+            "GET",
+            "/_matrix/client/v3/account/whoami",
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = login("third-pw").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
     env.shutdown().await;
 }
