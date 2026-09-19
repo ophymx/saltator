@@ -462,3 +462,118 @@ async fn client_queries_remote_profile_and_directory() {
     b_rooms.shutdown().await.unwrap();
     b_users.shutdown().await.unwrap();
 }
+
+/// Async uploads (MSC2246): the whole path, which nothing exercised.
+///
+/// The interesting half is the refusals. A reserved media ID is a claim
+/// on a name in a shared namespace, so it must not be fillable by anyone
+/// else, and must not be re-fillable once used — otherwise an `mxc://`
+/// URI already sent to other servers could be made to point at different
+/// bytes after the fact.
+#[tokio::test]
+async fn async_upload_reserves_an_id_that_only_its_owner_can_fill() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+    let mallory = env.register("mallory", "mallory-pw-1").await;
+
+    let (status, body) = env
+        .req(
+            "POST",
+            "/_matrix/media/v1/create",
+            Some(&alice),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mxc = body["content_uri"]
+        .as_str()
+        .expect("content_uri")
+        .to_owned();
+    let media_id = mxc.rsplit('/').next().unwrap().to_owned();
+
+    let put = |token: &str, id: &str, bytes: &'static str| {
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/_matrix/media/v3/upload/{SERVER}/{id}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "text/plain")
+            .body(Body::from(bytes))
+            .unwrap()
+    };
+
+    // Downloading a reserved-but-unfilled id is not a 404: the id exists,
+    // the content does not yet.
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v1/media/download/{SERVER}/{media_id}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["errcode"], "M_NOT_YET_UPLOADED", "{body}");
+
+    // Somebody else may not fill alice's reservation.
+    let resp = env
+        .router
+        .clone()
+        .oneshot(put(&mallory, &media_id, "not alice's bytes"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The owner may, once.
+    let resp = env
+        .router
+        .clone()
+        .oneshot(put(&alice, &media_id, "the real bytes"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // And not twice: the mxc URI may already be published elsewhere.
+    let resp = env
+        .router
+        .clone()
+        .oneshot(put(&alice, &media_id, "different bytes"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // An id nobody reserved is unknown rather than fillable.
+    let resp = env
+        .router
+        .clone()
+        .oneshot(put(&alice, "neverreserved", "bytes"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // The content now downloads, and is what the owner uploaded.
+    let resp = env
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/_matrix/client/v1/media/download/{SERVER}/{media_id}"
+                ))
+                .header("Authorization", format!("Bearer {alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"the real bytes");
+    env.shutdown().await;
+}

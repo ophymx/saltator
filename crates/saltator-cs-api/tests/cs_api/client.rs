@@ -1727,3 +1727,50 @@ async fn avatar_url_round_trips_and_joins_the_profile() {
     assert_eq!(body["avatar_url"], "mxc://hs.test/avatar", "{body}");
     env.shutdown().await;
 }
+
+/// A non-member must not read a room's relations or threads.
+///
+/// `/relations` and `/threads` expose event content, so they sit on the
+/// same privacy boundary as `/messages` — but they reach it through
+/// their own guard rather than the one `/messages` uses, which is why it
+/// needs its own test. All four entry points are swept: the three
+/// `/relations` arities and `/threads`.
+#[tokio::test]
+async fn a_non_member_cannot_read_relations_or_threads() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+    let mallory = env.register("mallory", "mallory-pw-1").await;
+
+    let room_id = make_room(&env, &alice, "relations-authz").await;
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+    let (_, sent) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc}/send/m.room.message/rel1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "private to the room"})),
+        )
+        .await;
+    let event_id = sent["event_id"].as_str().expect("event id").to_owned();
+    let ev = event_id.replace('$', "%24");
+
+    for path in [
+        format!("/_matrix/client/v1/rooms/{enc}/relations/{ev}"),
+        format!("/_matrix/client/v1/rooms/{enc}/relations/{ev}/m.annotation"),
+        format!("/_matrix/client/v1/rooms/{enc}/relations/{ev}/m.annotation/m.reaction"),
+        format!("/_matrix/client/v1/rooms/{enc}/threads"),
+    ] {
+        let (status, body) = env.req("GET", &path, Some(&mallory), None).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a non-member read {path}: {body}"
+        );
+        // And the refusal leaks nothing about the room's contents.
+        assert!(
+            !body.to_string().contains("private to the room"),
+            "{path}: {body}"
+        );
+    }
+    env.shutdown().await;
+}

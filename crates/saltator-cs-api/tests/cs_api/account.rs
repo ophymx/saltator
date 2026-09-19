@@ -863,3 +863,81 @@ async fn password_change_and_deactivation() {
 
     env.shutdown().await;
 }
+
+/// Every endpoint that takes a user id in its path must refuse a token
+/// belonging to someone else.
+///
+/// These nine checks are one decision repeated, which is exactly why
+/// they are worth a test: the pattern is easy to leave out of a tenth
+/// endpoint, and each omission is a user reading or writing another
+/// user's data. They are swept together rather than one test each
+/// because the interesting property is that NONE of them is missing.
+#[tokio::test]
+async fn a_token_cannot_act_on_another_users_resources() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+    let _bob = env.register("bob", "bob-pw-12345").await;
+    let bob_id = format!("@bob:{SERVER}");
+    let room_id = make_room(&env, &alice, "authz").await;
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+
+    // (method, path, body) — alice's token, bob's user id throughout.
+    let cases: Vec<(&str, String, Option<Value>)> = vec![
+        (
+            "PUT",
+            format!("/_matrix/client/v3/profile/{bob_id}/displayname"),
+            Some(json!({"displayname": "not bob"})),
+        ),
+        (
+            "PUT",
+            format!("/_matrix/client/v3/profile/{bob_id}/avatar_url"),
+            Some(json!({"avatar_url": "mxc://hs.test/nope"})),
+        ),
+        (
+            "PUT",
+            format!("/_matrix/client/v3/user/{bob_id}/account_data/m.test"),
+            Some(json!({"snooped": true})),
+        ),
+        (
+            "GET",
+            format!("/_matrix/client/v3/user/{bob_id}/account_data/m.test"),
+            None,
+        ),
+        (
+            "PUT",
+            format!("/_matrix/client/v3/user/{bob_id}/rooms/{enc}/account_data/m.test"),
+            Some(json!({"snooped": true})),
+        ),
+        (
+            "GET",
+            format!("/_matrix/client/v3/user/{bob_id}/rooms/{enc}/account_data/m.test"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/_matrix/client/v3/user/{bob_id}/filter"),
+            Some(json!({"room": {"timeline": {"limit": 1}}})),
+        ),
+        (
+            "GET",
+            format!("/_matrix/client/v3/user/{bob_id}/filter/0"),
+            None,
+        ),
+        (
+            "PUT",
+            format!("/_matrix/client/v3/presence/{bob_id}/status"),
+            Some(json!({"presence": "online"})),
+        ),
+    ];
+
+    for (method, path, body) in cases {
+        let (status, resp) = env.req(method, &path, Some(&alice), body).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {path} should refuse another user's token, got {status}: {resp}"
+        );
+        assert_eq!(resp["errcode"], "M_FORBIDDEN", "{method} {path}: {resp}");
+    }
+    env.shutdown().await;
+}
