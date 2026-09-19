@@ -514,7 +514,6 @@ upload to a non-founding node, and a thumbnail generated on a node that
 does not hold the blob (the read-through lives in `MediaStore::read`, so
 the thumbnailer inherits it rather than reimplementing it).
 
-
 ## Testing
 
 - **Unit**: Subscribe backfill/live splice (gap-free across the seam,

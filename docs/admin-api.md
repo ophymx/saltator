@@ -219,6 +219,21 @@ inside.
 
 ### `GET /registration_tokens`
 
+Every token, sorted by token string:
+
+```json
+{"registration_tokens": [
+  {"token": "abc", "uses_allowed": 10, "used": 3,
+   "expiry_ts": 1767225600000, "created_ts": 1760000000000,
+   "valid": true}
+]}
+```
+
+`uses_allowed` and `expiry_ts` are `null` for unlimited and
+never-expiring respectively. `valid` is computed — whether the token
+would authorise a registration right now — so an operator does not have
+to compare clocks and counters themselves.
+
 ### `POST /registration_tokens`
 
 ```json
