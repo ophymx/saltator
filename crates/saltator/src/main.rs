@@ -1,6 +1,7 @@
 //! Saltator: a Matrix homeserver as a self-clustering distributed system.
 //! See spec.md. M2: single-node with the full client-server surface.
 
+mod blobs;
 mod config;
 mod keys;
 mod lifecycle;
@@ -219,6 +220,14 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         ),
     ];
 
+    // The blob store opens before the internal listener: the bulk media
+    // RPCs serve out of it, and a peer may ask for a blob as soon as we
+    // are reachable (docs/design-room-sharding-phase2.md, "Media blob
+    // placement"). This handle is the placement-FREE one — the RPC side
+    // must never fall through to the cluster, or a blob nobody holds
+    // becomes a fetch loop between peers instead of a 404.
+    let media_local = saltator_media::MediaStore::open(cfg.data_dir.join("media"))?;
+
     // Serve the internal gRPC surface now (a joiner needs it to receive
     // replication; every node needs it for cross-node Raft traffic).
     let executors = saltator_shard::ExecutorRegistry::new();
@@ -232,6 +241,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             schemas.clone(),
             cfg.listeners.internal,
             internal_tls.clone(),
+            Some(media_local.clone()),
             async move {
                 let _ = rx.wait_for(|stop| *stop).await;
             },
@@ -591,8 +601,23 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // Client-server API.
     let default_room_version = saltator_core::RoomVersion::parse(&cfg.client.default_room_version)
         .map_err(|e| anyhow::anyhow!("client.default_room_version: {e}"))?;
-    let media = saltator_media::MediaStore::open(cfg.data_dir.join("media"))?;
+    // The same directory, now cluster-aware: uploads replicate to the
+    // blob's rendezvous replica set before acking, and a local miss on
+    // download falls through to that set. Every media call site — the CS
+    // upload/download routes, async uploads, the URL-preview cache, the
+    // federation media routes — inherits both without knowing about it.
+    let cluster_blobs = Arc::new(blobs::ClusterBlobs::new(
+        meta.clone(),
+        cfg.node.id,
+        media_local.clone(),
+        internal_tls.as_ref().map(|t| t.client()),
+    ));
+    let media = media_local.clone().with_placement(cluster_blobs.clone());
     let fed_media = media.clone();
+    // Heal replica counts after a topology change: a dead node's blobs
+    // re-rank onto survivors, which pull copies; a returning node pulls
+    // its share back.
+    let _blob_reconciler = blobs::spawn_reconciler(cluster_blobs, users.clone());
     // Optional extra CA for outbound federation (test harnesses / private
     // PKI). System roots are always trusted.
     let outbound_ca =

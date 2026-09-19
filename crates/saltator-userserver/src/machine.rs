@@ -2159,6 +2159,41 @@ impl UserStore {
     pub fn media(&self, media_id: &str) -> StoreResult<Option<MediaMeta>> {
         self.get_typed("media decode", T_MEDIA, media_id.as_bytes())
     }
+
+    /// Every distinct blob id the media table names — the index the blob
+    /// reconciler places against (docs/design-room-sharding-phase2.md,
+    /// "Media blob placement").
+    ///
+    /// Many media rows can point at one blob (identical bytes uploaded
+    /// under different filenames get distinct media ids and share the
+    /// content-addressed blob), so the result is deduplicated. Rows
+    /// without a `blob` predate that split and ARE their blob; `pending`
+    /// rows have no bytes yet and are skipped.
+    ///
+    /// Full table scan, like the alias scan above: a media row is tiny
+    /// and the sweep is background work. This is the point to revisit
+    /// first if a deployment's media table outgrows a periodic walk.
+    pub fn media_blob_ids(&self) -> StoreResult<std::collections::BTreeSet<String>> {
+        let mut out = std::collections::BTreeSet::new();
+        for (k, v) in self.read.range(T_MEDIA, &[], &[])? {
+            let meta: MediaMeta = dec("media decode", &v)?;
+            if meta.pending {
+                continue;
+            }
+            match meta.blob {
+                Some(blob) => {
+                    out.insert(blob);
+                }
+                None => {
+                    out.insert(
+                        String::from_utf8(k)
+                            .map_err(|_| StoreError::Engine("media id not UTF-8".into()))?,
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

@@ -393,7 +393,125 @@ writes, and syncs through the three survivors throughout. Node 4 then
 restarts: the detector restores it, rendezvous returns its 5 groups,
 and all four nodes serve everything.
 
-Still phase 3, not yet built: media blob placement.
+### Media blob placement (built 2026-09-18)
+
+Room state was the last *Raft* data left unplaced; media bytes were the
+last data of any kind. Blobs are deliberately not Raft-replicated (a
+50 MiB upload has no business in a replicated log), so they had no
+placement at all: `MediaStore` wrote them to the local disk of whichever
+node happened to answer the upload. In a single-node deployment that is
+invisible. In a cluster it is a correctness bug — `POST /upload` on
+node 1 followed by `GET /download` on node 2 is a 404, and the media is
+lost outright when node 1's disk dies.
+
+Blobs now place by the same rendezvous hashing that places groups, and
+the same three mechanisms that move a group move a blob.
+
+#### Rendezvous over the blob id, not a group
+
+A blob has no shard group, so it ranks the active nodes directly:
+`blob_replicas(blob_id, rf, nodes)` is the group scorer over a
+domain-separated hash of the blob id. Consequences fall out of that
+choice:
+
+- **No new topology.** `ClusterConfig` gains no field: the blob RF is
+  `replication_factor`, capped at the active-node count exactly like a
+  room group. Nothing about blob placement needs a meta schema bump,
+  because nothing about it is persisted — the placement is a pure
+  function of (blob id, roster), recomputed wherever it is needed.
+- **The roster is the only input.** A node join, drain, dead-node mark
+  or recovery re-ranks blobs the same way it re-ranks groups, so the
+  existing placement watch is the existing trigger.
+- **`Unreachable` counts as gone.** Blob placement reads
+  `active_nodes()`, so the failure detector's verdict re-places bytes
+  as well as groups.
+
+#### Write: replicate to a majority before the ack
+
+`MediaStore` gains one optional hook, `BlobPlacement`, and every
+existing call site inherits placement through it — the CS upload paths,
+the async-upload path, the URL-preview image cache, and the remote-media
+cache all call `store`/`store_at` and are unchanged.
+
+`store()` writes locally, then pushes to the blob's replica set over the
+bulk channel and **acks once a majority of that set holds the bytes**
+(itself included when it is a member). A majority is the durability
+promise every other write in this system makes; anything weaker would
+let an upload ack and then vanish with one machine. Stragglers are not
+waited on — the reconciler below finishes them.
+
+The uploading node is frequently *not* in the replica set; it keeps its
+local copy anyway, as a cache, since it just paid to have the bytes in
+memory.
+
+#### Read: local, then through
+
+`read()` serves the local copy if there is one and otherwise fetches
+from the replica set over `FetchBlob`, caching the result when this node
+is a placement target. The RPC server side uses `read_local()` — the
+distinction is what keeps a cluster-wide miss from becoming an infinite
+fetch loop rather than a 404.
+
+Because the fallback lives inside `MediaStore`, the *federation* media
+routes, the thumbnailer, and both download routes became cluster-correct
+without a line changed in any of them.
+
+#### Heal: the reconciler
+
+Every node runs a sweep on the placement watch (and an idle tick). It
+walks the media table — which lives in the user group and is therefore
+already on every node, so the index needs no new replication — computes
+each blob's replica set, and pulls what it should hold but doesn't.
+That is the whole self-healing story: a dead node's blobs re-rank onto
+survivors, which pull copies from each other; a returning node re-ranks
+them back and pulls its share again.
+
+**Eviction is separate, and conservative.** Deleting a blob is the only
+irreversible operation here, so the sweep never deletes on the same pass
+that it pulls. A local blob outside this node's placement is dropped
+only after the node has *verified* that a majority of its replica set
+holds it, and never for a blob the media table does not mention (an
+in-flight upload's bytes exist before its metadata is committed).
+
+What building it smoked out: **a node coming back from a blip deleted
+its entire blob store.** `active_nodes()` is the right input for
+deciding where data *goes* and the wrong one for deciding what to
+*delete*, and eviction had read it as both. A node marked `Unreachable`
+(or `Draining`) is excluded from every replica set by construction, so
+"which of these blobs are mine?" answered *none of them* — and the
+majority check passed for every one, because the survivors genuinely did
+hold them. This smoke's own victim restarted at `00:00:17.58` and had
+wiped all seven of its blobs by `00:00:18.08`, half a second later, then
+had to re-download its whole share at the moment the cluster was least
+healthy. The rule is now explicit and unit-tested
+(`placement::may_evict`): only an *active* placement participant may
+evict. A returning node's surviving copies are precisely what make its
+return cheap, and a draining node deleting its copies buys nothing while
+removing a spare copy of data the cluster is mid-way through moving.
+
+#### Deliberate limits
+
+- **Thumbnails are not replicated.** They are a pure function of the
+  blob; every node regenerates and caches its own.
+- **No erasure coding, no S3.** RF whole copies, like the groups. An
+  object-store backend stays a v1.x alternative to this, not a layer
+  under it.
+- **The media table is the index.** A blob not named by any media row is
+  invisible to the reconciler by design, which is exactly what makes the
+  eviction rule above safe.
+
+Proven by `media_placement_smoke.sh` (local-only, like the other cluster
+smokes; 3x green): three nodes at RF 3 replicate every upload to all
+three; node 4 joins and every blob converges to *exactly* three of four
+copies — the pull and the eviction both, since "at least three" would
+pass with eviction entirely broken — while all four nodes keep serving
+every blob; a holder is killed -9 and the survivors serve throughout and
+heal back to full replication; the node restarts, keeps the copies it
+came back with, and re-ranks. Throughout: bytes compared by content, an
+upload to a non-founding node, and a thumbnail generated on a node that
+does not hold the blob (the read-through lives in `MediaStore::read`, so
+the thumbnailer inherits it rather than reimplementing it).
+
 
 ## Testing
 

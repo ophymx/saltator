@@ -246,6 +246,12 @@ impl From<saltator_media::MediaError> for ApiError {
                 "Cannot thumbnail this content",
             ),
             MediaError::BadId => Self::invalid_param("Invalid media ID"),
+            // The cluster could not place or retrieve the bytes. This is
+            // our problem, not the client's request being wrong — and it
+            // is usually transient (a peer restarting), so it must not
+            // masquerade as a 404 the client would cache as "no such
+            // media".
+            MediaError::Placement(_) => Self::internal(e),
             MediaError::Io(_) | MediaError::Internal(_) => Self::internal(e),
         }
     }
