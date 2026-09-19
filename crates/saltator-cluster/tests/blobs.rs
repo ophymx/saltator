@@ -10,10 +10,8 @@ use saltator_media::MediaStore;
 use saltator_shard::ShardRegistry;
 use saltator_store::RocksEngine;
 
-fn ephemeral_addr() -> std::net::SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
-}
+mod common;
+use common::ephemeral_addr;
 
 struct Node {
     addr: std::net::SocketAddr,

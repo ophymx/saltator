@@ -16,6 +16,9 @@ use saltator_cluster::{
 use saltator_shard::{ApplyCtx, ShardApp, ShardHandle, ShardId, ShardRegistry, APP_TABLE_MIN};
 use saltator_store::{Keyspace, Result as StoreResult, RocksEngine};
 
+mod common;
+use common::ephemeral_addr;
+
 /// Minimal state machine: each command is stored verbatim under a fixed key,
 /// so a read reflects the last committed command — enough to observe that
 /// replication reached a follower.
@@ -26,11 +29,6 @@ impl ShardApp for KvApp {
         ctx.put(APP_TABLE_MIN, b"v", command.to_vec());
         Ok(Vec::new())
     }
-}
-
-fn ephemeral_addr() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
 }
 
 fn spawn_serve(

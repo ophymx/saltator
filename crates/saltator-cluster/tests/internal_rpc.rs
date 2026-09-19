@@ -19,11 +19,8 @@ use saltator_cluster::{serve_internal, MetadataHandle};
 use saltator_shard::{ShardId, ShardRegistry};
 use saltator_store::RocksEngine;
 
-/// Bind-and-release to pick a free port. Racy in principle; fine for tests.
-fn ephemeral_addr() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
-}
+mod common;
+use common::ephemeral_addr;
 
 async fn connect(addr: std::net::SocketAddr) -> tonic::transport::Channel {
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();

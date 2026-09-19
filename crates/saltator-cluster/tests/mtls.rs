@@ -14,6 +14,9 @@ use saltator_cluster::{
 use saltator_shard::ShardRegistry;
 use saltator_store::RocksEngine;
 
+mod common;
+use common::ephemeral_addr;
+
 /// A self-signed cert with `hs.test` as a DNS SAN, used as both a node's
 /// identity and — because a self-signed cert is its own root — as the CA
 /// that verifies it. Two independent certs model "signed by our CA" vs
@@ -39,13 +42,6 @@ fn tls(id: &Cred, ca: &Cred) -> InternalTls {
         ca.cert.as_bytes(),
         "hs.test",
     )
-}
-
-fn ephemeral_addr() -> std::net::SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
 }
 
 fn spawn_serve(

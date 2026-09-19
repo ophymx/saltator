@@ -14,11 +14,8 @@ use saltator_shard::{
 };
 use saltator_store::{Keyspace, RocksEngine};
 
-/// Bind-and-release to pick a free port. Racy in principle; fine for tests.
-fn ephemeral_addr() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
-}
+mod common;
+use common::ephemeral_addr;
 
 const T_J: u8 = APP_TABLE_FIRST;
 
