@@ -19,12 +19,8 @@ use saltator_store::RocksEngine;
 
 use saltator_core::RoomVersion;
 
-fn ephemeral_addr() -> std::net::SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
+mod common;
+use common::ephemeral_addr;
 
 /// A stand-in remote homeserver that just counts inbound transactions.
 async fn mock_remote(count: Arc<AtomicUsize>) -> String {

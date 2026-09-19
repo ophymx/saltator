@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+mod common;
+use common::free_port;
+
 struct Node {
     child: Child,
     base: String,
@@ -58,36 +61,6 @@ impl Drop for Node {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// A port nothing is listening on, and that this test binary has not
-/// already handed out.
-///
-/// Binding `:0` and dropping the listener leaves the port free — which
-/// is the point, since the daemon binds it — but the port also goes
-/// straight back to the ephemeral pool, so a sibling test running in
-/// parallel can be handed the same number. That is not hypothetical:
-/// it is what made `metrics_listener_exports_a_running_node` fail in
-/// CI with `Address already in use`, after which the daemon exited and
-/// the test sat waiting 30s for a process that was gone.
-///
-/// Remembering what has been issued closes it, because every port in
-/// this binary comes from here.
-fn free_port() -> u16 {
-    static TAKEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    for _ in 0..100 {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut taken = TAKEN.lock().expect("port registry");
-        if !taken.contains(&port) {
-            taken.push(port);
-            return port;
-        }
-    }
-    panic!("could not find an unused port");
 }
 
 /// The single-node config every e2e test shares, maintained once.

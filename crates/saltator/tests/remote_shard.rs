@@ -18,12 +18,8 @@ use saltator_roomserver::{Outcome, RoomServer, SeqEntry, ServerSigner};
 use saltator_shard::{NoopNetworkFactory, ShardRegistry};
 use saltator_store::RocksEngine;
 
-fn ephemeral_addr() -> std::net::SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
+mod common;
+use common::ephemeral_addr;
 
 #[tokio::test]
 async fn unhosted_shard_serves_reads_writes_and_changes() {
