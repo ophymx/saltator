@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dead-node re-placement smoke (phase 3, docs/design-room-sharding-phase2.md):
+# Dead-node re-placement smoke:
 # a crashed node's room-group replicas re-place automatically. Four nodes,
 # 8 room shards, replication_factor = 3, dead_node_grace_secs = 5. After
 # the cluster converges (each group on its rendezvous top-3 of 4) and every

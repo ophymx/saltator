@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remote-serving smoke (phase 2a, docs/design-room-sharding-phase2.md):
+# Remote-serving smoke:
 # two nodes, rf_cap_unsafe = 1, room_shards = 4 — so node 2 does NOT
 # host every room group, and rooms on its unhosted shards are served
 # through the remote data plane (reads over the Read RPC, writes as

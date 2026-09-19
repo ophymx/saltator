@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# The embedded admin console (docs/design-admin-ui.md). Default-OFF, and
+# The embedded admin console. Default-OFF, and
 # the workspace's first feature: enabling it makes this origin serve HTML,
 # which is a conscious act rather than something an upgrade brings.
 admin-ui = ["dep:saltator-admin-ui"]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RF-policy smoke (phase 3, docs/design-room-sharding-phase2.md): the
+# RF-policy smoke: the
 # replication factor is REAL policy now — no rf_cap_unsafe debug knob.
 # Node 1 founds an 8-shard cluster with replication_factor = 2 and fills
 # every shard with rooms. Node 2 joins (2 nodes <= RF: both host

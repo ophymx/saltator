@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 # Passthrough so `cargo build -p saltator --features admin-ui` works; the
-# console is served by the CS router (docs/design-admin-ui.md).
+# console is served by the CS router.
 admin-ui = ["saltator-cs-api/admin-ui"]
 
 [dependencies]

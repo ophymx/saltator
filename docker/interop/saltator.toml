@@ -29,5 +29,5 @@ allow_private_ips = true
 [cluster]
 # Multi-shard CI: 4 room groups, matching the Complement image — the
 # interop join/E2EE flows then cross real shard routing too
-# (docs/design-room-sharding.md §open question 3).
+# (see docs/design-notes.md).
 room_shards = 4
