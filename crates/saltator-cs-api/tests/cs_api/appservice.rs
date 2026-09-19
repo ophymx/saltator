@@ -518,40 +518,6 @@ async fn appservice_ts_massaging_on_state_events() {
     assert_eq!(body["origin_server_ts"], 12345, "{body}");
 }
 
-#[tokio::test]
-async fn admin_user_detail_reports_devices_and_404s_for_strangers() {
-    let env = start_env_admin(&["@root:hs.test"], Vec::new()).await;
-    let token = env.register("root", "pw-12345678").await;
-    env.register("alice", "pw-12345678").await;
-
-    let (status, body) = env
-        .req(
-            "GET",
-            "/_saltator/admin/v1/users/@alice:hs.test",
-            Some(&token),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["user_id"], "@alice:hs.test");
-    assert_eq!(body["displayname"], "alice");
-    assert_eq!(body["has_password"], true);
-    assert_eq!(body["devices"].as_array().unwrap().len(), 1);
-    // The hash is never exposed, only whether one exists.
-    assert!(body.get("password_hash").is_none());
-
-    let (status, body) = env
-        .req(
-            "GET",
-            "/_saltator/admin/v1/users/@nobody:hs.test",
-            Some(&token),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["errcode"], "M_NOT_FOUND");
-}
-
 /// The full appservice identity-assertion flow: ghost registration via
 /// `m.login.application_service` (no UIA), then `?user_id=` masquerading
 /// — which requires the ghost to exist and to sit inside the AS's user

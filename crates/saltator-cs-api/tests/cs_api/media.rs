@@ -1,9 +1,6 @@
 //! Remote media and profile lookups over federation: downloading
 //! another server's media, and querying its profiles and room
 //! directory.
-//!
-//! `fallback_keys_serve_after_otk_exhaustion` also lives here and
-//! belongs with the E2EE tests; it has not been moved yet.
 use axum::http::StatusCode;
 use saltator_cs_api::{CsConfig, CsState};
 use saltator_federation::{FedState, FederationClient, KeyCache};
@@ -17,104 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::harness::*;
-
-/// Fallback keys (spec 1.2): served by /keys/claim once one-time keys
-/// run dry, kept (not deleted) and marked used; sync advertises the
-/// unused algorithms; a rotated key resets the flag.
-#[tokio::test]
-async fn fallback_keys_serve_after_otk_exhaustion() {
-    let env = start_env().await;
-    let alice = env.register("alice", "alice-pw").await;
-    let user = format!("@alice:{SERVER}");
-
-    // A device identity, one OTK, and a fallback key.
-    let (status, body) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/keys/upload",
-            Some(&alice),
-            Some(json!({
-                "device_keys": {
-                    "user_id": user, "device_id": device_of(&env, &alice).await,
-                    "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
-                    "keys": {}, "signatures": {},
-                },
-                "one_time_keys": {"signed_curve25519:OTK1": {"key": "otk"}},
-                "fallback_keys": {"signed_curve25519:FALL1": {"key": "fall1"}},
-            })),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let device = device_of(&env, &alice).await;
-
-    // Sync advertises the unused fallback algorithm.
-    let (_, sync0) = env
-        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
-        .await;
-    assert_eq!(
-        sync0["device_unused_fallback_key_types"],
-        json!(["signed_curve25519"]),
-        "{sync0}"
-    );
-
-    async fn claim(env: &Env, token: String, user: String, device: String) -> String {
-        let (status, got) = env
-            .req(
-                "POST",
-                "/_matrix/client/v3/keys/claim",
-                Some(&token),
-                Some(json!({"one_time_keys": {&user: {&device: "signed_curve25519"}}})),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{got}");
-        got["one_time_keys"][&user][&device]
-            .as_object()
-            .and_then(|m| m.keys().next().cloned())
-            .unwrap_or_default()
-    }
-
-    // First claim eats the OTK; the next two serve the SAME fallback.
-    let k1 = claim(&env, alice.clone(), user.clone(), device.clone()).await;
-    assert_eq!(k1, "signed_curve25519:OTK1");
-    let k2 = claim(&env, alice.clone(), user.clone(), device.clone()).await;
-    assert_eq!(k2, "signed_curve25519:FALL1");
-    let k3 = claim(&env, alice.clone(), user.clone(), device.clone()).await;
-    assert_eq!(
-        k3, "signed_curve25519:FALL1",
-        "fallback must not be deleted"
-    );
-
-    // Used now — gone from the unused list until a new key rotates in.
-    let (_, sync1) = env
-        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
-        .await;
-    assert_eq!(
-        sync1["device_unused_fallback_key_types"],
-        json!([]),
-        "{sync1}"
-    );
-    let (status, body) = env
-        .req(
-            "POST",
-            "/_matrix/client/v3/keys/upload",
-            Some(&alice),
-            Some(json!({"fallback_keys": {"signed_curve25519:FALL2": {"key": "fall2"}}})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (_, sync2) = env
-        .req("GET", "/_matrix/client/v3/sync", Some(&alice), None)
-        .await;
-    assert_eq!(
-        sync2["device_unused_fallback_key_types"],
-        json!(["signed_curve25519"]),
-        "{sync2}"
-    );
-    let k4 = claim(&env, alice, user, device).await;
-    assert_eq!(k4, "signed_curve25519:FALL2");
-
-    env.shutdown().await;
-}
 
 // --- Remote media fetch over federation ----------------------------------
 
