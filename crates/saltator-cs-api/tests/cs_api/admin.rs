@@ -1,11 +1,11 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! The admin API (`/_saltator/admin/v1`): who may reach it at all, user
+//! lifecycle (lock, deactivate, erase, password reset, admin flag), room
+//! shutdown and blocking, server notices, health probes, cluster node
+//! listing and drain guards, and the embedded console's serving rules.
 use axum::http::StatusCode;
+use saltator_federation::{FedState, KeyCache, OldVerifyKey};
 use serde_json::json;
 use std::sync::Arc;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
-use saltator_federation::{FedState, KeyCache, OldVerifyKey};
 
 use crate::harness::*;
 
@@ -178,7 +178,7 @@ async fn admin_api_refuses_query_param_tokens() {
     assert_eq!(status, StatusCode::OK);
 }
 
-// -- admin lifecycle (docs/design-admin-identity.md slice 2) --------------
+// -- admin lifecycle --------------
 
 /// The headline property of `Locked`: an existing token stops working
 /// immediately and works again after unlock, with no re-login. Only
@@ -1033,7 +1033,7 @@ async fn cluster_node_list_and_drain_guards() {
     env.shutdown().await;
 }
 
-// -- admin console (docs/design-admin-ui.md slice 7) ----------------------
+// -- admin console ----------------------
 //
 // Feature-gated: the console is default-off, so these run in the same CI
 // job that builds with `--features admin-ui`.

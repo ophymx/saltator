@@ -1,13 +1,14 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! The core client-server loop against the real HTTP router: two users
+//! register, chat, and observe each other. Plus the surfaces that ride
+//! on `/sync` — account data, to-device and OTK counts, device-list
+//! changes, presence, relations and threads, the user directory,
+//! transaction-id scoping, and HTTP pusher delivery.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
 
 use crate::harness::*;
 
@@ -79,7 +80,7 @@ async fn two_users_chat_end_to_end() {
             "/_matrix/client/v3/createRoom",
             Some(&alice),
             Some(json!({
-                "name": "M2 exit",
+                "name": "two users chat",
                 "topic": "two users chat",
                 "preset": "private_chat",
                 "invite": [format!("@bob:{SERVER}")],

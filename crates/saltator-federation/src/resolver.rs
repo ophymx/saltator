@@ -48,9 +48,9 @@ impl ServerResolver {
     }
 
     /// Refuse a resolution that would dial a private/loopback/link-local
-    /// address, unless `allow_private_ips` was set for a trusted harness
-    /// (security review 2026-08-13, Vuln 5 / M2). This covers the two
-    /// targets the guarded DNS resolver cannot see: an IP-literal
+    /// address, unless `allow_private_ips` was set for a trusted
+    /// harness. This covers the two targets the guarded DNS resolver
+    /// cannot see: an IP-literal
     /// `base_url` (reqwest connects to it without a DNS lookup) and an SRV
     /// `connect_addr` (applied as a fixed `resolve` override that bypasses
     /// the resolver). Hostname `base_url`s with no override are vetted by
@@ -285,7 +285,7 @@ mod tests {
         }
     }
 
-    /// The pre-auth SSRF guard (Vuln 5 / M2): an IP-literal base_url or an
+    /// The pre-auth SSRF guard: an IP-literal base_url or an
     /// SRV connect address in a private range is refused, a public one
     /// passes, and a hostname base_url is left to the guarded client.
     #[test]

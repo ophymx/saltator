@@ -1,7 +1,7 @@
-//! M0 exit criterion: a 1-node "cluster" starts, persists, restarts
-//! (spec.md §12). Runs the metadata group in-process over a temp dir,
-//! writes through Raft, tears everything down, reopens the same data dir,
-//! and verifies recovery without re-initialization.
+//! A 1-node "cluster" starts, persists, and restarts. Runs the metadata
+//! group in-process over a temp dir, writes through Raft, tears
+//! everything down, reopens the same data dir, and verifies recovery
+//! without re-initialization.
 
 use std::sync::Arc;
 use std::time::Duration;

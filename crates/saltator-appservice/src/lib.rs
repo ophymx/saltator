@@ -1,5 +1,5 @@
 //! Application service registrations: the model, the YAML loading, and
-//! the namespace predicates (docs/design-appservices.md).
+//! the namespace predicates.
 //!
 //! This crate is deliberately a leaf shared by `saltator-cs-api` (auth,
 //! masquerading, the outbound push worker) and `saltator-federation`
@@ -32,8 +32,8 @@ pub struct AppServiceRegistration {
     /// Whether *masqueraded* users are rate-limited. The sender never is.
     pub rate_limited: bool,
     /// Whether the AS wants typing/receipt/presence data in its
-    /// transactions. Parsed, currently logged-and-ignored (deferred —
-    /// docs/design-appservices.md).
+    /// transactions. Parsed, currently logged-and-ignored (deferred;
+    /// see docs/deferred.md).
     pub receive_ephemeral: bool,
     /// Third-party protocol ids the AS bridges (informational for now;
     /// `/thirdparty` proxying is deferred).

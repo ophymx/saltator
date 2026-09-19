@@ -74,10 +74,10 @@ impl From<saltator_shard::ShardError> for ClusterError {
 
 /// The metadata group's command interpreter: a linearizable KV store
 /// which, from schema v2, also emits a change stream (the placement
-/// watch: `Subscribe(group 0)`, docs/design-room-sharding-phase2.md).
+/// watch: `Subscribe(group 0)`).
 pub struct MetaApp;
 
-/// The metadata group's schema version (see docs/design-schema-migrations.md).
+/// The metadata group's schema version.
 /// v2: every committed Set/Delete emits a [`MetaChange`] and journals it
 /// under its seq (`T_CHANGES`) for subscription backfill.
 /// v3: the roster may carry [`NodeStatus::Unreachable`] — a variant pre-v3
@@ -329,7 +329,7 @@ impl MetadataHandle {
         Ok(())
     }
 
-    // -- node removal (docs/design-admin-identity.md slice 6) -------------
+    // -- node removal -------------
     //
     // Two steps on purpose, mirroring how a node arrives. `admit_node` is
     // one call because a joiner has no state to release; leaving does.
@@ -585,8 +585,7 @@ pub async fn serve_internal_with_tls(
     listen: std::net::SocketAddr,
     tls: Option<tls::InternalTls>,
     // Local blob store, if this node serves media: the bulk blob RPCs
-    // (docs/design-room-sharding-phase2.md, "Media blob placement") read
-    // and write through it. `None` leaves those RPCs UNIMPLEMENTED.
+    // read and write through it. `None` leaves those RPCs UNIMPLEMENTED.
     media: Option<saltator_media::MediaStore>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {

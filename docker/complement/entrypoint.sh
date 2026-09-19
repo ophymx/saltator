@@ -83,8 +83,8 @@ advertise = "$_internal"
 seeds = [$_seeds]
 # Multi-shard CI: 4 room groups per suite server — enough to exercise the
 # vector-token/routing paths on every test without the raft overhead of
-# the 16-group production default (docs/design-room-sharding.md §open
-# question 3; e2e/cluster/chaos harnesses cover the default 16).
+# the 16-group production default (the e2e, cluster and chaos harnesses
+# cover the default 16).
 room_shards = 4
 
 [listeners]

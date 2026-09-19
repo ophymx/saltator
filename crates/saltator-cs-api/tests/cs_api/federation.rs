@@ -1,9 +1,12 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! Federation as a client sees it: remote join by room id and by alias
+//! (with backfill and unverifiable-state pruning), invites and bans in
+//! both directions, EDUs arriving in `/sync` (receipts, typing,
+//! presence, to-device), federated key query and claim, sync gaps, the
+//! SSRF guard, and rate limiting.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use saltator_cs_api::{CsConfig, CsState};
+use saltator_federation::{FedState, FederationClient, KeyCache, OldVerifyKey};
 use saltator_media::MediaStore;
 use saltator_roomserver::RoomServer;
 use saltator_shard::NoopNetworkFactory;
@@ -13,8 +16,6 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
-use saltator_federation::{FedState, FederationClient, KeyCache, OldVerifyKey};
 
 use crate::harness::*;
 

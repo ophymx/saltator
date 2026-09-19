@@ -7,7 +7,7 @@
 //! - `signing_key/{version}` → `scheme(1) ++ nonce(12) ++
 //!   chacha20poly1305(DER)`, AAD = the version string
 //! - `signing_key_meta/{version}` → JSON [`KeyMeta`] (created/expired
-//!   timestamps; `expired_ts_ms` feeds `old_verify_keys` in M3)
+//!   timestamps; `expired_ts_ms` feeds `old_verify_keys`)
 //!
 //! The key-encryption key (`master.key` in the data dir, owner-only) is a
 //! *cluster* secret (OQ-6): minted only at fresh bootstrap and provisioned
@@ -28,7 +28,7 @@ use saltator_roomserver::ServerSigner;
 
 const CURRENT_KEY: &str = "signing_key_current";
 
-/// Wrap scheme tag on stored key blobs, so an M4 custodian redesign
+/// Wrap scheme tag on stored key blobs, so a later custodian redesign
 /// (per-node unwrap, KMS, …) is an additive migration, not a format break.
 const SCHEME_CLUSTER_KEK_V1: u8 = 1;
 
@@ -41,7 +41,7 @@ fn meta_key(version: &str) -> String {
 }
 
 /// Lifecycle of one signing-key version (stored unencrypted — it is
-/// public information, served via `/_matrix/key/v2/server` in M3).
+/// public information, served via `/_matrix/key/v2/server`).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct KeyMeta {
     pub created_ts_ms: u64,
@@ -116,7 +116,7 @@ fn decrypt(kek: &[u8; 32], version: &str, blob: &[u8]) -> anyhow::Result<Vec<u8>
 }
 
 /// Load the active signing key from the metadata group, migrating a
-/// pre-M2 `signing.key` file or generating a fresh key as needed.
+/// legacy `signing.key` file or generating a fresh key as needed.
 pub async fn load_signing_key(
     meta: &MetadataHandle,
     kek: &[u8; 32],
@@ -135,7 +135,9 @@ pub async fn load_signing_key(
         return Ok(ServerSigner::from_der(server_name, &der, version)?);
     }
 
-    // Migrate the M0/M1 file-based key, if present.
+    // Migrate the legacy file-based key, if present. Early versions
+    // kept the signing key as a bare file in the data dir; a server
+    // upgraded from one still has it.
     let legacy = data_dir.join("signing.key");
     let migrated = legacy.exists();
     let (der, version) = if migrated {

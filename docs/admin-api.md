@@ -4,9 +4,13 @@ Saltator's administrative surface lives under `/_saltator/admin/v1`.
 
 It is **our own namespace, and only ours**. No `_synapse`-prefixed paths
 are served and no aliases exist for any other homeserver's admin tooling
-(`docs/design-admin-identity.md`, decision 1). The accepted cost of that
-choice is that an operator writes against this surface rather than
-reusing someone else's scripts — which is what this document is for.
+(`docs/design-notes.md`). The accepted cost of that choice is that an
+operator writes against this surface rather than reusing someone else's
+scripts — which is what this document is for.
+
+Every endpoint below is checked against the router by
+`crates/saltator/tests/docs.rs`: a route added without an entry here, or
+an entry here with no route, fails the build.
 
 ## Authentication
 
@@ -218,6 +222,21 @@ mint tokens, so enabling it on an empty server locks it with nobody
 inside.
 
 ### `GET /registration_tokens`
+
+Every token, sorted by token string:
+
+```json
+{"registration_tokens": [
+  {"token": "abc", "uses_allowed": 10, "used": 3,
+   "expiry_ts": 1767225600000, "created_ts": 1760000000000,
+   "valid": true}
+]}
+```
+
+`uses_allowed` and `expiry_ts` are `null` for unlimited and
+never-expiring respectively. `valid` is computed — whether the token
+would authorise a registration right now — so an operator does not have
+to compare clocks and counters themselves.
 
 ### `POST /registration_tokens`
 

@@ -1,7 +1,10 @@
 # Saltator — Technical Specification
 
-**Status:** v0.2 — decisions locked (2026-07-11)
-**Audience:** Implementers. This is the document v1 is built from.
+**Audience:** implementers. This describes the architecture the server
+is built on, and the reasoning behind the choices that shaped it.
+Where something is specified here but not yet built, it says so and
+points at `docs/deferred.md`.
+
 **Companion:** [INTENTION.md](INTENTION.md) for motivation and naming.
 
 ---
@@ -70,11 +73,10 @@ Deferred, with architectural room left for each:
 
 ## 3. Protocol target
 
-- **Matrix spec:** **v1.19** (released 2026-07-08; pinned in M0 per the
-  re-pin note in v0.2 of this document). Notable deltas since the v1.16
-  draft target: policy servers + removal of `/v1/send_join`//`/v1/send_leave`
-  (v1.18), encrypted history sharing and image packs (v1.19) — none change
-  the M0–M3 architecture.
+- **Matrix spec:** **v1.19** (released 2026-07-08). Notable deltas from
+  the v1.16 draft this was first designed against: policy servers and the
+  removal of `/v1/send_join` / `/v1/send_leave` (v1.18), encrypted history
+  sharing and image packs (v1.19). None of them changed the architecture.
 - **Room versions:** 11 and 12 supported; default per the pinned spec version.
   Older room versions (1–10) are needed in practice to *participate* in
   long-lived federated rooms — implement the auth/state-res deltas
@@ -127,19 +129,22 @@ Three planes, all embedded in the same binary:
 ### 4.1 Sharding model
 
 - Fixed count of **virtual shards** per keyspace, set at cluster creation
-  (default 16 room shards + 16 user shards; power of two — revised from 64
-  in docs/design-room-sharding.md review call 1: single-digit Raft-group
-  overhead on small clusters, and a deployment expecting more than 16
-  nodes sets 64 at creation). Virtual shards are many-to-few mapped onto
-  nodes, so rebalancing moves whole shards, never individual rooms.
+  (default 16 room shards; power of two). Virtual shards are many-to-few
+  mapped onto nodes, so rebalancing moves whole shards, never individual
+  rooms. The default was revised down from 64 for single-digit Raft-group
+  overhead on small clusters; a deployment expecting more than 16 nodes
+  sets a higher count at creation.
 - **Room keyspace** — sharded by `hash(room_id)`. Contains: event store, room
   DAG metadata, current state and state snapshots, per-room receipts/typing,
   room aliases (by `hash(alias)` → pointer), room directory entries.
 - **User keyspace** — sharded by `hash(user_id)`. Contains: accounts, access
   tokens, devices, E2EE key material, account data, push rules, pushers,
   to-device inboxes, per-user sync bookkeeping (room membership index).
+  *Not yet split:* the user keyspace runs as a single group replicated to
+  every node — `docs/deferred.md`.
 - **Federation-out keyspace** — sharded by `hash(destination_server)`.
   Contains durable outbound queues (PDUs/EDUs pending delivery per remote).
+  *Not yet split:* like the user keyspace, one group on every node.
   Guarantees exactly one sender per destination cluster-wide (per-destination
   ordering, as federation requires), without a configured "federation sender"
   role: the shard leader *is* the sender.
@@ -179,7 +184,7 @@ This constraint is load-bearing — new features must justify any exception.
   and shard moves), and prefix iterators.
 - Wrapped in a deliberately narrow trait (`get/put/delete/range/batch/
   checkpoint`) so a pure-Rust engine (`fjall`, `redb`) can be evaluated later
-  without touching shard logic. *(OQ-1: resolved — RocksDB.)*
+  without touching shard logic.
 
 ### 4.4 Node lifecycle
 
@@ -188,12 +193,16 @@ This constraint is load-bearing — new features must justify any exception.
   then the placement controller (runs on the metadata leader) rebalances
   shards onto it (add-learner → catch up via engine checkpoint transfer →
   promote → demote/remove an old replica).
-- **Failure:** shard leadership fails over via Raft election (target: <5s
-  disruption). A node dead past a threshold (default 10 min) has its replicas
-  re-placed by the controller.
-- **Rolling upgrade:** drain leaderships off a node (`saltator node drain`),
-  restart with the new binary, undrain. Raft log entries and KV schema carry
-  format versions; N and N+1 binaries must interoperate.
+- **Failure:** shard leadership fails over via Raft election. A node that
+  fails liveness probes continuously for `cluster.dead_node_grace_secs`
+  (default 30) is marked unreachable by the metadata leader, which takes
+  it out of placement and moves its replicas onto survivors; it is
+  restored automatically when it answers again.
+- **Rolling upgrade:** drain a node through the admin API
+  (`POST /cluster/nodes/{id}/drain`), restart it with the new binary,
+  then undrain. Raft log entries and shard state carry format versions,
+  and N/N+1 binaries must interoperate — migrations only run once every
+  voter reports support for the target version.
 
 ## 5. Matrix core engine
 
@@ -211,7 +220,7 @@ canonical JSON. Ruma is a types library, not a homeserver — using it is
 analogous to using serde, and re-typing the entire Matrix schema surface is
 weeks of error-prone work with no architectural payoff. The from-scratch
 commitment applies to the *server*: state resolution, auth, storage,
-clustering, federation logic are all ours. *(OQ-2: resolved — use ruma.)*
+clustering, federation logic are all ours.
 
 ### 5.2 Event pipeline (per room, executed at the room-shard leader)
 
@@ -295,29 +304,32 @@ stored per room for state-res performance.
 
 ## 6. Workspace layout
 
-```
-saltator/
-├── Cargo.toml               # workspace
-├── crates/
-│   ├── saltator/            # the binary: config, startup, CLI (node drain, init, status)
-│   ├── saltator-core/       # PURE: auth rules, state-res v2, event validation, room-version gates
-│   ├── saltator-cluster/    # metadata group, placement controller, node lifecycle, internal RPC
-│   ├── saltator-shard/      # generic Raft shard runtime: log, state-machine apply, change streams
-│   ├── saltator-store/      # storage-engine trait + RocksDB impl, keyspace/table schema
-│   ├── saltator-roomserver/ # event pipeline, room keyspace state machine (uses core, shard, store)
-│   ├── saltator-userserver/ # accounts, devices, E2EE keys, to-device, user keyspace state machine
-│   ├── saltator-cs-api/     # client-server HTTP surface (axum routers → internal calls)
-│   ├── saltator-federation/ # S2S HTTP surface, request signing/verification, out-queue logic
-│   ├── saltator-media/      # blob store + media endpoints
-│   └── saltator-macros/     # (as needed)
-└── tests/
-    ├── complement/          # Complement harness wiring (Docker image + CI)
-    └── cluster/             # multi-node integration tests (in-process cluster harness)
-```
+One crate per concern, under `crates/`:
 
-Dependency rule: `core` depends on nothing internal; `cs-api`/`federation`
-never touch `store` directly (always through roomserver/userserver);
-nothing depends on the binary crate.
+| Crate | Owns |
+| --- | --- |
+| `saltator` | the binary: config, startup, CLI, wiring |
+| `saltator-core` | **pure**: auth rules, state resolution, event validation, room-version gates |
+| `saltator-store` | storage-engine trait + RocksDB, keyspace/table layout |
+| `saltator-shard` | generic Raft shard runtime: log, apply, change streams, migrations |
+| `saltator-cluster` | metadata group, placement, node lifecycle, internal RPC |
+| `saltator-roomserver` | event pipeline and the room keyspace |
+| `saltator-userserver` | accounts, devices, E2EE material, the user keyspace |
+| `saltator-fedout` | the federation-out keyspace: durable delivery promises |
+| `saltator-cs-api` | client-server HTTP surface |
+| `saltator-federation` | server-server HTTP surface, signing and verification |
+| `saltator-appservice` | application-service registrations and client |
+| `saltator-media` | content-addressed blob store and thumbnailing |
+| `saltator-metrics` | Prometheus recorder, exporter, HTTP instrumentation |
+| `saltator-admin-ui` | the embedded admin console (feature-gated) |
+| `saltator-testsupport` | shared test support, including a mock federation peer |
+
+The dependency rule: `core` depends on nothing internal; `cs-api` and
+`federation` never touch `store` directly, always going through a
+keyspace crate; nothing depends on the binary.
+
+The Complement and Synapse-interop harnesses live under `docker/`, and
+the multi-node cluster scenarios under `scripts/`.
 
 ## 7. Key dependency choices
 
@@ -326,11 +338,11 @@ nothing depends on the binary crate.
 | Async runtime | tokio | — |
 | HTTP server | axum (hyper) | CS + federation + internal on separate listeners |
 | TLS | rustls | federation client verification per spec |
-| Consensus | openraft | resolved (OQ-3) |
-| Storage engine | RocksDB via `rust-rocksdb` | resolved (OQ-1); behind trait |
-| Matrix types | ruma | resolved (OQ-2) |
+| Consensus | openraft | async-native, multi-group; see §12 |
+| Storage engine | RocksDB via `rust-rocksdb` | behind the storage trait (§4.3) |
+| Matrix types | ruma | schema surface only; see §5.1 |
 | Signing | ed25519-dalek | + Matrix canonical JSON (via ruma) |
-| Internal RPC | gRPC (tonic) | resolved (OQ-4); two connection classes, see §8 |
+| Internal RPC | gRPC (tonic) | two connection classes, see §8 |
 | Serialization (internal) | postcard | versioned, inside proto envelopes (§8) |
 | Observability | tracing, tracing-opentelemetry, metrics → Prometheus exporter | per-shard metrics labeled by keyspace/shard |
 
@@ -385,98 +397,58 @@ group (self-contained CA; no external PKI).
 - At-rest encryption of the signing key material in the metadata group;
   full at-rest DB encryption deferred to the storage engine layer (post-v1).
 
-## 11. Testing strategy
+## 11. How it is verified
 
-- **`saltator-core`:** exhaustive unit tests; state-res v2 tested against the
-  spec's published test vectors and cross-checked by replaying real room DAGs
-  captured from federation; proptest for auth-rule invariants; fuzzing on
-  event/JSON parsing.
-- **Shard layer:** deterministic simulation harness (in-process multi-node
-  cluster, controlled network faults — madsim-style) for
-  election/rebalancing/failover invariants. This is a first-class deliverable,
-  not an afterthought: we own consensus-adjacent code, so we pay for it in
-  simulation testing.
-- **Protocol compliance:** Complement in CI from M2 onward; track pass-rate
-  as the headline project metric.
-- **Interop:** a standing federation test rig against Synapse and the
-  Conduit family (Docker compose) exercising join/backfill/E2EE flows.
+- **Unit and integration tests** across the workspace, run on every push.
+- **Complement**, the Matrix protocol suite, gates CI in two jobs —
+  client-server and federation. Each has an allowed-failures list, so a
+  newly-failing test breaks the build by default and a fixed one has to
+  be removed from the list deliberately.
+- **Interop**: a gating job federates against a real Synapse, including
+  an end-to-end E2EE exchange (`docker/interop`).
+- **Cluster behaviour**: a chaos job kills a node mid-traffic in CI, and
+  `scripts/*_smoke.sh` drive multi-node scenarios locally — shard moves,
+  replication-factor policy, dead-node re-placement, media placement.
+  These are local-only; they need more nodes than a CI runner affords.
 
-## 12. Milestones
+Deterministic simulation of the consensus layer (madsim-style),
+property-based testing of the auth rules, and fuzzing of event parsing
+are all things this design would benefit from and none of them exist.
 
-- **M0 — Foundations.** Workspace, config, storage trait + RocksDB, metadata
-  Raft group, single-node bootstrap, internal RPC skeleton, CI. *Exit: a
-  1-node "cluster" starts, persists, restarts.* **Exit met 2026-07-12.**
-- **M1 — Core engine.** `saltator-core` complete for room v11/12 (auth,
-  state-res v2, validation) with vector tests. Room + user shards as state
-  machines; event pipeline working single-node. *Exit: events flow through
-  the full pipeline in-process.* **Exit met 2026-07-13.**
-- **M2 — Client-server.** Registration, login, room create/join/send,
-  `/sync` v2, receipts/typing, media (local blobs). *Exit: two Element users
-  chat on a single-node Saltator; Complement CS suite running in CI.*
-  **Exit met 2026-07-14** (element-shaped e2e test + Complement in CI;
-  confirmed with real Element clients 2026-08-02).
-- **M3 — Federation.** Server keys, inbound/outbound transactions, remote
-  join + backfill, out-queues. *Exit: join a room on matrix.org, converse
-  bidirectionally with a Synapse user. This is the project's first public
-  proof point.* **Exit met 2026-07-24** via the gating CI interop job: a
-  Saltator user joins a real Synapse's room over federation and messages
-  flow both ways (no public deployment yet, so a live matrix.org join is
-  deferred to launch).
-- **M4 — Clustering.** Multi-node: placement controller, shard moves, node
-  join/drain/failure, sync across shards, per-destination out-queue
-  ownership. Simulation harness green. *Exit: 3-node cluster survives
-  kill -9 of any node mid-traffic with no message loss; chaos test in CI.*
-  **Exit met 2026-07-24** (gating chaos job; graceful drain and
-  leader-forwarded writes deferred as hardening).
-- **M5 — E2EE surface + hardening.** Device/key APIs, key backup,
-  cross-signing, to-device at scale, push, rate limits, Complement pass-rate
-  push, older room versions (9/10) for federation reach. *Exit: E2EE chat
-  between Element clients across Saltator↔Synapse federation.*
-  **Exit met 2026-08-02** via the gating CI interop job: fresh matrix-nio
-  devices exchange Megolm messages both directions across
-  Saltator↔Synapse federation (device-key query, one-time-key claim, and
-  room-key to-device sharing all crossing the wire); the same E2EE flows
-  verified hands-on with real Element clients against Saltator.
+## 12. Decisions
 
-Milestone order note: M2 before M3 is sequencing pragmatism, not a scope
-statement — federation remains in v1, and M1's pipeline is built
-federation-shaped (PDU validation, signatures, backfill hooks) so M3 is an
-exposure of existing structure, not a redesign.
+The choices that shaped the architecture, and what would reopen each.
 
-## 13. Decisions and open questions
-
-- **OQ-1 — Storage engine. RESOLVED (2026-07-11): RocksDB via
-  `rust-rocksdb`,** behind the narrow storage trait (§4.3). Pure-Rust engines
-  (`fjall`, `redb`) may be re-evaluated post-v1 if one reaches checkpoint
-  parity; not a v1 concern.
-- **OQ-2 — Wire types. RESOLVED (2026-07-11): use ruma.** The from-scratch
-  commitment applies to the server (state res, auth, storage, clustering,
-  federation logic), not to re-typing the Matrix schema surface (§5.1).
-- **OQ-3 — Consensus library. RESOLVED (2026-07-11): openraft.**
-  Async-native and multi-group friendly. Homegrown remains explicitly
-  rejected.
-- **OQ-4 — Internal RPC. RESOLVED (2026-07-11): gRPC (tonic) with two
-  connection classes per node pair** — control (Raft, forwarded ops,
-  subscriptions) and bulk (checkpoints, blobs) — which removes the
+- **Storage engine: RocksDB** via `rust-rocksdb`, behind the narrow
+  storage trait (§4.3). Pure-Rust engines (`fjall`, `redb`) are worth
+  re-evaluating if one reaches checkpoint parity; the trait is what keeps
+  that an option rather than a rewrite.
+- **Wire types: ruma.** The from-scratch commitment applies to the
+  server — state resolution, auth, storage, clustering, federation logic
+  — not to re-typing the Matrix schema surface (§5.1).
+- **Consensus: openraft.** Async-native and multi-group friendly. A
+  homegrown implementation is explicitly rejected.
+- **Internal RPC: gRPC (tonic), two connection classes per node pair** —
+  control (Raft, forwarded operations, subscriptions) and bulk
+  (checkpoints, media blobs). Separating them removes the
   head-of-line-blocking argument for QUIC on LAN-class networks (§8).
-  Envelopes in proto for upgrade evolution; internal payloads as versioned
-  postcard bytes. Re-evaluate QUIC only if geo-distributed clusters become a
-  goal.
-- **OQ-5 — Shard topology. RESOLVED (2026-07-11): shard count is fixed at
-  cluster creation** (default 64 room + 16 user, configurable at init).
-  Shard split/merge is out of scope for the foreseeable future; deployments
-  that outgrow their shard count migrate via room export/import or cluster
-  rebuild.
-- **OQ-6 — Metadata group as key custodian. RESOLVED for v1 (2026-07-14):
-  shared cluster KEK.** Signing keys stay in the metadata group, encrypted
-  under one cluster-wide KEK (`master.key`), which is an operator-provisioned
-  cluster secret: minted only at fresh bootstrap, copied to each node like a
-  TLS key. At-rest encryption protects offline artifacts (backups, shipped
-  checkpoints) — any node that signs necessarily holds the capability while
-  running, so fancier custodians can't raise that ceiling. Stored key blobs
-  carry a scheme tag and per-version created/expired timestamps (the latter
-  needed for `old_verify_keys` in M3 anyway) so the format forecloses
-  nothing. Custodian design is revisited at M4 alongside the node-join
-  ceremony — per-node sealed unwrap, KMS, or status quo; no decision now.
-- **OQ-7 — Follower-read scaling. DEFERRED (post-v1).** Shard-layer API must
-  not preclude it (§4.2, §5.3).
+  Envelopes are proto, for field-number evolution across rolling
+  upgrades; internal payloads are versioned postcard bytes, since both
+  ends are always Saltator. QUIC is worth revisiting only if
+  geo-distributed clusters become a goal.
+- **Shard count is fixed at cluster creation.** Split and merge are out
+  of scope for the foreseeable future; a deployment that outgrows its
+  count migrates by room export/import or cluster rebuild. This is why
+  the default matters more than it looks — see §4.1.
+- **Signing keys live in the metadata group under one cluster-wide
+  KEK** (`master.key`), an operator-provisioned cluster secret: minted
+  at fresh bootstrap and copied to each node like a TLS key. At-rest
+  encryption protects offline artifacts — backups, shipped checkpoints.
+  Any node that signs necessarily holds the signing capability while
+  running, so a more elaborate custodian cannot raise that ceiling.
+  Stored key blobs carry a scheme tag and per-version created/expired
+  timestamps, so moving to per-node sealed unwrap or a KMS later is an
+  additive migration rather than a format break.
+- **Follower reads are deferred, and not precluded.** Reads go to the
+  group leader behind a read-index barrier. The shard-layer API reserves
+  room for bounded staleness (§4.2, §5.3) without implementing it.

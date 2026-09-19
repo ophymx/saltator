@@ -1,7 +1,7 @@
 {
   "name": "saltator-admin",
   "version": "0.0.1",
-  "description": "Admin console for a saltator homeserver. Built out of band and embedded into the server binary; see docs/design-admin-ui.md.",
+  "description": "Admin console for a saltator homeserver. Built out of band and embedded into the server binary.",
   "private": true,
   "type": "module",
   "license": "MIT OR Apache-2.0",

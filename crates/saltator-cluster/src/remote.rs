@@ -1,7 +1,6 @@
-//! Client side of the unhosted-shard data plane
-//! (docs/design-room-sharding-phase2.md): storage-level reads at the
-//! group's leader and gap-free change subscriptions, against a replica
-//! set from the placement. The counterpart of `forward.rs` for reads —
+//! Client side of the unhosted-shard data plane: storage-level reads at
+//! the group's leader and gap-free change subscriptions, against a
+//! replica set from the placement. The counterpart of `forward.rs` for reads —
 //! same authed dialer, same channel cache, same leader-hint retarget
 //! discipline.
 
@@ -362,7 +361,7 @@ pub async fn fetch_checkpoint(
 
 // -- media blobs --------------------------------------------------------------
 //
-// docs/design-room-sharding-phase2.md, "Media blob placement". Blobs are
+// Blobs are
 // not Raft data: they move by these two calls, over the bulk channel, and
 // their replica set comes from `placement::blob_replicas` rather than from
 // the stored placement.

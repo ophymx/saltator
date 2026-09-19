@@ -1,9 +1,11 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! Rooms: creation and v12 creator semantics, upgrades, the read
+//! surfaces (`/messages` with lazy-loaded members, `/context`,
+//! `/timestamp_to_event`), invites and their stripped state, leave and
+//! forget behaviour, threaded receipts and unread counts, and URL
+//! previews. Also carries key-backup and push-rule/pusher cases that
+//! share these fixtures.
 use axum::http::StatusCode;
 use serde_json::{json, Value};
-// --- Remote join (the M3 exit criterion, crate level) --------------------
 
 use crate::harness::*;
 

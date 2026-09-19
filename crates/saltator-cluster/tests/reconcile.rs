@@ -2,8 +2,7 @@
 //! bootstrapped single-voter on node 1, gains node 2 as a voter purely by
 //! the reconciler converging its membership to the metadata placement — the
 //! same path a real room/user group takes when a node joins. And the way
-//! back out: draining node 2 releases the replica by the same mechanism
-//! (docs/design-admin-identity.md slice 6).
+//! back out: draining node 2 releases the replica by the same mechanism.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -242,7 +241,7 @@ async fn reconciler_admits_a_new_replica_to_a_shard_group() {
     c.shutdown().await;
 }
 
-/// The way out, end to end (docs/design-admin-identity.md slice 6): drain
+/// The way out, end to end: drain
 /// takes node 2 out of the placement, the ordinary reconciler releases the
 /// replica it was holding, and only then may the node be removed from the
 /// metadata group.

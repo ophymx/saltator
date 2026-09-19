@@ -1,8 +1,12 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! Remote media and profile lookups over federation: downloading
+//! another server's media, and querying its profiles and room
+//! directory.
+//!
+//! `fallback_keys_serve_after_otk_exhaustion` also lives here and
+//! belongs with the E2EE tests; it has not been moved yet.
 use axum::http::StatusCode;
 use saltator_cs_api::{CsConfig, CsState};
+use saltator_federation::{FedState, FederationClient, KeyCache};
 use saltator_media::MediaStore;
 use saltator_roomserver::RoomServer;
 use saltator_shard::NoopNetworkFactory;
@@ -11,8 +15,6 @@ use saltator_userserver::{spawn_membership_projection, UserServer};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
-use saltator_federation::{FedState, FederationClient, KeyCache};
 
 use crate::harness::*;
 

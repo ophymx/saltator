@@ -61,8 +61,8 @@ impl ShardApp for UserApp {
 
     fn migrate(&self, ctx: &mut ApplyCtx<'_>, to: u32) -> StoreResult<()> {
         match to {
-            // v2: the outbound EDU outbox lives in the fed-out shard now
-            // (docs/design-federation-out.md). Every remaining row here
+            // v2: the outbound EDU outbox lives in the fed-out shard now.
+            // Every remaining row here
             // was drained (the daemon gates this step on the fed-out
             // marker covering the tail), so the drop loses nothing. New
             // binaries never wrote here, and the voter gate guarantees no
@@ -74,7 +74,7 @@ impl ShardApp for UserApp {
                 Ok(())
             }
             // v3: `Account` gains state/admin/erased in place of the
-            // `deactivated` bool (docs/design-admin-identity.md). Rewrite
+            // `deactivated` bool. Rewrite
             // every row: the two encodings are not compatible, so this
             // must be total. Correct on an empty store.
             3 => {
@@ -2161,8 +2161,7 @@ impl UserStore {
     }
 
     /// Every distinct blob id the media table names — the index the blob
-    /// reconciler places against (docs/design-room-sharding-phase2.md,
-    /// "Media blob placement").
+    /// reconciler places against.
     ///
     /// Many media rows can point at one blob (identical bytes uploaded
     /// under different filenames get distinct media ids and share the

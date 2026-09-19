@@ -1,5 +1,5 @@
 //! Saltator: a Matrix homeserver as a self-clustering distributed system.
-//! See spec.md. M2: single-node with the full client-server surface.
+//! See spec.md for the architecture this binary assembles.
 
 mod blobs;
 mod config;
@@ -222,8 +222,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // The blob store opens before the internal listener: the bulk media
     // RPCs serve out of it, and a peer may ask for a blob as soon as we
-    // are reachable (docs/design-room-sharding-phase2.md, "Media blob
-    // placement"). This handle is the placement-FREE one — the RPC side
+    // are reachable. This handle is the placement-FREE one — the RPC side
     // must never fall through to the cluster, or a blob nobody holds
     // becomes a fetch loop between peers instead of a 404.
     let media_local = saltator_media::MediaStore::open(cfg.data_dir.join("media"))?;
@@ -275,7 +274,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // The founder writes the cluster control plane (topology, roster,
     // placement); joiners read the replicated copy. The room-shard count
-    // is chosen HERE, once, forever (docs/design-room-sharding.md):
+    // is chosen HERE, once, forever:
     // shard split/merge does not exist, so the founding value is the
     // cluster's value for life.
     if founding {
@@ -352,7 +351,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let shard_bootstrap_fedout = shard_bootstrap.clone();
     // The placement decides which room groups THIS node hosts (runs the
     // Raft group) vs serves remotely (reads over the Read RPC, writes as
-    // intents — docs/design-room-sharding-phase2.md). With
+    // intents). With
     // `replication_factor` a real cap (phase 3), any cluster larger
     // than RF boots some shards down each arm; `rf_cap_unsafe` forces
     // the remote arm even below RF (debug). Poll: a joiner can race
@@ -534,7 +533,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // Dead-node failure detection: the metadata leader probes the roster
     // and re-places an unanswering node's room groups after the grace
-    // period (docs/design-room-sharding-phase2.md, phase 3). Runs on
+    // period. Runs on
     // every node; acts only while this node holds metadata leadership.
     let dead_node_grace = cfg.cluster.dead_node_grace_secs.unwrap_or(30);
     if dead_node_grace > 0 {
@@ -557,7 +556,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // internal Status RPC). Tasks exit once each shard is current. The
     // USER shard's v2 step carries an extra precondition: the fed-out
     // drain marker must cover its outbox tail (the marker-coordinated
-    // cross-shard move; docs/design-federation-out.md §drain).
+    // cross-shard move).
     for h in rooms
         .iter()
         .filter_map(|(_, s)| s.hosted_handle().cloned())
@@ -629,7 +628,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         };
     // Whether outbound federation may reach private/loopback addresses.
     // False in production; the destination is attacker-influenced and
-    // resolved before any signature check (security review Vuln 5 / M2).
+    // resolved before any signature check.
     let allow_private_ips = cfg.federation.allow_private_ips;
     // Signed client for outbound federation, shared by the CS `/join` path
     // and the event sender.
@@ -659,8 +658,8 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("client.admin_users: {u:?} is not a user id: {e}"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    // Intent executors: every HOSTED room shard serves remote writes
-    // (docs/design-room-sharding-phase2.md, 2a part 3), with this
+    // Intent executors: every HOSTED room shard serves remote writes,
+    // with this
     // stack's federation client powering healing ingests.
     for (idx, shard_server) in rooms.iter() {
         if shard_server.is_hosted() {

@@ -1,5 +1,5 @@
-//! Media blob placement (docs/design-room-sharding-phase2.md, "Media blob
-//! placement"): the daemon half of [`saltator_media::BlobPlacement`], plus
+//! Media blob placement: the daemon half of
+//! [`saltator_media::BlobPlacement`], plus
 //! the reconciler that heals replica counts after a topology change.
 //!
 //! Blobs are not Raft data — a 50 MiB upload has no business in a

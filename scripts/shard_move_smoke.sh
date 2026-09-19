@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shard-movement smoke (phase 2b, docs/design-room-sharding-phase2.md):
+# Shard-movement smoke:
 # node 1 founds a 4-shard cluster under rf_cap_unsafe = 1 and fills every
 # shard with rooms. Node 2 then joins — the placement re-assigns each
 # group to exactly ONE node, so a subset MOVES: node 1's reconciler

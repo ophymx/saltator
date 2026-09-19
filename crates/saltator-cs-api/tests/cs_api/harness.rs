@@ -185,8 +185,7 @@ pub async fn start_env_full_fedout(
     .await
 }
 
-/// A multi-shard env: rooms spread across `room_shards` groups
-/// (docs/design-room-sharding.md phase 1).
+/// A multi-shard env: rooms spread across `room_shards` groups.
 pub async fn start_env_sharded(room_shards: u16) -> Env {
     start_env_sharded_inner(
         saltator_cs_api::RateLimitConfig::disabled(),
@@ -671,7 +670,7 @@ pub async fn reg(router: &axum::Router, user: &str) -> String {
     r["access_token"].as_str().unwrap().to_owned()
 }
 
-// -- admin API authorization (docs/design-admin-identity.md slice 1) ------
+// -- admin API authorization ------
 
 pub const ADMIN_USERS: &str = "/_saltator/admin/v1/users";
 
@@ -917,7 +916,7 @@ pub const REG_TOKENS: &str = "/_saltator/admin/v1/registration_tokens";
 
 pub const REGISTER: &str = "/_matrix/client/v3/register";
 
-// -- room admin (docs/design-admin-identity.md slice 5) -------------------
+// -- room admin -------------------
 
 pub const ADMIN_ROOMS: &str = "/_saltator/admin/v1/rooms";
 
@@ -934,12 +933,12 @@ pub async fn make_room(env: &Env, token: &str, name: &str) -> String {
     body["room_id"].as_str().unwrap().to_owned()
 }
 
-// -- server notices (docs/design-admin-identity.md slice 5) ---------------
+// -- server notices ---------------
 
 pub fn notice(body: &str) -> Value {
     json!({"content": {"msgtype": "m.text", "body": body}})
 }
 
-// -- cluster admin (docs/design-admin-identity.md slice 6) ----------------
+// -- cluster admin ----------------
 
 pub const CLUSTER_NODES: &str = "/_saltator/admin/v1/cluster/nodes";

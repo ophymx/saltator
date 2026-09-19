@@ -1,4 +1,4 @@
-//! The admin console, embedded (docs/design-admin-ui.md slice 7).
+//! The admin console, embedded.
 //!
 //! A leaf crate on purpose: it depends on axum and nothing else in this
 //! workspace, so a rebuilt bundle recompiles this crate alone and relinks

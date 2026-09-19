@@ -1,6 +1,6 @@
-//! Server-server HTTP surface, request signing/verification, outbound
-//! queues (spec.md §5.4). M3 work in progress: server keys + X-Matrix
-//! request authentication.
+//! Server-server HTTP surface: X-Matrix request signing and
+//! verification, published server keys, and outbound delivery
+//! (spec.md §5.4).
 
 mod backfill;
 mod delivery;
@@ -108,7 +108,7 @@ pub struct FedState {
     /// clears a destination's penalty (it is provably up). `None` when no
     /// delivery worker runs.
     pub delivery_backoff: Option<Arc<crate::delivery::DeliveryBackoff>>,
-    /// Appservice query-on-miss (docs/design-appservices.md): a remote
+    /// Appservice query-on-miss: a remote
     /// server asking about an alias or user an appservice owns gets the
     /// same blocking provision-then-answer as a local client. `None`
     /// when no appservices are registered.
@@ -330,10 +330,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route("/_matrix/key/v2/query", post(notary_query_batch))
         // ---- Spec'd endpoints we deliberately do NOT implement ----
         // Explicit stubs so the gap is visible here rather than discovered
-        // mid-investigation (see docs/federation-conformance.md "Endpoint
-        // inventory"). Behaviour matches the fallback (404 M_UNRECOGNIZED,
-        // the spec's signal for an unimplemented endpoint), so gating tests
-        // like TestUnknownEndpoints are unaffected.
+        // mid-investigation (see docs/federation-endpoints.md).
+        // Behaviour matches the fallback (404 M_UNRECOGNIZED, the spec's
+        // signal for an unimplemented endpoint), so gating tests like
+        // TestUnknownEndpoints are unaffected.
         //
         // v1 invite serves only room versions 1-2 (we support v8+); a 404
         // here is exactly the signal that makes senders stay on v2.

@@ -58,7 +58,7 @@ impl ShardId {
 
     /// The Raft group number used to multiplex all shard groups over the
     /// internal RPC control channel. `keyspace << 16 | index`, so the
-    /// metadata group is 0 — matching the M0 wire numbering.
+    /// metadata group is group 0.
     pub const fn group(self) -> u64 {
         ((self.keyspace as u64) << 16) | self.index as u64
     }

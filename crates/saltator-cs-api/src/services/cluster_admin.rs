@@ -1,4 +1,4 @@
-//! Cluster administration (docs/design-admin-identity.md slice 6): what
+//! Cluster administration: what
 //! the cluster looks like, and how a node leaves it. No HTTP anywhere;
 //! routes call this.
 //!

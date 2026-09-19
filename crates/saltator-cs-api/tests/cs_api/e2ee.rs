@@ -1,9 +1,8 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! End-to-end encryption key material: cross-signing upload, query and
+//! signature merging, the rule that subkeys must chain to the master
+//! key, and device-key validation with one-time-key claim ordering.
 use axum::http::StatusCode;
 use serde_json::json;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
 
 use crate::harness::*;
 

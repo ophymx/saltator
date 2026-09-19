@@ -1,5 +1,5 @@
-//! Whole-shard state transfer for shard moves
-//! (docs/design-room-sharding-phase2.md, 2b part 2): the build half runs
+//! Whole-shard state transfer for shard moves:
+//! the build half runs
 //! over an engine checkpoint on a hosting replica; the install half
 //! pre-seeds a joining replica's stores so it boots looking exactly like
 //! a node that crashed right after a Raft snapshot install — the leader

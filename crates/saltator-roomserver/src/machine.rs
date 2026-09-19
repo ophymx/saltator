@@ -689,7 +689,7 @@ fn apply_import_history(ctx: &mut ApplyCtx<'_>, cmd: &ImportHistory) -> StoreRes
 
 /// Typed read access to a room shard's applied state — local (this
 /// node hosts the shard) or remote (served by a hosting replica over
-/// the Read RPC, docs/design-room-sharding-phase2.md). Every read
+/// the Read RPC). Every read
 /// method is async for the remote case; the local case resolves
 /// immediately.
 #[derive(Clone)]

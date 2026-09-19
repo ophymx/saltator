@@ -1,4 +1,4 @@
-//! The room-shard router (docs/design-room-sharding.md): a fixed set of
+//! The room-shard router: a fixed set of
 //! room shard groups and the frozen hash that assigns every room to one.
 
 use std::sync::Arc;

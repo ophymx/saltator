@@ -1,12 +1,11 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! Registration and account identity: gated registration walking its UIA
+//! stages, one-use registration tokens and their admin CRUD, UIA session
+//! scoping, and the external-identity links the SSO path is built on.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tower::ServiceExt;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
 
 use crate::harness::*;
 
@@ -328,8 +327,8 @@ async fn complement_shaped_regressions() {
 /// request creates the account.
 #[tokio::test]
 async fn gated_registration_walks_both_stages() {
-    // The gate applies to everyone, including the bootstrap admin — see
-    // the ordering note in docs/design-admin-identity.md.
+    // The gate applies to everyone, including the bootstrap admin, so
+    // enabling it on an empty server locks it with nobody inside.
     let env = start_env_admin_cfg(&["@root:hs.test"], Vec::new(), true).await;
     let (status, body) = env
         .req(
@@ -583,7 +582,7 @@ async fn uia_session_does_not_cross_endpoints() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-// -- identity links (docs/design-admin-identity.md slice 4) ---------------
+// -- identity links ---------------
 
 /// The link surface is admin-only, like everything else under
 /// `/_saltator/admin`: an ordinary account authenticates and is refused.

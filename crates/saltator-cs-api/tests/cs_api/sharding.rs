@@ -1,14 +1,13 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! Multi-shard routing: rooms spread across shards sync and paginate as
+//! one, membership projections track their per-shard cursors, and a
+//! restricted join reads its allow-room from a different shard.
 use axum::http::StatusCode;
 use serde_json::json;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
 
 use crate::harness::*;
 
 // ---------------------------------------------------------------------------
-// Multi-shard rooms (docs/design-room-sharding.md phase 1)
+// Multi-shard rooms
 // ---------------------------------------------------------------------------
 
 /// Create rooms until two land on different shards, then run the core

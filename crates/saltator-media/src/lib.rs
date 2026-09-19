@@ -5,7 +5,7 @@
 //! SHA-256. An S3 backend is v1.x.
 //!
 //! In a cluster the bytes are placed by rendezvous hashing over the blob
-//! id (docs/design-room-sharding-phase2.md, "Media blob placement"). All
+//! id. All
 //! of that lives behind one optional hook, [`BlobPlacement`]: with it
 //! set, [`MediaStore::store`] replicates to the blob's replica set before
 //! returning and [`MediaStore::read`] falls through to that set on a

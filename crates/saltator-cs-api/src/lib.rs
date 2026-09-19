@@ -109,14 +109,13 @@ pub struct CsState {
     pub(crate) cluster: Option<saltator_cluster::MetadataHandle>,
     /// Registered application services: identity assertion
     /// (`?user_id=`/`?device_id=` masquerading), namespaces, `?ts`
-    /// massaging, ghost registration, and outbound event push
-    /// (docs/design-appservices.md).
+    /// massaging, ghost registration, and outbound event push.
     pub(crate) appservices: Arc<AppServices>,
     /// Query-on-miss client over the same registrations (alias/user
     /// lookups block on the owning AS creating the entity).
     pub(crate) as_querier: saltator_appservice::AppServiceQuerier,
     /// The credential providers this server offers, the single place the
-    /// list is built (docs/design-admin-identity.md slice 4). Local
+    /// list is built. Local
     /// passwords always; `with_oidc` appends external providers, and
     /// everything downstream (`GET /login`, the login path) derives from
     /// here so the advertisement and the login path cannot disagree.
@@ -178,7 +177,7 @@ impl CsState {
     }
 
     /// Attach the cluster control plane, enabling the admin node/drain
-    /// endpoints (docs/design-admin-identity.md slice 6).
+    /// endpoints.
     pub fn with_cluster(
         mut self: Arc<Self>,
         cluster: saltator_cluster::MetadataHandle,
@@ -202,8 +201,7 @@ impl CsState {
     ///
     /// The single resolution point, deliberately: no route reads the
     /// account's `admin` flag directly, so a later token-scope or
-    /// external-IdP arm lands here and nowhere else
-    /// (docs/design-admin-identity.md).
+    /// external-IdP arm lands here and nowhere else.
     pub(crate) fn is_admin(&self, auth: &extract::Auth) -> Result<bool, ApiError> {
         // Appservices are never administrators: an AS identity is
         // synthesized from config and has no account row at all, so there
@@ -231,7 +229,7 @@ impl CsState {
     }
 
     /// The room-administration service: room inspection, shutdown and the
-    /// join block (docs/design-admin-identity.md slice 5).
+    /// join block.
     pub(crate) fn room_admin(&self) -> services::room_admin::RoomAdmin<'_> {
         services::room_admin::RoomAdmin {
             users: &self.users,
@@ -240,7 +238,7 @@ impl CsState {
         }
     }
 
-    /// The server-notices service (docs/design-admin-identity.md slice 5).
+    /// The server-notices service.
     pub(crate) fn notices(&self) -> services::notices::Notices<'_> {
         services::notices::Notices {
             users: &self.users,
@@ -266,7 +264,7 @@ impl CsState {
     }
 
     /// The authentication service: login flows and credential
-    /// verification (docs/design-admin-identity.md slice 4).
+    /// verification.
     pub(crate) fn authn(&self) -> services::auth::Authn<'_> {
         services::auth::Authn {
             users: &self.users,
@@ -695,7 +693,7 @@ pub fn router(state: Arc<CsState>) -> axum::Router {
         .route("/_matrix/key/v2/query", post(notary_query))
         .route("/_matrix/key/v2/query/{server_name}", get(notary_query));
 
-    // -- admin API (docs/design-admin-identity.md). Our own namespace: no
+    // -- admin API. Our own namespace: no
     // `_synapse`-prefixed paths and no aliases for other servers' admin
     // tooling. Registered before the CORS layer deliberately — the admin
     // console may be served from a separate listener, and cross-origin

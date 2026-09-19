@@ -1,7 +1,7 @@
 //! Raft log storage and the generic state machine, backed by the
 //! node-local KV engine under the shard's key prefix.
 //!
-//! Generalized from the M0 metadata-group implementation: the shard is a
+//! Generalized from the metadata-group implementation: the shard is a
 //! parameter, `Normal` entries are interpreted by the [`ShardApp`], and the
 //! runtime owns the per-shard sequence counter and change-stream
 //! publication. KV calls are made inline from async context — RocksDB
@@ -538,7 +538,7 @@ impl<A: ShardApp> RaftStateMachine<TypeConfig> for ShardStateMachine<A> {
         // machine replays from the Raft log after a crash (the log's own
         // writes are always fsynced), and the log is never purged past a
         // durably persisted snapshot — so nothing readable can be lost,
-        // only re-derived. (docs/roadmap-refactors.md step 3.5.)
+        // only re-derived.
         self.engine.write_batch_relaxed(wb).map_err(write_err)?;
 
         // Publish only after the batch is applied; a subscriber that sees

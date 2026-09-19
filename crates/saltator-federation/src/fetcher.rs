@@ -185,7 +185,7 @@ fn query_encode(s: &str) -> String {
 }
 
 /// A [`saltator_shard::GroupExecutor`] for one hosted room shard: runs
-/// remote write INTENTS (docs/design-room-sharding-phase2.md, 2a part 3)
+/// remote write INTENTS
 /// through the local `RoomServer`, with this stack's federation fetcher
 /// powering healing ingests. Built by the daemon once the outbound
 /// client exists.

@@ -1,5 +1,5 @@
-//! The media-blob bulk RPCs end to end over a real listener
-//! (docs/design-room-sharding-phase2.md, "Media blob placement"): push a
+//! The media-blob bulk RPCs end to end over a real listener:
+//! push a
 //! blob to a peer, ask whether it has one, stream it back.
 
 use std::sync::Arc;

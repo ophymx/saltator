@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Media blob placement smoke (phase 3, docs/design-room-sharding-phase2.md
-# "Media blob placement"): media bytes place by rendezvous over the blob
+# Media blob placement smoke: media bytes place by rendezvous over the blob
 # id, replicate to a majority before an upload acks, fall through to the
 # replica set on a local miss, and re-place when the topology moves.
 #

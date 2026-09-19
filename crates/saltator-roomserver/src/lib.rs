@@ -7,8 +7,9 @@
 //! 1. **Validate** — schema/size checks, signature + content-hash
 //!    verification (hash mismatch → redact, not reject).
 //! 2. **Fetch** — resolve `auth_events`/`prev_events` from the shard;
-//!    events not present locally surface as [`RoomError::MissingEvents`]
-//!    (M3 turns this into federated missing-event/state fetch).
+//!    events not present locally surface as [`RoomError::MissingEvents`],
+//!    which the healing path in [`heal`] resolves by fetching from the
+//!    origin server before retrying.
 //! 3. **Authorize** — structural auth-events checks, the state-dependent
 //!    rules against the auth-event state, then against the state before
 //!    the event.
@@ -61,20 +62,22 @@ pub use types::{
     RoomResponse, SeqEntry, StateGroup, StoredEvent, MAX_GROUP_CHAIN,
 };
 
-/// M1 runs a single room shard; the fixed shard count and placement land
-/// with clustering (M4).
 /// This binary's schema version for this shard app — bump together with
-/// a `migrate` arm (see docs/design-schema-migrations.md).
+/// a `migrate` arm.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Shard 0 of the room keyspace: the shard a single-group server starts,
+/// and the id [`RoomServer::start`] uses. Multi-shard deployments route
+/// through [`RoomShards`] instead and never name a shard directly.
 pub const ROOM_SHARD: ShardId = ShardId::new(Keyspace::Room, 0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RoomError {
     #[error("unknown room {0}")]
     UnknownRoom(String),
-    /// Referenced events are not present locally. M3 turns this into the
-    /// federated missing-event / state fetch of pipeline step 2.
+    /// Referenced events are not present locally. For inbound federated
+    /// events this is not terminal: [`heal`] fetches the gap from the
+    /// origin and retries, and only a permanent hole stays an error.
     #[error("events required but not present locally: {0:?}")]
     MissingEvents(Vec<String>),
     /// The event's `auth_events` reference events not present locally,
@@ -236,8 +239,7 @@ fn id_list(obj: &CanonicalJsonObject, key: &str) -> Vec<String> {
 }
 
 /// Where this handle's shard lives: on this node (the full pipeline),
-/// or on other nodes (reads via the remote store, writes as intents —
-/// docs/design-room-sharding-phase2.md, 2a part 3).
+/// or on other nodes (reads via the remote store, writes as intents).
 enum RoomBackend {
     Hosted(ShardHandle),
     Remote(Arc<dyn saltator_shard::RemoteShardBackend>),
@@ -321,8 +323,10 @@ impl RoomChanges {
 pub struct RoomServer {
     backend: RoomBackend,
     signer: Arc<ServerSigner>,
-    /// Verification keys by entity. Seeded with our own keys; remote
-    /// server keys are added explicitly until M3 brings key fetching.
+    /// Verification keys by entity, seeded with our own. Remote servers'
+    /// keys are put here explicitly (see [`Self::trust_keys`]); the
+    /// federation layer's key cache is what populates them in a running
+    /// server.
     verify_keys: std::sync::RwLock<PublicKeyMap>,
     room_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
@@ -351,8 +355,8 @@ impl RoomServer {
         .await
     }
 
-    /// Start one room shard group on this node
-    /// (docs/design-room-sharding.md): the same server, scoped to the
+    /// Start one room shard group on this node:
+    /// the same server, scoped to the
     /// rooms whose ids hash to `shard.index`.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_shard(
@@ -594,8 +598,11 @@ impl RoomServer {
         postcard::from_bytes(payload).map_err(|e| RoomError::Codec(e.to_string()))
     }
 
-    /// Trust verification keys for a remote entity (tests / static
-    /// configuration; M3 replaces this with spec key fetching).
+    /// Trust verification keys for a remote entity outright.
+    ///
+    /// A test and static-configuration seam. The production path fetches
+    /// and caches published keys instead (`saltator_federation::KeyCache`)
+    /// rather than being told what to trust.
     pub async fn trust_keys(&self, entity: &str, keys: BTreeMap<String, ruma::serde::Base64>) {
         self.verify_keys
             .write()
@@ -2842,9 +2849,12 @@ impl RoomServer {
     /// For an accepted `m.room.redaction`, the target event it may be
     /// applied to: locally known, same room, and either sent by the
     /// redaction's sender or redactable at the sender's power level
-    /// (evaluated against the state before the redaction). Unknown targets
-    /// are dropped for now — M3 revisits out-of-order federated
-    /// redactions.
+    /// (evaluated against the state before the redaction).
+    ///
+    /// A redaction naming a target this server does not hold is dropped:
+    /// it is accepted as an event but applies to nothing. A federated
+    /// redaction that arrives before its target therefore never takes
+    /// effect, which is a known gap rather than a decision.
     async fn redaction_target(
         &self,
         store: &RoomStore,

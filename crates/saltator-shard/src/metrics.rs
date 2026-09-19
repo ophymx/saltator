@@ -2,7 +2,7 @@
 //!
 //! The facade is a no-op until `saltator-metrics` installs a recorder, so
 //! nothing here costs anything in a test binary and this crate never
-//! depends on an exporter (`docs/design-observability.md`).
+//! depends on an exporter.
 //!
 //! Every series is labeled `keyspace` and `shard` — spec.md §7's own
 //! phrasing — and by nothing else. A shard is the unit that has a leader,

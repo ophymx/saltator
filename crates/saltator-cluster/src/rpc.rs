@@ -220,8 +220,8 @@ impl ControlService for InternalRpc {
         }
     }
 
-    /// A storage-level read against a shard's applied state
-    /// (docs/design-room-sharding-phase2.md): served only at the group's
+    /// A storage-level read against a shard's applied state:
+    /// served only at the group's
     /// leader, after a read-index barrier — linearizable, and
     /// read-your-writes for any client that just forwarded a proposal to
     /// the same leader. Non-leaders answer with a hint, like Propose.
@@ -494,8 +494,7 @@ impl BulkService for InternalRpc {
     type FetchBlobStream =
         std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<BlobChunk, Status>> + Send>>;
 
-    /// Serve one media blob from THIS node's disk
-    /// (docs/design-room-sharding-phase2.md, "Media blob placement").
+    /// Serve one media blob from THIS node's disk.
     ///
     /// Strictly local: `read_local`, never `read`. A node that fell
     /// through to the cluster here would turn a blob nobody holds into a
