@@ -1,5 +1,5 @@
-//! Dead-node failure detection (docs/design-room-sharding-phase2.md,
-//! phase 3): the metadata leader pings every roster node's internal
+//! Dead-node failure detection: the metadata leader pings every roster
+//! node's internal
 //! Status RPC and, after a grace period of continuous failure, marks the
 //! node [`NodeStatus::Unreachable`] — which recomputes placement without
 //! it, so its room-group replicas re-place onto surviving nodes. When the

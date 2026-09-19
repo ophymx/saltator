@@ -1,5 +1,5 @@
 //! The marker-coordinated user-outbox drain + the user shard's v2
-//! migration (docs/design-federation-out.md §drain): rows staged in a
+//! migration: rows staged in a
 //! v1 user store end up in fed-out exactly once, the marker gates the
 //! drop, and the drop loses nothing.
 

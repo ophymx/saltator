@@ -936,7 +936,7 @@ async fn restricted_join_authoriser_selects_and_denies() {
     env.server.shutdown().await.unwrap();
 }
 
-/// The replay hook's contract (docs/design-room-sharding-phase2.md): the
+/// The replay hook's contract: the
 /// records reconstructed from applied state are BYTE-IDENTICAL to what
 /// the live broadcast carried at those seqs — the property that makes a
 /// remote subscription's backfill→live splice gap-free.

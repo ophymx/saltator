@@ -34,16 +34,15 @@ pub use types::{
 };
 
 /// This binary's schema version for this shard app — bump together with
-/// a `migrate` arm (see docs/design-schema-migrations.md).
+/// a `migrate` arm.
 ///
 /// v2 (step 4): the outbound EDU outbox moved to the fed-out shard; the
 /// migration drops the orphaned `T_EDU_OUTBOX`. Gated in the daemon on
-/// the fed-out drain marker covering every remaining row
-/// (docs/design-federation-out.md §drain).
+/// the fed-out drain marker covering every remaining row.
 ///
 /// v3 (step 5, slice 1): `Account` gains an explicit lifecycle state, an
-/// admin flag and an erasure marker, replacing the `deactivated` bool
-/// (docs/design-admin-identity.md). The migration rewrites every
+/// admin flag and an erasure marker, replacing the `deactivated` bool.
+/// The migration rewrites every
 /// `T_ACCOUNT` row in place; no cross-shard coordination, so no gate.
 ///
 /// Still v3 after slices 3, 4 and 5: each only *added* tables (UIA
@@ -916,7 +915,7 @@ impl UserServer {
         }
     }
 
-    // -- admin lifecycle (docs/design-admin-identity.md) ------------------
+    // -- admin lifecycle ------------------
 
     /// Lock or unlock an account. Reversible: no session is destroyed, so
     /// unlocking restores the user's existing devices.
@@ -985,7 +984,7 @@ impl UserServer {
         .await
     }
 
-    // -- identity links (docs/design-admin-identity.md slice 4) -----------
+    // -- identity links -----------
 
     /// Link an account to its subject at an external identity provider.
     ///

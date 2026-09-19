@@ -92,8 +92,8 @@ pub fn active_nodes(roster: &Roster) -> BTreeSet<NodeId> {
         .collect()
 }
 
-/// Why a roster transition was refused (docs/design-admin-identity.md
-/// slice 6). Separate from the storage errors so the admin surface can map
+/// Why a roster transition was refused. Separate from the storage errors
+/// so the admin surface can map
 /// each to the right status without string matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RosterError {
@@ -261,7 +261,7 @@ pub fn assign(config: &ClusterConfig, rf_cap: Option<u8>, nodes: &BTreeSet<NodeI
 /// order (first = highest weight), capped at `rf`.
 ///
 /// Media bytes have no shard group — they are not Raft-replicated at all
-/// (docs/design-room-sharding-phase2.md, "Media blob placement") — so
+/// — so
 /// they rank the active nodes directly off a hash of the blob id. Same
 /// scorer as groups, under a domain separator so a blob whose hash
 /// happens to equal a group number does not inherit that group's

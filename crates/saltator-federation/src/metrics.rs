@@ -1,4 +1,4 @@
-//! Federation delivery measurements (`docs/design-observability.md`).
+//! Federation delivery measurements (`docs/observability.md`).
 //!
 //! **No destination label, ever.** A remote server name is
 //! attacker-supplied — any server can claim any `origin`, and any user in

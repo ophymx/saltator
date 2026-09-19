@@ -1,4 +1,4 @@
-//! Authentication (docs/design-admin-identity.md slice 4): which login
+//! Authentication: which login
 //! flows this server offers, and verifying a presented credential against
 //! one of them. No HTTP anywhere; routes call this.
 //!

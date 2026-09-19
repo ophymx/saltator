@@ -1,7 +1,7 @@
 //! The schema-migration supervisor: watches a shard whose stored schema
 //! trails the binary's, and — when this node leads and every voter's
 //! binary supports the target — proposes stepwise `Migrate` commands
-//! through the log. See `docs/design-schema-migrations.md`.
+//! through the log.
 
 use std::time::Duration;
 

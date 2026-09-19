@@ -178,7 +178,7 @@ async fn admin_api_refuses_query_param_tokens() {
     assert_eq!(status, StatusCode::OK);
 }
 
-// -- admin lifecycle (docs/design-admin-identity.md slice 2) --------------
+// -- admin lifecycle --------------
 
 /// The headline property of `Locked`: an existing token stops working
 /// immediately and works again after unlock, with no re-login. Only
@@ -1033,7 +1033,7 @@ async fn cluster_node_list_and_drain_guards() {
     env.shutdown().await;
 }
 
-// -- admin console (docs/design-admin-ui.md slice 7) ----------------------
+// -- admin console ----------------------
 //
 // Feature-gated: the console is default-off, so these run in the same CI
 // job that builds with `--features admin-ui`.

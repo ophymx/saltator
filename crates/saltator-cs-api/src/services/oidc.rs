@@ -1,5 +1,4 @@
-//! One OpenID Connect identity provider (docs/design-admin-identity.md,
-//! "What the OIDC slice costs later"): discovery, JWKS, and the
+//! One OpenID Connect identity provider: discovery, JWKS, and the
 //! authorization-code exchange. No route knowledge here — routes hold an
 //! [`OidcProvider`] through [`super::auth::AuthProvider::Oidc`] and call
 //! these.

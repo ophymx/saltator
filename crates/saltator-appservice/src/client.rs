@@ -1,8 +1,8 @@
 //! The homeserver→appservice HTTP client: transaction push, the two
 //! query-on-miss lookups, and ping. Every request carries the AS's
 //! `hs_token` as a Bearer header; only the spec'd `/_matrix/app/v1`
-//! routes are spoken (legacy unversioned fallbacks are deferred —
-//! docs/design-appservices.md).
+//! routes are spoken (legacy unversioned fallbacks are deferred;
+//! see docs/deferred.md).
 
 use std::time::{Duration, Instant};
 

@@ -1,5 +1,5 @@
-//! Serving an unhosted room shard (docs/design-room-sharding-phase2.md,
-//! 2a part 3): node B holds NO replica of the room shard — its
+//! Serving an unhosted room shard: node B holds NO replica of the room
+//! shard — its
 //! `RoomServer::remote` handle writes via intents at node A's leader,
 //! reads through the Read RPC, and tails the change stream over
 //! Subscribe. The crate-level proof that a node can serve rooms it does

@@ -1,4 +1,4 @@
-//! Remote room intents (docs/design-room-sharding-phase2.md, 2a part 3).
+//! Remote room intents.
 //!
 //! A write to a room whose shard this node does not host cannot be
 //! proposed directly: proposing means running the event pipeline —

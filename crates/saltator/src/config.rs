@@ -232,16 +232,14 @@ pub struct ClusterConfig {
     /// and shard split/merge does not exist (spec OQ-5), so a deployment
     /// that outgrows its count migrates to a new cluster. On a joiner or
     /// restart a differing value here is ignored with a warning: the
-    /// durable cluster config is the only truth
-    /// (docs/design-room-sharding.md).
+    /// durable cluster config is the only truth.
     #[serde(default)]
     pub room_shards: Option<u16>,
     /// Room-shard replication factor, read ONLY when founding a new
     /// cluster (default 3; 1..=9). Immutable for the cluster's life —
     /// stored in cluster metadata like `room_shards`. Groups place on
     /// min(RF, node count) nodes: clusters smaller than RF replicate
-    /// everywhere and grow into the factor as nodes join
-    /// (docs/design-room-sharding-phase2.md, phase 3).
+    /// everywhere and grow into the factor as nodes join.
     #[serde(default)]
     pub replication_factor: Option<u8>,
     /// How long (seconds) a node must fail liveness probes continuously
@@ -253,8 +251,8 @@ pub struct ClusterConfig {
     /// the operator's drain + remove.
     #[serde(default)]
     pub dead_node_grace_secs: Option<u64>,
-    /// DEBUG-ONLY replication-factor cap (docs/design-room-sharding-phase2.md
-    /// review call 4): overrides the configured replication factor so
+    /// DEBUG-ONLY replication-factor cap: overrides the configured
+    /// replication factor so
     /// the cluster harness can force remote serving below RF. UNSAFE
     /// outside tests. Must be identical on every node (it is node-local
     /// config, not cluster state).
@@ -329,7 +327,7 @@ pub struct Listeners {
     /// counts, cluster size, which shards this node leads, and how much
     /// federation is failing. It carries no authentication, so the bind
     /// address IS the access control — keep it on loopback or a
-    /// management interface (docs/design-observability.md).
+    /// management interface.
     #[serde(default)]
     pub metrics: Option<SocketAddr>,
 }

@@ -89,13 +89,12 @@ pub const T_EDU_OUTBOX: u8 = APP_TABLE_FIRST + 21;
 /// to-device dedupe: EDU `message_id`s already applied. Replicated and
 /// written atomically with the inbox insert, so dedupe survives OUR
 /// restart — which is exactly when a sender's redelivery arrives
-/// (at-least-once, docs/design-federation-out.md decision 3).
+/// (delivery is at-least-once; see docs/design-notes.md).
 pub const T_TO_DEVICE_SEEN: u8 = APP_TABLE_FIRST + 22;
 /// `ts_ms (u64 BE) ++ origin ++ 0x00 ++ message_id → ()` — time index
 /// over [`T_TO_DEVICE_SEEN`] so the horizon prune is a range delete.
 pub const T_TO_DEVICE_SEEN_IDX: u8 = APP_TABLE_FIRST + 23;
-/// `session_id → UiaSession` — user-interactive auth sessions
-/// (docs/design-admin-identity.md slice 3).
+/// `session_id → UiaSession` — user-interactive auth sessions.
 pub const T_UIA_SESSION: u8 = APP_TABLE_FIRST + 24;
 /// `created_ts (u64 BE) ++ session_id → ()` — time index over
 /// [`T_UIA_SESSION`] so the expiry sweep is a bounded range scan rather
@@ -104,7 +103,7 @@ pub const T_UIA_SESSION_IDX: u8 = APP_TABLE_FIRST + 25;
 /// `token → RegToken` — registration tokens.
 pub const T_REG_TOKEN: u8 = APP_TABLE_FIRST + 26;
 /// `auth_provider ++ 0x00 ++ external_id → user_id` — the identity link
-/// table (docs/design-admin-identity.md slice 4). Uniqueness is on the
+/// table. Uniqueness is on the
 /// key: one subject at one provider maps to exactly one account.
 ///
 /// `auth_provider` is a stable opaque key, never a display name — Synapse
@@ -117,8 +116,7 @@ pub const T_EXTERNAL_ID: u8 = APP_TABLE_FIRST + 27;
 /// bolted its equivalent on later as a background update; ours is written
 /// in the same batch as the forward row, so the two cannot drift.
 pub const T_EXTERNAL_ID_USER: u8 = APP_TABLE_FIRST + 28;
-/// `room_id → BlockedRoom` — rooms an administrator has closed to joins
-/// (docs/design-admin-identity.md slice 5).
+/// `room_id → BlockedRoom` — rooms an administrator has closed to joins.
 ///
 /// Server-global room metadata, so it lives here beside the public
 /// directory ([`T_DIRECTORY`]) and the alias table rather than in the room
@@ -128,8 +126,8 @@ pub const T_EXTERNAL_ID_USER: u8 = APP_TABLE_FIRST + 28;
 /// federation surface holds a `UserServer` but reaches room state only
 /// through the pipeline it is trying to refuse.
 pub const T_ROOM_BLOCKED: u8 = APP_TABLE_FIRST + 29;
-/// `user_id → room_id` — the server-notices room for a user
-/// (docs/design-admin-identity.md slice 5). One per user, created on the
+/// `user_id → room_id` — the server-notices room for a user.
+/// One per user, created on the
 /// first notice and reused forever: remembering it is what stops the
 /// second notice opening a second room.
 pub const T_NOTICES_ROOM: u8 = APP_TABLE_FIRST + 30;
@@ -206,7 +204,7 @@ pub(crate) fn account_data_key(user_id: &str, room_id: &str, data_type: &str) ->
     k
 }
 
-/// Account lifecycle (docs/design-admin-identity.md). Postcard encodes
+/// Account lifecycle. Postcard encodes
 /// the variant index, so this is append-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -693,7 +691,7 @@ pub enum UserCommand {
         ts_ms: u64,
         messages: Vec<ToDeviceMessage>,
     },
-    /// Admin: lock or unlock an account (docs/design-admin-identity.md).
+    /// Admin: lock or unlock an account.
     /// Reversible and non-destructive — sessions stay on disk and start
     /// working again on unlock, because the refusal lives in the
     /// authentication check rather than in a teardown. Refuses to touch a
@@ -759,8 +757,8 @@ pub enum UserCommand {
     DeleteRegistrationToken {
         token: String,
     },
-    /// Link an account to its subject at an external identity provider
-    /// (docs/design-admin-identity.md slice 4). Writes both index rows in
+    /// Link an account to its subject at an external identity provider.
+    /// Writes both index rows in
     /// one batch.
     ///
     /// Deliberately writable before any provider is configured: an
@@ -788,8 +786,8 @@ pub enum UserCommand {
         user_id: String,
         room_id: String,
     },
-    /// Admin: close a room to joins, or reopen it
-    /// (docs/design-admin-identity.md slice 5). Takes a room id rather
+    /// Admin: close a room to joins, or reopen it.
+    /// Takes a room id rather
     /// than requiring the room to exist locally — blocking a room this
     /// server does not host is the point.
     SetRoomBlocked {

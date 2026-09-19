@@ -678,9 +678,8 @@ async fn to_device_dedupes_by_origin_and_message_id() {
     env.users.shutdown().await.unwrap();
 }
 
-/// The index the blob reconciler places against
-/// (docs/design-room-sharding-phase2.md, "Media blob placement"): every
-/// blob the media table names, deduplicated, with reserved-but-unuploaded
+/// The index the blob reconciler places against: every blob the media
+/// table names, deduplicated, with reserved-but-unuploaded
 /// rows left out.
 #[tokio::test]
 async fn media_blob_ids_is_the_placement_index() {

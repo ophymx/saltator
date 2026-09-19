@@ -1,7 +1,7 @@
 # Application services
 
 Bridges and bots, per the Matrix v1.19 Application Service API. Design
-and reasoning live in `docs/design-appservices.md`; this is the
+and reasoning live in `docs/design-notes.md`; this is the
 operator's reference.
 
 ## Turning it on
@@ -74,7 +74,7 @@ registration files in the wild are written against Python's `re.match`.
 
 ## What is deliberately not implemented
 
-Listed with reasoning in `docs/design-appservices.md`: ephemeral-data
+Listed with reasoning in `docs/deferred.md`: ephemeral-data
 push (`receive_ephemeral` parses but only logs a warning), the legacy
 unversioned HS→AS fallback routes, third-party protocol (`/thirdparty`)
 proxying and AS-published room directories, and MSC2409/MSC3202

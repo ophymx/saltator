@@ -63,7 +63,7 @@ pub use types::{
 };
 
 /// This binary's schema version for this shard app — bump together with
-/// a `migrate` arm (see docs/design-schema-migrations.md).
+/// a `migrate` arm.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Shard 0 of the room keyspace: the shard a single-group server starts,
@@ -239,8 +239,7 @@ fn id_list(obj: &CanonicalJsonObject, key: &str) -> Vec<String> {
 }
 
 /// Where this handle's shard lives: on this node (the full pipeline),
-/// or on other nodes (reads via the remote store, writes as intents —
-/// docs/design-room-sharding-phase2.md, 2a part 3).
+/// or on other nodes (reads via the remote store, writes as intents).
 enum RoomBackend {
     Hosted(ShardHandle),
     Remote(Arc<dyn saltator_shard::RemoteShardBackend>),
@@ -356,8 +355,8 @@ impl RoomServer {
         .await
     }
 
-    /// Start one room shard group on this node
-    /// (docs/design-room-sharding.md): the same server, scoped to the
+    /// Start one room shard group on this node:
+    /// the same server, scoped to the
     /// rooms whose ids hash to `shard.index`.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_shard(

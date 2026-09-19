@@ -1,4 +1,4 @@
-//! Room administration (docs/design-admin-identity.md slice 5): the
+//! Room administration: the
 //! operator's view of rooms, plus shutdown and the join block. No HTTP
 //! anywhere; routes call this.
 //!

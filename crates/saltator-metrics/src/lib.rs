@@ -1,5 +1,5 @@
 //! Prometheus metrics: the recorder, the exporter that serves it, and the
-//! HTTP instrumentation layer (`docs/design-observability.md`).
+//! HTTP instrumentation layer. Operator reference: `docs/observability.md`.
 //!
 //! Only this crate knows there is an exporter. Everything that *emits* a
 //! measurement — shard runtime, federation delivery — calls the `metrics`

@@ -1,6 +1,5 @@
 //! The admin API (`/_saltator/admin/v1`) — account inspection, lifecycle,
-//! registration tokens and identity links
-//! (docs/design-admin-identity.md slices 1–4).
+//! registration tokens and identity links.
 //!
 //! These are not Matrix endpoints and carry no ruma types: the request
 //! and response shapes are ours, hand-rolled like `/capabilities`. Errors

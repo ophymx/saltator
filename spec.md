@@ -133,7 +133,7 @@ Three planes, all embedded in the same binary:
   mapped onto nodes, so rebalancing moves whole shards, never individual
   rooms. The default was revised down from 64 for single-digit Raft-group
   overhead on small clusters; a deployment expecting more than 16 nodes
-  sets a higher count at creation. See `docs/design-room-sharding.md`.
+  sets a higher count at creation.
 - **Room keyspace** — sharded by `hash(room_id)`. Contains: event store, room
   DAG metadata, current state and state snapshots, per-room receipts/typing,
   room aliases (by `hash(alias)` → pointer), room directory entries.
@@ -193,12 +193,16 @@ This constraint is load-bearing — new features must justify any exception.
   then the placement controller (runs on the metadata leader) rebalances
   shards onto it (add-learner → catch up via engine checkpoint transfer →
   promote → demote/remove an old replica).
-- **Failure:** shard leadership fails over via Raft election (target: <5s
-  disruption). A node dead past a threshold (default 10 min) has its replicas
-  re-placed by the controller.
-- **Rolling upgrade:** drain leaderships off a node (`saltator node drain`),
-  restart with the new binary, undrain. Raft log entries and KV schema carry
-  format versions; N and N+1 binaries must interoperate.
+- **Failure:** shard leadership fails over via Raft election. A node that
+  fails liveness probes continuously for `cluster.dead_node_grace_secs`
+  (default 30) is marked unreachable by the metadata leader, which takes
+  it out of placement and moves its replicas onto survivors; it is
+  restored automatically when it answers again.
+- **Rolling upgrade:** drain a node through the admin API
+  (`POST /cluster/nodes/{id}/drain`), restart it with the new binary,
+  then undrain. Raft log entries and shard state carry format versions,
+  and N/N+1 binaries must interoperate — migrations only run once every
+  voter reports support for the target version.
 
 ## 5. Matrix core engine
 
@@ -300,29 +304,32 @@ stored per room for state-res performance.
 
 ## 6. Workspace layout
 
-```
-saltator/
-├── Cargo.toml               # workspace
-├── crates/
-│   ├── saltator/            # the binary: config, startup, CLI (node drain, init, status)
-│   ├── saltator-core/       # PURE: auth rules, state-res v2, event validation, room-version gates
-│   ├── saltator-cluster/    # metadata group, placement controller, node lifecycle, internal RPC
-│   ├── saltator-shard/      # generic Raft shard runtime: log, state-machine apply, change streams
-│   ├── saltator-store/      # storage-engine trait + RocksDB impl, keyspace/table schema
-│   ├── saltator-roomserver/ # event pipeline, room keyspace state machine (uses core, shard, store)
-│   ├── saltator-userserver/ # accounts, devices, E2EE keys, to-device, user keyspace state machine
-│   ├── saltator-cs-api/     # client-server HTTP surface (axum routers → internal calls)
-│   ├── saltator-federation/ # S2S HTTP surface, request signing/verification, out-queue logic
-│   ├── saltator-media/      # blob store + media endpoints
-│   └── saltator-macros/     # (as needed)
-└── tests/
-    ├── complement/          # Complement harness wiring (Docker image + CI)
-    └── cluster/             # multi-node integration tests (in-process cluster harness)
-```
+One crate per concern, under `crates/`:
 
-Dependency rule: `core` depends on nothing internal; `cs-api`/`federation`
-never touch `store` directly (always through roomserver/userserver);
-nothing depends on the binary crate.
+| Crate | Owns |
+| --- | --- |
+| `saltator` | the binary: config, startup, CLI, wiring |
+| `saltator-core` | **pure**: auth rules, state resolution, event validation, room-version gates |
+| `saltator-store` | storage-engine trait + RocksDB, keyspace/table layout |
+| `saltator-shard` | generic Raft shard runtime: log, apply, change streams, migrations |
+| `saltator-cluster` | metadata group, placement, node lifecycle, internal RPC |
+| `saltator-roomserver` | event pipeline and the room keyspace |
+| `saltator-userserver` | accounts, devices, E2EE material, the user keyspace |
+| `saltator-fedout` | the federation-out keyspace: durable delivery promises |
+| `saltator-cs-api` | client-server HTTP surface |
+| `saltator-federation` | server-server HTTP surface, signing and verification |
+| `saltator-appservice` | application-service registrations and client |
+| `saltator-media` | content-addressed blob store and thumbnailing |
+| `saltator-metrics` | Prometheus recorder, exporter, HTTP instrumentation |
+| `saltator-admin-ui` | the embedded admin console (feature-gated) |
+| `saltator-testsupport` | shared test support, including a mock federation peer |
+
+The dependency rule: `core` depends on nothing internal; `cs-api` and
+`federation` never touch `store` directly, always going through a
+keyspace crate; nothing depends on the binary.
+
+The Complement and Synapse-interop harnesses live under `docker/`, and
+the multi-node cluster scenarios under `scripts/`.
 
 ## 7. Key dependency choices
 
@@ -390,21 +397,23 @@ group (self-contained CA; no external PKI).
 - At-rest encryption of the signing key material in the metadata group;
   full at-rest DB encryption deferred to the storage engine layer (post-v1).
 
-## 11. Testing strategy
+## 11. How it is verified
 
-- **`saltator-core`:** exhaustive unit tests; state-res v2 tested against the
-  spec's published test vectors and cross-checked by replaying real room DAGs
-  captured from federation; proptest for auth-rule invariants; fuzzing on
-  event/JSON parsing.
-- **Shard layer:** deterministic simulation harness (in-process multi-node
-  cluster, controlled network faults — madsim-style) for
-  election/rebalancing/failover invariants. This is a first-class deliverable,
-  not an afterthought: we own consensus-adjacent code, so we pay for it in
-  simulation testing.
-- **Protocol compliance:** Complement runs in CI, and its pass rate is
-  the headline project metric.
-- **Interop:** a standing federation test rig against Synapse and the
-  Conduit family (Docker compose) exercising join/backfill/E2EE flows.
+- **Unit and integration tests** across the workspace, run on every push.
+- **Complement**, the Matrix protocol suite, gates CI in two jobs —
+  client-server and federation. Each has an allowed-failures list, so a
+  newly-failing test breaks the build by default and a fixed one has to
+  be removed from the list deliberately.
+- **Interop**: a gating job federates against a real Synapse, including
+  an end-to-end E2EE exchange (`docker/interop`).
+- **Cluster behaviour**: a chaos job kills a node mid-traffic in CI, and
+  `scripts/*_smoke.sh` drive multi-node scenarios locally — shard moves,
+  replication-factor policy, dead-node re-placement, media placement.
+  These are local-only; they need more nodes than a CI runner affords.
+
+Deterministic simulation of the consensus layer (madsim-style),
+property-based testing of the auth rules, and fuzzing of event parsing
+are all things this design would benefit from and none of them exist.
 
 ## 12. Decisions
 

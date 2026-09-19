@@ -26,7 +26,7 @@ fn err(
 type FedResult = Result<axum::Json<serde_json::Value>, (StatusCode, axum::Json<serde_json::Value>)>;
 
 /// Refuse an inbound membership handshake into a room an administrator has
-/// closed (docs/design-admin-identity.md slice 5).
+/// closed.
 ///
 /// The resident side has to enforce this, not just the client API: a block
 /// that only stopped our own users would leave the room reachable through

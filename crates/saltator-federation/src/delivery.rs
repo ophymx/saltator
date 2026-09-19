@@ -1,4 +1,4 @@
-//! The unified outbound delivery worker (docs/design-federation-out.md):
+//! The unified outbound delivery worker:
 //! runs wherever the fed-out shard leads, and owns ALL outbound
 //! federation — PDUs against durable per-destination cursors, EDUs from
 //! the fed-out outbox — with one per-destination backoff policy and

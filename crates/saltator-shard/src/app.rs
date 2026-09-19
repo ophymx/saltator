@@ -55,8 +55,7 @@ pub trait ShardApp: Send + Sync + 'static {
     /// The schema version this code reads and writes. Bump together with
     /// a [`ShardApp::migrate`] arm for each step. The runtime refuses to
     /// serve state newer than this (downgrade protection) and migrates
-    /// state older than this through the log (see
-    /// `docs/design-schema-migrations.md`).
+    /// state older than this through the log.
     fn schema_version(&self) -> u32 {
         1
     }
@@ -76,8 +75,8 @@ pub trait ShardApp: Send + Sync + 'static {
     /// Reconstruct the change-stream records for `(from_seq, from_seq +
     /// limit]` from applied state — byte-identical payloads to what
     /// [`ApplyCtx::emit`] published at those seqs. Backs the remote
-    /// Subscribe RPC's server-side backfill
-    /// (docs/design-room-sharding-phase2.md): a subscriber resuming from
+    /// Subscribe RPC's server-side backfill:
+    /// a subscriber resuming from
     /// seq N gets `replay` until it reaches the live broadcast, gap-free.
     ///
     /// Only apps whose shards are remotely subscribed need this (room,

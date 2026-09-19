@@ -1,4 +1,4 @@
-//! Room-shard lifecycle (docs/design-room-sharding-phase2.md, phase 2b):
+//! Room-shard lifecycle:
 //! a per-node task on the placement watch that starts a group when the
 //! placement moves it onto this node and stands it down — handle swap,
 //! deregistration, data removal — when it moves away.

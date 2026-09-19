@@ -7,7 +7,7 @@ someone is; this server still issues the Matrix access token. That is the
 deliberate consequence of not adopting MAS/MSC3861: every existing Matrix
 client already speaks this flow, and none of `/login`, `/register`,
 `/account/password` or `/logout` is given up
-(`docs/design-admin-identity.md`, "Explicitly out of scope").
+(`docs/design-notes.md`).
 
 Off by default. With no `oidc_providers` configured, `GET /login`
 advertises passwords alone and every SSO route returns 404.

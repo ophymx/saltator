@@ -1,5 +1,5 @@
-//! Storage-level read operations for the remote Read RPC
-//! (docs/design-room-sharding-phase2.md): the read half of the store
+//! Storage-level read operations for the remote Read RPC:
+//! the read half of the store
 //! trait as a wire enum, executed against a shard's applied state at
 //! its leader after a read-index barrier. Opaque postcard bytes inside
 //! the proto envelope, like every other internal payload.
@@ -39,7 +39,7 @@ pub enum ReadOp {
     /// the authoritative membership. The lifecycle driver's removal
     /// gate: a departing replica may never receive the log entry that
     /// removes it, so its LOCAL membership can read stale-as-voter
-    /// forever (docs/design-room-sharding-phase2.md, 2b).
+    /// forever.
     Voters,
 }
 
@@ -53,7 +53,7 @@ pub enum ReadValue {
 }
 
 /// Executes [`ReadOp`]s against a shard replicated elsewhere — the
-/// remote half of a store backend (docs/design-room-sharding-phase2.md).
+/// remote half of a store backend.
 /// Implemented by the cluster crate's RemoteShard over the internal
 /// ControlService; defined here so store layers (roomserver) can hold
 /// one without depending on the transport.

@@ -35,9 +35,7 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 }
 
 /// Positions across the shards backing a sync response. `room` holds one
-/// seq per room shard, indexed by shard number
-/// (docs/design-room-sharding.md: a sync position is inherently
-/// multi-shard).
+/// seq per room shard, indexed by shard number.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct SyncPos {
     room: Vec<u64>,

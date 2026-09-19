@@ -1,4 +1,4 @@
-//! Admin / user-management domain logic (docs/design-admin-identity.md):
+//! Admin / user-management domain logic:
 //! the operator's view of accounts. No HTTP anywhere; routes call this.
 //!
 //! Authorization is *not* here — it is resolved once in

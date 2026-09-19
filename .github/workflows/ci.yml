@@ -91,7 +91,7 @@ jobs:
     # the same contract as the release binary below. cargo NEVER shells
     # out to npm (crates/saltator-admin-ui/build.rs), so this is the only
     # place Node is required and `cargo build` keeps needing nothing but a
-    # Rust toolchain. See docs/design-admin-ui.md.
+    # Rust toolchain.
     needs: [changes]
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest

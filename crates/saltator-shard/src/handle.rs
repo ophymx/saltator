@@ -153,8 +153,7 @@ impl ShardHandle {
 
         let stores = stores.into();
         // Downgrade protection: state written by a newer schema must
-        // never be reinterpreted by this binary (see
-        // docs/design-schema-migrations.md).
+        // never be reinterpreted by this binary.
         let app_schema_version = app.schema_version();
         let stored = crate::storage::stored_schema_version(&*stores.state, shard)
             .map_err(|e| ShardError::Storage(e.to_string()))?;
@@ -442,7 +441,7 @@ impl ShardHandle {
 
     /// Build a whole-shard transfer payload from a point-in-time engine
     /// checkpoint written under `scratch` (serving side of the bulk
-    /// FetchCheckpoint stream; docs/design-room-sharding-phase2.md 2b).
+    /// FetchCheckpoint stream).
     /// Any replica may serve this — a lagging follower's payload just
     /// leaves a longer log tail for the leader to replicate.
     pub fn build_transfer(

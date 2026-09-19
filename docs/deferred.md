@@ -8,7 +8,7 @@ This is not a plan. Nothing here is scheduled.
 
 ## User and fed-out shards are not placed
 
-Room data shards and places; user data does not. `ClusterConfig`
+Room data is sharded and placed; user data is neither. `ClusterConfig`
 carries a `user_shards` field that is always 1, there is no
 `[cluster] user_shards` config key, and `placement::assign` keeps the
 every-active-node floor for the `User` and `FedOut` keyspaces. Every
@@ -95,15 +95,10 @@ would also convert "believed compatible" (conflict truncation as
 index-superseding appends) into "verified" — merge the findings, not
 the code.
 
-## Scoped out elsewhere
-
-Two areas keep their own deferral lists beside the designs that made
-the calls:
+## Scoped out by design
 
 - **Application services** — ephemeral-data push, the legacy
   unversioned HS→AS routes, `/thirdparty` proxying, AS-published room
-  directories, and MSC2409/MSC3202 to-device pushing. See
-  `design-appservices.md`.
+  directories, and MSC2409/MSC3202 to-device pushing.
 - **Admin and identity** — 3PID and identity servers, guest access,
-  room purge, and a read-only account suspend state. See
-  `design-admin-identity.md`.
+  room purge, and a read-only account suspend state.

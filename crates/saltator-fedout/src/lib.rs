@@ -1,5 +1,5 @@
 //! The federation-out shard: durable ownership of "what have I promised
-//! to deliver to whom" (docs/design-federation-out.md, roadmap step 4).
+//! to deliver to whom".
 //!
 //! State: per-destination PDU delivery cursors (keyed by source room
 //! shard from day one), the outbound EDU outbox (moved here from the
@@ -29,7 +29,7 @@ use saltator_store::{Keyspace, Result as StoreResult, StoreError};
 pub const FED_OUT_SHARD: ShardId = ShardId::new(Keyspace::FedOut, 0);
 
 /// This binary's schema version for this shard app — bump together with
-/// a `migrate` arm (see docs/design-schema-migrations.md).
+/// a `migrate` arm.
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// `room_shard (u16 BE) ++ destination → postcard(u64)` — the room-shard
@@ -43,12 +43,12 @@ pub const T_EDU_OUTBOX: u8 = APP_TABLE_FIRST + 1;
 /// `b"user_outbox_drained" → postcard(u64)` — the drained-up-to marker
 /// for the user-shard outbox move: the highest user-shard outbox row
 /// seq already enqueued here. The user shard's v2 migration gate reads
-/// this from its local replica (docs/design-federation-out.md §drain).
+/// this from its local replica.
 pub const T_DRAIN: u8 = APP_TABLE_FIRST + 2;
 
 /// `as_id ++ 0x00 ++ room_shard (u16 BE) → postcard(u64)` — the
-/// room-shard seq fully delivered to an application service (v2,
-/// docs/design-appservices.md). Same charter as the PDU cursor: an AS
+/// room-shard seq fully delivered to an application service (v2).
+/// Same charter as the PDU cursor: an AS
 /// transaction is a promise of delivery, so its progress is fed-out
 /// state. Absent = never delivered (the push worker seeds from the
 /// current tip: history predating AS support is not replayed at a

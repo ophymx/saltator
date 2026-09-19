@@ -1,4 +1,4 @@
-//! Appservice transaction push (docs/design-appservices.md): tail the
+//! Appservice transaction push: tail the
 //! room timeline and PUT every interesting event to each registered
 //! appservice as `/_matrix/app/v1/transactions/{txnId}`.
 //!
@@ -258,8 +258,7 @@ async fn deliver_to(
         // recomputes the identical id and the AS dedupes on it. If the
         // batch composition shifts between attempts (events appended
         // past a short scan, interest-relevant state changed), the id
-        // shifts with it — the residual corner is documented in
-        // docs/design-appservices.md.
+        // shifts with it.
         let txn_id = format!("s{room_shard}_{first}_{last}_{}", events.len());
         let started = Instant::now();
         let outcome = client.push_transaction(reg, &txn_id, &events).await;

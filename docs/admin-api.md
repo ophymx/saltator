@@ -4,7 +4,7 @@ Saltator's administrative surface lives under `/_saltator/admin/v1`.
 
 It is **our own namespace, and only ours**. No `_synapse`-prefixed paths
 are served and no aliases exist for any other homeserver's admin tooling
-(`docs/design-admin-identity.md`, decision 1). The accepted cost of that
+(`docs/design-notes.md`). The accepted cost of that
 choice is that an operator writes against this surface rather than
 reusing someone else's scripts — which is what this document is for.
 

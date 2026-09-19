@@ -1,5 +1,5 @@
 //! The user-outbox drain: half of the marker-coordinated cross-shard
-//! move (docs/design-federation-out.md §drain). Runs on the fed-out
+//! move. Runs on the fed-out
 //! leader; reads the user shard's legacy outbox from the LOCAL replica
 //! (cross-shard reads are free), enqueues rows into its own shard
 //! (proposer == leader), and advances the durable drained-up-to marker.

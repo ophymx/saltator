@@ -108,7 +108,7 @@ pub struct FedState {
     /// clears a destination's penalty (it is provably up). `None` when no
     /// delivery worker runs.
     pub delivery_backoff: Option<Arc<crate::delivery::DeliveryBackoff>>,
-    /// Appservice query-on-miss (docs/design-appservices.md): a remote
+    /// Appservice query-on-miss: a remote
     /// server asking about an alias or user an appservice owns gets the
     /// same blocking provision-then-answer as a local client. `None`
     /// when no appservices are registered.

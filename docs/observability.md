@@ -1,7 +1,7 @@
 # Observability
 
 The server exports Prometheus metrics. Design and the reasoning behind
-the choices live in `docs/design-observability.md`; this is the operator's
+the choices live in `docs/design-notes.md`; this is the operator's
 reference.
 
 Logs are the other half and are unchanged: structured `tracing` output on

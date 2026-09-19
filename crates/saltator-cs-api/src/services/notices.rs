@@ -1,4 +1,4 @@
-//! Server notices (docs/design-admin-identity.md slice 5): a way for the
+//! Server notices: a way for the
 //! operator to say something to one user, in the client they already have
 //! open, without an email address.
 //!

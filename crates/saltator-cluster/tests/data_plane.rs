@@ -1,5 +1,4 @@
-//! The unhosted-shard data plane (docs/design-room-sharding-phase2.md,
-//! phase 2a): storage-level reads at the leader and gap-free change
+//! The unhosted-shard data plane: storage-level reads at the leader and gap-free change
 //! subscriptions, over the real internal gRPC surface.
 
 use std::sync::Arc;

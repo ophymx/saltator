@@ -7,7 +7,7 @@ use serde_json::json;
 use crate::harness::*;
 
 // ---------------------------------------------------------------------------
-// Multi-shard rooms (docs/design-room-sharding.md phase 1)
+// Multi-shard rooms
 // ---------------------------------------------------------------------------
 
 /// Create rooms until two land on different shards, then run the core
