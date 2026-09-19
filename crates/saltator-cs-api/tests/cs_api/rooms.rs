@@ -1897,3 +1897,225 @@ async fn room_upgrade_to_v9_and_search_across() {
 
     env.shutdown().await;
 }
+
+/// `/joined_rooms` reads the membership projection rather than the room
+/// shards, so it is the endpoint that notices if that projection stops
+/// tracking leaves.
+#[tokio::test]
+async fn joined_rooms_follows_membership() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+
+    let joined = |body: &Value| -> Vec<String> {
+        body["joined_rooms"]
+            .as_array()
+            .expect("joined_rooms")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let (status, body) = env
+        .req("GET", "/_matrix/client/v3/joined_rooms", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(joined(&body).is_empty(), "{body}");
+
+    let room_id = make_room(&env, &alice, "joined-rooms").await;
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+    let (_, body) = env
+        .req("GET", "/_matrix/client/v3/joined_rooms", Some(&alice), None)
+        .await;
+    assert_eq!(joined(&body), vec![room_id.clone()], "{body}");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/leave"),
+            Some(&alice),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = env
+        .req("GET", "/_matrix/client/v3/joined_rooms", Some(&alice), None)
+        .await;
+    assert!(
+        joined(&body).is_empty(),
+        "a left room is not joined: {body}"
+    );
+    env.shutdown().await;
+}
+
+/// `/read_markers` sets two different things in one call: `m.fully_read`
+/// is per-room account data, while the receipt goes through the same path
+/// as `/receipt` (and federates). A private receipt must stay invisible to
+/// everyone else.
+///
+/// The public and private receipts deliberately point at DIFFERENT events.
+/// Pointing both at one event makes the leak untestable: the private
+/// receipt showing up is then indistinguishable from the public one, and
+/// asserting on the `m.read.private` label instead catches nothing,
+/// because a receipt leaked under the `m.read` label does not carry it.
+/// (Checked: that weaker test passes while the handler leaks.)
+#[tokio::test]
+async fn read_markers_set_fully_read_and_keep_private_receipts_private() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+    let bob = env.register("bob", "bob-pw-12345").await;
+    let user = format!("@alice:{SERVER}");
+
+    let room_id = make_room(&env, &alice, "markers").await;
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+    env.req(
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{enc}/invite"),
+        Some(&alice),
+        Some(json!({"user_id": format!("@bob:{SERVER}")})),
+    )
+    .await;
+    env.req(
+        "POST",
+        &format!("/_matrix/client/v3/rooms/{enc}/join"),
+        Some(&bob),
+        Some(json!({})),
+    )
+    .await;
+
+    let (_, sent) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc}/send/m.room.message/rm1"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "the public marker"})),
+        )
+        .await;
+    let public_at = sent["event_id"].as_str().expect("event id").to_owned();
+
+    let (_, sent) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/rooms/{enc}/send/m.room.message/rm2"),
+            Some(&alice),
+            Some(json!({"msgtype": "m.text", "body": "the private marker"})),
+        )
+        .await;
+    let private_at = sent["event_id"].as_str().expect("event id").to_owned();
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/read_markers"),
+            Some(&alice),
+            Some(json!({
+                "m.fully_read": public_at,
+                "m.read": public_at,
+                "m.read.private": private_at,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The fully-read marker is per-room account data.
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/user/{user}/rooms/{enc}/account_data/m.fully_read"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["event_id"], public_at.as_str(), "{body}");
+
+    // Bob sees the public receipt, and nothing pointing at the private one.
+    let (_, sync) = env
+        .req("GET", "/_matrix/client/v3/sync?timeout=0", Some(&bob), None)
+        .await;
+    let ephemeral = sync["rooms"]["join"][&room_id]["ephemeral"]["events"].to_string();
+    assert!(
+        ephemeral.contains(&public_at),
+        "bob should see the public receipt: {ephemeral}"
+    );
+    assert!(
+        !ephemeral.contains(&private_at),
+        "a private receipt must not reach another user: {ephemeral}"
+    );
+    env.shutdown().await;
+}
+
+/// Unban is a membership transition like any other: it writes `leave`
+/// over `ban`, which is what re-opens the room to the user. The guard
+/// worth having is that the ban really did block a join first, so a
+/// passing test cannot be a room that was never closed.
+#[tokio::test]
+async fn unban_reopens_a_banned_room() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+    let bob = env.register("bob", "bob-pw-12345").await;
+    let bob_id = format!("@bob:{SERVER}");
+
+    let room_id = make_room(&env, &alice, "unban").await;
+    let enc = room_id.replace('!', "%21").replace(':', "%3A");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/ban"),
+            Some(&alice),
+            Some(json!({"user_id": bob_id, "reason": "spam"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/join"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a ban must actually close the room: {body}"
+    );
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/unban"),
+            Some(&alice),
+            Some(json!({"user_id": bob_id})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/rooms/{enc}/state/m.room.member/{bob_id}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["membership"], "leave", "{body}");
+
+    let (status, body) = env
+        .req(
+            "POST",
+            &format!("/_matrix/client/v3/rooms/{enc}/join"),
+            Some(&bob),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unban must re-open the room: {body}"
+    );
+    env.shutdown().await;
+}

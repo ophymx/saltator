@@ -1643,3 +1643,87 @@ async fn v12_create_event_semantics() {
 
     env.shutdown().await;
 }
+
+/// `/capabilities` is hand-rolled rather than ruma-typed, because ruma
+/// omits any capability equal to its spec default — which would leave the
+/// keys clients actually look for absent from the response. This is the
+/// test that notices if it ever goes back to the typed version.
+#[tokio::test]
+async fn capabilities_advertise_room_versions_and_password_change() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+
+    let (status, _) = env
+        .req("GET", "/_matrix/client/v3/capabilities", None, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = env
+        .req("GET", "/_matrix/client/v3/capabilities", Some(&alice), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let caps = &body["capabilities"];
+    assert_eq!(caps["m.change_password"]["enabled"], true, "{body}");
+
+    let versions = &caps["m.room_versions"];
+    let default = versions["default"].as_str().expect("a default version");
+    assert_eq!(
+        versions["available"][default], "stable",
+        "the default version must itself be advertised: {body}"
+    );
+    env.shutdown().await;
+}
+
+/// Avatar URLs round-trip through the per-field endpoint and show up in
+/// the whole-profile read, which is the one federation and the user
+/// directory go through.
+#[tokio::test]
+async fn avatar_url_round_trips_and_joins_the_profile() {
+    let env = start_env().await;
+    let alice = env.register("alice", "alice-pw-123").await;
+    let user = format!("@alice:{SERVER}");
+
+    // Absent to begin with: a profile with no avatar answers without one
+    // rather than 404ing the whole profile.
+    let (status, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/profile/{user}/avatar_url"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("avatar_url").is_none_or(Value::is_null), "{body}");
+
+    let (status, body) = env
+        .req(
+            "PUT",
+            &format!("/_matrix/client/v3/profile/{user}/avatar_url"),
+            Some(&alice),
+            Some(json!({"avatar_url": "mxc://hs.test/avatar"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/profile/{user}/avatar_url"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(body["avatar_url"], "mxc://hs.test/avatar", "{body}");
+
+    let (_, body) = env
+        .req(
+            "GET",
+            &format!("/_matrix/client/v3/profile/{user}"),
+            Some(&alice),
+            None,
+        )
+        .await;
+    assert_eq!(body["avatar_url"], "mxc://hs.test/avatar", "{body}");
+    env.shutdown().await;
+}
