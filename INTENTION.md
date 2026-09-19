@@ -21,25 +21,12 @@ server relaying traffic across a cluster.
 It also continues the Matrix ecosystem's neuroscience naming tradition
 (Synapse, Dendrite, Telodendria).
 
-### Name conflict research (done 2026-07-11)
-
-Vetted before selection. Summary of what's clear and what to route around:
-
-- **crates.io**: `saltator` and `saltatory` — both free. Claim `saltator`.
-- **Matrix ecosystem**: nothing named Saltator. Fully clean.
-- **General software**: no collisions (only unrelated *Salt*/SaltStack and
-  *Salto*, distinct words).
-- **Trademark**: none found in software/comms class.
-- **GitHub `Saltator` org/user**: TAKEN — but a dead, empty account (registered
-  2015, zero repos, no activity since 2016). Route around with a variant
-  (`saltator-rs`, `saltatorhq`) or file a name-release request.
-- **Domains**: `saltator.com` is registered (held by a domain investor, GoDaddy,
-  since 2014). `.dev`, `.io`, `.chat`, `.org`, `.net`, `.app`, `.rs` all appeared
-  unregistered (DNS-based check — confirm at a registrar's checkout before
-  relying on it). Natural stack: `saltator.dev` + `saltator.rs`.
-- **Footnote**: "Saltator" is also a genus of songbirds — no legal/technical
-  conflict, but launch-day SEO will surface birds until the project gains
-  traction. Pair the name with context ("Saltator Matrix server").
+The name was checked for collisions before it was chosen: nothing in the
+Matrix ecosystem carries it, there is no trademark in the
+software/communications class, and the near-misses in general software
+(SaltStack, Salto) are distinct words. *Saltator* is also a genus of
+songbirds, which is harmless except that searching for it surfaces birds
+— worth pairing the name with context.
 
 ## Goals
 
@@ -49,23 +36,8 @@ Vetted before selection. Summary of what's clear and what to route around:
 - Rust for memory safety, performance, and operational simplicity (single
   static binary where possible).
 
-## Status
+## Where it stands
 
-**M0–M5 complete** — see [spec.md](spec.md) §12 for the milestone plan
-and [README.md](README.md) for the current feature surface. Saltator
-federates with Synapse (proven in CI), self-clusters and survives node
-loss without message loss, and carries real E2EE traffic for matrix-nio
-and Element clients. Matrix spec pinned at v1.19. Next: hardening and a
-first public deployment.
-
-## Next steps (from the original inception list)
-
-- [ ] Reserve the name: publish a placeholder `saltator` crate, claim a GitHub
-      org variant, register `saltator.dev` / `saltator.rs`.
-- [x] Study the Matrix spec (client-server + federation) and Synapse's
-      worker/HA architecture as reference → spec.md.
-- [x] Sketch the HA architecture: state storage, sharding/partitioning,
-      federation handling, consensus/coordination approach → spec.md §4.
-- [x] Decide the storage backend and async runtime (RocksDB, tokio) →
-      spec.md §7.
-- [x] Stand up a Cargo workspace (client-server API skeleton lands in M2).
+[README.md](README.md) describes the feature surface and what is not
+built yet; [spec.md](spec.md) describes the architecture and the
+decisions behind it.

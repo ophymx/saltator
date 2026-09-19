@@ -51,7 +51,7 @@ leadership**:
   inclusion — moved verbatim), sends, then proposes
   `AdvancePduCursor` to its *own* shard — proposer == leader, so no
   cross-shard write and no dependency on leader-forwarded proposals
-  (still deferred M4 hardening).
+  (which did not exist yet at the time).
 - **EDUs**: the existing edu_sender loop, reading/acking the fed-out
   outbox instead of the user shard's.
 - One retry policy: per-destination exponential backoff, unbounded

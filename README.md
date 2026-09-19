@@ -5,13 +5,15 @@ availability — a self-clustering distributed system with no external
 database and no role configuration.
 
 - **[INTENTION.md](INTENTION.md)** — why this exists, the name.
-- **[spec.md](spec.md)** — the technical specification (architecture,
-  decisions, milestones).
+- **[spec.md](spec.md)** — the technical specification: architecture and
+  the decisions behind it.
+- **[docs/deferred.md](docs/deferred.md)** — what is deliberately not
+  built, and what would justify building it.
 
 ## Status
 
-**M0–M5 complete** (see spec.md §12 for the milestone plan) — the full
-stack works end to end, with every exit criterion proven in CI:
+The full stack works end to end, with each of the following proven by a
+gating CI job:
 
 - **Client-server**: registration, login, rooms (versions 9–12 +
   upgrades), messaging, `/sync`, receipts/typing/presence, search, media
@@ -30,26 +32,30 @@ stack works end to end, with every exit criterion proven in CI:
   matrix-nio devices exchange Megolm-encrypted messages in both
   directions across Saltator↔Synapse federation; also verified hands-on
   with real Element clients.
-
 - **Operability**: liveness/readiness probes, a graceful drain, an admin
   API with a web console, and Prometheus metrics covering HTTP, the
   shards' Raft groups, and federation delivery latency
   ([docs/observability.md](docs/observability.md)).
-
 - **Application services**: the full v1.19 AS API for bridges and bots —
   registration files, namespaces, masquerading, durable outbound event
   push, query-on-miss, ping ([docs/appservices.md](docs/appservices.md)).
+- **Scale-out**: rooms are spread across a configurable number of Raft
+  shard groups, placed on a subset of nodes by rendezvous hashing. A
+  node serves rooms it does not host, shards move between nodes while
+  serving, a dead node's replicas re-place automatically, and media
+  blobs are placed and replicated the same way
+  ([docs/design-room-sharding.md](docs/design-room-sharding.md)).
 
 The Complement federation suite gates CI too (92/96 top-level; the
 remaining four need room versions 6/7, which this server deliberately
 does not implement), and the on-disk format is versioned with in-place
 migrations.
 
-Still pre-release: rooms live on a single shard group (multi-shard
-routing and resharding — the M-scale work — is designed for but not
-built, so replication factor is floored at node count), guest access,
-3PIDs, and room purge are unimplemented, and there are no published
-release artifacts yet.
+Still pre-release. The user and federation-out keyspaces are not yet
+split, so every node holds all user data; guest access, 3PIDs and room
+purge are unimplemented; and there are no published release artifacts
+yet. [docs/deferred.md](docs/deferred.md) has the full list with
+reasoning.
 
 ## Try it
 

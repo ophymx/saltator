@@ -38,8 +38,8 @@ What breaks today if a node simply doesn't host shard `Room/7`
 - **Placement changes** are only acted on by the leader-driven
   reconciler folding voters in; nothing starts or stops a group at
   runtime (`ShardRegistry::deregister` has zero callers), and nothing
-  ships a checkpoint (the proto's bulk-channel comment promises services
-  "added in M4" that never were).
+  ships a checkpoint — the proto's bulk-channel comment promised
+  services that had never been written.
 
 Writes are the one path that mostly works already: leader forwarding
 (`ProposeRequest.group`) reaches any group from any node. Its
