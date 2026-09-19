@@ -1,37 +1,37 @@
-# Design: room sharding (M-scale, phase 1 of 3)
+# Design: room sharding
 
-Status: ACCEPTED · 2026-09-12 — all four review calls resolved:
-default 16 for new clusters (spec §4.1 updated); founding value wins
-with a warning on TOML mismatch; CI flips to multi-shard in a follow-up
-PR after the local 3-node harness is green; phase 2 gets its own design
-doc against merged phase 1.
+This is the first of two sharding design documents. It covers the
+routing layer — how a room finds its shard. `design-room-sharding-phase2.md`
+covers the data plane that lets a node serve a shard it does not host,
+and the placement policy built on top of it.
 
-## Problem
+## Why this exists
 
-Every room on the server lives in one shard group (`Room/0`), and every
-node replicates every group. That single group is the write-serialization
-point for all rooms at once — one Raft leader carries the whole server's
-event traffic — and it is why `replication_factor` is floored at the node
-count (`placement.rs`): with no way to serve a room from a node that
-doesn't host its shard, every node must host everything.
+Every room on the server used to live in one shard group (`Room/0`),
+with every node replicating that group. A single group is the
+write-serialization point for all rooms at once — one Raft leader
+carrying the whole server's event traffic — and it was why
+`replication_factor` was floored at the node count: with no way to
+serve a room from a node that does not host its shard, every node had
+to host everything.
 
-spec.md committed to the answer long ago (§4.1): a fixed count of virtual
-room shards set at cluster creation, rooms mapped by `hash(room_id)`,
-whole shards — never individual rooms — moved between nodes, RF 3.
-OQ-5 (resolved) bounds the scope hard: **shard split/merge is out of
-scope for the foreseeable future**; a deployment that outgrows its count
-migrates by export/import or rebuild. So this is initial sizing plus
-routing, not online resharding.
+spec.md §4.1 committed to the answer long before any of it was built: a
+fixed count of virtual room shards set at cluster creation, rooms
+mapped by `hash(room_id)`, whole shards — never individual rooms —
+moved between nodes, RF 3. OQ-5 bounds the scope hard: **shard
+split/merge is out of scope for the foreseeable future**; a deployment
+that outgrows its count migrates by export/import or rebuild. So this
+is initial sizing plus routing, not online resharding.
 
-## Three phases, because the blockers are not the same blocker
+## Three phases, because the blockers were not the same blocker
 
-The survey (2026-09-12) found the machinery in three distinct states:
+The machinery was in three distinct states:
 
 - **Already built**: `ClusterConfig.room_shards` with
   `data_groups()` emitting `Room/0..n` (`placement.rs:48`), placement
   assignment + rendezvous ranking over N groups, the shard-prefixed key
   layout (`saltator-store`, `keyspace|shard|table|key`), per-group
-  leader-forwarded writes with the RYW barrier (PR #47), and fed-out
+  leader-forwarded writes with the RYW barrier, and fed-out
   delivery cursors keyed by `room_shard` since step 4.
 - **Missing for N groups at all**: starting N `RoomServer`s, a
   room→shard router, and the generalization of every consumer that
@@ -82,7 +82,7 @@ and continue exactly as they are: **no migration, no token change, no
 behavioral difference for any existing deployment.** A cluster that wants
 more shards is a new cluster (OQ-5's explicit trade).
 
-Default for new clusters: **16**, not spec §4.1's 64 — review call 1.
+Default for new clusters: **16**, not spec §4.1's 64 — see Decisions.
 
 ### Routing: `hash(room_id) mod count`
 
@@ -156,7 +156,7 @@ durable position, one pass structure:
 - **Federation delivery**: `scan_pos` becomes per-shard; `T_PDU_CURSOR`
   already keys by `room_shard`, so only the constant `0` and the loop
   die. The pass iterates shards, then destinations (the concurrent
-  fan-out from PR #63 applies per shard).
+  fan-out applies per shard).
 - **Appservice push**: same — `T_AS_CURSOR` already keyed, the txn id
   already carries `s{shard}_…` so ids stay unique across shards.
 - **Push gateway**: one loop per shard, each gated on *that shard's*
@@ -207,32 +207,27 @@ durable position, one pass structure:
   asserted.
 - Cluster harness (local-only, per the hardening pattern): 3 nodes ×
   `room_shards = 8`, Complement suites pointed at it, churn soak — the
-  same bar PR #47 set.
-- CI Complement stays on `room_shards = 1` initially; flipping the
-  Complement image to N=4 once green locally is the ratchet that keeps
-  multi-shard honest forever — review call 3.
+  same bar the cluster-hardening work set.
+- CI Complement started on `room_shards = 1`; flipping the Complement
+  image to 4 once the local harness was green is the ratchet that keeps
+  multi-shard honest from then on.
 
-## Review calls
+## Decisions
 
-1. **Default shard count for new clusters: 16 (this doc) vs 64 (spec
-   §4.1).** OQ-5 makes under-provisioning expensive (no split later), so
-   spec said 64. But 64 Raft groups on a 1–3 node cluster is heartbeat
-   and log-file overhead with zero benefit at that scale, and the
-   raft-engine trigger in the roadmap explicitly names "shard count
-   grows to where per-group write patterns dominate" as the point where
-   the log store needs rework. 16 keeps a single digit of overhead and
-   still spreads leaders across any cluster ≤ 16 nodes; a deployment
-   that expects to outgrow 16 nodes sets 64 in config. If 64-as-default
-   wins instead, nothing else in the design changes.
-2. **Immutability enforcement.** This doc: founding value wins silently
-   (warn on TOML mismatch). The alternative — refuse to boot on
-   mismatch — is louder but turns an edited config file into an outage.
-3. **When does CI flip to multi-shard?** This doc proposes: land phase 1
-   with CI at count 1 (proving zero regression), then flip the
-   Complement image to 4 in a follow-up PR once the local 3-node ×
-   8-shard harness is green. Flipping in the same PR couples a huge
-   diff to a new CI regime.
-4. **Phase-2 sequencing.** The read-RPC + pub/sub design doc can be
-   written against a merged phase 1; nothing here precommits its shape
-   beyond spec §4.2's "leader read-index by default, don't preclude
-   follower reads".
+1. **The default shard count for new clusters is 16, not the 64 spec
+   §4.1 originally named.** OQ-5 makes under-provisioning expensive
+   (there is no split later), which is what argued for 64. But 64 Raft
+   groups on a one-to-three node cluster is heartbeat and log-file
+   overhead with no benefit at that scale, and a high group count is
+   precisely the condition that would force a rework of the log store.
+   16 keeps the overhead to a single digit and still spreads leaders
+   across any cluster up to 16 nodes; a deployment expecting to outgrow
+   that sets 64 in config at founding. Nothing else in the design
+   depends on which number wins.
+2. **A config/cluster mismatch warns rather than refuses.** The
+   founding value wins and the differing TOML value is logged. Refusing
+   to boot would be louder, but it turns an edited config file into an
+   outage.
+3. **Follower reads are not precluded.** Everything here holds to spec
+   §4.2's "leader read-index by default", without foreclosing bounded-
+   staleness follower reads later.

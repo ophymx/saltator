@@ -1,40 +1,28 @@
-# Design: admin API + user management (roadmap step 5)
+# Design: admin API + user management
 
-Status: ACCEPTED · 2026-08-09 (all four calls resolved in review the same
-day; see "Decisions" at the end).
+The shaping constraint: **do not adopt MAS**, keep user management
+**internal**, but shape the design so **OIDC/Keycloak drops in later**
+without re-cutting the account model.
 
-Constraint set by the user (2026-08-09): **do not adopt MAS**, keep user
-management **internal**, but shape the design so **OIDC/Keycloak drops in
-later** without re-cutting the account model.
+## Why this exists
 
-## Problem
+Before this, there was no operational surface at all:
 
-There is no operational surface at all. Concretely, today:
-
-- `Account` is `{password_hash, created_ts, deactivated}`
-  (`crates/saltator-userserver/src/types.rs:152`). No admin bit, no
-  lifecycle beyond a one-way `deactivated`, no reactivate command.
-- No admin routes of any kind anywhere in the router
-  (`crates/saltator-cs-api/src/lib.rs:232`), and no way to enumerate
-  accounts: `UserStore::account()` is a point lookup
-  (`crates/saltator-userserver/src/machine.rs:1201`) and nothing ranges
-  over `T_ACCOUNT`.
-- **UIA is theatre.** `ApiError::uiaa` mints a random `session` string
-  that is stored nowhere and validated never
-  (`crates/saltator-cs-api/src/error.rs:108-125`); the only real check
-  is the stateless single-shot `require_password_uia`
-  (`crates/saltator-cs-api/src/routes/account.rs:409`). Any multi-stage
-  flow — registration tokens, SSO re-auth — needs a real session store
-  that does not exist.
-- Login is hardcoded to one flow: `get_login_types` returns a literal
-  `vec![LoginType::Password(..)]` (`routes/session.rs:146-153`) and
-  `login` rejects everything that is not `LoginInfo::Password`
-  (`:159-161`). There is no provider indirection to extend.
-- Registration accepts only `m.login.dummy` (`routes/session.rs:84-93`).
-- `NodeStatus::Draining` exists in the roster model
-  (`crates/saltator-cluster/src/placement.rs:70`) and nothing ever sets
-  it — crash-and-forget is the only node-removal path. Owed from the
-  cluster-hardening interlude.
+- `Account` was `{password_hash, created_ts, deactivated}` — no admin
+  bit, no lifecycle beyond a one-way `deactivated`, no reactivate.
+- No admin routes anywhere in the router, and no way to enumerate
+  accounts: `UserStore::account()` was a point lookup and nothing
+  ranged over `T_ACCOUNT`.
+- **UIA was theatre.** `ApiError::uiaa` minted a random `session`
+  string that was stored nowhere and validated never; the only real
+  check was a stateless single-shot password re-auth. Any multi-stage
+  flow — registration tokens, SSO re-auth — needs a real session store.
+- Login was hardcoded to one flow: the login-types endpoint returned a
+  literal password entry, and login rejected anything that was not a
+  password. There was no provider indirection to extend.
+- Registration accepted only `m.login.dummy`.
+- `NodeStatus::Draining` existed in the roster model and nothing ever
+  set it — crash-and-forget was the only node-removal path.
 
 ## The organising idea: split three things Synapse conflates
 
@@ -149,7 +137,7 @@ account row at all — the identity is synthesised from config in
 `auth.appservice` outright rather than inventing a per-registration
 admin flag.
 
-### The identity link table — the OIDC seam, built now
+### The identity link table — the OIDC seam
 
 This is the one piece that is expensive to retrofit and nearly free to
 add today. Synapse's entire "account is linked to an IdP" state is a
@@ -405,9 +393,9 @@ room. Four decisions worth recording:
 
 **Cluster** — `GET /cluster/nodes`, `POST /cluster/nodes/{id}/drain`,
 `POST /cluster/nodes/{id}/undrain`, `DELETE /cluster/nodes/{id}`. This is
-where the interlude's owed work lands: `NodeStatus::Draining` existed in
-the roster model and nothing set it, so crash-and-forget was the only
-node-removal path.
+what finally gives `NodeStatus::Draining` a writer: it existed in the
+roster model with nothing setting it, so crash-and-forget had been the
+only node-removal path.
 
 **The interim placement policy turned out not to block this.** The worry
 was that flooring RF at the node count (`placement.rs`) would mean a node
@@ -495,38 +483,11 @@ hashed at the gateway, exactly as `Register` does — not the password.
 New `UserCommand` variants are appended, never reordered; postcard
 variant indices are a durable log format.
 
-## Slices
-
-One concern per PR, in dependency order.
-
-1. **Account model + admin spine.** Schema v3, `AdminAuth`,
-   `CsState::is_admin`, `admin_users` bootstrap, `T_ACCOUNT` range
-   reader, `services/admin.rs`, and the read-only endpoints
-   (`GET /users`, `GET /users/{id}`). Nothing destructive yet.
-2. **Account lifecycle.** Lock/unlock, deactivate+erase, admin password
-   reset, admin device revocation, `PUT /users/{id}`. New `UserCommand`
-   variants; `authenticate` learns `Locked`.
-3. **Real UIA + registration tokens.** Session table and commands,
-   token CRUD, the `m.login.registration_token` stage, `/register` flows
-   derived from config instead of the `m.login.dummy` literal.
-4. **Identity seam.** Link tables, admin link read/write, and
-   `services/auth.rs` with local password as the sole provider and
-   config-derived `/login` advertisement. **No OIDC code.**
-5. **Room admin + server notices.** Room list/detail, shutdown/block,
-   notices room.
-6. **Cluster drain.** `Draining` wired end to end; the interlude's debt.
-7. **Admin web UI** — a TypeScript/Vite sub-project served by the
-   binary. Its own design: `docs/design-admin-ui.md`. Startable as soon
-   as slice 1 lands, and it needs no admin-specific auth mechanism,
-   which is a dividend of admin being a property of an ordinary account.
-
-Slices 1–4 are the ones the user's constraint is really about. 5, 6 and
-7 are independent and can reorder.
-
 ## Explicitly out of scope
 
-- **MAS / MSC3861 / OAuth 2.0 server.** Per the user's call. Worth being
-  clear about what that forgoes, because it is a lot of surface: under
+- **MAS / MSC3861 / OAuth 2.0 server.** Deliberately not adopted.
+  Worth being clear about what that forgoes, because it is a lot of
+  surface: under
   MAS, Synapse *unregisters* `/login`, `/refresh`, `/logout`,
   `/register` (bar appservices), `/account/password`,
   `/account/deactivate` and every 3PID route
@@ -546,10 +507,10 @@ Slices 1–4 are the ones the user's constraint is really about. 5, 6 and
 - **The SSO browser flow itself** — templates, IdP picker, localpart
   picker, callback. That is the OIDC slice, below.
 
-## What the OIDC slice cost — DONE 2026-08-17
+## What the OIDC seam actually cost
 
-Built as forecast, and the forecast held: every item below was additive,
-and the password path was not edited. Operator documentation lives in
+The forecast held: every item below was additive, and the password path
+was not edited. Operator documentation lives in
 `docs/oidc.md`; the tests are `crates/saltator-cs-api/tests/oidc.rs`,
 which drives the whole flow against a stub IdP serving a real discovery
 document, a real JWKS and real RS256 ID tokens.
@@ -599,10 +560,7 @@ permanently (`handlers/sso.py:480-485`,
 `handlers/oidc.py:1359-1388`). A user can hold both a password and a
 link; neither excludes the other.
 
-## Decisions (resolved in review, 2026-08-09)
-
-All four calls AGREED as recommended, with decision 1 generalised beyond
-this step.
+## Decisions
 
 1. **Namespace: `/_saltator/admin/v1`.** Vendor-prefixed paths use our
    own prefix, and no compatibility aliases are served for other

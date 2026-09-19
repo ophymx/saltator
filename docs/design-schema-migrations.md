@@ -1,16 +1,14 @@
-# Design: versioned data schema + migrations (roadmap step 3)
+# Design: versioned data schema + migrations
 
-Status: ACCEPTED + IMPLEMENTED · 2026-08-06 (this branch)
-
-## Problem
+## Why this exists
 
 Shard state (RocksDB tables ≥ `APP_TABLE_MIN`, one keyspace per shard
-app) has no version identity. Any layout change — new table, changed
-value encoding, moved data — currently ships as "new code reads old
-bytes and hopes", and anything nontrivial (step 4 wants to *move* the
-EDU outbox between shards) has nowhere to put its transition logic.
-Downgrades are silently undefined: an old binary opening new-layout
-state misreads it.
+app) had no version identity. Any layout change — new table, changed
+value encoding, moved data — shipped as "new code reads old bytes and
+hopes", and anything nontrivial (moving the EDU outbox between shards,
+which the federation-out work needed) had nowhere to put its transition
+logic. Downgrades were silently undefined: an old binary opening
+new-layout state misread it.
 
 ## Invariants the design must not break
 
@@ -120,17 +118,16 @@ the table once the new shard acks. Both ends stay within their own
 log-ordered migrations; the daemon sequences them. This stays a
 documented pattern, implemented first by step 4 itself.
 
-## Implementation sketch (one PR, after this doc settles)
+## Shape of the implementation
 
-1. `saltator-shard`: version cell helpers on `ApplyCtx`/`ReadCtx`;
-   `ShardApp::SCHEMA_VERSION` (default 1) + `fn migrations()` registry;
-   runtime refuses to serve `stored > code`; leader-side proposal loop.
-2. Each app declares version 1 explicitly; a no-op v1→v2 toy migration
-   under `#[cfg(test)]` proves the machinery.
-3. Chaos scenario as above; unit tests for refuse-newer, stepwise
-   application, replay determinism.
+`saltator-shard` carries the version-cell helpers on
+`ApplyCtx`/`ReadCtx`, `ShardApp::SCHEMA_VERSION` (default 1) and a
+`migrations()` registry; the runtime refuses to serve `stored > code`,
+and the leader runs the proposal loop. Every app declares its version
+explicitly, and a no-op toy migration under `#[cfg(test)]` keeps the
+machinery honest independently of whether any real migration exists.
 
-## Resolved questions (from the roadmap)
+## Settled questions
 
 - **Granularity**: per-shard. One apply loop, one version.
 - **Raft semantics**: migrations are log commands; open-time work is
@@ -138,7 +135,7 @@ documented pattern, implemented first by step 4 itself.
 - **Snapshot interplay**: free — the version cell is app state, so
   snapshots carry it and installs stay coherent.
 
-## Decisions (review resolved 2026-08-06)
+## Decisions
 
 - **Version cell**: reserved shared table `T_SCHEMA = APP_TABLE_MIN`;
   apps allocate their tables from `APP_TABLE_MIN + 1` up. This shifts
@@ -147,8 +144,8 @@ documented pattern, implemented first by step 4 itself.
   environments all start from fresh data dirs); the framework this
   builds is what makes such shifts impossible-by-default afterwards.
   The snapshot range (`APP_TABLE_MIN..`) covers the cell unchanged.
-- **The all-voters-upgraded gate ships in code, v1** (user call: a
-  footgun as documentation). Before proposing `Migrate`, the leader
+- **The all-voters-upgraded gate is enforced in code, not documented
+  as a rule** — a rule of that kind is a footgun with a manual. Before proposing `Migrate`, the leader
   queries each voter's live binary `schema_version` over the internal
   RPC layer — transient, never persisted, so no codec impact on the
   membership state. Any voter unreachable or behind → no proposal,

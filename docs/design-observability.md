@@ -1,32 +1,21 @@
 # Design: metrics and the exporter that serves them
 
-Status: ACCEPTED · 2026-09-01 (this branch)
+## Why this exists
 
-## Problem
+`tracing` was wired for *logs* only: no registry, no exporter, no
+`/metrics`. The server could be read after the fact, one line at a
+time, and not measured at all. An operator who cannot see request rate,
+error rate, or whether this node is a shard leader is not operating a
+server, they are watching a process.
 
-`spec.md` §7 names observability as a chosen dependency —
-"tracing, tracing-opentelemetry, metrics → Prometheus exporter,
-per-shard metrics labeled by keyspace/shard" — and none of it exists.
-`tracing` is wired for *logs* only; there is no registry, no exporter,
-no `/metrics`. The server can be read after the fact, one line at a
-time, and not measured at all.
+Measurement was also the blocker for the one open performance question
+at the time — federation delivery latency. `delivery.rs` already
+*computed* `queue_ms` and `put_ms` and threw them at `tracing::debug!`,
+where no aggregate could be taken.
 
-Two things depend on closing this:
-
-1. **A public deployment.** `INTENTION.md` names it as the next step.
-   An operator who cannot see request rate, error rate, or whether this
-   node is a shard leader is not operating a server, they are watching
-   a process.
-2. **The one open performance item.** `docs/roadmap-refactors.md`
-   ("federation delivery latency") says: instrument `deliver_pdus`
-   latency, then attack the dominant term. The instrumentation is the
-   blocker — `delivery.rs` already *computes* `queue_ms` and `put_ms`
-   and throws them at `tracing::debug!`, where no aggregate can be
-   taken.
-
-This branch does metrics. OpenTelemetry tracing is deliberately left
-for a separate decision: it carries an SDK, an exporter, and a batching
-pipeline, and none of that is needed to answer the questions above.
+Metrics only. OpenTelemetry tracing is deliberately a separate
+decision: it carries an SDK, an exporter, and a batching pipeline, and
+none of that is needed to answer the questions above.
 
 ## Exposure: its own listener
 

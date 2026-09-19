@@ -1,20 +1,21 @@
-# Design: federation-out shard (roadmap step 4)
+# Design: the federation-out shard
 
-Status: ACCEPTED · 2026-08-06 (all four review calls resolved; drain mechanism refined in review)
+## Why this exists
 
-## Problem
+Outbound delivery state used to be scattered and partly ephemeral:
 
-Outbound delivery state is scattered and partly ephemeral:
+- The **PDU sender** tailed the room change stream from an in-memory
+  cursor that restarted at the *tip*, so events committed while a node
+  restarted were silently never federated. A bounded three-attempts-
+  per-pass retry also dropped deliveries on sustained destination
+  outages. A real correctness gap, not a tidiness complaint.
+- The **EDU outbox** lived in the *user* shard by historical
+  convenience (it had a durable store), not because delivery is
+  user-domain.
+- Two delivery loops duplicated retry and backoff policy.
 
-- The **PDU sender** (federation `sender.rs`) tails the room change
-  stream from an in-memory cursor that restarts at the *tip*: events
-  committed while a node restarts are silently never federated. A
-  bounded 3-attempts-per-pass retry also drops on sustained destination
-  outages. Real correctness gap, flagged since M3.
-- The **EDU outbox** lives in the *user* shard by historical convenience
-  (it had a durable store), not because delivery is user-domain.
-- Two delivery loops (sender, edu_sender) duplicate retry/backoff
-  policy.
+Delivery is its own domain, so it got its own shard: one place that
+owns *what have I promised to deliver to whom*.
 
 ## Design
 
@@ -125,28 +126,25 @@ drain/ingest/drop pattern the framework was built for:
   test-only schema-bump knob for *timing* the kill inside the window
   stays deferred.)
 
-## Decisions (resolved in review, 2026-08-06)
+## Decisions
 
-All four calls below are AGREED, with decision 3 carrying three riders:
-to-device `message_id` dedupe on receive (bounded, time-horizoned),
-an inbound `(origin, txn_id)` response-replay cache, and a redelivery
-test asserting *exactly-once client visibility* (uniqueness, not
-presence). The receiver currently ignores both txn ids and message_id
-— at-least-once is only honest once those land, so they are in this
-step's scope.
-
-## The calls as reviewed
-
-1. **Delivery ownership consolidates on the fed-out leader** — room and
-   user leaders stop sending; one worker owns all outbound. Rationale:
-   proposer==leader for cursor writes, one backoff policy, one place to
-   observe. Cost: outbound work no longer spreads across shard leaders
-   (irrelevant at current scale; revisit with M-scale placement).
-2. **New tiny crate** (`saltator-fedout`) vs folding into
-   saltator-federation. Lean: new crate — cs-api must enqueue without
-   depending on the whole federation/HTTP crate.
-3. **At-least-once + receiver dedupe** stays the delivery contract
-   (as today); no exactly-once machinery.
+1. **Delivery ownership consolidates on the fed-out leader.** Room and
+   user leaders do not send; one worker owns all outbound. The reasons:
+   proposer == leader for cursor writes, one backoff policy, one place
+   to observe. The cost is that outbound work no longer spreads across
+   shard leaders — irrelevant at the scale this runs at, and worth
+   revisiting if fed-out is ever placed rather than replicated
+   everywhere.
+2. **A separate crate** (`saltator-fedout`) rather than folding into
+   `saltator-federation`: cs-api must be able to enqueue without
+   depending on the whole federation and HTTP stack.
+3. **At-least-once delivery plus receiver-side dedupe** is the
+   contract; there is no exactly-once machinery. Honouring it needs
+   three things on the receive side, all in scope here: to-device
+   `message_id` dedupe (bounded and time-horizoned), an inbound
+   `(origin, txn_id)` response-replay cache, and a redelivery test
+   asserting *exactly-once client visibility* — uniqueness, not mere
+   presence.
 4. **The drain runs in the daemon before the user-v2 proposal**, not
-   inside the migration apply (a migration must stay deterministic and
-   single-shard; the drain is cross-shard I/O).
+   inside the migration apply: a migration must stay deterministic and
+   single-shard, and the drain is cross-shard I/O.

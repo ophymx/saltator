@@ -1,26 +1,26 @@
-# Design: room sharding phase 2 — the data plane for unhosted shards
+# Design: the data plane for unhosted shards
 
-Status: DRAFT · 2026-09-12 — five review calls open (bottom). Written
-against merged phase 1 (PR #64 + CI flip PR #65), per phase 1's review
-call 4.
+The second of two sharding design documents. `design-room-sharding.md`
+covers the routing layer — how a room finds its shard. This one covers
+how a node serves a shard it does not host, how shards move between
+nodes, and the placement policy built on both.
 
-## Problem
+## Why this exists
 
-Phase 1 gave the cluster N room shard groups, but every node still
-replicates every group: `placement::assign` floors RF at the node count
-because the entire serving surface assumes local applied state. The
-INTERIM POLICY comment in `placement.rs` names the deal — the floor
-comes off only "once data-plane routing for unhosted shards exists."
+Routing gave the cluster N room shard groups, but every node still
+replicated every group: `placement::assign` floored the replication
+factor at the node count, because the entire serving surface assumed
+local applied state. The floor could only come off once data-plane
+routing for unhosted shards existed.
 
-This design is that data plane. It builds the *mechanisms* — remote
-reads, remote change-stream subscription, placement watch, runtime group
-lifecycle, checkpoint transfer — and deliberately does **not** flip the
-policy. Phase 3 lifts the floor (a one-line `assign()` change once
-nothing needs the floor), re-places replicas of dead nodes, and takes on
-media blob placement.
+This is that data plane — remote reads, remote change-stream
+subscription, placement watch, runtime group lifecycle, checkpoint
+transfer — followed by the policy that uses it: a real replication
+factor, automatic re-placement of a dead node's replicas, and media
+blob placement.
 
 What breaks today if a node simply doesn't host shard `Room/7`
-(catalogued 2026-09-12; the churn soak found the boot half the hard way):
+(the churn soak found the boot half the hard way):
 
 - **Boot** waits for every group's leader; a non-hosting node wedges at
   "awaiting join".
@@ -33,7 +33,7 @@ What breaks today if a node simply doesn't host shard `Room/7`
   flags this explicitly).
 - **Cross-room reads inside a request** (restricted-join allow rooms,
   space hierarchy children) assume the sibling shard is local — the
-  same class PR #65's second bug fixed *within* a node; RF < N recreates
+  the same class as the cross-shard read bug fixed *within* a node; RF < N recreates
   it *between* nodes.
 - **Placement changes** are only acted on by the leader-driven
   reconciler folding voters in; nothing starts or stops a group at
@@ -42,28 +42,30 @@ What breaks today if a node simply doesn't host shard `Room/7`
   "added in M4" that never were).
 
 Writes are the one path that mostly works already: leader forwarding
-(`ProposeRequest.group`, PR #47) reaches any group from any node. Its
+(`ProposeRequest.group`) reaches any group from any node. Its
 read-your-writes barrier is the exception — it waits for the *local*
 apply to reach the acked index, and a non-hosting node has no local
 apply. The fix falls out of the read design (below): remote reads are
 leader reads, which are read-your-writes by construction.
 
-## Scope: 2a serving, 2b movement
+## Two halves: serving, then movement
 
-The five mechanisms split into two independent deliverables with a clean
-boundary, and nothing in 2b blocks 2a:
+The five mechanisms split into two independent halves with a clean
+boundary, and nothing in movement blocks serving:
 
-- **Phase 2a — serving unhosted shards**: Read RPC, Subscribe RPC,
-  placement watch, the router seam, every consumer generalized. After
-  2a, a node *could* serve rooms it doesn't host (proven by harness,
-  not by default policy).
-- **Phase 2b — moving shards**: runtime group start/stop driven by
-  placement changes, checkpoint transfer on the bulk channel, the
+- **Serving unhosted shards (2a)**: Read RPC, Subscribe RPC, placement
+  watch, the router seam, every consumer generalized. After this a node
+  *can* serve rooms it does not host — exercised by a harness, but not
+  yet by default policy.
+- **Moving shards (2b)**: runtime group start/stop driven by placement
+  changes, checkpoint transfer on the bulk channel, and the
   add-learner → ship → catch-up → promote → demote flow (spec §4.4).
-  After 2b, placement changes *mean* something at RF < N.
+  After this, placement changes *mean* something below RF = N.
 
-Phase 3 then flips policy: un-floor `assign()`, dead-node re-placement,
-media. Review call 1 asks whether to keep this split or land 2 whole.
+Only then does the policy flip: `assign()` loses its floor, dead nodes'
+replicas re-place, and media blobs get a placement of their own. Keeping
+the policy change behind the mechanisms meant each half could be proven
+on its own, with the floor still in place if anything went wrong.
 
 ## Phase 2a design
 
@@ -106,8 +108,8 @@ the same RPC into a follower read). Leader reads also close the RYW gap
 for free: a non-hosting node that just forwarded a write reads back
 through the same leader that acked it.
 
-**`Read` ops are storage-level, not domain-level** (review call 2 —
-this is the load-bearing choice). The op enum is the store trait's
+**`Read` ops are storage-level, not domain-level** — the load-bearing
+choice here, and the first entry under Decisions. The op enum is the store trait's
 read half: `Get(table, key)`, `Range(table, bounds, limit)`, `Seq`.
 Rationale: phase 1 funneled consumers through `RoomShards`, but many go
 on to `for_room(x).store()` and read whatever they need — sync assembly,
@@ -145,10 +147,10 @@ Phase 1's router only hands out local handles. Phase 2a makes the
   the existing forwarding) against the group's replica set from the
   placement (`Placement::replicas` — rendezvous-ordered, first entry the
   leader preference), dialed through `forward::connect` (authed, mTLS
-  per PR #48). Leader hints from `ReadResponse` re-target exactly as
+  as the internal RPC surface requires). Leader hints from `ReadResponse` re-target exactly as
   proposal forwarding does today.
 - Writes through a `Remote` handle need no new machinery — that's
-  PR #47 — minus the local-apply RYW barrier, replaced by leader reads
+  the write path does — minus the local-apply RYW barrier, replaced by leader reads
   as above.
 
 Consumers keep calling what they call now. The compile-time work is
@@ -190,7 +192,7 @@ lifecycle driver, and the reconciler (which today polls).
 - **Push gateway**: gated on each room shard's *own* leadership — a
   leader hosts by definition. No change.
 - **Cross-room reads** (restricted-join allow rooms, hierarchy
-  children, MSC3266): already routed per room id since PR #65/#67; the
+  children, MSC3266): already routed per room id; the
   handle makes the remote case transparent. The regression tests from
   that bug become the phase-2a harness cases with the allow room
   *unhosted* instead of merely other-sharded.
@@ -215,7 +217,7 @@ lifecycle driver, and the reconciler (which today polls).
 
 Split into two parts once 2a's shapes were real:
 
-### 2b part 1 — runtime lifecycle (BUILT 2026-09-13)
+### Runtime lifecycle
 
 The survey after 2a found that *movement mechanics already exist*: the
 reconciler converges membership toward the placement (add-learner →
@@ -252,7 +254,7 @@ node 2 joins; the placement moves a subset; rooms and messages created
 BEFORE the move stay readable through both nodes and new writes flow
 through node 1's remote path after it stood the group down.
 
-### 2b part 2 — checkpoint transfer (BUILT 2026-09-13)
+### Checkpoint transfer
 
 - **`BulkService.FetchCheckpoint`** (server-streaming): the serving
   replica checkpoints its state engine (`KvEngine::checkpoint` — a
@@ -291,7 +293,7 @@ through node 1's remote path after it stood the group down.
   crate round-trip test (fetch → install → boot → replay; double
   install refused).
 
-### Phase 3 — the policy flip (BUILT 2026-09-13)
+### The policy flip
 
 `replication_factor` is a real cap for ROOM groups: `assign()` places
 each on its rendezvous top-`min(RF, nodes)`, configurable at founding
@@ -342,7 +344,7 @@ nodes 1/2 balance node 3's gains (every group ends at exactly 2
 replicas), gained state arrives via checkpoint pre-seed, and all three
 nodes read, write, and sync every room afterward.
 
-### Dead-node re-placement (built 2026-09-13)
+### Dead-node re-placement
 
 Placement previously reacted only to roster changes: a crashed node's
 replicas stayed assigned to it until an operator drained it. Now the
@@ -393,7 +395,7 @@ writes, and syncs through the three survivors throughout. Node 4 then
 restarts: the detector restores it, rendezvous returns its 5 groups,
 and all four nodes serve everything.
 
-### Media blob placement (built 2026-09-18)
+### Media blob placement
 
 Room state was the last *Raft* data left unplaced; media bytes were the
 last data of any kind. Blobs are deliberately not Raft-replicated (a
@@ -533,33 +535,32 @@ the thumbnailer inherits it rather than reimplementing it).
   the remote path in the normal test jobs via the cs_api env. The
   Complement-at-RF<N flip is phase 3's ratchet, mirroring phase 1's.
 
-## Review calls
+## Decisions
 
-1. **Land as 2a → 2b, or one phase-2 PR arc?** This doc: split. 2a is
-   independently verifiable (the RF floor stays either way) and 2b's
-   lifecycle work is where operational risk lives; separating them
-   mirrors the phase-1 → CI-flip pattern that just paid off twice.
-2. **Read primitive level: storage ops (this doc) vs domain
-   read-commands vs whole-request gateway forwarding.** Storage ops
-   keep the ~hundred read sites untouched behind the store trait and
-   don't enumerate access patterns; domain commands would be
-   tighter-typed but a large, ongoing enumeration; request forwarding
-   can't serve sync (no node hosts all of a user's shards at RF < N)
-   so it would be a second mechanism, not a replacement. If domain
-   commands win instead, the envelope is unchanged — only the op enum
-   moves up a layer.
-3. **Subscribe carries backfill server-side.** The alternative (bare
-   live stream + consumer-side catch-up reads) is what local consumers
-   do today; centralizing it removes five copies of the
-   read-then-splice dance and its off-by-one seams. Costs a
+1. **The read primitive is a storage op, not a domain read-command or a
+   whole-request gateway forward.** Storage ops leave roughly a hundred
+   read sites untouched behind the store trait and require no
+   enumeration of access patterns. Domain commands would be
+   tighter-typed, but the enumeration is large and never finishes.
+   Request forwarding cannot serve `/sync` at all — below RF = N no
+   single node hosts all of a user's shards — so it would have been a
+   second mechanism rather than a replacement. If domain commands ever
+   win, the envelope is unchanged: only the op enum moves up a layer.
+2. **Subscribe carries its backfill server-side.** The alternative — a
+   bare live stream plus consumer-side catch-up reads — is what local
+   consumers did, in five separate copies of the same read-then-splice
+   dance, each with its own off-by-one seam. Centralizing it costs a
    seq-indexed read path on the serving side, which the timeline
    already provides.
-4. **The `rf_cap` debug knob** (config-gated, named so nobody mistakes
-   it for supported policy) so 2a is exercised by the cluster harness
-   before phase 3 exists. Alternative: 2a lands dark behind unit + crate
-   tests only. The knob is the churn-soak lesson from PR #47 applied
-   early.
-5. **Leader-only remote reads for all of 2a**, including sync assembly
-   (spec §5.3 marks follower/staleness reads a post-v1 optimization,
-   OQ-7). Accepting this now sizes the Read RPC for one consistency
-   mode; the field for bounded staleness is reserved, not implemented.
+3. **Remote reads go to the leader, including for sync assembly.** Spec
+   §5.3 marks follower and bounded-staleness reads a post-v1
+   optimization (OQ-7). Sizing the Read RPC for one consistency mode
+   keeps it simple; the field for bounded staleness is reserved, not
+   implemented.
+4. **The serving half landed before the movement half, and the policy
+   flip after both.** Serving is independently verifiable with the RF
+   floor still in place, and the lifecycle work is where the
+   operational risk lives. A `rf_cap` debug knob — config-gated and
+   named so nobody mistakes it for supported policy — let the cluster
+   harness exercise remote serving before the real policy existed,
+   rather than landing that code dark behind unit tests.

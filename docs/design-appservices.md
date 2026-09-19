@@ -1,20 +1,18 @@
-# Design: full application services
+# Design: application services
 
-Status: IMPLEMENTED · 2026-09-10 (appservices branch). Operator reference: docs/appservices.md.
+Operator reference: `docs/appservices.md`.
 
-## Problem
+## Why this exists
 
-The minimal slice from jump-to-date (PR #44) gets a bridge user through
-the door — `as_token` auth as the sender user, `?ts` massaging on
-`/send`, registration files hand-parsed for two flat scalars — but none
-of what makes an appservice an appservice exists: no namespaces, no
-`?user_id=` masquerading, no ghost registration, no outbound event
-push, no query-on-miss. A real bridge (mautrix-*, IRC) cannot run
-against saltator today. spec.md §"Application services" promises the AS
-API; this closes it.
+An earlier minimal slice got a bridge user through the door —
+`as_token` auth as the sender user, `?ts` massaging on `/send`,
+registration files hand-parsed for two flat scalars — but none of what
+makes an appservice an appservice: no namespaces, no `?user_id=`
+masquerading, no ghost registration, no outbound event push, no
+query-on-miss. A real bridge (mautrix-*, IRC) could not run against it.
 
-Target: Matrix v1.19 Application Service API, minus the explicitly
-deferred pieces listed at the end.
+The target is the Matrix v1.19 Application Service API, minus the
+pieces listed under "Deferred, deliberately" at the end.
 
 ## Design
 

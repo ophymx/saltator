@@ -1,14 +1,11 @@
-# Design: admin web UI (roadmap step 5, slice 7)
+# Design: the admin web console
 
-Status: ACCEPTED + IMPLEMENTED · 2026-08-13. Companion to
-`docs/design-admin-identity.md`, which defines the API this consumes.
-Framework confirmed in review: **Svelte 5**.
+A web console for the admin API, shipped as a sub-project in this repo
+and served by the saltator binary itself. Built with **Svelte 5** and
+**TypeScript + Vite**. `docs/design-admin-identity.md` defines the API
+it consumes.
 
-A web console for the step-5 admin API, shipped as a sub-project in this
-repo and served by the saltator binary itself. Toolchain decided in
-review: **TypeScript + Vite**.
-
-## Problem
+## Why this exists
 
 The admin API is only usable from `curl` without a UI, and we have
 deliberately foreclosed the alternative — no `_synapse` paths means no
@@ -208,20 +205,7 @@ unlock, deactivate, password reset, device revocation, registration
 tokens, room list with shutdown, cluster nodes with drain. No
 analytics, no charts, no room timeline browsing.
 
-## Slices
-
-Slice 7 of step 5, startable as soon as API slice 1 lands.
-
-- **7a — plumbing.** The `saltator-admin-ui` crate, `build.rs`, the
-  `admin-ui` feature, the nest + security-header helper, the CI frontend
-  job, and a Vite skeleton that renders one real page against slice 1's
-  read-only endpoints. The point is proving the pipeline end to end
-  while there is almost no UI to break.
-- **7b — account operations.** Everything from API slices 2 and 3:
-  lifecycle actions, registration tokens.
-- **7c — rooms and cluster.** API slices 5 and 6.
-
-## Notes from building it
+## What building it settled
 
 - **The three properties survived, measured rather than assumed.** A
   touch-rebuild of `saltator-roomserver` followed by
