@@ -425,6 +425,14 @@ fn is_remote(state: &CsState, server_name: &ruma::ServerName) -> bool {
 
 /// Fetch media hosted on `server_name` over federation, returning the file
 /// bytes and its `Content-Type`.
+///
+/// `server_name` comes from the client, by way of the `mxc://` URI it is
+/// resolving, so this is an outbound request a client chooses the target
+/// of. That is inherent to serving remote media and is an accepted risk
+/// (SECURITY.md, "Known, and accepted") — but only because the outbound
+/// client refuses private, loopback and link-local targets before
+/// connecting. If that guard is ever bypassed or removed, this becomes a
+/// pre-auth SSRF into the deployment's own network.
 async fn fetch_remote_media(
     state: &CsState,
     server_name: &ruma::ServerName,

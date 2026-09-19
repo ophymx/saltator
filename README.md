@@ -9,6 +9,8 @@ database and no role configuration.
   the decisions behind it.
 - **[docs/deferred.md](docs/deferred.md)** — what is deliberately not
   built, and what would justify building it.
+- **[SECURITY.md](SECURITY.md)** — reporting a vulnerability, and what
+  to expect when you do.
 
 ## Status
 
