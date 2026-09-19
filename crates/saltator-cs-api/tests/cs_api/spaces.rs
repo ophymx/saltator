@@ -1,8 +1,9 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! Spaces and room discovery: the `/hierarchy` walk across federation,
+//! MSC3266 room summaries with `allowed_room_ids`, a local knock
+//! surfacing in `/sync`, and the federated public-room directory.
 use axum::http::StatusCode;
 use saltator_cs_api::{CsConfig, CsState};
+use saltator_federation::{FedState, FederationClient, KeyCache, OldVerifyKey};
 use saltator_media::MediaStore;
 use saltator_roomserver::RoomServer;
 use saltator_shard::NoopNetworkFactory;
@@ -11,8 +12,6 @@ use saltator_userserver::{spawn_membership_projection, UserServer};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
-use saltator_federation::{FedState, FederationClient, KeyCache, OldVerifyKey};
 
 use crate::harness::*;
 

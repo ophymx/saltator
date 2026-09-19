@@ -1,7 +1,7 @@
 //! Raft log storage and the generic state machine, backed by the
 //! node-local KV engine under the shard's key prefix.
 //!
-//! Generalized from the M0 metadata-group implementation: the shard is a
+//! Generalized from the metadata-group implementation: the shard is a
 //! parameter, `Normal` entries are interpreted by the [`ShardApp`], and the
 //! runtime owns the per-shard sequence counter and change-stream
 //! publication. KV calls are made inline from async context — RocksDB

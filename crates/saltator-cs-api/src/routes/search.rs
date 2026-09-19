@@ -1,7 +1,9 @@
 //! `POST /search` (spec "Server side search"): linear scan over the
-//! caller's rooms, tokenized match on `content.body`. No index — M2's
-//! rooms are node-local and small; an inverted index arrives when scale
-//! demands it.
+//! caller's rooms, tokenized match on `content.body`.
+//!
+//! There is no index. The scan is linear in the caller's room history,
+//! so this is the endpoint that will need an inverted index first if a
+//! deployment leans on search.
 
 use std::sync::Arc;
 

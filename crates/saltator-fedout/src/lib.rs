@@ -19,8 +19,13 @@ use saltator_shard::{
 };
 use saltator_store::{Keyspace, Result as StoreResult, StoreError};
 
-/// M1-style single shard; placement/resharding is M-scale work (the
-/// cursor key's `room_shard` component already anticipates it).
+/// Federation-out is a single shard group, replicated to every active
+/// node rather than placed at a replication factor — its delivery
+/// worker reads these tables locally under the group leader.
+///
+/// Splitting it is not blocked by this constant: the cursor keys
+/// already carry a `room_shard` component, so the table layout is
+/// shard-ready ahead of any decision to shard it.
 pub const FED_OUT_SHARD: ShardId = ShardId::new(Keyspace::FedOut, 0);
 
 /// This binary's schema version for this shard app — bump together with

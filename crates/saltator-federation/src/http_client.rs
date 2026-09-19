@@ -14,7 +14,7 @@ use std::time::Duration;
 /// targets are attacker-influenced and resolved before any signature
 /// check, so a plain client is a pre-auth SSRF. When false the client
 /// filters private/loopback/link-local addresses out of every DNS
-/// resolution and redirect (security review 2026-08-13, Vuln 5 / M2).
+/// resolution and redirect.
 pub fn build_http_client(extra_ca_pem: Option<&[u8]>, allow_private_ips: bool) -> reqwest::Client {
     build_client(extra_ca_pem, None, allow_private_ips)
 }

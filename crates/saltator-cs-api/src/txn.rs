@@ -1,6 +1,10 @@
 //! Client transaction-ID idempotence for `/send`, `/redact`, and
-//! `/sendToDevice` (node-local; cross-node txn dedup arrives with M4
-//! clustering).
+//! `/sendToDevice`.
+//!
+//! The cache is in-memory and **node-local**: a client that retries the
+//! same transaction against a different node of a cluster, or across a
+//! restart, is not deduplicated and will send twice. Making this durable
+//! and cluster-wide means moving it into the user shard.
 //!
 //! Transaction IDs are scoped to the device AND the endpoint path (spec
 //! v1.7): the same txn ID against a different room or event type is a new

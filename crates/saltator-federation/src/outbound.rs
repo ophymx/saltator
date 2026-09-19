@@ -140,8 +140,8 @@ impl FederationClient {
     /// Refuses a private/loopback target before any connection: every
     /// signed request runs against a destination the caller does not fully
     /// control (a room's member servers, a well-known/SRV delegation), so
-    /// the SSRF guard belongs on this common path, not just the key fetch
-    /// (Vuln 5 / M2).
+    /// the SSRF guard belongs on this common path, not just the key
+    /// fetch.
     async fn route(
         &self,
         destination: &str,

@@ -1,5 +1,5 @@
 //! Saltator: a Matrix homeserver as a self-clustering distributed system.
-//! See spec.md. M2: single-node with the full client-server surface.
+//! See spec.md for the architecture this binary assembles.
 
 mod blobs;
 mod config;
@@ -629,7 +629,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         };
     // Whether outbound federation may reach private/loopback addresses.
     // False in production; the destination is attacker-influenced and
-    // resolved before any signature check (security review Vuln 5 / M2).
+    // resolved before any signature check.
     let allow_private_ips = cfg.federation.allow_private_ips;
     // Signed client for outbound federation, shared by the CS `/join` path
     // and the event sender.

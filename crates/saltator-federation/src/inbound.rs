@@ -61,9 +61,9 @@ impl FromRequest<Arc<FedState>> for Authenticated {
         // Validate the origin as a Matrix server name before it is used to
         // fetch keys: `keys_for` resolves and connects to it, and this runs
         // before any signature is verified, so a garbage or crafted origin
-        // must not reach the resolver (security review 2026-08-13,
-        // Vuln 5 / M2). A literal-IP server name is still valid here; the
-        // resolver's own SSRF guard refuses a private target.
+        // must not reach the resolver. A literal-IP server name is still
+        // valid here; the resolver's own SSRF guard refuses a private
+        // target.
         if ruma::ServerName::parse(&params.origin).is_err() {
             return Err(AuthRejection::Malformed);
         }

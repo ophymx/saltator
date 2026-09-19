@@ -7,9 +7,14 @@ pub use saltator_shard::{Node, NodeId, TypeConfig, CODEC_VERSION};
 
 /// Commands applied to the metadata state machine (spec.md §4).
 ///
-/// M0/M1 carry a plain KV surface; placement-controller commands
-/// (shard moves, node lifecycle) land in M4 as new variants — additive,
-/// so old logs stay replayable.
+/// A plain KV surface, and deliberately still one: the placement, the
+/// roster and the cluster config are stored as values under well-known
+/// keys rather than as command variants of their own. Typed
+/// placement-controller commands were once planned here; keeping the
+/// surface narrow turned out to cost nothing, since every control-plane
+/// write is a read-modify-write of one such value.
+///
+/// New variants remain additive, so old logs stay replayable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetaCommand {
     Set { key: String, value: Vec<u8> },

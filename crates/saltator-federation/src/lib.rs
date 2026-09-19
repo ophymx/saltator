@@ -1,6 +1,6 @@
-//! Server-server HTTP surface, request signing/verification, outbound
-//! queues (spec.md §5.4). M3 work in progress: server keys + X-Matrix
-//! request authentication.
+//! Server-server HTTP surface: X-Matrix request signing and
+//! verification, published server keys, and outbound delivery
+//! (spec.md §5.4).
 
 mod backfill;
 mod delivery;

@@ -1,6 +1,6 @@
-//! M2 exit criterion (spec.md §12): two users chat on a single-node
-//! Saltator over real HTTP — the compiled binary, real sockets, plus
-//! restart persistence.
+//! Two users chat on a single-node Saltator over real HTTP — the
+//! compiled binary, real sockets, plus restart persistence. The
+//! broadest test in the tree: everything else stubs something.
 
 use std::process::{Child, Command};
 use std::time::Duration;

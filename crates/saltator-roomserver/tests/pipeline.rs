@@ -1,6 +1,6 @@
-//! M1 exit criterion (spec.md §12): events flow through the full pipeline
-//! in-process — local sends and federation-shaped PDU ingests, both room
-//! versions, validate → fetch → authorize → resolve → persist → emit.
+//! The event pipeline end to end, in-process: local sends and
+//! federation-shaped PDU ingests, across room versions, through
+//! validate → fetch → authorize → resolve → persist → emit.
 
 use std::sync::Arc;
 
@@ -559,8 +559,8 @@ async fn restart_recovers_rooms() {
     server.shutdown().await.unwrap();
 }
 
-/// M2 additions: durable receipts, redaction application, per-room
-/// timeline reads.
+/// Durable receipts, redaction application, and per-room timeline
+/// reads.
 #[tokio::test]
 async fn receipts_redactions_room_timeline() {
     let env = start_env().await;

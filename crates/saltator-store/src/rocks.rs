@@ -19,8 +19,9 @@ impl RocksEngine {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(DBCompressionType::Lz4);
-        // Prefix layout is (keyspace|shard|table); bloom filters and
-        // tuning per column family can come later — one default CF for M0.
+        // Prefix layout is (keyspace|shard|table). One default column
+        // family: per-CF bloom filters and tuning are a later option,
+        // not something the layout forecloses.
         let db = DB::open(&opts, path).map_err(rocks_err)?;
         Ok(Self {
             db,

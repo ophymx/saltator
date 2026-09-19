@@ -1,12 +1,11 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! Registration and account identity: gated registration walking its UIA
+//! stages, one-use registration tokens and their admin CRUD, UIA session
+//! scoping, and the external-identity links the SSO path is built on.
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tower::ServiceExt;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
 
 use crate::harness::*;
 

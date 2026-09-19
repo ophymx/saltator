@@ -33,8 +33,6 @@ pub use types::{
     TokenKind, UiaSession, UserChangePayload, UserCommand, UserResponse,
 };
 
-/// M2 runs a single user shard; the fixed shard count and placement land
-/// with clustering (M4).
 /// This binary's schema version for this shard app — bump together with
 /// a `migrate` arm (see docs/design-schema-migrations.md).
 ///

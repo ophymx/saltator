@@ -1,10 +1,10 @@
-//! The M2 exit criterion, at the crate level: two users register, chat,
-//! and observe each other through the real HTTP surface (router-level
-//! requests; the binary-level test covers real sockets).
+//! The application-service API: namespace exclusivity in both
+//! directions, ghost-user provisioning and masquerading, AS login,
+//! outbound push with retry, query-on-miss, ping, `?ts` massaging, and
+//! AS-managed devices.
 use axum::http::StatusCode;
 use serde_json::json;
 use std::time::Duration;
-// --- Remote join (the M3 exit criterion, crate level) --------------------
 
 use crate::harness::*;
 

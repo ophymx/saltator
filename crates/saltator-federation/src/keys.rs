@@ -90,7 +90,7 @@ pub struct KeyCache {
     /// Test override: a fixed base URL that skips resolution.
     base_url: Option<String>,
     /// Allow private-IP targets. False in production; the resolver and the
-    /// HTTP client both enforce it (Vuln 5 / M2).
+    /// HTTP client both enforce it.
     allow_private_ips: bool,
 }
 
@@ -222,7 +222,7 @@ impl KeyCache {
                 let r = self.resolver.resolve(server).await;
                 // Refuse a private/loopback target before connecting: this
                 // fetch runs on an attacker-controlled `origin` before the
-                // request's signature is verified (Vuln 5 / M2).
+                // request's signature is verified.
                 self.resolver.ensure_allowed(&r).map_err(KeyError::Ssrf)?;
                 (self.client_for(&r), r.base_url, Some(r.host_header))
             }
@@ -351,7 +351,7 @@ mod tests {
     use super::*;
     use saltator_roomserver::ServerSigner;
 
-    /// The pre-auth SSRF (Vuln 5 / M2): an inbound request's `origin` reaches
+    /// The pre-auth SSRF: an inbound request's `origin` reaches
     /// `keys_for` before any signature is verified. A private-IP origin must
     /// be refused before any connection is attempted.
     #[tokio::test]

@@ -1,6 +1,10 @@
 //! The homeserver's event-signing identity: an ed25519 key bound to the
-//! server name. Key persistence/rotation and remote-key fetching are
-//! M2/M3 concerns; this is the minimal signing surface the pipeline needs.
+//! server name, and the minimal signing surface the event pipeline needs.
+//!
+//! Two neighbouring concerns live elsewhere on purpose: the key's
+//! persistence and rotation are the daemon's (`saltator::keys`), and
+//! fetching *other* servers' published keys is the federation layer's
+//! (`saltator_federation::KeyCache`).
 
 use ruma::signatures::{Ed25519KeyPair, PublicKeyMap};
 use ruma::{CanonicalJsonObject, OwnedServerName};

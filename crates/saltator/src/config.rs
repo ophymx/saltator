@@ -316,9 +316,9 @@ pub fn require_tls_or_loopback(internal: SocketAddr, has_tls: bool) -> anyhow::R
 pub struct Listeners {
     /// Internal RPC (control + bulk channels).
     pub internal: SocketAddr,
-    /// Client-server API (serves from M2).
+    /// Client-server API.
     pub client: SocketAddr,
-    /// Federation API (serves from M3).
+    /// Federation (server-server) API.
     pub federation: SocketAddr,
     /// Prometheus exporter (`GET /metrics`). Absent — the default — means
     /// no exporter and no port: a server should not open one nobody asked
