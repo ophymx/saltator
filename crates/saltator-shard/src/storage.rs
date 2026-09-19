@@ -538,7 +538,7 @@ impl<A: ShardApp> RaftStateMachine<TypeConfig> for ShardStateMachine<A> {
         // machine replays from the Raft log after a crash (the log's own
         // writes are always fsynced), and the log is never purged past a
         // durably persisted snapshot — so nothing readable can be lost,
-        // only re-derived. (docs/roadmap-refactors.md step 3.5.)
+        // only re-derived.
         self.engine.write_batch_relaxed(wb).map_err(write_err)?;
 
         // Publish only after the batch is applied; a subscriber that sees

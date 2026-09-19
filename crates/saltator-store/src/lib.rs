@@ -222,8 +222,7 @@ mod tests {
 /// can differ: the Raft log (and vote) must fsync before the node
 /// responds; applied state may lag and replay. `From` impls let every
 /// single-engine call site (tests, embedded use) pass one engine for
-/// both roles unchanged; the daemon passes a split pair
-/// (docs/roadmap-refactors.md step 3.5).
+/// both roles unchanged; the daemon passes a split pair.
 #[derive(Clone)]
 pub struct Stores {
     pub log: std::sync::Arc<dyn KvEngine>,

@@ -330,10 +330,10 @@ pub fn router(state: Arc<FedState>) -> axum::Router {
         .route("/_matrix/key/v2/query", post(notary_query_batch))
         // ---- Spec'd endpoints we deliberately do NOT implement ----
         // Explicit stubs so the gap is visible here rather than discovered
-        // mid-investigation (see docs/federation-conformance.md "Endpoint
-        // inventory"). Behaviour matches the fallback (404 M_UNRECOGNIZED,
-        // the spec's signal for an unimplemented endpoint), so gating tests
-        // like TestUnknownEndpoints are unaffected.
+        // mid-investigation (see docs/federation-endpoints.md).
+        // Behaviour matches the fallback (404 M_UNRECOGNIZED, the spec's
+        // signal for an unimplemented endpoint), so gating tests like
+        // TestUnknownEndpoints are unaffected.
         //
         // v1 invite serves only room versions 1-2 (we support v8+); a 404
         // here is exactly the signal that makes senders stay on v2.
