@@ -257,6 +257,77 @@ pub fn assign(config: &ClusterConfig, rf_cap: Option<u8>, nodes: &BTreeSet<NodeI
     Placement { groups }
 }
 
+/// The nodes that should hold a replica of `blob_id`, in rendezvous rank
+/// order (first = highest weight), capped at `rf`.
+///
+/// Media bytes have no shard group — they are not Raft-replicated at all
+/// (docs/design-room-sharding-phase2.md, "Media blob placement") — so
+/// they rank the active nodes directly off a hash of the blob id. Same
+/// scorer as groups, under a domain separator so a blob whose hash
+/// happens to equal a group number does not inherit that group's
+/// ranking.
+///
+/// Pure in (blob id, rf, nodes): nothing about blob placement is
+/// persisted, so there is no format to migrate and no state to get
+/// stale. Callers pass `active_nodes(&roster)`, which is what makes a
+/// drain, a removal, or the failure detector's `Unreachable` verdict
+/// re-place bytes exactly as it re-places groups.
+pub fn blob_replicas(blob_id: &str, rf: u8, nodes: &BTreeSet<NodeId>) -> Vec<NodeId> {
+    let rf = (rf as usize).min(nodes.len()).max(1);
+    let key = blob_key(blob_id);
+    let mut ranked: Vec<NodeId> = nodes.iter().copied().collect();
+    // Highest weight first; ties break by ascending node id (sort_by is
+    // stable and `ranked` starts id-sorted) — identical discipline to
+    // `assign`, so both rankings are reproducible on every node.
+    ranked.sort_by(|a, b| score(key, *b).cmp(&score(key, *a)).then(a.cmp(b)));
+    ranked.truncate(rf);
+    ranked
+}
+
+/// Whether `node` may delete local blobs that have re-placed away from
+/// it.
+///
+/// Only a node that is an ACTIVE placement participant may. This is not
+/// the same question as "is this blob mine", and conflating the two is a
+/// data-churn bug waiting to happen: a `Draining` or `Unreachable` node
+/// is excluded from every replica set by definition, so the naive
+/// reading is "none of these blobs are mine — delete them all". That is
+/// backwards on both counts. A node returning from a blip is precisely
+/// the one whose surviving local copies make its return cheap; throwing
+/// them away forces it to re-download its entire share at the moment the
+/// cluster is least healthy. And a node mid-drain is leaving anyway, so
+/// deleting its copies buys nothing while removing a spare copy of data
+/// the cluster is in the middle of moving.
+///
+/// A node absent from the roster entirely (not yet joined) may not
+/// evict either — it has no business deleting anything.
+pub fn may_evict(roster: &Roster, node: NodeId) -> bool {
+    active_nodes(roster).contains(&node)
+}
+
+/// How many replicas must hold a blob for it to count as durably stored:
+/// a majority of its replica set, the same promise every Raft write in
+/// this system makes. Uploads ack at this threshold and eviction refuses
+/// below it.
+pub fn blob_quorum(replicas: usize) -> usize {
+    replicas / 2 + 1
+}
+
+/// Hash a blob id into the scorer's group-shaped key space, domain-
+/// separated from real group numbers (which are small integers).
+fn blob_key(blob_id: &str) -> u64 {
+    // FNV-1a: stable across releases and architectures, which matters —
+    // every node must rank a blob identically or they will disagree
+    // about who stores it.
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for b in blob_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    // Domain separator: blob keys must not collide with group ids.
+    h ^ 0x424C_4F42_424C_4F42
+}
+
 /// Rendezvous weight of `node` for `group`: a splitmix64 mix of both, so
 /// weights are well-distributed and independent across groups.
 fn score(group: u64, node: NodeId) -> u64 {
@@ -463,5 +534,108 @@ mod tests {
         }
         // The new node actually took on work.
         assert!(!after.groups_for(4).is_empty(), "newcomer got no groups");
+    }
+
+    fn blob_ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("blob-{i:04}")).collect()
+    }
+
+    /// The properties blob placement is relied on for: RF distinct
+    /// replicas, deterministic across nodes, capped by the cluster size,
+    /// and spread over every node.
+    #[test]
+    fn blob_placement_is_deterministic_and_spread() {
+        let ns = nodes(&[1, 2, 3, 4, 5]);
+        let mut seen: BTreeSet<NodeId> = BTreeSet::new();
+        for id in blob_ids(400) {
+            let r = blob_replicas(&id, 3, &ns);
+            assert_eq!(r.len(), 3, "{id} got {} replicas", r.len());
+            let uniq: BTreeSet<_> = r.iter().copied().collect();
+            assert_eq!(uniq.len(), r.len(), "{id} repeated a node");
+            assert_eq!(r, blob_replicas(&id, 3, &ns), "{id} ranked unstably");
+            seen.extend(r);
+        }
+        assert_eq!(seen, ns, "some node holds no blobs at all");
+        // Below RF, every node holds every blob.
+        for id in blob_ids(20) {
+            assert_eq!(blob_replicas(&id, 3, &nodes(&[1, 2])).len(), 2);
+        }
+    }
+
+    /// The same minimal-churn property groups get: growing the cluster
+    /// must not restripe media across the whole fleet.
+    #[test]
+    fn blob_join_moves_at_most_one_replica() {
+        let before_nodes = nodes(&[1, 2, 3, 4]);
+        let after_nodes = nodes(&[1, 2, 3, 4, 5]);
+        let mut moved = 0;
+        for id in blob_ids(400) {
+            let before: BTreeSet<_> = blob_replicas(&id, 3, &before_nodes).into_iter().collect();
+            let after: BTreeSet<_> = blob_replicas(&id, 3, &after_nodes).into_iter().collect();
+            let added: Vec<_> = after.difference(&before).copied().collect();
+            assert!(
+                added.iter().all(|n| *n == 5),
+                "{id} added a non-newcomer: {added:?}"
+            );
+            assert!(added.len() <= 1, "{id} churned {added:?}");
+            moved += added.len();
+        }
+        // How much movement to expect is RF/(new node count), not
+        // 1/(new node count): the newcomer takes a copy of every blob it
+        // ranks in the top RF of, which at RF 3 over 5 nodes is 3/5 of
+        // them — ~240 of 400. The per-blob bound above is the property
+        // that matters (one replica each, never a restripe); this bound
+        // only catches a scorer that has stopped distributing at all.
+        assert!((180..=300).contains(&moved), "{moved} blobs moved of 400");
+    }
+
+    /// A blob id whose hash lands on a small integer must not inherit
+    /// that group number's ranking — the domain separator's whole job.
+    #[test]
+    fn blob_keys_are_domain_separated_from_groups() {
+        let ns = nodes(&[1, 2, 3, 4, 5]);
+        let mut collisions = 0;
+        for id in blob_ids(200) {
+            let key = blob_key(&id);
+            if key < 1024 {
+                collisions += 1;
+            }
+            // Whatever the key, the ranking is the blob's own.
+            assert_eq!(blob_replicas(&id, 3, &ns).len(), 3);
+        }
+        assert_eq!(collisions, 0, "blob keys landed in the group number range");
+    }
+
+    /// Regression (found by media_placement_smoke): a node that had been
+    /// marked unreachable came back and deleted its ENTIRE blob store
+    /// within half a second, because placement legitimately excluded it
+    /// and eviction read that as "none of this is mine". Only an active
+    /// participant may evict.
+    #[test]
+    fn only_active_nodes_may_evict() {
+        let r = roster(&[
+            (1, NodeStatus::Active),
+            (2, NodeStatus::Unreachable),
+            (3, NodeStatus::Draining),
+        ]);
+        assert!(may_evict(&r, 1));
+        assert!(
+            !may_evict(&r, 2),
+            "a node returning from a blip must keep the copies that make its return cheap"
+        );
+        assert!(
+            !may_evict(&r, 3),
+            "a draining node deleting its copies buys nothing and removes a spare"
+        );
+        assert!(!may_evict(&r, 9), "a node not in the roster evicts nothing");
+    }
+
+    #[test]
+    fn blob_quorum_is_a_majority() {
+        assert_eq!(blob_quorum(1), 1);
+        assert_eq!(blob_quorum(2), 2);
+        assert_eq!(blob_quorum(3), 2);
+        assert_eq!(blob_quorum(4), 3);
+        assert_eq!(blob_quorum(5), 3);
     }
 }

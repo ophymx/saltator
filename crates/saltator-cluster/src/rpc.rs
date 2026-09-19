@@ -13,9 +13,10 @@ use crate::proto::bulk_service_server::BulkService;
 use crate::proto::control_service_server::ControlService;
 use crate::proto::raft_service_server::RaftService;
 use crate::proto::{
-    ChangeFrame, CheckpointChunk, CheckpointRequest, ExecuteRequest, ExecuteResponse, JoinRequest,
-    JoinResponse, ProposeRequest, ProposeResponse, RaftPayload, ReadRequest, ReadResponse,
-    StatusRequest, StatusResponse, SubscribeRequest,
+    BlobChunk, ChangeFrame, CheckpointChunk, CheckpointRequest, ExecuteRequest, ExecuteResponse,
+    FetchBlobRequest, HasBlobResponse, JoinRequest, JoinResponse, ProposeRequest, ProposeResponse,
+    RaftPayload, ReadRequest, ReadResponse, StatusRequest, StatusResponse, StoreBlobResponse,
+    SubscribeRequest,
 };
 use crate::types::CODEC_VERSION;
 use crate::MetadataHandle;
@@ -28,6 +29,12 @@ pub struct InternalRpc {
     /// This binary's app schema versions per keyspace discriminant,
     /// reported in Status for the migration gate.
     schemas: Vec<(u32, u32)>,
+    /// Local blob store, for the bulk media RPCs. `None` in the cluster
+    /// crate's own tests and anywhere media is not served; the blob RPCs
+    /// then answer UNIMPLEMENTED rather than pretending the blob is
+    /// missing (a peer must be able to tell "I don't serve media" from
+    /// "I don't have it").
+    media: Option<saltator_media::MediaStore>,
 }
 
 impl InternalRpc {
@@ -37,6 +44,7 @@ impl InternalRpc {
         executors: saltator_shard::ExecutorRegistry,
         server_name: String,
         schemas: Vec<(u32, u32)>,
+        media: Option<saltator_media::MediaStore>,
     ) -> Self {
         Self {
             handle,
@@ -44,7 +52,14 @@ impl InternalRpc {
             executors,
             server_name,
             schemas,
+            media,
         }
+    }
+
+    fn media(&self) -> Result<&saltator_media::MediaStore, Status> {
+        self.media
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("this node does not serve media"))
     }
 
     /// Envelope checks + route to the addressed shard group's Raft
@@ -474,5 +489,95 @@ impl BulkService for InternalRpc {
             .map(|c| Ok(CheckpointChunk { data: c.to_vec() }))
             .collect();
         Ok(Response::new(Box::pin(futures_util::stream::iter(chunks))))
+    }
+
+    type FetchBlobStream =
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<BlobChunk, Status>> + Send>>;
+
+    /// Serve one media blob from THIS node's disk
+    /// (docs/design-room-sharding-phase2.md, "Media blob placement").
+    ///
+    /// Strictly local: `read_local`, never `read`. A node that fell
+    /// through to the cluster here would turn a blob nobody holds into a
+    /// fetch loop between peers instead of a 404.
+    async fn fetch_blob(
+        &self,
+        request: Request<FetchBlobRequest>,
+    ) -> Result<Response<Self::FetchBlobStream>, Status> {
+        let req = request.into_inner();
+        let bytes = self
+            .media()?
+            .read_local(&req.blob_id)
+            .await
+            .map_err(|e| Status::internal(format!("blob read: {e}")))?
+            // NOT_FOUND rather than an empty stream: a zero-byte blob is
+            // a legal blob, and the caller has to tell them apart to know
+            // whether to try the next replica.
+            .ok_or_else(|| Status::not_found("no such blob on this node"))?;
+        let chunks: Vec<Result<BlobChunk, Status>> = if bytes.is_empty() {
+            vec![Ok(BlobChunk {
+                data: Vec::new(),
+                blob_id: None,
+            })]
+        } else {
+            bytes
+                .chunks(CHECKPOINT_CHUNK)
+                .map(|c| {
+                    Ok(BlobChunk {
+                        data: c.to_vec(),
+                        blob_id: None,
+                    })
+                })
+                .collect()
+        };
+        Ok(Response::new(Box::pin(futures_util::stream::iter(chunks))))
+    }
+
+    /// Accept a replica of one blob. The first frame names the blob; the
+    /// rest carry its bytes.
+    ///
+    /// Writes with `store_local`: this IS the replication path, and a
+    /// receiver that re-replicated what it was handed would have every
+    /// push fan out across the cluster again.
+    async fn store_blob(
+        &self,
+        request: Request<tonic::Streaming<BlobChunk>>,
+    ) -> Result<Response<StoreBlobResponse>, Status> {
+        let media = self.media()?;
+        let mut stream = request.into_inner();
+        let mut blob_id: Option<String> = None;
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            if let Some(id) = chunk.blob_id {
+                if blob_id.is_some() {
+                    return Err(Status::invalid_argument("blob id sent twice"));
+                }
+                blob_id = Some(id);
+            }
+            bytes.extend_from_slice(&chunk.data);
+        }
+        let blob_id = blob_id.ok_or_else(|| Status::invalid_argument("stream named no blob"))?;
+        media
+            .store_local(&blob_id, &bytes)
+            .await
+            .map_err(|e| Status::internal(format!("blob write: {e}")))?;
+        Ok(Response::new(StoreBlobResponse { blob_id }))
+    }
+
+    /// Does this node hold the blob? The eviction check: a node only
+    /// deletes a local copy once it has confirmed a majority of the
+    /// blob's replica set holds it, and confirming that by downloading
+    /// the blob from each of them would defeat the purpose.
+    async fn has_blob(
+        &self,
+        request: Request<FetchBlobRequest>,
+    ) -> Result<Response<HasBlobResponse>, Status> {
+        let req = request.into_inner();
+        let present = self
+            .media()?
+            .has_local(&req.blob_id)
+            .await
+            .map_err(|e| Status::internal(format!("blob stat: {e}")))?;
+        Ok(Response::new(HasBlobResponse { present }))
     }
 }

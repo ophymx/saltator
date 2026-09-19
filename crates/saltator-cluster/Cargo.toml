@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+saltator-media.workspace = true
 saltator-shard.workspace = true
 saltator-store.workspace = true
 

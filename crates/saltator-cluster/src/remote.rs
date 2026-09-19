@@ -359,3 +359,140 @@ pub async fn fetch_checkpoint(
     Err(last_err
         .unwrap_or_else(|| ShardError::Raft(format!("group {group}: no checkpoint source"))))
 }
+
+// -- media blobs --------------------------------------------------------------
+//
+// docs/design-room-sharding-phase2.md, "Media blob placement". Blobs are
+// not Raft data: they move by these two calls, over the bulk channel, and
+// their replica set comes from `placement::blob_replicas` rather than from
+// the stored placement.
+
+/// Bytes per blob frame. Matches the checkpoint chunk — comfortably under
+/// any gRPC message ceiling while keeping the frame count low for a
+/// 50 MiB upload.
+const BLOB_CHUNK: usize = 1 << 20;
+
+/// Fetch one blob from the first candidate that has it.
+///
+/// `Ok(None)` is the meaningful answer "no replica holds this" — every
+/// candidate answered NOT_FOUND — and becomes the client's 404. An error
+/// means we could not get a straight answer from anyone, which is not the
+/// same thing and must not be reported as a missing blob.
+pub async fn fetch_blob(
+    blob_id: &str,
+    candidates: &[String],
+    tls: Option<&ClientTlsConfig>,
+) -> Result<Option<Vec<u8>>> {
+    let mut last_err = None;
+    let mut saw_answer = false;
+    for addr in candidates {
+        let channel = match connect(addr, tls).await {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let mut client = crate::proto::bulk_service_client::BulkServiceClient::new(channel)
+            .max_decoding_message_size(usize::MAX);
+        let stream = match client
+            .fetch_blob(crate::proto::FetchBlobRequest {
+                blob_id: blob_id.to_owned(),
+            })
+            .await
+        {
+            Ok(s) => s.into_inner(),
+            Err(e) if e.code() == tonic::Code::NotFound => {
+                // A definite "not here" from a reachable peer.
+                saw_answer = true;
+                continue;
+            }
+            Err(e) => {
+                last_err = Some(ShardError::Raft(format!("fetch_blob {addr}: {e}")));
+                continue;
+            }
+        };
+        let mut stream = stream;
+        let mut bytes = Vec::new();
+        let mut failed = false;
+        loop {
+            match stream.message().await {
+                Ok(Some(chunk)) => bytes.extend_from_slice(&chunk.data),
+                Ok(None) => break,
+                Err(e) => {
+                    last_err = Some(ShardError::Raft(format!("blob stream {addr}: {e}")));
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            continue;
+        }
+        return Ok(Some(bytes));
+    }
+    // Everyone we reached said "not here": that is an answer, not a
+    // failure. Only report an error if nobody gave us one at all.
+    if saw_answer {
+        return Ok(None);
+    }
+    match last_err {
+        Some(e) => Err(e),
+        // No candidates at all — a single-node cluster, or a roster that
+        // has not converged yet. Nothing holds it that we know of.
+        None => Ok(None),
+    }
+}
+
+/// Push one blob to `addr`, over a fresh (bulk) connection.
+pub async fn store_blob(
+    blob_id: &str,
+    bytes: &[u8],
+    addr: &str,
+    tls: Option<&ClientTlsConfig>,
+) -> Result<()> {
+    let channel = connect(addr, tls).await?;
+    let mut client = crate::proto::bulk_service_client::BulkServiceClient::new(channel)
+        .max_encoding_message_size(usize::MAX);
+    // The first frame names the blob and carries no data; the rest carry
+    // data only. An empty blob is therefore just the naming frame.
+    let mut frames = Vec::with_capacity(bytes.len() / BLOB_CHUNK + 2);
+    frames.push(crate::proto::BlobChunk {
+        data: Vec::new(),
+        blob_id: Some(blob_id.to_owned()),
+    });
+    for c in bytes.chunks(BLOB_CHUNK) {
+        frames.push(crate::proto::BlobChunk {
+            data: c.to_vec(),
+            blob_id: None,
+        });
+    }
+    let resp = client
+        .store_blob(futures_util::stream::iter(frames))
+        .await
+        .map_err(|e| ShardError::Raft(format!("store_blob {addr}: {e}")))?;
+    let echoed = resp.into_inner().blob_id;
+    if echoed != blob_id {
+        return Err(ShardError::Raft(format!(
+            "store_blob {addr}: stored as {echoed:?}, expected {blob_id:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Ask `addr` whether it holds `blob_id`. Existence only — no bytes move.
+///
+/// An unreachable peer is an error, never a `false`: the caller uses this
+/// to decide whether deleting its own copy is safe, and "I could not ask"
+/// must never read as "yes, someone else has it".
+pub async fn has_blob(blob_id: &str, addr: &str, tls: Option<&ClientTlsConfig>) -> Result<bool> {
+    let channel = connect(addr, tls).await?;
+    let mut client = crate::proto::bulk_service_client::BulkServiceClient::new(channel);
+    let resp = client
+        .has_blob(crate::proto::FetchBlobRequest {
+            blob_id: blob_id.to_owned(),
+        })
+        .await
+        .map_err(|e| ShardError::Raft(format!("has_blob {addr}: {e}")))?;
+    Ok(resp.into_inner().present)
+}

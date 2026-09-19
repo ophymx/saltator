@@ -3173,6 +3173,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rcgen",
  "rustls",
+ "saltator-media",
  "saltator-shard",
  "saltator-store",
  "serde",

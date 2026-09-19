@@ -677,3 +677,53 @@ async fn to_device_dedupes_by_origin_and_message_id() {
     assert_eq!(bodies, vec!["first", "other", "second"], "{bodies:?}");
     env.users.shutdown().await.unwrap();
 }
+
+/// The index the blob reconciler places against
+/// (docs/design-room-sharding-phase2.md, "Media blob placement"): every
+/// blob the media table names, deduplicated, with reserved-but-unuploaded
+/// rows left out.
+#[tokio::test]
+async fn media_blob_ids_is_the_placement_index() {
+    let env = start_env().await;
+    let meta = |blob: Option<&str>, pending: bool| saltator_userserver::MediaMeta {
+        owner: "@u:hs.test".into(),
+        content_type: Some("text/plain".into()),
+        filename: None,
+        size: 3,
+        created_ts: 1,
+        pending,
+        blob: blob.map(str::to_owned),
+    };
+
+    // Two media ids sharing one content-addressed blob: the same bytes
+    // uploaded under two filenames. One blob, not two.
+    env.users
+        .put_media("upload-a", meta(Some("blob-shared"), false))
+        .await
+        .unwrap();
+    env.users
+        .put_media("upload-b", meta(Some("blob-shared"), false))
+        .await
+        .unwrap();
+    // A row predating the upload-id/blob-id split: the media id IS the blob.
+    env.users
+        .put_media("legacy-id", meta(None, false))
+        .await
+        .unwrap();
+    // A reserved async upload: no bytes exist yet, so nothing to place.
+    env.users
+        .put_media("reserved-id", meta(None, true))
+        .await
+        .unwrap();
+
+    let ids = env.users.store().media_blob_ids().unwrap();
+    assert_eq!(
+        ids,
+        ["blob-shared", "legacy-id"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>(),
+        "pending rows must not be placed, and shared blobs counted once"
+    );
+    env.users.shutdown().await.unwrap();
+}

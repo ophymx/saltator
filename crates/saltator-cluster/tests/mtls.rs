@@ -63,6 +63,7 @@ fn spawn_serve(
         vec![],
         addr,
         tls,
+        None,
         async {
             let _ = stop_rx.await;
         },

@@ -21,7 +21,10 @@ pub use tls::InternalTls;
 pub mod types;
 
 pub use join::{join_cluster, join_cluster_with_tls};
-pub use placement::{ClusterConfig, NodeInfo, NodeStatus, Placement, Roster};
+pub use placement::{
+    active_nodes, blob_quorum, blob_replicas, may_evict, ClusterConfig, NodeInfo, NodeStatus,
+    Placement, Roster,
+};
 pub use reconcile::{reconcile_once, spawn_reconciler, LocalGroup, LocalGroups};
 
 pub mod proto {
@@ -561,6 +564,7 @@ pub async fn serve_internal(
         schemas,
         listen,
         None,
+        None,
         shutdown,
     )
     .await
@@ -580,9 +584,13 @@ pub async fn serve_internal_with_tls(
     schemas: Vec<(u32, u32)>,
     listen: std::net::SocketAddr,
     tls: Option<tls::InternalTls>,
+    // Local blob store, if this node serves media: the bulk blob RPCs
+    // (docs/design-room-sharding-phase2.md, "Media blob placement") read
+    // and write through it. `None` leaves those RPCs UNIMPLEMENTED.
+    media: Option<saltator_media::MediaStore>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let svc = rpc::InternalRpc::new(handle, registry, executors, server_name, schemas);
+    let svc = rpc::InternalRpc::new(handle, registry, executors, server_name, schemas, media);
     let svc = Arc::new(svc);
 
     let mut builder = tonic::transport::Server::builder();

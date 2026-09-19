@@ -159,8 +159,42 @@ message CheckpointChunk {
   bytes data = 1;
 }
 
+// Media bytes for one blob (docs/design-room-sharding-phase2.md, "Media
+// blob placement"). Blobs are NOT Raft-replicated — they are placed by
+// rendezvous over the blob id and moved by these two RPCs. BULK traffic,
+// same connection discipline as checkpoints: a 50 MiB upload must never
+// share a connection with Raft heartbeats.
+message FetchBlobRequest {
+  string blob_id = 1;
+}
+
+message BlobChunk {
+  // The first chunk of a StoreBlob stream carries `blob_id` and no data;
+  // every later chunk carries data and no id. FetchBlob responses carry
+  // data only (the requester already named the blob).
+  bytes data = 1;
+  optional string blob_id = 2;
+}
+
+message HasBlobResponse {
+  bool present = 1;
+}
+
+message StoreBlobResponse {
+  // The id the bytes were stored under, echoed so a pusher can detect a
+  // truncated or misrouted transfer.
+  string blob_id = 1;
+}
+
 service BulkService {
   rpc FetchCheckpoint(CheckpointRequest) returns (stream CheckpointChunk);
+  // Absent blob: NOT_FOUND (never an empty stream — an empty blob is a
+  // legal blob).
+  rpc FetchBlob(FetchBlobRequest) returns (stream BlobChunk);
+  rpc StoreBlob(stream BlobChunk) returns (StoreBlobResponse);
+  // Existence only, no bytes: the eviction check must not cost a
+  // transfer of the very blob it is deciding whether to delete.
+  rpc HasBlob(FetchBlobRequest) returns (HasBlobResponse);
 }
 
 service ControlService {
