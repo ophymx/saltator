@@ -292,6 +292,18 @@ pub async fn list_cluster_nodes(
 }
 
 /// `POST /_saltator/admin/v1/cluster/nodes/{node_id}/drain`
+///
+/// The node stops being a placement target; each data group's leader
+/// then reconciles it out of the voter set by the ordinary mechanism,
+/// which is why this works even for groups the draining node leads.
+///
+/// It stays a metadata voter throughout — that is what lets it *hear*
+/// the placement update telling it to stand down. Draining and removing
+/// are therefore deliberately two operations: doing both at once cuts
+/// the node off from the metadata group while it still leads groups,
+/// leaving it unable to learn it should release them.
+///
+/// Draining the last active node is refused.
 pub async fn drain_node(
     State(state): State<Arc<CsState>>,
     auth: AdminAuth,
@@ -302,6 +314,9 @@ pub async fn drain_node(
 }
 
 /// `POST /_saltator/admin/v1/cluster/nodes/{node_id}/undrain`
+///
+/// Always allowed: an operator who drained the wrong node needs the way
+/// back.
 pub async fn undrain_node(
     State(state): State<Arc<CsState>>,
     auth: AdminAuth,
@@ -313,8 +328,14 @@ pub async fn undrain_node(
 
 /// `DELETE /_saltator/admin/v1/cluster/nodes/{node_id}`
 ///
-/// Forget a drained node. Bookkeeping after the node has been stopped —
-/// it does not stop anything itself.
+/// Forget a drained node: it leaves the metadata group and the roster.
+/// Bookkeeping after the node has been stopped — it does not stop
+/// anything itself.
+///
+/// Refused for a node that is still active (drain it first — see
+/// [`drain_node`] for why the two are separate), and refused for the
+/// node answering the call, which would take the leader out of its own
+/// group.
 pub async fn remove_cluster_node(
     State(state): State<Arc<CsState>>,
     auth: AdminAuth,

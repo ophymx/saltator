@@ -4,9 +4,13 @@ Saltator's administrative surface lives under `/_saltator/admin/v1`.
 
 It is **our own namespace, and only ours**. No `_synapse`-prefixed paths
 are served and no aliases exist for any other homeserver's admin tooling
-(`docs/design-notes.md`). The accepted cost of that
-choice is that an operator writes against this surface rather than
-reusing someone else's scripts — which is what this document is for.
+(`docs/design-notes.md`). The accepted cost of that choice is that an
+operator writes against this surface rather than reusing someone else's
+scripts — which is what this document is for.
+
+Every endpoint below is checked against the router by
+`crates/saltator/tests/docs.rs`: a route added without an entry here, or
+an entry here with no route, fails the build.
 
 ## Authentication
 

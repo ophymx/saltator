@@ -48,11 +48,7 @@ know that path".
 
 ## Keeping this current
 
-When adding a route, move it into **Served**. When the spec pin
-advances, re-run the diff: extract the paths from the spec YAML and
-compare against
-
-```sh
-grep -oE '"/_matrix/federation/v[12][^"]*"|"/_matrix/key/v2[^"]*"' \
-  crates/saltator-federation/src/lib.rs
-```
+Nothing to remember: `crates/saltator/tests/docs.rs` fails the build if
+this list and the router disagree. When the spec pin advances, diff the
+spec YAML's paths against this file to find endpoints neither side has
+yet.
