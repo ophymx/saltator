@@ -11,11 +11,28 @@ packaging/verify.sh dist        # installs them across six distros
 
 | package | CPU requirement | RocksDB CRC32c |
 | --- | --- | --- |
-| `saltator` | any x86-64 | software |
-| `saltator-x86-64-v2` | SSE4.2 + PCLMULQDQ (Westmere 2010 / Bulldozer 2011) | hardware |
+| `saltator` | SSE4.2 + PCLMULQDQ (Westmere 2010 / Bulldozer 2011) | hardware |
+| `saltator-baseline` | any x86-64 | software |
+
+The accelerated build is the default on purpose. PCLMULQDQ dates to 2010,
+so it is right for almost every machine, and a default that silently took
+the software path would be a performance cliff nobody discovers. Being
+wrong now means a refused install that names the fix, rather than a server
+that is quietly slower forever. On a CPU without those instructions,
+`apt install saltator` fails in `preinst` and tells you to install
+`saltator-baseline`.
 
 They `Conflict` with each other and both `Provide: saltator-homeserver`, so
-exactly one is installed at a time.
+exactly one is installed at a time. That virtual name is for *other*
+packages to depend on — it cannot select between them. apt refuses to
+choose between two providers ("has no installation candidate"), and a
+metapackage with `Depends: a | b` takes the first listed alternative
+whatever the CPU, because `preinst` runs long after the solver has
+decided. The package name is the only thing that actually selects.
+
+Off x86 there is only `saltator`: no such flags exist to apply, so a
+second name would be two labels for one build. The `preinst` check is a
+no-op there.
 
 ## Why a container, and why bullseye
 
@@ -136,10 +153,10 @@ rebuilt from its peers.
 ## The release job
 
 `.github/workflows/release.yml` runs on `v*` tags: amd64 builds both
-variants natively and must pass `verify.sh` (the six-distro install
-matrix and the v2 CPU-guard test) before anything publishes; arm64
-builds the baseline package under QEMU emulation (`--build-arg
-BUILD_V2=0` — the v2 variant is meaningless off x86) and is proven by
+packages natively and must pass `verify.sh` (the six-distro install
+matrix and the CPU-guard test on the default package) before anything
+publishes; arm64 builds the single package under QEMU emulation
+(`--build-arg X86_ACCEL=0`) and is proven by
 `dpkg-deb` inspection instead of the matrix, which would multiply the
 emulation cost by six distros. The release gets all three debs plus a
 `SHA256SUMS`.

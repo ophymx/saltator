@@ -78,9 +78,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 COPY . .
 
-# BUILD_V2=0 skips the x86-64-v2 variant: it is meaningless off x86, and
-# the arm64 release build sets it.
-ARG BUILD_V2=1
+# X86_ACCEL=0 builds the default package WITHOUT the x86-64-v2 flags and
+# skips the baseline package entirely. Off x86 those flags are meaningless
+# and there is no CPU floor to fall below, so one build under the default
+# name is the whole story; the arm64 release build sets it.
+ARG X86_ACCEL=1
 
 # Two full builds, because the variants differ in RUSTFLAGS and that
 # invalidates every crate. Both happen in one RUN so the target/ cache mount
@@ -97,8 +99,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     mkdir -p /out packaging/config; \
     STATIC_CXX="-L /opt/staticcxx -C link-arg=-static-libgcc"; \
     \
-    echo '=== baseline (portable x86-64) ==='; \
-    RUSTFLAGS="$STATIC_CXX" cargo build --profile dist -p saltator --bin saltator; \
+    if [ "$X86_ACCEL" = "1" ]; then \
+        ACCEL="-C target-cpu=x86-64-v2 -C target-feature=+pclmulqdq"; \
+    else \
+        ACCEL=""; \
+    fi; \
+    \
+    echo '=== saltator (default package) ==='; \
+    RUSTFLAGS="$STATIC_CXX $ACCEL" cargo build --profile dist -p saltator --bin saltator; \
     \
     ldd target/dist/saltator; \
     ! ldd target/dist/saltator | grep -q libstdc++; \
@@ -106,19 +114,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     \
     ./target/dist/saltator example-config > packaging/config/saltator.toml; \
     \
-    echo '--- max versioned glibc symbol (baseline) ---'; \
+    echo '--- max versioned glibc symbol ---'; \
     objdump -T target/dist/saltator | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1; \
     \
-    cargo deb -p saltator --profile dist --no-build --variant baseline --output /out; \
+    cargo deb -p saltator --profile dist --no-build --output /out; \
     \
-    if [ "$BUILD_V2" = "1" ]; then \
-        echo '=== x86-64-v2 (hardware CRC32c) ==='; \
-        RUSTFLAGS="$STATIC_CXX -C target-cpu=x86-64-v2 -C target-feature=+pclmulqdq" \
+    if [ "$X86_ACCEL" = "1" ]; then \
+        echo '=== saltator-baseline (portable x86-64) ==='; \
+        RUSTFLAGS="$STATIC_CXX" \
             cargo build --profile dist -p saltator --bin saltator; \
         \
         ! ldd target/dist/saltator | grep -q libstdc++; \
         \
-        cargo deb -p saltator --profile dist --no-build --variant v2 --output /out; \
+        cargo deb -p saltator --profile dist --no-build --variant baseline --output /out; \
     fi; \
     \
     ls -la /out

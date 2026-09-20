@@ -56,10 +56,23 @@ reqwest.workspace = true
 # on every live Debian and Ubuntu. A deb built here would demand this
 # machine's glibc and silently narrow to it.
 #
-# Two variants, because the CPU floor is real and dpkg cannot express it:
-# `baseline` runs anywhere x86-64 runs, `v2` takes RocksDB's hardware
-# CRC32c and refuses to install without PCLMULQDQ (see
-# packaging/maintainer-scripts-v2/preinst).
+# Two packages, because the CPU floor is real and dpkg cannot express it.
+# The DEFAULT package takes RocksDB's hardware CRC32c and refuses to
+# install without PCLMULQDQ (packaging/maintainer-scripts/preinst);
+# `saltator-baseline` is the portable fallback.
+#
+# That way round on purpose. PCLMULQDQ dates to 2010, so the accelerated
+# build is right for almost every machine, and a default that silently
+# took the software path would be a performance cliff nobody discovers.
+# Getting it wrong is now a refused install that names the fix, rather
+# than a server that is quietly slower forever.
+#
+# `Provides: saltator-homeserver` on both lets a dependency name either.
+# It cannot pick one: apt refuses to choose between two providers of a
+# virtual package ("has no installation candidate"), and a metapackage
+# with `Depends: a | b` takes the first listed alternative regardless of
+# CPU, because preinst runs long after the solver has decided. Both
+# measured. The package NAME is the only thing that actually selects.
 [package.metadata.deb]
 name = "saltator"
 maintainer = "Jeffrey T. Peckham <abic@ophymx.com>"
@@ -69,9 +82,17 @@ extended-description = """\
 A Matrix homeserver written from scratch in Rust, designed for high \
 availability: a self-clustering distributed system with no external \
 database and no role configuration. RocksDB is embedded, so there is no \
-Postgres to run alongside it."""
+Postgres to run alongside it.
+.
+On x86-64 this is the x86-64-v2 build, so RocksDB uses hardware CRC32c. \
+It therefore requires SSE4.2 and PCLMULQDQ (Intel Westmere 2010, AMD \
+Bulldozer 2011 and later); the install refuses rather than letting the \
+daemon die later, and points at `saltator-baseline` for older \
+machines. Other architectures carry no such requirement."""
 section = "net"
 priority = "optional"
+provides = "saltator-homeserver"
+conflicts = "saltator-baseline"
 assets = [
     ["../../target/dist/saltator", "usr/bin/", "755"],
     ["../../packaging/config/saltator.toml", "etc/saltator/saltator.toml", "640"],
@@ -105,22 +126,21 @@ start = false
 restart-after-upgrade = true
 
 [package.metadata.deb.variants.baseline]
-name = "saltator"
-provides = "saltator-homeserver"
-conflicts = "saltator-x86-64-v2"
-
-[package.metadata.deb.variants.v2]
-name = "saltator-x86-64-v2"
+# The fallback for pre-2011 x86: no `-C target-cpu` flags, so RocksDB
+# takes the software CRC32c path and the binary runs anywhere. Built on
+# x86 only — off x86 the default package already carries no such
+# requirement, so a second variant would be two names for one build.
+name = "saltator-baseline"
 provides = "saltator-homeserver"
 conflicts = "saltator"
-maintainer-scripts = "../../packaging/maintainer-scripts-v2"
+maintainer-scripts = "../../packaging/maintainer-scripts-baseline"
 assets = [
     ["../../target/dist/saltator", "usr/bin/", "755"],
     ["../../packaging/config/saltator.toml", "etc/saltator/saltator.toml", "640"],
-    ["../../README.md", "usr/share/doc/saltator-x86-64-v2/README.md", "644"],
-    ["../../NOTICE", "usr/share/doc/saltator-x86-64-v2/NOTICE", "644"],
-    ["../../LICENSE-APACHE", "usr/share/doc/saltator-x86-64-v2/LICENSE-APACHE", "644"],
-    ["../../LICENSE-MIT", "usr/share/doc/saltator-x86-64-v2/LICENSE-MIT", "644"],
+    ["../../README.md", "usr/share/doc/saltator-baseline/README.md", "644"],
+    ["../../NOTICE", "usr/share/doc/saltator-baseline/NOTICE", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/saltator-baseline/LICENSE-APACHE", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/saltator-baseline/LICENSE-MIT", "644"],
 ]
 extended-description = """\
 A Matrix homeserver written from scratch in Rust, designed for high \
@@ -128,7 +148,7 @@ availability: a self-clustering distributed system with no external \
 database and no role configuration. RocksDB is embedded, so there is no \
 Postgres to run alongside it.
 .
-This is the x86-64-v2 build: RocksDB gets hardware CRC32c, and the binary \
-therefore requires SSE4.2 and PCLMULQDQ (Intel Westmere 2010, AMD \
-Bulldozer 2011 and later). Install the `saltator` package instead on \
-older hardware."""
+This is the portable build, for x86-64 CPUs without SSE4.2 and \
+PCLMULQDQ (before Intel Westmere 2010 / AMD Bulldozer 2011, and the \
+low-power lines until 2013). It is the same server taking the software \
+CRC32c path. On anything newer, install `saltator` instead."""

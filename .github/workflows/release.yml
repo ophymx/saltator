@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - name: Build packages (baseline + x86-64-v2)
+      - name: Build packages (default + baseline)
         run: |
           docker buildx build -f packaging/Dockerfile --target export \
             -o type=local,dest=dist .
@@ -51,7 +51,7 @@ jobs:
       - name: Build package (baseline only; v2 is x86-only)
         run: |
           docker buildx build -f packaging/Dockerfile --target export \
-            --platform linux/arm64 --build-arg BUILD_V2=0 \
+            --platform linux/arm64 --build-arg X86_ACCEL=0 \
             -o type=local,dest=dist .
       - name: Inspect the artifact
         # cargo-deb fails silently in exactly the ways a green build

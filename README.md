@@ -77,10 +77,12 @@ DOCKER_BUILDKIT=1 docker build -f packaging/Dockerfile --target export \
   -o type=local,dest=dist .
 ```
 
-`saltator` runs on any x86-64; `saltator-x86-64-v2` takes RocksDB's hardware
-CRC32c and refuses to install without PCLMULQDQ rather than letting the
-daemon SIGILL later. The C++ runtime is linked statically, so `libstdc++` is
-not a dependency. See **[docs/packaging.md](docs/packaging.md)**.
+`saltator` takes RocksDB's hardware CRC32c, so on x86-64 it needs SSE4.2
+and PCLMULQDQ (2010 and later) and refuses to install without them rather
+than letting the daemon SIGILL later; `saltator-baseline` is the portable
+fallback for older machines. The C++ runtime is linked statically, so
+`libstdc++` is not a dependency. See
+**[docs/packaging.md](docs/packaging.md)**.
 
 ## Development
 

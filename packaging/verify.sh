@@ -3,19 +3,26 @@
 #
 #   1. the baseline deb installs and runs everywhere glibc >= 2.31, and
 #      pulls in no libstdc++;
-#   2. the v2 deb's preinst refuses a CPU without PCLMULQDQ instead of
-#      letting the daemon SIGILL later.
+#   2. the DEFAULT deb's preinst refuses a CPU without PCLMULQDQ instead
+#      of letting the daemon SIGILL later.
+#
+# The default package is the accelerated one, so the guard is on the
+# package `apt install saltator` gives you — which is the whole point of
+# that arrangement, and therefore the thing worth proving.
 #
 # Usage: packaging/verify.sh [dist-dir]   (default ./dist)
 set -uo pipefail
 
 DIST="${1:-dist}"
-BASE=$(ls "$DIST"/saltator_*.deb 2>/dev/null | head -1)
-V2=$(ls "$DIST"/saltator-x86-64-v2_*.deb 2>/dev/null | head -1)
-[ -n "$BASE" ] || { echo "no baseline deb in $DIST" >&2; exit 1; }
-[ -n "$V2" ]   || { echo "no v2 deb in $DIST" >&2; exit 1; }
+# The underscore is what keeps these apart: `saltator_*.deb` does not
+# match `saltator-baseline_*.deb`, because a deb filename separates name
+# from version with `_` and the other name has `-` in that position.
+DEFAULT=$(ls "$DIST"/saltator_*.deb 2>/dev/null | head -1)
+BASE=$(ls "$DIST"/saltator-baseline_*.deb 2>/dev/null | head -1)
+[ -n "$DEFAULT" ] || { echo "no default deb in $DIST" >&2; exit 1; }
+[ -n "$BASE" ]    || { echo "no baseline deb in $DIST" >&2; exit 1; }
+echo "default:  $DEFAULT"
 echo "baseline: $BASE"
-echo "v2:       $V2"
 
 fails=0
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
@@ -46,7 +53,7 @@ for img in debian:11 debian:12 debian:13 ubuntu:20.04 ubuntu:22.04 ubuntu:24.04;
 done
 
 echo
-echo "=== v2 preinst CPU guard ==="
+echo "=== default package preinst CPU guard ==="
 tmp=$(mktemp -d)
 # A Core 2-era flag line: SSE4.2 and PCLMULQDQ both absent.
 printf 'processor\t: 0\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr\n' > "$tmp/cpuinfo.old"
@@ -55,7 +62,7 @@ printf 'processor\t: 0\nflags\t\t: fpu vme de pse tsc sse4_2 pclmulqdq aes avx\n
 
 for case_name in old new; do
     out=$(docker run --rm \
-            -v "$(readlink -f "$V2")":/pkg.deb:ro \
+            -v "$(readlink -f "$DEFAULT")":/pkg.deb:ro \
             -v "$tmp/cpuinfo.$case_name":/proc/cpuinfo:ro \
             debian:12 sh -c '
         export DEBIAN_FRONTEND=noninteractive
