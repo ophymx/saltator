@@ -3,7 +3,7 @@ set -e
 
 # The one thing dpkg cannot express as a dependency.
 #
-# This variant is built with `-C target-cpu=x86-64-v2 -C
+# On x86 this package is built with `-C target-cpu=x86-64-v2 -C
 # target-feature=+pclmulqdq` so RocksDB gets hardware CRC32c, and RocksDB
 # stopped doing runtime feature detection on x86 -- it just runs the
 # instructions. On a CPU without them the daemon dies with SIGILL, at an
@@ -14,6 +14,13 @@ set -e
 # PCLMULQDQ is the binding constraint (Intel Westmere 2010, AMD Bulldozer
 # 2011); SSE4.2 is checked too because x86-64-v2 requires it and the
 # Nehalem-EP Xeon 5500s have SSE4.2 without PCLMULQDQ.
+
+# Off x86 there are no such flags and nothing to check: the same package
+# name ships an arm64 build that needs none of this.
+case "$(uname -m)" in
+    x86_64|amd64) ;;
+    *) exit 0 ;;
+esac
 
 case "$1" in
     install|upgrade)
@@ -26,16 +33,17 @@ case "$1" in
         if [ -n "$missing" ]; then
             cat >&2 <<MSG
 
-saltator-x86-64-v2: this CPU is missing:$missing
+saltator: this CPU is missing:$missing
 
-  This package is the x86-64-v2 build. It executes SSE4.2 and PCLMULQDQ
-  unconditionally and would die with SIGILL on this machine.
+  The default package is the x86-64-v2 build. It executes SSE4.2 and
+  PCLMULQDQ unconditionally and would die with SIGILL on this machine.
 
   Install the baseline package instead:
 
-      apt-get install saltator
+      apt-get install saltator-baseline
 
-  It is the same server taking the software CRC32c path.
+  It is the same server taking the software CRC32c path. Everything
+  else about it is identical.
 
 MSG
             exit 1
