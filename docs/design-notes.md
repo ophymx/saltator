@@ -98,6 +98,14 @@ replica applies it identically and replay stays deterministic.
 The version cell is a reserved table at `APP_TABLE_MIN`, with app
 tables allocated above it.
 
+A stored record's field list is part of that version. Postcard encodes
+fields positionally, so appending a field makes every older row
+undecodable — `#[serde(default)]` does not help, because the decoder
+runs out of bytes before serde is asked for a default. The userserver's
+`Account` v2→v3 is the worked example, and it asserts that a v2-shaped
+read *fails*: that is what makes the migration load-bearing rather than
+cosmetic.
+
 **The all-voters-upgraded gate is enforced in code, not documented as a
 rule** — a rule of that kind is a footgun with a manual. Before
 proposing a migration the leader asks every voter for its live binary's

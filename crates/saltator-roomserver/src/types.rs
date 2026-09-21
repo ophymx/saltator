@@ -118,6 +118,14 @@ impl<'a> RedactDirective<'a> {
 }
 
 /// One persisted event.
+///
+/// Postcard encodes fields positionally, so this shape *is* the schema: a
+/// record written before a field was added does not decode at all, and
+/// `#[serde(default)]` cannot rescue it — the decoder runs out of bytes
+/// before serde is ever asked for a default. Adding a field to a live
+/// record is a migration step, not an attribute (the userserver's
+/// `Account` v2→v3 is the worked example). Schema version 1 is the
+/// baseline and already includes every field below.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredEvent {
     /// The canonical JSON text — the crypto/wire truth. The typed view is
@@ -138,9 +146,7 @@ pub struct StoredEvent {
     /// True for events adopted from a resident's `send_join` state dump
     /// (our own remote-join membership and its supporting state). The
     /// resident distributes those to the room, so our outbound sender must
-    /// not re-federate them. `#[serde(default)]` keeps older records
-    /// (written before this field) readable as `false`.
-    #[serde(default)]
+    /// not re-federate them.
     pub imported: bool,
     /// True for a membership we applied as the *resident* of a
     /// `send_join`/`send_leave` handshake — the joining/leaving server chose
@@ -149,9 +155,7 @@ pub struct StoredEvent {
     /// participating in the room", so the outbound sender fans these out even
     /// though their `sender` is remote. Ordinary events received from another
     /// origin (via `/send`) have this `false`: distributing those is that
-    /// origin's job, not ours. `#[serde(default)]` keeps older records
-    /// readable as `false`.
-    #[serde(default)]
+    /// origin's job, not ours.
     pub relay: bool,
 }
 
@@ -392,6 +396,40 @@ pub enum ChangePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record written before `imported` and `relay` were added must not
+    /// decode as today's `StoredEvent` — and it does not, because postcard
+    /// is positional and runs out of bytes. Both fields carried a
+    /// `#[serde(default)]` and a comment promising that kept older records
+    /// readable as `false`; it never did. They predate the schema-version
+    /// machinery (which landed three days after them), so version 1 is the
+    /// baseline and nothing on disk is affected — but the next field added
+    /// here needs a migration, and this is what says so.
+    #[test]
+    fn a_record_written_before_a_field_was_added_does_not_decode() {
+        #[derive(Serialize)]
+        struct BeforeImportedAndRelay {
+            raw: Vec<u8>,
+            seq: u64,
+            state_group_after: u64,
+            depth: u64,
+            rejected: Option<Rejected>,
+            history_idx: Option<u64>,
+        }
+        let blob = postcard::to_stdvec(&BeforeImportedAndRelay {
+            raw: b"{}".to_vec(),
+            seq: 1,
+            state_group_after: 2,
+            depth: 3,
+            rejected: None,
+            history_idx: None,
+        })
+        .unwrap();
+        assert!(
+            postcard::from_bytes::<StoredEvent>(&blob).is_err(),
+            "the old shape must not be readable as the new one"
+        );
+    }
 
     #[test]
     fn every_form_round_trips_and_a_bare_event_id_reads_as_applies() {
