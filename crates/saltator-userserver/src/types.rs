@@ -342,6 +342,29 @@ pub struct TokenEntry {
     /// Access tokens issued alongside a refresh token expire (ms since
     /// epoch); plain access tokens do not.
     pub expires_ts: Option<u64>,
+    /// The owning account's state, mirrored here so that authenticating a
+    /// request is one read of this table and never a read of per-user
+    /// state. That is what lets the user keyspace be placed away from the
+    /// node serving the request.
+    ///
+    /// Two paths keep it in step, and they are the only two that can
+    /// change it: `write_session` stamps it from the account it has just
+    /// read, and `SetLocked` rewrites a user's rows in place. Deactivation
+    /// needs no arm — it deletes them.
+    pub state: AccountState,
+}
+
+/// [`TokenEntry`] before it mirrored the account state (user schema v4).
+///
+/// `Serialize` is derived purely so tests can mint a genuine v4 blob and
+/// assert the encoding contract; nothing in the server ever writes one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TokenEntryV4 {
+    pub user_id: String,
+    pub device_id: String,
+    pub kind: TokenKind,
+    pub created_ts: u64,
+    pub expires_ts: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

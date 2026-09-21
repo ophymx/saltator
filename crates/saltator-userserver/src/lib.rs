@@ -50,7 +50,7 @@ pub use types::{
 /// rooms). A new table starts empty and no existing row changes shape, so
 /// there is nothing for a migration to do — the version tracks layout
 /// changes to data that already exists.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 
@@ -394,21 +394,18 @@ impl UserServer {
         if entry.expires_ts.is_some_and(|t| t <= now_ms()) {
             return Ok(None);
         }
-        let user_id = OwnedUserId::try_from(entry.user_id)
-            .map_err(|e| UserError::Internal(format!("stored user id: {e}")))?;
-        // Defence in depth: deactivation already deletes a user's tokens,
-        // but never honour a token for a non-active account even if one
-        // survived (a missed deletion path, projection lag, a future
-        // session command that skips the check). `Locked` has no teardown
-        // at all, so this check is the whole kill-switch.
-        if self
-            .store()
-            .account(user_id.as_str())
-            .map_err(storage_err)?
-            .is_none_or(|a| !a.state.can_authenticate())
-        {
+        // The kill-switch, and still defence in depth: deactivation
+        // deletes a user's tokens outright, but a token must never be
+        // honoured for an account that cannot authenticate even if one
+        // survived a missed deletion path. The state is mirrored onto the
+        // row (`TokenEntry::state`) rather than read from the account, so
+        // this costs no per-user read — which is what lets the user
+        // keyspace be placed away from the node serving the request.
+        if !entry.state.can_authenticate() {
             return Ok(None);
         }
+        let user_id = OwnedUserId::try_from(entry.user_id)
+            .map_err(|e| UserError::Internal(format!("stored user id: {e}")))?;
         Ok(Some((user_id, entry.device_id)))
     }
 
