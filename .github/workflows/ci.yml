@@ -275,6 +275,49 @@ jobs:
         timeout-minutes: 12
         run: ./scripts/three_node_chaos.sh target/release/saltator
 
+  rolling-upgrade:
+    name: rolling upgrade (3-node, schema step)
+    # Weekly, not per-PR: it needs a SECOND release build (the old binary),
+    # and what it guards — an existing cluster being upgraded — is not a
+    # thing a pull request can break in a way a push would not.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The old revision is checked out from this history.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_PIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The NEW binary is the one every other job already uses.
+      - uses: actions/download-artifact@v8
+        with:
+          name: saltator-release
+          path: target/release
+      - run: chmod +x target/release/saltator
+      - name: Build the oldest supported upgrade source
+        # Pinned deliberately: this revision is the claim about how far back
+        # an in-place upgrade is supported. Moving it forward drops that
+        # claim, so move it when the support window actually changes, not to
+        # make a red run go green.
+        env:
+          OLD_REV: 525d7be
+        run: |
+          git worktree add /tmp/saltator-old "$OLD_REV"
+          cd /tmp/saltator-old
+          CARGO_TARGET_DIR=/tmp/saltator-old-target cargo build --release -p saltator
+      - name: Roll a 3-node cluster from the old binary to this one
+        timeout-minutes: 15
+        run: |
+          ./scripts/rolling_upgrade_smoke.sh \
+            /tmp/saltator-old-target/release/saltator \
+            target/release/saltator
+
   complement:
     name: complement (csapi)
     runs-on: ubuntu-24.04

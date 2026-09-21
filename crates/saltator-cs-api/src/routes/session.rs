@@ -270,9 +270,9 @@ pub async fn register_available(
         return Err(ApiError::forbidden("Registration is disabled"));
     }
     let user_id = state.users.canonical_user_id(&req.username)?;
-    let store = state.users.store();
     if is_reserved_notices(&state, &req.username)
-        || store
+        || state
+            .users
             .username_taken(user_id.as_str())
             .map_err(ApiError::internal)?
     {

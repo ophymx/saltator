@@ -52,6 +52,11 @@ pub use types::{
 /// changes to data that already exists.
 pub const SCHEMA_VERSION: u32 = 6;
 
+/// The step at which `T_USERNAME` was backfilled from the accounts that
+/// already existed. Below it, the namespace table is not yet the whole
+/// truth and [`UserServer::username_taken`] has to say so.
+const USERNAME_BACKFILL_VERSION: u32 = 6;
+
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 
 /// Access tokens issued alongside a refresh token expire after this long.
@@ -381,11 +386,11 @@ impl UserServer {
 
     /// Resolve an access token to `(user_id, device_id)`.
     pub fn authenticate(&self, token: &str) -> Result<Option<(OwnedUserId, String)>> {
-        let entry = self
+        let Some((entry, state_mirrored)) = self
             .store()
-            .token(&token_hash(token))
-            .map_err(storage_err)?;
-        let Some(entry) = entry else {
+            .token_compat(&token_hash(token))
+            .map_err(storage_err)?
+        else {
             return Ok(None);
         };
         if entry.kind != TokenKind::Access {
@@ -394,18 +399,31 @@ impl UserServer {
         if entry.expires_ts.is_some_and(|t| t <= now_ms()) {
             return Ok(None);
         }
-        // The kill-switch, and still defence in depth: deactivation
-        // deletes a user's tokens outright, but a token must never be
-        // honoured for an account that cannot authenticate even if one
-        // survived a missed deletion path. The state is mirrored onto the
-        // row (`TokenEntry::state`) rather than read from the account, so
-        // this costs no per-user read — which is what lets the user
-        // keyspace be placed away from the node serving the request.
-        if !entry.state.can_authenticate() {
-            return Ok(None);
-        }
         let user_id = OwnedUserId::try_from(entry.user_id)
             .map_err(|e| UserError::Internal(format!("stored user id: {e}")))?;
+        // The kill-switch, and still defence in depth: deactivation deletes
+        // a user's tokens outright, but a token must never be honoured for
+        // an account that cannot authenticate even if one survived a missed
+        // deletion path. The state is mirrored onto the row rather than read
+        // from the account, so this costs no per-user read — which is what
+        // lets the user keyspace be placed away from the node serving the
+        // request.
+        let permitted = if state_mirrored {
+            entry.state.can_authenticate()
+        } else {
+            // A row written before the mirror existed. The migration that
+            // would fill it in is gated on the whole fleet, so until it runs
+            // the row cannot answer for itself: fall back to the account,
+            // which is exactly what this did before the mirror. An absent
+            // account refuses.
+            self.store()
+                .account(user_id.as_str())
+                .map_err(storage_err)?
+                .is_some_and(|a| a.state.can_authenticate())
+        };
+        if !permitted {
+            return Ok(None);
+        }
         Ok(Some((user_id, entry.device_id)))
     }
 
@@ -539,6 +557,29 @@ impl UserServer {
             UserResponse::ClaimedKeys(keys) => Ok(keys),
             other => Err(unexpected(other)),
         }
+    }
+
+    /// Whether an account name is taken.
+    ///
+    /// Answered from the namespace, with the account row behind it while
+    /// the backfill has not run. The schema gate holds that migration until
+    /// every voter's binary supports it, so a node upgraded before it lands
+    /// reads a table that is still empty — and "this name is free" is the
+    /// one wrong answer here that costs something, because it invites a
+    /// client to try to take a name somebody already has.
+    pub fn username_taken(&self, user_id: &str) -> Result<bool> {
+        let store = self.store();
+        if store.username_taken(user_id).map_err(storage_err)? {
+            return Ok(true);
+        }
+        let backfilled = matches!(
+            self.shard_handle().schema_versions(),
+            Ok((stored, _)) if stored >= USERNAME_BACKFILL_VERSION
+        );
+        if backfilled {
+            return Ok(false);
+        }
+        Ok(store.account(user_id).map_err(storage_err)?.is_some())
     }
 
     /// Whether this shard's applied state is at the version
