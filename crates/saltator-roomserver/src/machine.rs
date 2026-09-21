@@ -11,8 +11,8 @@ use saltator_store::{Result as StoreResult, StoreError};
 
 use crate::types::{
     AppendEvent, ChangePayload, ImportHistory, ImportRoom, ImportSegment, ReceiptCmd,
-    ReceiptRecord, RoomCommand, RoomMeta, RoomResponse, SeqEntry, StateGroup, StoredEvent, T_EVENT,
-    T_GROUP, T_HISTORY, T_RECEIPT, T_REDACT, T_ROOM, T_ROOM_SEQ, T_SEQ,
+    ReceiptRecord, RedactDirective, RoomCommand, RoomMeta, RoomResponse, SeqEntry, StateGroup,
+    StoredEvent, T_EVENT, T_GROUP, T_HISTORY, T_RECEIPT, T_REDACT, T_ROOM, T_ROOM_SEQ, T_SEQ,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -271,8 +271,8 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
         &room_u64_key(&cmd.room_id, seq),
         cmd.event_id.as_bytes(),
     );
-    if let Some(target) = &cmd.redacts {
-        ctx.put(T_REDACT, target.as_bytes(), cmd.event_id.as_bytes());
+    if let Some(directive) = &cmd.redacts {
+        put_redact(ctx, directive, &cmd.event_id)?;
     }
 
     for (id, group) in &cmd.new_groups {
@@ -321,6 +321,35 @@ fn apply_append(ctx: &mut ApplyCtx<'_>, cmd: &AppendEvent) -> StoreResult<RoomRe
         event_id: cmd.event_id.clone(),
         seq,
     })
+}
+
+/// Record what a redaction does to its target (`T_REDACT`), in whichever
+/// of [`RedactDirective`]'s forms the pipeline decided on.
+fn put_redact(ctx: &mut ApplyCtx<'_>, directive: &str, redactor_id: &str) -> StoreResult<()> {
+    let (target, entry) = match RedactDirective::decode(directive) {
+        RedactDirective::Applies(target) => {
+            (target, RedactDirective::Applies(redactor_id).encode())
+        }
+        RedactDirective::Pending { id, may_redact } => {
+            // A redaction that can only apply if it turns out to be the
+            // target's own sender must not displace an entry already here:
+            // that one either applies outright or carries the redact power
+            // level, and both outrank this one.
+            if !may_redact && ctx.get(T_REDACT, id.as_bytes())?.is_some() {
+                return Ok(());
+            }
+            (
+                id,
+                RedactDirective::Pending {
+                    id: redactor_id,
+                    may_redact,
+                }
+                .encode(),
+            )
+        }
+    };
+    ctx.put(T_REDACT, target.as_bytes(), entry.into_bytes());
+    Ok(())
 }
 
 fn apply_import(ctx: &mut ApplyCtx<'_>, cmd: &ImportRoom) -> StoreResult<RoomResponse> {
@@ -1004,15 +1033,47 @@ impl RoomStore {
         Ok(out)
     }
 
-    /// The event that redacted `event_id`, if any.
+    /// The event that redacted `event_id`, if a redaction applies to it.
+    ///
+    /// A redaction whose target had not arrived yet was stored undecided
+    /// ([`RedactDirective::Pending`]); this is where that decision is
+    /// finished, now that the target is in hand.
     pub async fn redacted_by(&self, event_id: &str) -> StoreResult<Option<String>> {
-        Ok(match self.kv_get(T_REDACT, event_id.as_bytes()).await? {
-            Some(v) => Some(
-                String::from_utf8(v)
-                    .map_err(|_| StoreError::Engine("redact value not UTF-8".into()))?,
-            ),
-            None => None,
-        })
+        let Some(entry) = self.kv_get(T_REDACT, event_id.as_bytes()).await? else {
+            return Ok(None);
+        };
+        let entry = String::from_utf8(entry)
+            .map_err(|_| StoreError::Engine("redact value not UTF-8".into()))?;
+        let (redactor_id, may_redact) = match RedactDirective::decode(&entry) {
+            RedactDirective::Applies(id) => return Ok(Some(id.to_owned())),
+            RedactDirective::Pending { id, may_redact } => (id, may_redact),
+        };
+        // The undecided half needs both events: the target for its sender,
+        // and — the check the apply could not make either — that it is in
+        // the redaction's own room. A shard holds many rooms, and nothing
+        // stops a redaction naming an event in one of the others.
+        let (Some(target), Some(redactor)) =
+            (self.event(event_id).await?, self.event(redactor_id).await?)
+        else {
+            return Ok(None);
+        };
+        if target.rejected.is_some() {
+            return Ok(None);
+        }
+        let (target, redactor) = (parse_raw(&target.raw)?, parse_raw(&redactor.raw)?);
+        // v12 create events carry no room_id and are never redactable.
+        let (Some(room_id), Some(sender)) =
+            (json_str(&target, "room_id"), json_str(&target, "sender"))
+        else {
+            return Ok(None);
+        };
+        if json_str(&redactor, "room_id") != Some(room_id) {
+            return Ok(None);
+        }
+        if may_redact || json_str(&redactor, "sender") == Some(sender) {
+            return Ok(Some(redactor_id.to_owned()));
+        }
+        Ok(None)
     }
 
     /// An event in its servable form: the stored canonical JSON, with the
@@ -1056,6 +1117,14 @@ impl RoomStore {
             }
         }
         Ok(Some(raw))
+    }
+}
+
+/// A string field of a stored event's canonical JSON.
+fn json_str<'a>(event: &'a CanonicalJsonObject, key: &str) -> Option<&'a str> {
+    match event.get(key) {
+        Some(CanonicalJsonValue::String(s)) => Some(s.as_str()),
+        _ => None,
     }
 }
 

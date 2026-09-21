@@ -23,8 +23,10 @@ pub const T_ROOM: u8 = APP_TABLE_FIRST + 3;
 pub const T_ROOM_SEQ: u8 = APP_TABLE_FIRST + 4;
 /// `room_id ++ 0x00 ++ user_id ++ 0x00 ++ receipt_type → ReceiptRecord`.
 pub const T_RECEIPT: u8 = APP_TABLE_FIRST + 5;
-/// `event_id → redacting event_id (UTF-8)` — set when an accepted
-/// `m.room.redaction` applies to a locally known event.
+/// `event_id → redaction directive (UTF-8)` — what redacts the keyed
+/// event, in one of [`RedactDirective`]'s two forms: a bare redacting
+/// `event_id` for a redaction already known to apply, or the pending form
+/// for one whose target had not arrived when it was stored.
 pub const T_REDACT: u8 = APP_TABLE_FIRST + 6;
 /// `room_id ++ 0x00 ++ idx (u64 BE) → event_id (UTF-8)` — backfilled
 /// history in reverse-chronological order: idx 1 is the newest event
@@ -55,6 +57,62 @@ impl Rejected {
     pub fn reason(&self) -> &str {
         match self {
             Rejected::AuthChain(r) | Rejected::State(r) => r,
+        }
+    }
+}
+
+/// What an accepted `m.room.redaction` does to its target.
+///
+/// The pipeline decides this and the apply stores it: as the command's
+/// [`AppendEvent::redacts`], naming the target; as the `T_REDACT` value
+/// under that target, naming the redaction. Both spellings encode into one
+/// string rather than a struct of their own so the command set stays
+/// byte-compatible across an N/N+1 rolling upgrade (spec.md §4.4). An
+/// older binary decodes either form as today's bare event id: from a
+/// command it writes the pending spelling under a key no event can have
+/// (inert), and from storage it looks up a redaction that does not exist
+/// and serves the event unredacted — its present behaviour, not a new
+/// failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactDirective<'a> {
+    /// The redaction applies: its target was held when it was accepted,
+    /// and the sender was allowed to redact it.
+    Applies(&'a str),
+    /// The redaction arrived before its target — federated traffic is not
+    /// ordered, and history older than our join arrives by backfill — so
+    /// `sender == target.sender` could not be evaluated. `may_redact`
+    /// carries the half that could be: whether the sender held the redact
+    /// power level in the state before the redaction. The read path
+    /// finishes the test once the target lands.
+    Pending { id: &'a str, may_redact: bool },
+}
+
+impl<'a> RedactDirective<'a> {
+    pub fn encode(&self) -> String {
+        match self {
+            Self::Applies(id) => (*id).to_owned(),
+            Self::Pending { id, may_redact } => {
+                format!("?{}{id}", if *may_redact { 'p' } else { '-' })
+            }
+        }
+    }
+
+    /// Event IDs are `$`-prefixed, so the pending marker cannot collide
+    /// with an encoded `Applies` — and anything unrecognized reads as
+    /// `Applies`, which is what a bare event id is.
+    pub fn decode(s: &'a str) -> Self {
+        match s.as_bytes() {
+            // Marker and flag are both ASCII, so `s[2..]` is on a char
+            // boundary.
+            [b'?', b'p', ..] => Self::Pending {
+                id: &s[2..],
+                may_redact: true,
+            },
+            [b'?', b'-', ..] => Self::Pending {
+                id: &s[2..],
+                may_redact: false,
+            },
+            _ => Self::Applies(s),
         }
     }
 }
@@ -235,9 +293,10 @@ pub struct AppendEvent {
     pub next_group: u64,
     /// `Some(version)` exactly for `m.room.create`: initializes the room.
     pub create_version: Option<String>,
-    /// `Some(target)` for an accepted `m.room.redaction` whose sender may
-    /// redact the (locally known, same-room) target — precomputed by the
-    /// pipeline; the apply just writes the `T_REDACT` redirect.
+    /// `Some(directive)` for an accepted `m.room.redaction` that may yet
+    /// take effect — an encoded [`RedactDirective`] naming the target,
+    /// precomputed by the pipeline; the apply just writes the `T_REDACT`
+    /// entry.
     pub redacts: Option<String>,
     /// Carried onto [`StoredEvent::relay`]: set when we applied this event as
     /// the resident of a `send_join`/`send_leave` handshake and must fan the
@@ -328,4 +387,33 @@ pub enum SeqEntry {
 pub enum ChangePayload {
     Event { room_id: String, event_id: String },
     Receipt { room_id: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_form_round_trips_and_a_bare_event_id_reads_as_applies() {
+        let id = "$LQ0QzL1mCLrsrYNvT1LCGxsHqGPHKPqZ";
+        for form in [
+            RedactDirective::Applies(id),
+            RedactDirective::Pending {
+                id,
+                may_redact: true,
+            },
+            RedactDirective::Pending {
+                id,
+                may_redact: false,
+            },
+        ] {
+            let encoded = form.encode();
+            assert_eq!(RedactDirective::decode(&encoded), form, "{encoded}");
+        }
+        // The rolling-upgrade contract, from both sides: what an older
+        // binary wrote is a bare event id, and what it makes of the
+        // pending form is a (nonexistent) bare event id.
+        assert_eq!(RedactDirective::decode(id), RedactDirective::Applies(id));
+        assert_eq!(RedactDirective::Applies(id).encode(), id);
+    }
 }

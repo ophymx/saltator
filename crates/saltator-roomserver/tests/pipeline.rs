@@ -680,6 +680,156 @@ async fn receipts_redactions_room_timeline() {
     env.server.shutdown().await.unwrap();
 }
 
+/// Craft bob's message without ingesting it, in a room where only the
+/// same-sender half of the redaction test can authorize bob: the redact
+/// power level is out of his reach, so nothing is decidable until the
+/// target is held. Returns the withheld event and its ID.
+async fn withheld_message(
+    env: &Env,
+    version: RoomVersion,
+    room_id: &RoomId,
+    sender: &OwnedUserId,
+) -> (CanonicalJsonObject, ruma::OwnedEventId) {
+    let prev = env.server.room_extremities(room_id.as_str()).await.unwrap();
+    let raw = craft_pdu(
+        env,
+        version,
+        room_id,
+        sender.as_str(),
+        "m.room.message",
+        None,
+        json!({"body": "late"}),
+        &prev,
+        &auth_ids_from_state(
+            env,
+            version,
+            room_id,
+            "m.room.message",
+            sender,
+            None,
+            &json!({}),
+        )
+        .await,
+        20,
+    );
+    let id = env.server.pdu_event_id(&raw).await.unwrap();
+    (raw, id)
+}
+
+/// Raise the redact level past bob so his redactions can only be
+/// authorized by matching the target's sender.
+async fn redact_level_above_bob(env: &Env, room_id: &RoomId) {
+    let (alice, bob) = (user("alice"), user("bob"));
+    accepted(
+        &env.server
+            .send_state(
+                room_id,
+                &alice,
+                "m.room.power_levels",
+                "",
+                json!({"users": {alice.as_str(): 100, bob.as_str(): 50}, "redact": 100}),
+            )
+            .await
+            .unwrap(),
+    );
+}
+
+fn content_of(event: &CanonicalJsonObject) -> &CanonicalJsonObject {
+    match event.get("content").unwrap() {
+        CanonicalJsonValue::Object(o) => o,
+        _ => panic!("content not an object"),
+    }
+}
+
+/// A redaction can reach us before the event it redacts — federated
+/// traffic is not ordered, and history older than a remote join arrives by
+/// backfill. It must take effect when the target lands, with no other
+/// trigger.
+#[tokio::test]
+async fn redaction_that_overtakes_its_target_applies_when_it_lands() {
+    let version = RoomVersion::V11;
+    let env = start_env().await;
+    let bob = user("bob");
+    let room_id = bootstrap_room(&env, version).await;
+    let store = env.server.store();
+    redact_level_above_bob(&env, &room_id).await;
+
+    let (target, target_id) = withheld_message(&env, version, &room_id, &bob).await;
+    accepted(
+        &env.server
+            .send_message(
+                &room_id,
+                &bob,
+                "m.room.redaction",
+                json!({"redacts": target_id.as_str()}),
+            )
+            .await
+            .unwrap(),
+    );
+    // Undecided, not dropped: bob may redact his own event, but whose
+    // event it is cannot be known yet.
+    assert_eq!(store.redacted_by(target_id.as_str()).await.unwrap(), None);
+
+    accepted(&env.server.ingest_pdu(target).await.unwrap());
+
+    let served = store
+        .served_event(target_id.as_str(), version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        content_of(&served).is_empty(),
+        "the redaction must take effect once its target arrives"
+    );
+    assert!(matches!(
+        served.get("unsigned"),
+        Some(CanonicalJsonValue::Object(u)) if u.contains_key("redacted_because")
+    ));
+
+    env.server.shutdown().await.unwrap();
+}
+
+/// Arriving early is not a licence to apply: when the target lands and
+/// neither half of the test holds, the redaction stays inert.
+#[tokio::test]
+async fn redaction_that_overtakes_a_target_it_may_not_redact_stays_inert() {
+    let version = RoomVersion::V11;
+    let env = start_env().await;
+    let (alice, bob) = (user("alice"), user("bob"));
+    let room_id = bootstrap_room(&env, version).await;
+    let store = env.server.store();
+    redact_level_above_bob(&env, &room_id).await;
+
+    // Alice's event, redacted by bob: not his to redact, and he is below
+    // the redact level.
+    let (target, target_id) = withheld_message(&env, version, &room_id, &alice).await;
+    accepted(
+        &env.server
+            .send_message(
+                &room_id,
+                &bob,
+                "m.room.redaction",
+                json!({"redacts": target_id.as_str()}),
+            )
+            .await
+            .unwrap(),
+    );
+    accepted(&env.server.ingest_pdu(target).await.unwrap());
+
+    assert_eq!(store.redacted_by(target_id.as_str()).await.unwrap(), None);
+    let served = store
+        .served_event(target_id.as_str(), version)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !content_of(&served).is_empty(),
+        "an unauthorized redaction must not strip its target"
+    );
+
+    env.server.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn remote_servers_in_room_lists_only_joined_remotes() {
     let env = start_env().await;
