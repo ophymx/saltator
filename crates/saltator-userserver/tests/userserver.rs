@@ -726,3 +726,182 @@ async fn media_blob_ids_is_the_placement_index() {
     );
     env.users.shutdown().await.unwrap();
 }
+
+// --- SPIKE: two-phase registration ------------------------------------------
+//
+// Prices option 3 of the user-keyspace split: keep "one use of a
+// registration token" linearizable when the token lives in one shard group
+// and the account it authorises lives in another. A hold is taken in the
+// token's group, the account is created elsewhere, and the hold is then
+// committed or released.
+//
+// What these assert is the boundary of the guarantee, which is the thing
+// worth knowing before building it.
+
+/// The property the whole design exists for: a hold counts against the
+/// limit, so two racing registrations cannot both spend a one-use token.
+/// This works without any coordinator because the decision never leaves
+/// the token's own group — Raft serializes the two reserves.
+#[tokio::test]
+async fn a_held_use_cannot_be_reserved_twice() {
+    let env = start_env().await;
+    env.users
+        .create_registration_token("tok-one-use", Some(1), None)
+        .await
+        .unwrap();
+
+    env.users
+        .reserve_reg_token("tok-one-use", "res-a")
+        .await
+        .unwrap();
+    let second = env.users.reserve_reg_token("tok-one-use", "res-b").await;
+    assert!(
+        matches!(second, Err(UserError::InvalidToken)),
+        "a held use must not be reservable again, got {second:?}"
+    );
+
+    // Idempotent: the holder retrying its own reservation is not a second use.
+    env.users
+        .reserve_reg_token("tok-one-use", "res-a")
+        .await
+        .unwrap();
+    env.users.shutdown().await.unwrap();
+}
+
+/// A registration that fails after reserving returns the use immediately,
+/// rather than making the operator wait out the horizon.
+#[tokio::test]
+async fn releasing_a_hold_returns_the_use() {
+    let env = start_env().await;
+    env.users
+        .create_registration_token("tok-release", Some(1), None)
+        .await
+        .unwrap();
+
+    env.users
+        .reserve_reg_token("tok-release", "res-a")
+        .await
+        .unwrap();
+    env.users
+        .release_reg_token("tok-release", "res-a")
+        .await
+        .unwrap();
+    env.users
+        .reserve_reg_token("tok-release", "res-b")
+        .await
+        .unwrap();
+    env.users.shutdown().await.unwrap();
+}
+
+/// The cost of holds existing at all: a gateway that dies between reserve
+/// and commit strands the use. The horizon bounds the strand — this is the
+/// "pending count" `RegToken`'s doc says the single-command design avoided.
+#[tokio::test]
+async fn an_abandoned_hold_is_swept_back_into_circulation() {
+    let env = start_env().await;
+    env.users
+        .create_registration_token("tok-sweep", Some(1), None)
+        .await
+        .unwrap();
+
+    let t0 = 1_700_000_000_000;
+    env.users
+        .reserve_reg_token_at("tok-sweep", "res-dead", t0)
+        .await
+        .unwrap();
+    // Still held just inside the horizon.
+    let inside = env
+        .users
+        .reserve_reg_token_at("tok-sweep", "res-b", t0 + 9 * 60 * 1000)
+        .await;
+    assert!(matches!(inside, Err(UserError::InvalidToken)), "{inside:?}");
+    // Past it, the abandoned hold is reclaimed and the use is available.
+    env.users
+        .reserve_reg_token_at("tok-sweep", "res-c", t0 + 11 * 60 * 1000)
+        .await
+        .unwrap();
+    env.users.shutdown().await.unwrap();
+}
+
+/// Where the absolute guarantee weakens, asserted rather than discovered
+/// later: a commit whose hold has already been swept is indistinguishable
+/// from a commit that already happened, so it does not count the use. The
+/// registration still succeeded, so the token has authorised one more
+/// account than it was allowed to.
+///
+/// Today's single-command design cannot express this failure at all. That
+/// is the price, and it is not payable in code — only in horizon length.
+#[tokio::test]
+async fn a_commit_after_its_hold_expired_does_not_count_the_use() {
+    let env = start_env().await;
+    env.users
+        .create_registration_token("tok-late", Some(1), None)
+        .await
+        .unwrap();
+
+    let t0 = 1_700_000_000_000;
+    env.users
+        .reserve_reg_token_at("tok-late", "res-slow", t0)
+        .await
+        .unwrap();
+    // Some later registration sweeps the abandoned-looking hold.
+    env.users
+        .reserve_reg_token_at("tok-late", "res-other", t0 + 11 * 60 * 1000)
+        .await
+        .unwrap();
+    // The slow gateway finally commits. The use is not counted.
+    env.users
+        .commit_reg_token("tok-late", "res-slow")
+        .await
+        .unwrap();
+
+    // Proof it went uncounted: the other hold still commits, so a one-use
+    // token has now authorised two registrations.
+    env.users
+        .commit_reg_token("tok-late", "res-other")
+        .await
+        .unwrap();
+    let third = env.users.reserve_reg_token("tok-late", "res-third").await;
+    assert!(
+        matches!(third, Err(UserError::InvalidToken)),
+        "the token should be spent out by now, got {third:?}"
+    );
+    env.users.shutdown().await.unwrap();
+}
+
+/// Committing twice spends one use, so a gateway that retries its commit
+/// after a timeout does not double-count.
+#[tokio::test]
+async fn commit_is_idempotent() {
+    let env = start_env().await;
+    env.users
+        .create_registration_token("tok-idem", Some(2), None)
+        .await
+        .unwrap();
+
+    env.users
+        .reserve_reg_token("tok-idem", "res-a")
+        .await
+        .unwrap();
+    env.users
+        .commit_reg_token("tok-idem", "res-a")
+        .await
+        .unwrap();
+    env.users
+        .commit_reg_token("tok-idem", "res-a")
+        .await
+        .unwrap();
+
+    // One use spent, so exactly one remains.
+    env.users
+        .reserve_reg_token("tok-idem", "res-b")
+        .await
+        .unwrap();
+    env.users
+        .commit_reg_token("tok-idem", "res-b")
+        .await
+        .unwrap();
+    let third = env.users.reserve_reg_token("tok-idem", "res-c").await;
+    assert!(matches!(third, Err(UserError::InvalidToken)), "{third:?}");
+    env.users.shutdown().await.unwrap();
+}

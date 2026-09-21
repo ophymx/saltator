@@ -13,8 +13,9 @@ use crate::types::{
     T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY,
     T_EDU_OUTBOX, T_EXTERNAL_ID, T_EXTERNAL_ID_USER, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE,
     T_KEY_CHANGE, T_LOGIN_TOKEN, T_MEDIA, T_MEMBERSHIP, T_NOTICES_ROOM, T_ONE_TIME_KEY, T_PROFILE,
-    T_PUSHER, T_REG_TOKEN, T_ROOM_BLOCKED, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN,
-    T_TO_DEVICE_SEEN_IDX, T_TXN_SEEN, T_TXN_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
+    T_PUSHER, T_REG_RESERVE, T_REG_RESERVE_IDX, T_REG_TOKEN, T_ROOM_BLOCKED, T_TOKEN, T_TO_DEVICE,
+    T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_TXN_SEEN, T_TXN_SEEN_IDX, T_UIA_SESSION,
+    T_UIA_SESSION_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -451,6 +452,50 @@ fn apply_register(
         write_session(ctx, session)?;
     }
     Ok(UserResponse::Ok)
+}
+
+/// SPIKE (two-phase registration). How long a held registration-token use
+/// survives without being committed or released. It has to exceed the
+/// window between the reserve and the commit — one Raft round trip to
+/// another group — by a wide margin, because the whole point of the hold
+/// is that the two cannot be atomic.
+const REG_RESERVE_HORIZON_MS: u64 = 10 * 60 * 1000;
+
+/// SPIKE: `T_REG_RESERVE` key: `token ++ 0x00 ++ reservation_id`.
+fn reserve_key(token: &str, reservation_id: &str) -> Vec<u8> {
+    user_key(token, reservation_id)
+}
+
+/// SPIKE: how many uses of `token` are held but not yet spent, counting
+/// only holds at or after `cutoff`.
+///
+/// The cutoff is not an optimisation. `ApplyCtx::range` does not see writes
+/// staged earlier in the same batch (unlike `get`), so a hold the sweep has
+/// just deleted is still returned here — counting it would keep a reclaimed
+/// use out of circulation forever. Filtering on the stored timestamp makes
+/// the count correct whether or not the delete is visible yet.
+fn held_uses(ctx: &ApplyCtx<'_>, token: &str, cutoff: u64) -> StoreResult<u64> {
+    let start = user_key(token, "");
+    let mut live = 0;
+    for (_, v) in ctx.range(T_REG_RESERVE, &start, &user_end(token))? {
+        let held_ts: u64 = dec("reserve decode", &v)?;
+        if held_ts >= cutoff {
+            live += 1;
+        }
+    }
+    Ok(live)
+}
+
+/// SPIKE: reclaim holds older than the horizon. Deterministic: the cutoff
+/// rides in the command, never read from a clock.
+fn sweep_reg_reserves(ctx: &mut ApplyCtx<'_>, cutoff: u64) -> StoreResult<()> {
+    for (k, _) in ctx.range(T_REG_RESERVE_IDX, &[], &cutoff.to_be_bytes())? {
+        ctx.delete(T_REG_RESERVE_IDX, &k);
+        if k.len() > 8 {
+            ctx.delete(T_REG_RESERVE, &k[8..]);
+        }
+    }
+    Ok(())
 }
 
 /// `T_UIA_SESSION_IDX` key: `created_ts (BE) ++ session_id`.
@@ -1117,6 +1162,80 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                 if k.len() > 8 {
                     ctx.delete(T_TXN_SEEN, &k[8..]);
                 }
+            }
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::ReserveRegToken {
+            token,
+            reservation_id,
+            ts,
+        } => {
+            // Sweep first: an abandoned hold must not keep a use out of
+            // circulation for longer than the horizon.
+            let cutoff = ts.saturating_sub(REG_RESERVE_HORIZON_MS);
+            sweep_reg_reserves(ctx, cutoff)?;
+            let key = reserve_key(token, reservation_id);
+            if ctx.get(T_REG_RESERVE, &key)?.is_some() {
+                return Ok(UserResponse::Ok); // idempotent replay
+            }
+            let Some(entry): Option<RegToken> =
+                get_typed(ctx, "reg token decode", T_REG_TOKEN, token.as_bytes())?
+            else {
+                return Ok(UserResponse::InvalidToken);
+            };
+            // Holds count against the limit, which is the whole reason the
+            // decision can stay in one group: two racing registrations are
+            // serialized here, so only one of them holds the last use.
+            if !entry.usable_with_held(*ts, held_uses(ctx, token, cutoff)?) {
+                return Ok(UserResponse::InvalidToken);
+            }
+            ctx.put(T_REG_RESERVE, &key, enc("reserve encode", ts)?);
+            let mut idx = ts.to_be_bytes().to_vec();
+            idx.extend_from_slice(&key);
+            ctx.put(T_REG_RESERVE_IDX, &idx, Vec::new());
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::CommitRegToken {
+            token,
+            reservation_id,
+        } => {
+            let key = reserve_key(token, reservation_id);
+            let Some(held_ts): Option<u64> = get_typed(ctx, "reserve decode", T_REG_RESERVE, &key)?
+            else {
+                // Already committed, or the hold was swept. The two are
+                // indistinguishable from here, and that is the spike's
+                // finding: a commit arriving after its own hold expired
+                // silently does not count the use.
+                return Ok(UserResponse::Ok);
+            };
+            let Some(mut entry): Option<RegToken> =
+                get_typed(ctx, "reg token decode", T_REG_TOKEN, token.as_bytes())?
+            else {
+                return Ok(UserResponse::NotFound);
+            };
+            entry.used += 1;
+            ctx.put(
+                T_REG_TOKEN,
+                token.as_bytes(),
+                enc("reg token encode", &entry)?,
+            );
+            let mut idx = held_ts.to_be_bytes().to_vec();
+            idx.extend_from_slice(&key);
+            ctx.delete(T_REG_RESERVE_IDX, &idx);
+            ctx.delete(T_REG_RESERVE, &key);
+            Ok(UserResponse::Ok)
+        }
+        UserCommand::ReleaseRegToken {
+            token,
+            reservation_id,
+        } => {
+            let key = reserve_key(token, reservation_id);
+            let held: Option<u64> = get_typed(ctx, "reserve decode", T_REG_RESERVE, &key)?;
+            if let Some(held_ts) = held {
+                let mut idx = held_ts.to_be_bytes().to_vec();
+                idx.extend_from_slice(&key);
+                ctx.delete(T_REG_RESERVE_IDX, &idx);
+                ctx.delete(T_REG_RESERVE, &key);
             }
             Ok(UserResponse::Ok)
         }

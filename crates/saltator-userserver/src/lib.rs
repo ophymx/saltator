@@ -933,6 +933,65 @@ impl UserServer {
         }
     }
 
+    /// SPIKE (two-phase registration): hold one use of `token`.
+    /// `Err(InvalidToken)` when no use is available — including because
+    /// another registration is holding it.
+    pub async fn reserve_reg_token(&self, token: &str, reservation_id: &str) -> Result<()> {
+        match self
+            .propose(&UserCommand::ReserveRegToken {
+                token: token.to_owned(),
+                reservation_id: reservation_id.to_owned(),
+                ts: now_ms(),
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::InvalidToken => Err(UserError::InvalidToken),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// SPIKE: hold one use of `token` at an explicit `ts` — the hook the
+    /// sweep test needs, since the horizon is measured against the
+    /// command's own timestamp.
+    pub async fn reserve_reg_token_at(
+        &self,
+        token: &str,
+        reservation_id: &str,
+        ts: u64,
+    ) -> Result<()> {
+        match self
+            .propose(&UserCommand::ReserveRegToken {
+                token: token.to_owned(),
+                reservation_id: reservation_id.to_owned(),
+                ts,
+            })
+            .await?
+        {
+            UserResponse::Ok => Ok(()),
+            UserResponse::InvalidToken => Err(UserError::InvalidToken),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// SPIKE: spend a held use.
+    pub async fn commit_reg_token(&self, token: &str, reservation_id: &str) -> Result<()> {
+        self.expect_ok(&UserCommand::CommitRegToken {
+            token: token.to_owned(),
+            reservation_id: reservation_id.to_owned(),
+        })
+        .await
+    }
+
+    /// SPIKE: return a held use.
+    pub async fn release_reg_token(&self, token: &str, reservation_id: &str) -> Result<()> {
+        self.expect_ok(&UserCommand::ReleaseRegToken {
+            token: token.to_owned(),
+            reservation_id: reservation_id.to_owned(),
+        })
+        .await
+    }
+
     pub async fn delete_registration_token(&self, token: &str) -> Result<()> {
         match self
             .propose(&UserCommand::DeleteRegistrationToken {

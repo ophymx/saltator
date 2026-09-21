@@ -140,6 +140,19 @@ pub const T_NOTICES_ROOM: u8 = APP_TABLE_FIRST + 30;
 /// human login rates, so the create-side sweep is a full-table walk over
 /// a table that is almost always empty.
 pub const T_LOGIN_TOKEN: u8 = APP_TABLE_FIRST + 31;
+/// SPIKE (two-phase registration): `token ++ 0x00 ++ reservation_id →
+/// postcard(u64 created_ts)` — one use of a registration token *held* but
+/// not yet spent, while the account it authorises is created in another
+/// shard group.
+///
+/// This is the "pending count" [`RegToken`] deliberately does not have.
+/// The hold is what makes a claim strandable, and the horizon sweep is
+/// what bounds the strand.
+pub const T_REG_RESERVE: u8 = APP_TABLE_FIRST + 34;
+/// SPIKE: `created_ts (u64 BE) ++ token ++ 0x00 ++ reservation_id → ()` —
+/// time index over [`T_REG_RESERVE`] so reclaiming abandoned holds is a
+/// range delete.
+pub const T_REG_RESERVE_IDX: u8 = APP_TABLE_FIRST + 35;
 /// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ scope ++ 0x00 ++ txn_id →
 /// postcard(u64 ts_ms)` — client transaction idempotence for
 /// `/sendToDevice`, the one transaction-bearing endpoint that is not
@@ -310,8 +323,17 @@ pub struct RegToken {
 impl RegToken {
     /// Whether the token may still authorise a registration at `now`.
     pub fn usable(&self, now: u64) -> bool {
+        self.usable_with_held(now, 0)
+    }
+
+    /// SPIKE: [`Self::usable`] counting `held` reservations against the
+    /// limit as well as spent uses. Holds have to count, or two concurrent
+    /// registrations both reserve the last use of a one-use token.
+    pub fn usable_with_held(&self, now: u64, held: u64) -> bool {
         self.expiry_ts.is_none_or(|e| now < e)
-            && self.uses_allowed.is_none_or(|allowed| self.used < allowed)
+            && self
+                .uses_allowed
+                .is_none_or(|allowed| self.used.saturating_add(held) < allowed)
     }
 }
 
@@ -870,6 +892,32 @@ pub enum UserCommand {
         /// Stamped by the gateway — apply must not read clocks. Drives the
         /// deterministic horizon prune.
         ts: u64,
+    },
+    /// SPIKE (two-phase registration): hold one use of a registration
+    /// token for `reservation_id` without spending it, so the account it
+    /// authorises can be created in another shard group and the use
+    /// committed afterwards.
+    ///
+    /// Idempotent on `reservation_id`. `ts` also drives the horizon sweep
+    /// that reclaims holds nobody committed or released.
+    ReserveRegToken {
+        token: String,
+        reservation_id: String,
+        ts: u64,
+    },
+    /// SPIKE: spend a held use. Idempotent — but see the spike note: a
+    /// commit and a commit-whose-hold-was-swept are indistinguishable
+    /// here, which is where the absolute "one use" weakens to "one use,
+    /// provided the commit lands inside the horizon".
+    CommitRegToken {
+        token: String,
+        reservation_id: String,
+    },
+    /// SPIKE: return a held use without spending it (the registration it
+    /// was held for failed). Idempotent.
+    ReleaseRegToken {
+        token: String,
+        reservation_id: String,
     },
 }
 
