@@ -726,3 +726,58 @@ async fn media_blob_ids_is_the_placement_index() {
     );
     env.users.shutdown().await.unwrap();
 }
+
+/// A name is a server-wide namespace, not a property of the account row
+/// behind it: it stays taken once the account is deactivated, and no second
+/// account may take it. Deactivation is irreversible, so handing a
+/// deactivated user's ID to somebody else would give them a stranger's
+/// history in every room that remembers it.
+#[tokio::test]
+async fn a_name_stays_taken_after_the_account_is_deactivated() {
+    let env = start_env().await;
+    let u = &env.users;
+    u.register("alice", Some("pw-12345678"), None, None, false, false)
+        .await
+        .unwrap();
+    let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
+    assert!(u.store().username_taken(alice.as_str()).unwrap());
+
+    u.deactivate(&alice).await.unwrap();
+    assert!(
+        u.store().username_taken(alice.as_str()).unwrap(),
+        "deactivation must not free the name"
+    );
+    match u
+        .register("alice", Some("pw-87654321"), None, None, false, false)
+        .await
+    {
+        Err(UserError::UserExists) => {}
+        other => panic!("expected UserExists, got {other:?}"),
+    }
+    env.users.shutdown().await.unwrap();
+}
+
+/// Every account has a row in the namespace. The invariant matters beyond
+/// registration: once the per-user half is sharded away, the namespace is
+/// the only table that can answer "is this name taken" without knowing
+/// where the account lives, so an account that never reserved its name
+/// would be invisible to the check that protects it.
+#[tokio::test]
+async fn every_account_holds_its_name_in_the_namespace() {
+    let env = start_env().await;
+    let u = &env.users;
+    for localpart in ["alice", "bob", "carol"] {
+        u.register(localpart, Some("pw-12345678"), None, None, false, false)
+            .await
+            .unwrap();
+    }
+    let (accounts, _) = u.store().accounts(None, 100).unwrap();
+    assert_eq!(accounts.len(), 3, "{accounts:?}");
+    for (user_id, _) in &accounts {
+        assert!(
+            u.store().username_taken(user_id).unwrap(),
+            "{user_id} has an account but no name reserved"
+        );
+    }
+    env.users.shutdown().await.unwrap();
+}

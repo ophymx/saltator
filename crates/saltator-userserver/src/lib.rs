@@ -50,7 +50,7 @@ pub use types::{
 /// rooms). A new table starts empty and no existing row changes shape, so
 /// there is nothing for a migration to do — the version tracks layout
 /// changes to data that already exists.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 

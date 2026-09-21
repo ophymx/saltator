@@ -273,9 +273,8 @@ pub async fn register_available(
     let store = state.users.store();
     if is_reserved_notices(&state, &req.username)
         || store
-            .account(user_id.as_str())
+            .username_taken(user_id.as_str())
             .map_err(ApiError::internal)?
-            .is_some()
     {
         return Err(ApiError::new(
             axum::http::StatusCode::BAD_REQUEST,

@@ -36,6 +36,31 @@ and its index, `T_EXTERNAL_ID`), and cross-user logs and cursors
 also the small ones: the volume is in key backups, to-device queues,
 one-time keys and account data, all user-keyed.
 
+Two commands straddle the halves, and they are what a naive split would
+break. **Registration** no longer does: an account name is now a
+namespace row of its own (`T_USERNAME`), so consuming a registration
+token and reserving the name stay in one group and one command, exactly
+as linearizable as before. What becomes non-atomic is writing the
+per-user account row, whose failure leaves a name reserved by the same
+user and an idempotent retry to finish it.
+
+Keeping that atomicity across groups instead was spiked and rejected
+(branch `spike-reg-token-reserve`). A hold taken in the token's group,
+committed after the account lands, needs no coordinator — holds counting
+against the limit is enough, because the decision never leaves that
+group. But a commit arriving after its own hold was swept is
+indistinguishable from a commit that already happened, so the use goes
+uncounted and a one-use token authorises two accounts. Exactly-once
+commit needs a dedup set with its own horizon, which has the same cliff
+one level down. "One use" would become "one use, provided the commit
+lands inside the horizon" — precisely the stranded claim `RegToken`'s
+doc says the single-command design exists to avoid.
+
+**Login** is the one left: `write_session` writes the device (per-user)
+and the token (global) together. Order it device-first and a crash
+leaves a device with no token, which the next login overwrites; the
+reverse order would leave a live token for a device that does not exist.
+
 So the split is not `user_shards = N` over what is there today. It is:
 separate the two groups of tables, sharding the per-user half and
 leaving the global half on every node — which keeps the token lookup and
