@@ -140,6 +140,21 @@ pub const T_NOTICES_ROOM: u8 = APP_TABLE_FIRST + 30;
 /// human login rates, so the create-side sweep is a full-table walk over
 /// a table that is almost always empty.
 pub const T_LOGIN_TOKEN: u8 = APP_TABLE_FIRST + 31;
+/// `user_id → [1]` — the taken-names namespace. Presence in the table is
+/// the fact; the value is a placeholder.
+///
+/// An account is two things that this keyspace has so far kept in one row:
+/// a *name*, which is unique across the whole server, and the *state*
+/// behind it, which belongs to one user. [`T_ALIAS`] is the same shape for
+/// rooms, and lives here for the same reason. Separating them is what lets
+/// the per-user half be sharded by user while the namespace stays whole:
+/// uniqueness is then decided in one group, so registration needs no
+/// cross-group protocol to stay linearizable.
+///
+/// Rows are never deleted. Deactivation is irreversible and a deactivated
+/// user's ID must never be handed to somebody else, so a name stays taken
+/// for the life of the server.
+pub const T_USERNAME: u8 = APP_TABLE_FIRST + 34;
 /// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ scope ++ 0x00 ++ txn_id →
 /// postcard(u64 ts_ms)` — client transaction idempotence for
 /// `/sendToDevice`, the one transaction-bearing endpoint that is not

@@ -14,7 +14,7 @@ use crate::types::{
     T_EDU_OUTBOX, T_EXTERNAL_ID, T_EXTERNAL_ID_USER, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE,
     T_KEY_CHANGE, T_LOGIN_TOKEN, T_MEDIA, T_MEMBERSHIP, T_NOTICES_ROOM, T_ONE_TIME_KEY, T_PROFILE,
     T_PUSHER, T_REG_TOKEN, T_ROOM_BLOCKED, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN,
-    T_TO_DEVICE_SEEN_IDX, T_TXN_SEEN, T_TXN_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
+    T_TO_DEVICE_SEEN_IDX, T_TXN_SEEN, T_TXN_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX, T_USERNAME,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -128,6 +128,18 @@ impl ShardApp for UserApp {
                         &k,
                         enc("account encode", &account_v2_to_v3(old))?,
                     );
+                }
+                Ok(())
+            }
+            // v6: account names move into a namespace table of their own
+            // ([`T_USERNAME`]), so uniqueness is decided by something that
+            // does not travel with the user's data. Backfill it from the
+            // accounts that already exist; nothing else has to change,
+            // because a name is taken for the life of the server whatever
+            // state its account is in.
+            6 => {
+                for (k, _) in ctx.range(T_ACCOUNT, &[], &[])? {
+                    ctx.put(T_USERNAME, &k, vec![1]);
                 }
                 Ok(())
             }
@@ -414,7 +426,12 @@ fn apply_register(
     registration_token: Option<&str>,
 ) -> StoreResult<UserResponse> {
     let ukey = user_id.as_bytes();
-    if ctx.get(T_ACCOUNT, ukey)?.is_some() {
+    // The namespace decides whether the name is free — that decision has to
+    // stay in one group, and this is the table that will still be there
+    // when the per-user half is sharded away. The account check behind it
+    // is a clobber guard, not the uniqueness rule: it lives in the same
+    // group as the row it protects, so it stays free either way.
+    if ctx.get(T_USERNAME, ukey)?.is_some() || ctx.get(T_ACCOUNT, ukey)?.is_some() {
         return Ok(UserResponse::UserExists);
     }
     if let Some(token) = registration_token {
@@ -447,6 +464,7 @@ fn apply_register(
             },
         )?,
     );
+    ctx.put(T_USERNAME, ukey, vec![1]);
     if let Some(session) = session {
         write_session(ctx, session)?;
     }
@@ -1774,6 +1792,14 @@ impl UserStore {
 
     pub fn account(&self, user_id: &str) -> StoreResult<Option<Account>> {
         self.get_typed("account decode", T_ACCOUNT, user_id.as_bytes())
+    }
+
+    /// Whether an account name is taken. The namespace, not the account
+    /// row: a name stays taken after deactivation, and under a sharded user
+    /// keyspace this is the question that can be answered without knowing
+    /// where the account itself lives.
+    pub fn username_taken(&self, user_id: &str) -> StoreResult<bool> {
+        Ok(self.read.get(T_USERNAME, user_id.as_bytes())?.is_some())
     }
 
     /// Whether this client transaction was already handled — durably, so
