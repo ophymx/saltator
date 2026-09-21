@@ -478,9 +478,14 @@ pub async fn get_room_event(
     if ev.get("room_id").and_then(|r| r.as_str()) != Some(req.room_id.as_str()) {
         return Err(ApiError::not_found("Event not found"));
     }
-    state
-        .txns
-        .stamp_echo(&mut ev, auth.user_id.as_str(), &auth.device_id);
+    crate::room_util::stamp_echo(
+        &state.rooms,
+        req.room_id.as_str(),
+        &mut ev,
+        auth.user_id.as_str(),
+        &auth.device_id,
+    )
+    .await?;
     Ok(Ra(get_room_event::v3::Response::new(to_raw(&ev)?)))
 }
 

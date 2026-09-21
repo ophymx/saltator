@@ -12,7 +12,8 @@ use saltator_store::{Result as StoreResult, StoreError};
 use crate::types::{
     AppendEvent, ChangePayload, ImportHistory, ImportRoom, ImportSegment, ReceiptCmd,
     ReceiptRecord, RedactDirective, RoomCommand, RoomMeta, RoomResponse, SeqEntry, StateGroup,
-    StoredEvent, T_EVENT, T_GROUP, T_HISTORY, T_RECEIPT, T_REDACT, T_ROOM, T_ROOM_SEQ, T_SEQ,
+    StoredEvent, TxnStamp, T_EVENT, T_GROUP, T_HISTORY, T_RECEIPT, T_REDACT, T_ROOM, T_ROOM_SEQ,
+    T_SEQ, T_TXN, T_TXN_ECHO, T_TXN_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -93,8 +94,33 @@ impl ShardApp for RoomApp {
             RoomCommand::Import(cmd) => apply_import(ctx, &cmd)?,
             RoomCommand::ImportHistory(cmd) => apply_import_history(ctx, &cmd)?,
             RoomCommand::ImportSegment(cmd) => apply_import_segment(ctx, &cmd)?,
+            RoomCommand::AppendStamped { event, txn } => {
+                let resp = apply_append(ctx, &event)?;
+                // Only an event that actually landed earns a record. A
+                // rejected append must stay rejected on retry, and a
+                // duplicate already has whatever record it was given.
+                if let RoomResponse::Accepted { event_id, .. } = &resp {
+                    put_txn(ctx, &txn, event_id)?;
+                }
+                resp
+            }
         };
         enc("room response encode", &resp)
+    }
+
+    /// v2: the keyspace gains the client-transaction tables ([`T_TXN`] and
+    /// friends). There is nothing to rewrite — they start empty. The step
+    /// exists for what reaching it *certifies*: the supervisor proposes a
+    /// migration only once every voter reports support for the target, so
+    /// stored v2 is the proof that [`RoomCommand::AppendStamped`] can be
+    /// proposed without wedging a replica whose binary cannot decode it.
+    fn migrate(&self, _ctx: &mut ApplyCtx<'_>, to: u32) -> StoreResult<()> {
+        match to {
+            2 => Ok(()),
+            other => Err(StoreError::Engine(format!(
+                "no migration registered for room schema step v{other}"
+            ))),
+        }
     }
 
     /// Change-stream backfill for remote subscribers: every emit writes a
@@ -349,6 +375,62 @@ fn put_redact(ctx: &mut ApplyCtx<'_>, directive: &str, redactor_id: &str) -> Sto
         }
     };
     ctx.put(T_REDACT, target.as_bytes(), entry.into_bytes());
+    Ok(())
+}
+
+/// How long a client transaction stays deduplicated. It has to outlive
+/// any retry a client plausibly makes — a phone resuming after being
+/// backgrounded, not just a socket timeout — and each record is a few
+/// dozen bytes reclaimed by a range delete, so the horizon is generous
+/// rather than tight.
+const TXN_HORIZON_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Key of a transaction record: `user ++ 0x00 ++ device ++ 0x00 ++ scope
+/// ++ 0x00 ++ txn`.
+fn txn_key(user_id: &str, device_id: &str, scope: &str, txn_id: &str) -> Vec<u8> {
+    let mut k =
+        Vec::with_capacity(user_id.len() + device_id.len() + scope.len() + txn_id.len() + 3);
+    k.extend_from_slice(user_id.as_bytes());
+    k.push(0);
+    k.extend_from_slice(device_id.as_bytes());
+    k.push(0);
+    k.extend_from_slice(scope.as_bytes());
+    k.push(0);
+    k.extend_from_slice(txn_id.as_bytes());
+    k
+}
+
+/// Record a transaction and the event it produced — both directions — and
+/// prune past the horizon. Everything is deterministic off the command's
+/// own `ts`, so every replica writes and drops the same rows.
+fn put_txn(ctx: &mut ApplyCtx<'_>, txn: &TxnStamp, event_id: &str) -> StoreResult<()> {
+    let key = txn_key(&txn.user_id, &txn.device_id, &txn.scope, &txn.txn_id);
+    ctx.put(T_TXN, &key, event_id.as_bytes());
+
+    let mut idx = txn.ts.to_be_bytes().to_vec();
+    idx.extend_from_slice(&key);
+    ctx.put(T_TXN_IDX, &idx, Vec::new());
+
+    let mut echo =
+        Vec::with_capacity(txn.user_id.len() + txn.device_id.len() + txn.txn_id.len() + 2);
+    echo.extend_from_slice(txn.user_id.as_bytes());
+    echo.push(0);
+    echo.extend_from_slice(txn.device_id.as_bytes());
+    echo.push(0);
+    echo.extend_from_slice(txn.txn_id.as_bytes());
+    ctx.put(T_TXN_ECHO, event_id.as_bytes(), echo);
+
+    let cutoff = txn.ts.saturating_sub(TXN_HORIZON_MS);
+    for (k, _) in ctx.range(T_TXN_IDX, &[], &cutoff.to_be_bytes())? {
+        ctx.delete(T_TXN_IDX, &k);
+        // The index key is the timestamp followed by the record's own key.
+        if k.len() > 8 {
+            if let Some(stale) = ctx.get(T_TXN, &k[8..])? {
+                ctx.delete(T_TXN_ECHO, &stale);
+            }
+            ctx.delete(T_TXN, &k[8..]);
+        }
+    }
     Ok(())
 }
 
@@ -1074,6 +1156,40 @@ impl RoomStore {
             return Ok(Some(redactor_id.to_owned()));
         }
         Ok(None)
+    }
+
+    /// The event a client transaction already produced, if this exact
+    /// transaction was accepted before — on any node, before any restart.
+    pub async fn txn_event(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        scope: &str,
+        txn_id: &str,
+    ) -> StoreResult<Option<String>> {
+        let key = txn_key(user_id, device_id, scope, txn_id);
+        Ok(match self.kv_get(T_TXN, &key).await? {
+            Some(v) => Some(
+                String::from_utf8(v)
+                    .map_err(|_| StoreError::Engine("txn event id not UTF-8".into()))?,
+            ),
+            None => None,
+        })
+    }
+
+    /// The transaction that produced `event_id` — `(user, device, txn)` —
+    /// for stamping `unsigned.transaction_id` on that device's local echo.
+    pub async fn txn_echo(&self, event_id: &str) -> StoreResult<Option<(String, String, String)>> {
+        let Some(v) = self.kv_get(T_TXN_ECHO, event_id.as_bytes()).await? else {
+            return Ok(None);
+        };
+        let v =
+            String::from_utf8(v).map_err(|_| StoreError::Engine("txn echo not UTF-8".into()))?;
+        let mut parts = v.splitn(3, '\0');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(u), Some(d), Some(t)) => Ok(Some((u.to_owned(), d.to_owned(), t.to_owned()))),
+            _ => Err(StoreError::Engine("txn echo value shape".into())),
+        }
     }
 
     /// An event in its servable form: the stored canonical JSON, with the

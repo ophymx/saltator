@@ -24,13 +24,45 @@ factor would strand a node with no remote path to fall back on.
 Generalizing it means giving those two surfaces the same remote seam
 the room read path got.
 
-## Transaction-ID dedupe is node-local
+## A retried transaction can still duplicate, in four narrow windows
 
-`TxnCache` is an in-memory map. A client that retries the same
-transaction against a *different* node of a cluster, or across a
-restart, is not deduplicated and will send its event twice. Making the
-guarantee cluster-wide means moving the cache into the user shard,
-which is durable and replicated.
+Client transaction records are durable and cluster-wide. Where they live
+follows from what each endpoint is scoped to rather than from one tidy
+home: `/send` and `/redact` are scoped to a room, so their record goes
+into that room's own shard and is written in the same batch as the event
+— no retry can observe the event without the record that deduplicates
+it, and the reverse index that stamps `unsigned.transaction_id` sits
+beside the event the sync path is already reading. `/sendToDevice` is
+scoped to the device, not a room, so its record goes into the user
+shard. Putting the room-scoped records in the user shard instead would
+have bought a second Raft group per send and no atomicity.
+
+What is left:
+
+- **`/sendToDevice`'s record is not atomic with its effects.** The mark
+  is its own command, proposed last — after the local inbox write and
+  the remote EDU enqueue — because folding it into the queue command
+  would mark the transaction *before* the EDUs went out, and lose them
+  on a failure there. A crash in that gap leaves the retry
+  undeduplicated. Closing it means making an inbox write, an EDU
+  enqueue and a mark one atomic act across three Raft groups: a
+  distributed transaction, not a table.
+- **Records do not exist below the target schema version.** Proposing
+  the stamped commands to a group that still holds a replica whose
+  binary cannot decode them would wedge that replica, so both are gated
+  on a voter-gated schema step (room v2, user v4). Until a shard
+  migrates — which happens at startup, in milliseconds — transactions
+  are node-local, exactly as they were before.
+- **The lookup is a follower read.** A node answering a retry reads its
+  own applied state, which can trail the leader by the replication
+  delay; a retry that arrives inside that window does not see the
+  record. Making it linearizable means a Raft read-index round trip on
+  every send, which is a real cost on the hot path for a window a
+  client only hits by racing itself — the failover case this exists for
+  is orders of magnitude slower.
+- **The horizon is 24 hours.** A retry older than that is a new
+  transaction. The alternative is unbounded retention of a row per
+  message ever sent, which is worse.
 
 ## Redactions in imported history do not take effect
 

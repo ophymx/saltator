@@ -25,14 +25,21 @@ pub async fn send_to_device(
     auth: Auth,
     Ar(req): Ar<send_event_to_device::v3::Request>,
 ) -> Result<Ra<send_event_to_device::v3::Response>> {
-    // A retransmitted transaction was already queued; do nothing.
+    // A retransmitted transaction was already queued; do nothing. The
+    // record is in the user shard — replicated and durable — so a retry
+    // against another node, or after this one restarted, is still a retry.
     let scope = format!("to_device\0{}", req.event_type);
-    if state.txns.seen(
-        auth.user_id.as_str(),
-        &auth.device_id,
-        &scope,
-        req.txn_id.as_str(),
-    ) {
+    if state
+        .users
+        .store()
+        .txn_seen(
+            auth.user_id.as_str(),
+            &auth.device_id,
+            &scope,
+            req.txn_id.as_str(),
+        )
+        .map_err(crate::error::ApiError::internal)?
+    {
         return Ok(Ra(send_event_to_device::v3::Response::new()));
     }
 
@@ -114,11 +121,18 @@ pub async fn send_to_device(
         }
     }
 
-    state.txns.mark(
-        auth.user_id.as_str(),
-        &auth.device_id,
-        &scope,
-        req.txn_id.as_str(),
-    );
+    // Last, as before: after the local inbox write and the remote EDU
+    // enqueue, so a failure in either still leaves the transaction
+    // retryable rather than marked-and-lost.
+    state
+        .users
+        .mark_txn(
+            auth.user_id.as_str(),
+            &auth.device_id,
+            &scope,
+            req.txn_id.as_str(),
+            crate::now_ms(),
+        )
+        .await?;
     Ok(Ra(send_event_to_device::v3::Response::new()))
 }

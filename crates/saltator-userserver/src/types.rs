@@ -140,6 +140,15 @@ pub const T_NOTICES_ROOM: u8 = APP_TABLE_FIRST + 30;
 /// human login rates, so the create-side sweep is a full-table walk over
 /// a table that is almost always empty.
 pub const T_LOGIN_TOKEN: u8 = APP_TABLE_FIRST + 31;
+/// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ scope ++ 0x00 ++ txn_id →
+/// postcard(u64 ts_ms)` — client transaction idempotence for
+/// `/sendToDevice`, the one transaction-bearing endpoint that is not
+/// scoped to a room (so its record cannot ride a room append the way
+/// `/send` and `/redact` do — see the room keyspace's `T_TXN`).
+pub const T_TXN_SEEN: u8 = APP_TABLE_FIRST + 32;
+/// `ts_ms (u64 BE) ++ <[`T_TXN_SEEN`] key> → ()` — time index over
+/// [`T_TXN_SEEN`] so the horizon prune is a range delete.
+pub const T_TXN_SEEN_IDX: u8 = APP_TABLE_FIRST + 33;
 
 /// `user_id ++ 0x00 ++ rest` — user IDs cannot contain NUL.
 pub(crate) fn user_key(user_id: &str, rest: &str) -> Vec<u8> {
@@ -423,6 +432,12 @@ pub struct SessionCmd {
 }
 
 /// Commands applied to the user state machine.
+///
+/// Variants are appended, never reordered or inserted: postcard encodes the
+/// discriminant positionally, so moving one renumbers every variant after it
+/// and misreads every log entry written before the change. A new variant at
+/// the end leaves existing entries byte-identical; the schema version gates
+/// when proposing it is safe (see [`crate::SCHEMA_VERSION`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UserCommand {
     /// Reserve a username and (unless `inhibit_login`) create the first
@@ -814,6 +829,24 @@ pub enum UserCommand {
         token_hash: [u8; 32],
         /// Gateway clock, against which expiry is judged.
         now_ts: u64,
+    },
+    /// Mark a client transaction handled, durably and for the whole
+    /// cluster (`/sendToDevice`, which has no event ID to replay — the
+    /// record only has to exist).
+    ///
+    /// Deliberately its own command, proposed where the in-memory mark
+    /// used to happen: last, after the local inbox write AND the remote
+    /// EDU enqueue. Folding it into the queue command would mark the
+    /// transaction before the EDUs were enqueued, so a failure there would
+    /// leave a retry no-opping and the remote messages lost.
+    MarkTxn {
+        user_id: String,
+        device_id: String,
+        scope: String,
+        txn_id: String,
+        /// Stamped by the gateway — apply must not read clocks. Drives the
+        /// deterministic horizon prune.
+        ts: u64,
     },
 }
 

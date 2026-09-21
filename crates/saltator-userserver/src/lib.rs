@@ -50,7 +50,7 @@ pub use types::{
 /// rooms). A new table starts empty and no existing row changes shape, so
 /// there is nothing for a migration to do — the version tracks layout
 /// changes to data that already exists.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 pub const USER_SHARD: ShardId = ShardId::new(Keyspace::User, 0);
 
@@ -542,6 +542,40 @@ impl UserServer {
             UserResponse::ClaimedKeys(keys) => Ok(keys),
             other => Err(unexpected(other)),
         }
+    }
+
+    /// Whether this shard's applied state is at the version
+    /// [`UserCommand::MarkTxn`] needs. False while a shard is still
+    /// mid-upgrade, where transactions stay node-local — the behaviour that
+    /// predates the record, not a new failure.
+    fn txn_records_available(&self) -> bool {
+        matches!(self.shard_handle().schema_versions(), Ok((stored, _)) if stored >= 4)
+    }
+
+    /// Mark a client transaction handled, durably and cluster-wide.
+    ///
+    /// Proposing to a group holding a replica that cannot decode the
+    /// command would wedge that replica, so this is a no-op until the
+    /// voter gate has advanced the shard to v4 (see the `migrate` arm).
+    pub async fn mark_txn(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        scope: &str,
+        txn_id: &str,
+        ts: u64,
+    ) -> Result<()> {
+        if !self.txn_records_available() {
+            return Ok(());
+        }
+        self.expect_ok(&UserCommand::MarkTxn {
+            user_id: user_id.to_owned(),
+            device_id: device_id.to_owned(),
+            scope: scope.to_owned(),
+            txn_id: txn_id.to_owned(),
+            ts,
+        })
+        .await
     }
 
     /// Queue to-device messages into recipients' inboxes (`/sendToDevice`),

@@ -13,8 +13,8 @@ use crate::types::{
     T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_EDU_OUTBOX, T_EXTERNAL_ID,
     T_EXTERNAL_ID_USER, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_LOGIN_TOKEN,
     T_MEDIA, T_MEMBERSHIP, T_NOTICES_ROOM, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_REG_TOKEN,
-    T_ROOM_BLOCKED, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_UIA_SESSION,
-    T_UIA_SESSION_IDX,
+    T_ROOM_BLOCKED, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_TXN_SEEN,
+    T_TXN_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -88,6 +88,13 @@ impl ShardApp for UserApp {
                 }
                 Ok(())
             }
+            // v4: the keyspace gains the client-transaction tables
+            // ([`T_TXN_SEEN`] and its index). Nothing to rewrite — they
+            // start empty. The step exists for what reaching it certifies:
+            // the voter gate only lets it be proposed once every voter's
+            // binary supports v4, which is what makes `MarkTxn` safe to
+            // propose.
+            4 => Ok(()),
             other => Err(StoreError::Engine(format!(
                 "no migration registered for user schema step v{other}"
             ))),
@@ -1025,6 +1032,28 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
             queue_to_device(ctx, messages)?;
             Ok(UserResponse::Ok)
         }
+        UserCommand::MarkTxn {
+            user_id,
+            device_id,
+            scope,
+            txn_id,
+            ts,
+        } => {
+            let key = txn_key(user_id, device_id, scope, txn_id);
+            ctx.put(T_TXN_SEEN, &key, enc("txn seen encode", ts)?);
+            let mut idx_key = ts.to_be_bytes().to_vec();
+            idx_key.extend_from_slice(&key);
+            ctx.put(T_TXN_SEEN_IDX, &idx_key, Vec::new());
+            // Horizon prune, deterministic off the command's own ts.
+            let cutoff = ts.saturating_sub(TXN_SEEN_HORIZON_MS);
+            for (k, _) in ctx.range(T_TXN_SEEN_IDX, &[], &cutoff.to_be_bytes())? {
+                ctx.delete(T_TXN_SEEN_IDX, &k);
+                if k.len() > 8 {
+                    ctx.delete(T_TXN_SEEN, &k[8..]);
+                }
+            }
+            Ok(UserResponse::Ok)
+        }
         UserCommand::RecordKeyChange { user_id } => {
             log_key_change(ctx, user_id)?;
             Ok(UserResponse::Ok)
@@ -1572,6 +1601,27 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
 /// generous while keeping the seen-set bounded.
 const TO_DEVICE_SEEN_HORIZON_MS: u64 = 60 * 60 * 1000;
 
+/// How long a client transaction stays deduplicated. Longer than the
+/// federation horizon above on purpose: that one bounds a peer server's
+/// redelivery, this one bounds a *client's* retry — a phone resuming after
+/// being backgrounded, not a socket timeout.
+const TXN_SEEN_HORIZON_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Key of a client transaction record: `user ++ 0x00 ++ device ++ 0x00 ++
+/// scope ++ 0x00 ++ txn`.
+fn txn_key(user_id: &str, device_id: &str, scope: &str, txn_id: &str) -> Vec<u8> {
+    let mut k =
+        Vec::with_capacity(user_id.len() + device_id.len() + scope.len() + txn_id.len() + 3);
+    k.extend_from_slice(user_id.as_bytes());
+    k.push(0);
+    k.extend_from_slice(device_id.as_bytes());
+    k.push(0);
+    k.extend_from_slice(scope.as_bytes());
+    k.push(0);
+    k.extend_from_slice(txn_id.as_bytes());
+    k
+}
+
 /// Queue to-device messages into recipients' durable inboxes (shared by
 /// the local and federation-deduped commands).
 fn queue_to_device(ctx: &mut ApplyCtx<'_>, messages: &[crate::ToDeviceMessage]) -> StoreResult<()> {
@@ -1655,6 +1705,22 @@ impl UserStore {
 
     pub fn account(&self, user_id: &str) -> StoreResult<Option<Account>> {
         self.get_typed("account decode", T_ACCOUNT, user_id.as_bytes())
+    }
+
+    /// Whether this client transaction was already handled — durably, so
+    /// the answer is the same on every node of the cluster and survives a
+    /// restart of any of them.
+    pub fn txn_seen(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        scope: &str,
+        txn_id: &str,
+    ) -> StoreResult<bool> {
+        Ok(self
+            .read
+            .get(T_TXN_SEEN, &txn_key(user_id, device_id, scope, txn_id))?
+            .is_some())
     }
 
     /// One page of accounts in user-id order, starting at `from`

@@ -13,7 +13,6 @@ mod ratelimit;
 mod room_util;
 mod routes;
 mod services;
-mod txn;
 mod typing;
 
 use std::sync::Arc;
@@ -96,7 +95,6 @@ pub struct CsState {
     /// (absent in client-only test harnesses). Enables joining remote
     /// rooms.
     pub federation: Option<Federation>,
-    pub(crate) txns: txn::TxnCache,
     /// Per-user serialization of push-rule read-modify-writes: concurrent
     /// mutations (two parallel joins both copying upgrade rules, say)
     /// would otherwise lose one write.
@@ -306,7 +304,6 @@ impl CsState {
             presence: Arc::new(PresenceMap::new()),
             federation: None,
             fedout: None,
-            txns: txn::TxnCache::new(),
             push_rule_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             rate_limiter: ratelimit::RateLimiter::new(),
             appservices: Arc::new(AppServices::default()),

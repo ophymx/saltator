@@ -8,9 +8,51 @@ use axum::extract::State;
 use ruma::api::client::message::send_message_event;
 use ruma::api::client::redact::redact_event;
 use ruma::api::client::state::send_state_event;
+use ruma::OwnedEventId;
+use saltator_roomserver::TxnStamp;
 use std::sync::Arc;
 
 use super::*;
+
+/// The transaction record for a room-scoped send, carried into the append
+/// so it lands in the same write batch as the event.
+fn txn_stamp(auth: &Auth, scope: &str, txn_id: &str) -> TxnStamp {
+    TxnStamp {
+        user_id: auth.user_id.to_string(),
+        device_id: auth.device_id.clone(),
+        scope: scope.to_owned(),
+        txn_id: txn_id.to_owned(),
+        // Stamped here rather than in the apply, which must not read
+        // clocks; it drives the room shard's horizon prune.
+        ts: crate::now_ms(),
+    }
+}
+
+/// The event a previous attempt at this transaction already produced, if
+/// any. The record lives in the room's own shard next to the event, so the
+/// answer is the same on every node and across a restart — not a property
+/// of whichever process happens to answer the retry.
+async fn txn_replay(
+    state: &CsState,
+    room_id: &str,
+    auth: &Auth,
+    scope: &str,
+    txn_id: &str,
+) -> Result<Option<OwnedEventId>> {
+    let replayed = state
+        .rooms
+        .for_room(room_id)
+        .store()
+        .txn_event(auth.user_id.as_str(), &auth.device_id, scope, txn_id)
+        .await
+        .map_err(ApiError::internal)?;
+    match replayed {
+        Some(id) => Ok(Some(
+            OwnedEventId::try_from(id).map_err(|e| ApiError::internal(e.to_string()))?,
+        )),
+        None => Ok(None),
+    }
+}
 
 // -- send ----------------------------------------------------------------------
 
@@ -21,15 +63,18 @@ pub async fn send_message_event(
 ) -> Result<Ra<send_message_event::v3::Response>> {
     // Txn IDs are scoped to the endpoint path: room + event type.
     let scope = format!("send\0{}\0{}", req.room_id, req.event_type);
-    if let Some(event_id) = state.txns.get(
-        auth.user_id.as_str(),
-        &auth.device_id,
+    if let Some(event_id) = txn_replay(
+        &state,
+        req.room_id.as_str(),
+        &auth,
         &scope,
         req.txn_id.as_str(),
-    ) {
+    )
+    .await?
+    {
         return Ok(Ra(send_message_event::v3::Response::new(event_id)));
     }
-    // After the txn-cache check: idempotent retries must not be limited.
+    // After the transaction check: idempotent retries must not be limited.
     // Appservices may be exempt (`rate_limited: false`, and the sender
     // always is) — a bridge relaying a busy remote room is not a spammer.
     if !auth.rate_limit_exempt() {
@@ -43,39 +88,18 @@ pub async fn send_message_event(
         Some(ts) if auth.is_appservice() => Some(u64::from(ts.0)),
         _ => None,
     };
-    let outcome = match ts_override {
-        Some(ts) => {
-            state
-                .rooms
-                .send_message_at(
-                    &req.room_id,
-                    &auth.user_id,
-                    &req.event_type.to_string(),
-                    content,
-                    ts,
-                )
-                .await?
-        }
-        None => {
-            state
-                .rooms
-                .send_message(
-                    &req.room_id,
-                    &auth.user_id,
-                    &req.event_type.to_string(),
-                    content,
-                )
-                .await?
-        }
-    };
+    let outcome = state
+        .rooms
+        .send_message_stamped(
+            &req.room_id,
+            &auth.user_id,
+            &req.event_type.to_string(),
+            content,
+            ts_override,
+            Some(txn_stamp(&auth, &scope, req.txn_id.as_str())),
+        )
+        .await?;
     let (event_id, _) = accepted_event_id(outcome)?;
-    state.txns.put(
-        auth.user_id.as_str(),
-        &auth.device_id,
-        &scope,
-        req.txn_id.as_str(),
-        event_id.clone(),
-    );
     Ok(Ra(send_message_event::v3::Response::new(event_id)))
 }
 
@@ -266,12 +290,15 @@ pub async fn redact_event(
     Ar(req): Ar<redact_event::v3::Request>,
 ) -> Result<Ra<redact_event::v3::Response>> {
     let scope = format!("redact\0{}\0{}", req.room_id, req.event_id);
-    if let Some(event_id) = state.txns.get(
-        auth.user_id.as_str(),
-        &auth.device_id,
+    if let Some(event_id) = txn_replay(
+        &state,
+        req.room_id.as_str(),
+        &auth,
         &scope,
         req.txn_id.as_str(),
-    ) {
+    )
+    .await?
+    {
         return Ok(Ra(redact_event::v3::Response::new(event_id)));
     }
     let mut content = serde_json::json!({ "redacts": req.event_id.as_str() });
@@ -280,15 +307,15 @@ pub async fn redact_event(
     }
     let outcome = state
         .rooms
-        .send_message(&req.room_id, &auth.user_id, "m.room.redaction", content)
+        .send_message_stamped(
+            &req.room_id,
+            &auth.user_id,
+            "m.room.redaction",
+            content,
+            None,
+            Some(txn_stamp(&auth, &scope, req.txn_id.as_str())),
+        )
         .await?;
     let (event_id, _) = accepted_event_id(outcome)?;
-    state.txns.put(
-        auth.user_id.as_str(),
-        &auth.device_id,
-        &scope,
-        req.txn_id.as_str(),
-        event_id.clone(),
-    );
     Ok(Ra(redact_event::v3::Response::new(event_id)))
 }

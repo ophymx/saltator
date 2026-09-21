@@ -5,8 +5,8 @@
 # The spec's guarantee ("Transaction identifiers", CS API) is per device and
 # per endpoint path, not per server process — a retry is a retry whichever
 # node answers it, and whether or not that node has been restarted since.
-# `TxnCache` is an in-memory map owned by one cs-api process, so both of
-# those are currently duplicates:
+# Both used to duplicate, back when the record was an in-memory map owned
+# by one cs-api process:
 #
 #   A. retry against a DIFFERENT node of the cluster
 #   B. retry against the SAME node after it restarted
@@ -15,10 +15,9 @@
 # node drains or fails a health check — the event HA exists to survive. (B)
 # is what a rolling upgrade does to every in-flight client.
 #
-# NOT WIRED INTO CI YET: this fails today, by design — it is the proof of
-# the gap, written before the fix. Add it to the cluster job in the same
-# change that makes dedupe durable (docs/deferred.md, "Transaction-ID
-# dedupe is node-local").
+# Gates the cluster job. It is the only place either property is visible:
+# cs-api's suite is single-node by construction, and cluster_churn_soak.sh
+# deliberately never retries across nodes.
 #
 # Usage: scripts/txn_dedupe_smoke.sh [path-to-saltator-binary]
 set -uo pipefail
