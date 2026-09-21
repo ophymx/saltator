@@ -32,14 +32,22 @@ restart, is not deduplicated and will send its event twice. Making the
 guarantee cluster-wide means moving the cache into the user shard,
 which is durable and replicated.
 
-## A federated redaction can arrive before its target
+## Redactions in imported history do not take effect
 
-The redaction is accepted and stored, but `T_REDACT` — the target →
-redactor mapping the read path consults — is only written when the
-target is already held. Nothing backfills it, so a redaction that
-overtakes its target in transit never takes effect. Closing this means
-either retrying unresolved redactions when their target lands, or
-resolving them at read time.
+Only the event pipeline decides what a redaction does; the bulk import
+paths trust their events wholesale and never ask. A redaction that
+arrives inside backfilled history (`ImportHistory`) or a recovered
+segment (`ImportSegment`) is stored as an event and applies to nothing —
+even when its target is an event we hold. A redaction that merely
+*overtakes* its target through the pipeline is handled: it is stored
+undecided and settled on the read path (`RedactDirective`).
+
+Closing this means deciding redactions for imported events too. The
+same-sender half of the test needs nothing the import does not already
+have. The redact-power-level half needs the state at the redaction:
+`ImportSegment` has an anchor snapshot that would approximate it, and
+`ImportHistory` has no state to resolve against at all — which is the
+part that needs a decision rather than code.
 
 ## The `saltator-federation` split
 

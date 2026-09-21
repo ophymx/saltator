@@ -58,8 +58,8 @@ pub use machine::{RoomApp, RoomPage, RoomStore};
 pub use shards::{shard_of, RoomShards, ShardTail};
 pub use signer::{ServerSigner, SignError};
 pub use types::{
-    AppendEvent, ChangePayload, ReceiptCmd, ReceiptRecord, Rejected, RoomCommand, RoomMeta,
-    RoomResponse, SeqEntry, StateGroup, StoredEvent, MAX_GROUP_CHAIN,
+    AppendEvent, ChangePayload, ReceiptCmd, ReceiptRecord, RedactDirective, Rejected, RoomCommand,
+    RoomMeta, RoomResponse, SeqEntry, StateGroup, StoredEvent, MAX_GROUP_CHAIN,
 };
 
 /// This binary's schema version for this shard app — bump together with
@@ -2821,7 +2821,7 @@ impl RoomServer {
         // Accepted m.room.redaction: decide whether it *applies* to its
         // target (spec "Redactions": same sender, or redact power level).
         let redacts = if event.event_type() == "m.room.redaction" {
-            self.redaction_target(&store, room_id, &event, version, &state_before, &fetch)
+            self.redaction_directive(&store, room_id, &event, version, &state_before, &fetch)
                 .await?
         } else {
             None
@@ -2846,16 +2846,17 @@ impl RoomServer {
         self.propose(cmd).await
     }
 
-    /// For an accepted `m.room.redaction`, the target event it may be
-    /// applied to: locally known, same room, and either sent by the
-    /// redaction's sender or redactable at the sender's power level
-    /// (evaluated against the state before the redaction).
+    /// For an accepted `m.room.redaction`, what it does to its target —
+    /// the [`RedactDirective`] the apply stores, or `None` for a redaction
+    /// that can never apply.
     ///
-    /// A redaction naming a target this server does not hold is dropped:
-    /// it is accepted as an event but applies to nothing. A federated
-    /// redaction that arrives before its target therefore never takes
-    /// effect, which is a known gap rather than a decision.
-    async fn redaction_target(
+    /// The spec's test ("Redactions") is that the redaction was sent by
+    /// the target's own sender, or by someone holding the redact power
+    /// level in the state before the redaction. Only the second half is
+    /// decidable without the target, so a redaction that overtook its
+    /// target is stored pending with that half recorded, and the read path
+    /// settles it when the target lands.
+    async fn redaction_directive(
         &self,
         store: &RoomStore,
         room_id: &ruma::RoomId,
@@ -2871,7 +2872,13 @@ impl RoomServer {
             return Ok(None);
         };
         let Some(stored) = store.event(target_id.as_str()).await.map_err(storage_err)? else {
-            return Ok(None);
+            return Ok(Some(
+                RedactDirective::Pending {
+                    id: target_id.as_str(),
+                    may_redact: sender_may_redact(event, version, state_before, fetch)?,
+                }
+                .encode(),
+            ));
         };
         if stored.rejected.is_some() {
             return Ok(None);
@@ -2882,21 +2889,12 @@ impl RoomServer {
         if target.room_id() != Some(room_id) {
             return Ok(None);
         }
-        if target.sender() == event.sender() {
-            return Ok(Some(target_id.to_string()));
+        if target.sender() == event.sender()
+            || sender_may_redact(event, version, state_before, fetch)?
+        {
+            return Ok(Some(RedactDirective::Applies(target_id.as_str()).encode()));
         }
-        let create_key = ("m.room.create".to_owned(), String::new());
-        let Some(create) = state_before.get(&create_key).and_then(|id| fetch(id)) else {
-            return Ok(None);
-        };
-        let pl_key = ("m.room.power_levels".to_owned(), String::new());
-        let pl_event = state_before.get(&pl_key).and_then(|id| fetch(id));
-        let pls = RoomPowerLevels::resolve(version, &create, pl_event.as_ref())
-            .map_err(|e| RoomError::Malformed(e.to_string()))?;
-        Ok(pls
-            .user(event.sender())
-            .satisfies(pls.redact)
-            .then(|| target_id.to_string()))
+        Ok(None)
     }
 
     async fn propose_rejected(
@@ -2988,6 +2986,26 @@ impl RoomServer {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Whether `event`'s sender held the redact power level in the state
+/// before it — the half of the spec's redaction test ("Redactions") that
+/// does not need the target event in hand.
+fn sender_may_redact(
+    event: &IdentifiedPdu,
+    version: RoomVersion,
+    state_before: &StateIds,
+    fetch: &impl Fn(&EventId) -> Option<IdentifiedPdu>,
+) -> Result<bool> {
+    let create_key = ("m.room.create".to_owned(), String::new());
+    let Some(create) = state_before.get(&create_key).and_then(|id| fetch(id)) else {
+        return Ok(false);
+    };
+    let pl_key = ("m.room.power_levels".to_owned(), String::new());
+    let pl_event = state_before.get(&pl_key).and_then(|id| fetch(id));
+    let pls = RoomPowerLevels::resolve(version, &create, pl_event.as_ref())
+        .map_err(|e| RoomError::Malformed(e.to_string()))?;
+    Ok(pls.user(event.sender()).satisfies(pls.redact))
+}
 
 /// Allocate a full-snapshot state group.
 fn alloc_full(
