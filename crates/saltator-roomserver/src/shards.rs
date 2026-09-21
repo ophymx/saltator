@@ -191,6 +191,22 @@ impl RoomShards {
             .await
     }
 
+    /// [`Self::send_message`] carrying the client transaction behind it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message_stamped(
+        &self,
+        room_id: &ruma::RoomId,
+        sender: &ruma::UserId,
+        event_type: &str,
+        content: serde_json::Value,
+        ts: Option<u64>,
+        txn: Option<crate::TxnStamp>,
+    ) -> Result<Outcome> {
+        self.for_room(room_id.as_str())
+            .send_message_stamped(room_id, sender, event_type, content, ts, txn)
+            .await
+    }
+
     pub async fn send_message_at(
         &self,
         room_id: &ruma::RoomId,

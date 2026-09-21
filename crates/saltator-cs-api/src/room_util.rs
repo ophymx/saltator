@@ -236,6 +236,44 @@ pub async fn require_joined(rooms: &RoomShards, room_id: &str, user_id: &str) ->
     Ok(state)
 }
 
+/// Stamp `unsigned.transaction_id` on an event this device sent.
+///
+/// The record sits in the room's own shard beside the event, so a client
+/// that reconnects through a different node — or after this one restarted —
+/// still recognizes its own echo. Only the requester's own events are
+/// looked up: nobody else's event can be their transaction, which keeps
+/// this off the hot path for the rest of a sync batch.
+pub async fn stamp_echo(
+    rooms: &RoomShards,
+    room_id: &str,
+    ev: &mut serde_json::Value,
+    user_id: &str,
+    device_id: &str,
+) -> Result<()> {
+    if ev.get("sender").and_then(|s| s.as_str()) != Some(user_id) {
+        return Ok(());
+    }
+    let Some(event_id) = ev
+        .get("event_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+    else {
+        return Ok(());
+    };
+    let echo = rooms
+        .for_room(room_id)
+        .store()
+        .txn_echo(&event_id)
+        .await
+        .map_err(ApiError::internal)?;
+    if let Some((u, d, txn)) = echo {
+        if u == user_id && d == device_id {
+            ev["unsigned"]["transaction_id"] = txn.into();
+        }
+    }
+    Ok(())
+}
+
 /// An event in the client event format (redactions applied): `content`,
 /// `event_id`, `origin_server_ts`, `room_id`, `sender`, `state_key`,
 /// `type`, `unsigned`. `as_user` is the requesting user, whose membership

@@ -34,6 +34,20 @@ pub const T_REDACT: u8 = APP_TABLE_FIRST + 6;
 /// [`RoomCommand::ImportHistory`]; `/messages` pagination continues here
 /// after the local timeline floor.
 pub const T_HISTORY: u8 = APP_TABLE_FIRST + 7;
+/// `user_id ++ 0x00 ++ device_id ++ 0x00 ++ scope ++ 0x00 ++ txn_id →
+/// event_id (UTF-8)` — client transaction idempotence for the room-scoped
+/// endpoints (`/send`, `/redact`). Written in the same batch as the event
+/// it names, so no retry can see the event without the record that
+/// deduplicates it, on any node and across any restart.
+pub const T_TXN: u8 = APP_TABLE_FIRST + 8;
+/// `ts_ms (u64 BE) ++ <[`T_TXN`] key> → ()` — time index over [`T_TXN`]
+/// so the horizon prune is a range delete.
+pub const T_TXN_IDX: u8 = APP_TABLE_FIRST + 9;
+/// `event_id → user_id ++ 0x00 ++ device_id ++ 0x00 ++ txn_id` — the
+/// reverse direction of [`T_TXN`], for stamping
+/// `unsigned.transaction_id` on the local echo served back to the device
+/// that sent the event. Pruned with its [`T_TXN`] row.
+pub const T_TXN_ECHO: u8 = APP_TABLE_FIRST + 10;
 
 /// Full state maps are stored every `MAX_GROUP_CHAIN` groups along a fork;
 /// deltas otherwise (spec.md §5.2, "state deltas with periodic full
@@ -198,7 +212,30 @@ pub struct RoomMeta {
     pub gap_markers: Vec<u64>,
 }
 
+/// The client transaction that produced a locally sent event.
+///
+/// Transaction IDs are scoped to the device AND the endpoint path (spec
+/// v1.7): the same ID against a different room or event type is a
+/// different transaction. `scope` carries that path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxnStamp {
+    pub user_id: String,
+    pub device_id: String,
+    pub scope: String,
+    pub txn_id: String,
+    /// Stamped by the gateway — apply must not read clocks. Drives the
+    /// deterministic horizon prune.
+    pub ts: u64,
+}
+
 /// Commands applied to the room state machine.
+///
+/// Variants are appended, never reordered or given new fields: these are
+/// persisted postcard, which encodes positionally and carries no
+/// per-command version tag, so an entry written by an older binary must
+/// still decode here (spec.md §4.4 — N/N+1 binaries interoperate). A new
+/// variant leaves every existing entry byte-identical; the schema version
+/// gates when proposing it is safe (see [`crate::SCHEMA_VERSION`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RoomCommand {
     Append(Box<AppendEvent>),
@@ -206,6 +243,15 @@ pub enum RoomCommand {
     Import(Box<ImportRoom>),
     ImportHistory(Box<ImportHistory>),
     ImportSegment(Box<ImportSegment>),
+    /// [`Self::Append`] plus the transaction that produced the event,
+    /// recorded in the same write batch — which is the whole point: a
+    /// transaction record in another Raft group could not be atomic with
+    /// the append, leaving a window where the event exists and the record
+    /// that dedupes it does not.
+    AppendStamped {
+        event: Box<AppendEvent>,
+        txn: TxnStamp,
+    },
 }
 
 /// Append a recovered chain of events past an unfillable gap: when

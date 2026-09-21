@@ -112,6 +112,26 @@ proposing a migration the leader asks every voter for its live binary's
 schema version over the internal RPC; any voter unreachable or behind
 means no proposal, retried on a timer.
 
+## Transaction records live with whatever they are scoped to
+
+A client transaction ID is scoped to the device and the endpoint path,
+and two of the three endpoints carrying one — `/send` and `/redact` —
+name a room. So their record goes into that room's shard, in the same
+write batch as the event: no retry can observe the event without the
+record that deduplicates it, and the send path gains no second Raft
+group. The reverse index that stamps `unsigned.transaction_id` rides
+along, beside the event the sync path is already reading.
+
+`/sendToDevice` names no room, so its record goes into the user shard —
+and there it is a separate command, proposed last, after the inbox write
+and the EDU enqueue. Marking before those would turn a failure into lost
+messages rather than a duplicate, which is the worse trade.
+
+The uniform alternative, everything in the user shard, reads better on
+paper and is worse in fact: a second Raft group on every send, no
+atomicity to show for it, and a user-shard lookup on every timeline
+event the sync path serves.
+
 ## Room shutdown is not room purge
 
 `DELETE /rooms/{id}` kicks local members and blocks re-join. It does not

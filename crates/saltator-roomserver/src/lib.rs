@@ -59,12 +59,12 @@ pub use shards::{shard_of, RoomShards, ShardTail};
 pub use signer::{ServerSigner, SignError};
 pub use types::{
     AppendEvent, ChangePayload, ReceiptCmd, ReceiptRecord, RedactDirective, Rejected, RoomCommand,
-    RoomMeta, RoomResponse, SeqEntry, StateGroup, StoredEvent, MAX_GROUP_CHAIN,
+    RoomMeta, RoomResponse, SeqEntry, StateGroup, StoredEvent, TxnStamp, MAX_GROUP_CHAIN,
 };
 
 /// This binary's schema version for this shard app — bump together with
 /// a `migrate` arm.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Shard 0 of the room keyspace: the shard a single-group server starts,
 /// and the id [`RoomServer::start`] uses. Multi-shard deployments route
@@ -741,8 +741,16 @@ impl RoomServer {
             };
             return remote::want_outcome(remote::call(r, &intent).await?);
         }
-        self.send_local(room_id, sender, event_type, Some(state_key), content, None)
-            .await
+        self.send_local(
+            room_id,
+            sender,
+            event_type,
+            Some(state_key),
+            content,
+            None,
+            None,
+        )
+        .await
     }
 
     /// [`send_state`](Self::send_state) with an appservice-supplied
@@ -775,6 +783,7 @@ impl RoomServer {
             Some(state_key),
             content,
             Some(ts),
+            None,
         )
         .await
     }
@@ -787,17 +796,35 @@ impl RoomServer {
         event_type: &str,
         content: serde_json::Value,
     ) -> Result<Outcome> {
+        self.send_message_stamped(room_id, sender, event_type, content, None, None)
+            .await
+    }
+
+    /// [`Self::send_message`] carrying the client transaction that produced
+    /// the event, so its idempotence record is written in the same batch as
+    /// the event itself — the reason the record lives in this keyspace and
+    /// not the user one.
+    pub async fn send_message_stamped(
+        &self,
+        room_id: &ruma::RoomId,
+        sender: &UserId,
+        event_type: &str,
+        content: serde_json::Value,
+        ts: Option<u64>,
+        txn: Option<TxnStamp>,
+    ) -> Result<Outcome> {
         if let Some(r) = self.remote_backend() {
             let intent = remote::RoomIntent::SendMessage {
                 room_id: room_id.to_string(),
                 sender: sender.to_string(),
                 event_type: event_type.to_owned(),
                 content,
-                ts: None,
+                ts,
+                txn,
             };
             return remote::want_outcome(remote::call(r, &intent).await?);
         }
-        self.send_local(room_id, sender, event_type, None, content, None)
+        self.send_local(room_id, sender, event_type, None, content, ts, txn)
             .await
     }
 
@@ -812,17 +839,7 @@ impl RoomServer {
         content: serde_json::Value,
         ts: u64,
     ) -> Result<Outcome> {
-        if let Some(r) = self.remote_backend() {
-            let intent = remote::RoomIntent::SendMessage {
-                room_id: room_id.to_string(),
-                sender: sender.to_string(),
-                event_type: event_type.to_owned(),
-                content,
-                ts: Some(ts),
-            };
-            return remote::want_outcome(remote::call(r, &intent).await?);
-        }
-        self.send_local(room_id, sender, event_type, None, content, Some(ts))
+        self.send_message_stamped(room_id, sender, event_type, content, Some(ts), None)
             .await
     }
 
@@ -869,7 +886,7 @@ impl RoomServer {
         }
         let (version, room_id, is_create) = self.classify(&raw).await?;
         let _guard = self.lock_room(room_id.as_str()).await;
-        self.process_inner(raw, version, &room_id, is_create, false, true)
+        self.process_inner(raw, version, &room_id, is_create, false, true, None)
             .await
     }
 
@@ -2339,6 +2356,7 @@ impl RoomServer {
 
     // -- internals --------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_local(
         &self,
         room_id: &ruma::RoomId,
@@ -2347,6 +2365,7 @@ impl RoomServer {
         state_key: Option<&str>,
         content: serde_json::Value,
         ts_override: Option<u64>,
+        txn: Option<TxnStamp>,
     ) -> Result<Outcome> {
         // The lock spans build + process: prev_events/auth_events read
         // here must still be the room's tip when the proposal lands.
@@ -2355,7 +2374,7 @@ impl RoomServer {
             .build_local(room_id, sender, event_type, state_key, content, ts_override)
             .await?;
         // Locally authored: the sender's `is_local` check fans it out already.
-        self.process(raw, version, &room_id.to_owned(), false, false)
+        self.process_inner(raw, version, &room_id.to_owned(), false, false, false, txn)
             .await
     }
 
@@ -2506,11 +2525,12 @@ impl RoomServer {
         is_create: bool,
         relay: bool,
     ) -> Result<Outcome> {
-        self.process_inner(raw, version, room_id, is_create, relay, false)
+        self.process_inner(raw, version, room_id, is_create, relay, false, None)
             .await
     }
 
     /// Pipeline steps 1–5 for one event. Caller holds the room lock.
+    #[allow(clippy::too_many_arguments)]
     async fn process_inner(
         &self,
         raw: CanonicalJsonObject,
@@ -2525,6 +2545,10 @@ impl RoomServer {
         // events, instead of erroring MissingAuthEvents — see
         // [`Self::ingest_pdu_rejecting_missing_auth`].
         reject_missing_auth: bool,
+        // The client transaction this event came from, for a local send
+        // that carried one. `None` for everything federated — a remote
+        // server's events are not any client's transaction.
+        txn: Option<TxnStamp>,
     ) -> Result<Outcome> {
         // -- 1. validate: format, then signatures/hash.
         let mut raw = raw;
@@ -2843,7 +2867,7 @@ impl RoomServer {
             redacts,
             relay,
         };
-        self.propose(cmd).await
+        self.propose(cmd, txn).await
     }
 
     /// For an accepted `m.room.redaction`, what it does to its target —
@@ -2936,7 +2960,7 @@ impl RoomServer {
             redacts: None,
             relay: false,
         };
-        self.propose(cmd).await
+        self.propose(cmd, None).await
     }
 
     async fn propose_cmd(&self, cmd: &RoomCommand) -> Result<RoomResponse> {
@@ -2945,10 +2969,26 @@ impl RoomServer {
         postcard::from_bytes(&resp).map_err(|e| RoomError::Codec(e.to_string()))
     }
 
-    async fn propose(&self, cmd: AppendEvent) -> Result<Outcome> {
-        let resp = self
-            .propose_cmd(&RoomCommand::Append(Box::new(cmd)))
-            .await?;
+    /// Whether this shard's applied state is at the version
+    /// [`RoomCommand::AppendStamped`] needs. False while a shard is still
+    /// mid-upgrade, where transactions stay node-local — the behaviour
+    /// that predates this record, not a new failure.
+    fn txn_records_available(&self) -> bool {
+        matches!(self.shard_handle().schema_versions(), Ok((stored, _)) if stored >= 2)
+    }
+
+    async fn propose(&self, cmd: AppendEvent, txn: Option<TxnStamp>) -> Result<Outcome> {
+        // Proposing the stamped form to a group holding a replica that
+        // cannot decode it would wedge that replica. Reaching schema v2 is
+        // the voter gate's certificate that none remain (`RoomApp::migrate`).
+        let command = match txn {
+            Some(txn) if self.txn_records_available() => RoomCommand::AppendStamped {
+                event: Box::new(cmd),
+                txn,
+            },
+            _ => RoomCommand::Append(Box::new(cmd)),
+        };
+        let resp = self.propose_cmd(&command).await?;
         let parse_id = |s: String| {
             OwnedEventId::try_from(s).map_err(|e| RoomError::Codec(format!("event id: {e}")))
         };

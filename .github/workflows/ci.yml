@@ -248,6 +248,12 @@ jobs:
       - run: chmod +x target/release/saltator
       - name: Two-node smoke test
         run: ./scripts/two_node_smoke.sh target/release/saltator
+      - name: Transaction dedupe across a node hop and a restart
+        # The one property no other job can see: cs-api's suite is
+        # single-node by construction, and the churn soak deliberately
+        # never retries across nodes.
+        timeout-minutes: 10
+        run: ./scripts/txn_dedupe_smoke.sh target/release/saltator
 
   chaos:
     name: chaos (3-node kill -9)

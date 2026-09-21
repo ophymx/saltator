@@ -32,6 +32,20 @@ pub struct Env {
     pub fedout: Option<Arc<saltator_fedout::FedOutServer>>,
 }
 
+/// Bring a shard to this binary's schema version, the way the daemon does.
+/// An in-process harness runs no migration supervisor, so without this every
+/// shard sits at the v1 baseline and the schema gates that guard newer
+/// commands never open — the transaction records among them.
+async fn ready(h: &saltator_shard::ShardHandle) {
+    h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    saltator_shard::migrate::spawn_migration_supervisor(
+        h.clone(),
+        saltator_shard::migrate::SingleNodeGate,
+    )
+    .await
+    .unwrap();
+}
+
 pub async fn start_env() -> Env {
     // Tests hammer the API far past real-client rates.
     start_env_cfg(saltator_cs_api::RateLimitConfig::disabled(), true).await
@@ -251,7 +265,7 @@ pub async fn start_env_sharded_inner(
         .map(|(_, s)| s.shard_handle().clone())
         .chain([users.shard_handle().clone()])
     {
-        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+        ready(&h).await;
     }
     // A single-node metadata group over the same engine: a real control
     // plane for the cluster endpoints to read and mutate.
@@ -587,7 +601,7 @@ pub async fn cs_stack(
     .await
     .unwrap();
     for h in [rooms.shard_handle(), users.shard_handle()] {
-        h.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+        ready(h).await;
     }
     let projection = spawn_membership_projection(
         users.clone(),

@@ -767,9 +767,14 @@ async fn build_joined_room(
             if let Some(sender) = ev.get("sender").and_then(|s| s.as_str()) {
                 timeline_senders.push(sender.to_owned());
             }
-            state
-                .txns
-                .stamp_echo(&mut ev, auth.user_id.as_str(), &auth.device_id);
+            crate::room_util::stamp_echo(
+                &state.rooms,
+                room_id.as_str(),
+                &mut ev,
+                auth.user_id.as_str(),
+                &auth.device_id,
+            )
+            .await?;
             out.timeline.events.push(to_raw(&ev)?);
         }
     }
@@ -1141,9 +1146,14 @@ async fn build_left_room(
             if !type_matches(&filter.timeline_types, &filter.timeline_not_types, ty) {
                 continue;
             }
-            state
-                .txns
-                .stamp_echo(&mut ev, auth.user_id.as_str(), &auth.device_id);
+            crate::room_util::stamp_echo(
+                &state.rooms,
+                room_id,
+                &mut ev,
+                auth.user_id.as_str(),
+                &auth.device_id,
+            )
+            .await?;
             out.timeline.events.push(to_raw(&ev)?);
         }
     }

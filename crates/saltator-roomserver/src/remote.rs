@@ -37,6 +37,13 @@ pub enum RoomIntent {
         event_type: String,
         content: serde_json::Value,
         ts: Option<u64>,
+        /// The client transaction behind the send, forwarded so the record
+        /// lands with the event at the hosting leader. `#[serde(default)]`
+        /// is load-bearing for the N/N+1 requirement (spec.md §4.4):
+        /// intents are serde_json, so an older node ignores this field and
+        /// a newer one reads an older intent as `None`.
+        #[serde(default)]
+        txn: Option<crate::TxnStamp>,
     },
     SendState {
         room_id: String,
@@ -206,18 +213,19 @@ async fn run_intent<F: EventFetcher>(
             event_type,
             content,
             ts,
-        } => RoomIntentOk::Outcome(match ts {
-            None => {
-                server
-                    .send_message(&room(&room_id)?, &user(&sender)?, &event_type, content)
-                    .await?
-            }
-            Some(ts) => {
-                server
-                    .send_message_at(&room(&room_id)?, &user(&sender)?, &event_type, content, ts)
-                    .await?
-            }
-        }),
+            txn,
+        } => RoomIntentOk::Outcome(
+            server
+                .send_message_stamped(
+                    &room(&room_id)?,
+                    &user(&sender)?,
+                    &event_type,
+                    content,
+                    ts,
+                    txn,
+                )
+                .await?,
+        ),
         RoomIntent::SendState {
             room_id,
             sender,
