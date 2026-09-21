@@ -8,13 +8,13 @@ use crate::types::{
     account_data_key, device_scoped_key, external_key, prefix_end, to_device_key, user_key,
     Account, AccountDataEntry, AccountState, AccountV2, AliasEntry, BackupVersionMeta, BlockedRoom,
     ClaimedKey, Device, FallbackEntry, KeyChangeEntry, LoginTokenEntry, MediaMeta, MembershipEntry,
-    OtkEntry, Profile, RegToken, SessionCmd, TokenEntry, TokenKind, UiaSession, UserChangePayload,
-    UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY, T_BACKUP_VERSION,
-    T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY, T_EDU_OUTBOX, T_EXTERNAL_ID,
-    T_EXTERNAL_ID_USER, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE, T_KEY_CHANGE, T_LOGIN_TOKEN,
-    T_MEDIA, T_MEMBERSHIP, T_NOTICES_ROOM, T_ONE_TIME_KEY, T_PROFILE, T_PUSHER, T_REG_TOKEN,
-    T_ROOM_BLOCKED, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN, T_TO_DEVICE_SEEN_IDX, T_TXN_SEEN,
-    T_TXN_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
+    OtkEntry, Profile, RegToken, SessionCmd, TokenEntry, TokenEntryV4, TokenKind, UiaSession,
+    UserChangePayload, UserCommand, UserResponse, T_ACCOUNT, T_ACCOUNT_DATA, T_ALIAS, T_BACKUP_KEY,
+    T_BACKUP_VERSION, T_CROSS_SIGNING, T_CURSOR, T_DEVICE, T_DEVICE_KEYS, T_DIRECTORY,
+    T_EDU_OUTBOX, T_EXTERNAL_ID, T_EXTERNAL_ID_USER, T_FALLBACK_KEY, T_FILTER, T_INVITE_STATE,
+    T_KEY_CHANGE, T_LOGIN_TOKEN, T_MEDIA, T_MEMBERSHIP, T_NOTICES_ROOM, T_ONE_TIME_KEY, T_PROFILE,
+    T_PUSHER, T_REG_TOKEN, T_ROOM_BLOCKED, T_TOKEN, T_TO_DEVICE, T_TO_DEVICE_SEEN,
+    T_TO_DEVICE_SEEN_IDX, T_TXN_SEEN, T_TXN_SEEN_IDX, T_UIA_SESSION, T_UIA_SESSION_IDX,
 };
 
 fn codec_err(what: &str, e: impl std::fmt::Display) -> StoreError {
@@ -38,6 +38,49 @@ pub type AccountPage = (Vec<(String, Account)>, Option<String>);
 /// credential and creation time, a `deactivated` bool becomes the
 /// corresponding lifecycle state, and nobody is grandfathered into being
 /// an administrator.
+/// The state an account is in, or `Deactivated` when there is no account:
+/// a token with no account behind it must not authenticate, and closing
+/// that case by default is cheaper than reasoning about how it arose.
+fn account_state(ctx: &ApplyCtx<'_>, user_id: &str) -> StoreResult<AccountState> {
+    let account: Option<Account> = get_typed(ctx, "account decode", T_ACCOUNT, user_id.as_bytes())?;
+    Ok(account.map_or(AccountState::Deactivated, |a| a.state))
+}
+
+fn token_v4_to_v5(old: TokenEntryV4, state: AccountState) -> TokenEntry {
+    TokenEntry {
+        user_id: old.user_id,
+        device_id: old.device_id,
+        kind: old.kind,
+        created_ts: old.created_ts,
+        expires_ts: old.expires_ts,
+        state,
+    }
+}
+
+/// Rewrite the state mirrored in a user's token rows, reached through their
+/// devices — which index the live hashes, so this needs no table scan.
+/// Lock and unlock destroy no session (docs/admin-api.md), so the rows are
+/// edited in place rather than deleted and reissued.
+fn restamp_tokens(ctx: &mut ApplyCtx<'_>, user_id: &str, state: AccountState) -> StoreResult<()> {
+    let start = user_key(user_id, "");
+    let rows = ctx.range(T_DEVICE, &start, &user_end(user_id))?;
+    let mut hashes = Vec::new();
+    for (_, v) in rows {
+        let device: Device = dec("device decode", &v)?;
+        hashes.extend(device.access_token_hash);
+        hashes.extend(device.refresh_token_hash);
+    }
+    for h in hashes {
+        let Some(mut entry): Option<TokenEntry> = get_typed(ctx, "token decode", T_TOKEN, &h)?
+        else {
+            continue;
+        };
+        entry.state = state;
+        ctx.put(T_TOKEN, &h, enc("token encode", &entry)?);
+    }
+    Ok(())
+}
+
 fn account_v2_to_v3(old: AccountV2) -> Account {
     Account {
         password_hash: old.password_hash,
@@ -84,6 +127,23 @@ impl ShardApp for UserApp {
                         T_ACCOUNT,
                         &k,
                         enc("account encode", &account_v2_to_v3(old))?,
+                    );
+                }
+                Ok(())
+            }
+            // v5: `TokenEntry` mirrors the owning account's state, so
+            // authenticating a request reads only the token table. Rewrite
+            // every row, stamping it from the account it belongs to; a row
+            // whose account is gone is refused rather than carried forward
+            // as usable.
+            5 => {
+                for (k, v) in ctx.range(T_TOKEN, &[], &[])? {
+                    let old: TokenEntryV4 = dec("token v4 decode", &v)?;
+                    let state = account_state(ctx, &old.user_id)?;
+                    ctx.put(
+                        T_TOKEN,
+                        &k,
+                        enc("token encode", &token_v4_to_v5(old, state))?,
                     );
                 }
                 Ok(())
@@ -143,6 +203,10 @@ fn write_session(ctx: &mut ApplyCtx<'_>, s: &SessionCmd) -> StoreResult<()> {
         refresh_token_hash: s.refresh_hash,
     };
     ctx.put(T_DEVICE, &dkey, enc("device encode", &device)?);
+    // Stamped from the account, not assumed: a session minted for an
+    // account that cannot authenticate is born unusable, so forgetting the
+    // check on some future login path cannot hand out a live token.
+    let state = account_state(ctx, &s.user_id)?;
     ctx.put(
         T_TOKEN,
         &s.token_hash,
@@ -154,6 +218,7 @@ fn write_session(ctx: &mut ApplyCtx<'_>, s: &SessionCmd) -> StoreResult<()> {
                 kind: TokenKind::Access,
                 created_ts: s.ts,
                 expires_ts: s.expires_ts,
+                state,
             },
         )?,
     );
@@ -169,6 +234,7 @@ fn write_session(ctx: &mut ApplyCtx<'_>, s: &SessionCmd) -> StoreResult<()> {
                     kind: TokenKind::Refresh,
                     created_ts: s.ts,
                     expires_ts: None,
+                    state,
                 },
             )?,
         );
@@ -1124,6 +1190,9 @@ fn apply_command(ctx: &mut ApplyCtx<'_>, cmd: &UserCommand) -> StoreResult<UserR
                 AccountState::Active
             };
             ctx.put(T_ACCOUNT, ukey, enc("account encode", &account)?);
+            // The token rows mirror this, and authentication reads only
+            // them — so the lock takes effect here or not at all.
+            restamp_tokens(ctx, user_id, account.state)?;
             Ok(UserResponse::Ok)
         }
         UserCommand::SetAdmin { user_id, admin } => {
@@ -2283,6 +2352,52 @@ mod tests {
             postcard::from_bytes::<Account>(&blob).is_err(),
             "v2 blob must not be readable as a v3 Account"
         );
+    }
+
+    /// A v4 token row must not decode as v5. Postcard is positional, so
+    /// the added `state` runs the decoder out of bytes — and that failure
+    /// is what makes the v5 migration load-bearing rather than cosmetic:
+    /// if this ever started succeeding, old rows would be read with a
+    /// garbage state, which for this field means a garbage answer to "may
+    /// this token authenticate".
+    #[test]
+    fn v4_token_does_not_decode_as_v5() {
+        let blob = postcard::to_stdvec(&TokenEntryV4 {
+            user_id: "@alice:hs.test".into(),
+            device_id: "DEV".into(),
+            kind: TokenKind::Access,
+            created_ts: 1_700_000_000_000,
+            expires_ts: None,
+        })
+        .unwrap();
+        assert!(
+            postcard::from_bytes::<TokenEntry>(&blob).is_err(),
+            "v4 blob must not be readable as a v5 TokenEntry"
+        );
+    }
+
+    #[test]
+    fn v5_migration_carries_the_owning_account_state() {
+        let v4 = TokenEntryV4 {
+            user_id: "@alice:hs.test".into(),
+            device_id: "DEV".into(),
+            kind: TokenKind::Refresh,
+            created_ts: 7,
+            expires_ts: Some(9),
+        };
+        let locked = token_v4_to_v5(v4.clone(), AccountState::Locked);
+        assert_eq!(locked.state, AccountState::Locked);
+        assert!(!locked.state.can_authenticate());
+        // Everything else survives the rewrite untouched.
+        assert_eq!(locked.user_id, "@alice:hs.test");
+        assert_eq!(locked.device_id, "DEV");
+        assert_eq!(locked.kind, TokenKind::Refresh);
+        assert_eq!(locked.created_ts, 7);
+        assert_eq!(locked.expires_ts, Some(9));
+
+        assert!(token_v4_to_v5(v4, AccountState::Active)
+            .state
+            .can_authenticate());
     }
 
     #[test]

@@ -17,12 +17,37 @@ to-device queues, media metadata, and sync state.
 
 The data plane this would need already exists — remote reads, gap-free
 subscribe, intents, runtime lifecycle, checkpoint transfer, all built
-for room shards. What makes the user keyspace harder is its *serving*
-surfaces: `/sync` assembly and authentication read the user shard
-locally on every node, which is exactly why capping its replication
-factor would strand a node with no remote path to fall back on.
-Generalizing it means giving those two surfaces the same remote seam
-the room read path got.
+for room shards. What is left is not one problem but two.
+
+**Authentication no longer is one.** It used to read the account row on
+every request, as a kill-switch for `Locked` (deactivation deletes
+tokens, so it needed no read). That state is now mirrored onto the token
+row, so `authenticate` is a single read of the token table — see
+design-notes, "A token row answers its own authentication". No remote
+seam was needed for it, and none should be added.
+
+**The keyspace boundary is the real one.** Only 19 of this keyspace's
+tables are keyed by user and can shard by user at all. The other 14 are
+three other things wearing the same name: cluster-global namespaces
+(`T_ALIAS`, `T_DIRECTORY`, `T_MEDIA`, `T_REG_TOKEN`, `T_ROOM_BLOCKED`),
+indexes keyed by a secret (`T_TOKEN`, `T_LOGIN_TOKEN`, `T_UIA_SESSION`
+and its index, `T_EXTERNAL_ID`), and cross-user logs and cursors
+(`T_KEY_CHANGE`, `T_CURSOR`, `T_TO_DEVICE_SEEN` and its index). They are
+also the small ones: the volume is in key backups, to-device queues,
+one-time keys and account data, all user-keyed.
+
+So the split is not `user_shards = N` over what is there today. It is:
+separate the two groups of tables, sharding the per-user half and
+leaving the global half on every node — which keeps the token lookup and
+the alias/directory namespaces local reads. `/sync` then touches exactly
+one user shard per user, its one cross-user read being the
+`T_KEY_CHANGE` log, which belongs with the global half for the same
+reason. The per-user read surface still has to go async and
+remote-capable the way `RoomStore` did (`Backend::{Local,Remote}`), and
+`placement::assign` has to stop applying the every-active-node floor to
+the sharded half. FedOut is its own question: it is keyed by destination
+server, and its serving surface is the delivery worker under its
+leader.
 
 ## A retried transaction can still duplicate, in four narrow windows
 

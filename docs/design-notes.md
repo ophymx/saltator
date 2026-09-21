@@ -112,6 +112,28 @@ proposing a migration the leader asks every voter for its live binary's
 schema version over the internal RPC; any voter unreachable or behind
 means no proposal, retried on a timer.
 
+## A token row answers its own authentication
+
+Authenticating a request reads the token table and nothing else. The
+owning account's state is mirrored onto the token row, rather than read
+from the account, because the account is per-user state and per-user
+state is what the user keyspace will eventually place elsewhere — a
+remote read on every authenticated request is not a seam worth having.
+
+A mirror is only as good as what maintains it, so the writers are few and
+each is the whole of its case. `write_session` stamps the state from the
+account it has just read, which makes a session minted for a
+non-authenticating account *born* unusable — a future login path that
+forgets its own check cannot hand out a live token. `SetLocked` rewrites
+the user's rows in place, reached through their devices, which already
+index the live hashes; lock destroys no session and unlock restores it,
+so editing beats deleting. Deactivation needs no arm at all: it deletes
+every device, and every token with them.
+
+The check itself stays `AccountState::can_authenticate`, so a state added
+later is refused until something deliberately stamps it — closed by
+default, in one place.
+
 ## Transaction records live with whatever they are scoped to
 
 A client transaction ID is scoped to the device and the endpoint path,
