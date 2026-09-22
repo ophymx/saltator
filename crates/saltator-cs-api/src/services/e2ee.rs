@@ -39,20 +39,30 @@ impl E2ee<'_> {
         upto: u64,
     ) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
         let store = self.users.store();
-        let shares_room = |other: &str| -> Result<bool> {
+        // An async fn rather than a closure: the membership read is
+        // per-user state, so it is async now, and all three arms below use
+        // it.
+        async fn shares_room(
+            store: &saltator_userserver::UserStore,
+            my_joined_rooms: &BTreeSet<String>,
+            other: &str,
+        ) -> Result<bool> {
             Ok(store
                 .memberships(other)
+                .await
                 .map_err(ApiError::internal)?
                 .iter()
                 .any(|(rid, m)| m.membership == "join" && my_joined_rooms.contains(rid)))
-        };
+        }
         let mut changed = BTreeSet::new();
         let mut left = BTreeSet::new();
         for entry in store.key_changes(since, upto).map_err(ApiError::internal)? {
             match entry.membership {
                 // The device list itself changed: visible if we share a room.
                 None => {
-                    if entry.user_id == user_id || shares_room(&entry.user_id)? {
+                    if entry.user_id == user_id
+                        || shares_room(&store, my_joined_rooms, &entry.user_id).await?
+                    {
                         left.remove(&entry.user_id);
                         changed.insert(entry.user_id);
                     }
@@ -81,12 +91,16 @@ impl E2ee<'_> {
                         for member in
                             crate::room_util::joined_member_ids(self.rooms, &room_id).await?
                         {
-                            if member != user_id && !shares_room(&member)? {
+                            if member != user_id
+                                && !shares_room(&store, my_joined_rooms, &member).await?
+                            {
                                 changed.remove(&member);
                                 left.insert(member);
                             }
                         }
-                    } else if my_joined_rooms.contains(&room_id) && !shares_room(&entry.user_id)? {
+                    } else if my_joined_rooms.contains(&room_id)
+                        && !shares_room(&store, my_joined_rooms, &entry.user_id).await?
+                    {
                         changed.remove(&entry.user_id);
                         left.insert(entry.user_id);
                     }
@@ -99,7 +113,7 @@ impl E2ee<'_> {
     /// Remote servers sharing any joined room with `user_id` — the
     /// audience for that user's device-list updates (and presence).
     pub async fn sharing_servers(&self, user_id: &str) -> Vec<String> {
-        let Ok(memberships) = self.users.store().memberships(user_id) else {
+        let Ok(memberships) = self.users.store().memberships(user_id).await else {
             return Vec::new();
         };
         let mut servers = BTreeSet::new();
@@ -145,7 +159,13 @@ impl E2ee<'_> {
         if dests.is_empty() {
             return;
         }
-        for (device_id, _) in self.users.store().devices(user_id).unwrap_or_default() {
+        for (device_id, _) in self
+            .users
+            .store()
+            .devices(user_id)
+            .await
+            .unwrap_or_default()
+        {
             self.queue_update(dests.clone(), user_id, &device_id, false, true);
         }
     }

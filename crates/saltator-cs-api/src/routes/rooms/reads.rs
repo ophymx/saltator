@@ -19,11 +19,16 @@ use super::*;
 
 /// Departed members keep reading history up to their leave — unless they
 /// forgot the room, which revokes that residual access.
-pub(crate) fn ensure_not_forgotten(state: &CsState, user_id: &str, room_id: &str) -> Result<()> {
+pub(crate) async fn ensure_not_forgotten(
+    state: &CsState,
+    user_id: &str,
+    room_id: &str,
+) -> Result<()> {
     let forgotten = state
         .users
         .store()
         .membership(user_id, room_id)
+        .await
         .map_err(internal)?
         .is_some_and(|m| m.forgotten);
     if forgotten {
@@ -37,7 +42,7 @@ pub async fn get_state_events(
     auth: Auth,
     Ar(req): Ar<get_state_events::v3::Request>,
 ) -> Result<Ra<get_state_events::v3::Response>> {
-    ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str())?;
+    ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str()).await?;
     let (current, _) =
         crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())
             .await?;
@@ -65,7 +70,7 @@ pub async fn get_state_event(
     auth: Auth,
     Ar(req): Ar<get_state_event_for_key::v3::Request>,
 ) -> Result<Ra<get_state_event_for_key::v3::Response>> {
-    ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str())?;
+    ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str()).await?;
     let (current, _) =
         crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())
             .await?;
@@ -494,7 +499,7 @@ pub async fn get_members(
     auth: Auth,
     Ar(req): Ar<get_member_events::v3::Request>,
 ) -> Result<Ra<get_member_events::v3::Response>> {
-    ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str())?;
+    ensure_not_forgotten(&state, auth.user_id.as_str(), req.room_id.as_str()).await?;
     let (mut current, cap) =
         crate::room_util::member_view(&state.rooms, req.room_id.as_str(), auth.user_id.as_str())
             .await?;
@@ -597,7 +602,7 @@ pub async fn get_messages(
     // unknown room reads as 403 too (sytest: "You aren't a member"), not
     // as an existence oracle. Departed members read history only up to
     // their leave (`cap`).
-    ensure_not_forgotten(&state, auth.user_id.as_str(), &room_id)?;
+    ensure_not_forgotten(&state, auth.user_id.as_str(), &room_id).await?;
     let (_, cap) = crate::room_util::member_view(&state.rooms, &room_id, auth.user_id.as_str())
         .await
         .map_err(|e| {

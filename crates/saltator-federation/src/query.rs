@@ -72,23 +72,25 @@ pub async fn profile(
     // Unknown user → 404 (spec) — but a user an appservice's namespaces
     // cover is the appservice's to provision first (spec §Querying), so
     // a bridge ghost is visible to remote servers on first reference.
-    let known = |u: &saltator_userserver::UserServer| {
-        u.store().account(parsed.as_str()).map(|a| a.is_some())
-    };
-    let mut exists = known(users).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "M_UNKNOWN",
-            &e.to_string(),
-        )
-    })?;
+    // An async fn rather than a closure: the account read is per-user
+    // state, so it is async now, and this is called twice.
+    async fn known(u: &saltator_userserver::UserServer, user_id: &str) -> Result<bool, String> {
+        u.store()
+            .account(user_id)
+            .await
+            .map(|a| a.is_some())
+            .map_err(|e| e.to_string())
+    }
+    let mut exists = known(users, parsed.as_str())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", &e))?;
     if !exists {
         if let Some(asq) = &state.appservices {
             if asq
                 .query_user(parsed.as_str(), state.server_name.as_str())
                 .await
             {
-                exists = known(users).unwrap_or(false);
+                exists = known(users, parsed.as_str()).await.unwrap_or(false);
             }
         }
     }
@@ -98,6 +100,7 @@ pub async fn profile(
     let prof = users
         .store()
         .profile(parsed.as_str())
+        .await
         .map_err(|e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,

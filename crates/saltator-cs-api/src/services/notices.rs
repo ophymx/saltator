@@ -74,6 +74,7 @@ impl Notices<'_> {
             .users
             .store()
             .account(sender.as_str())
+            .await
             .map_err(ApiError::internal)?
             .is_some()
         {
@@ -103,6 +104,7 @@ impl Notices<'_> {
             .users
             .store()
             .account(target.as_str())
+            .await
             .map_err(ApiError::internal)?
             .is_none()
         {
@@ -114,6 +116,7 @@ impl Notices<'_> {
             .users
             .store()
             .notices_room(target.as_str())
+            .await
             .map_err(ApiError::internal)?
         {
             Some(existing) => {
@@ -157,7 +160,7 @@ impl Notices<'_> {
 
     async fn invite(&self, room_id: &RoomId, sender: &UserId, target: &UserId) -> Result<()> {
         let mut content = serde_json::json!({"membership": "invite"});
-        if let Ok(Some(profile)) = self.users.store().profile(target.as_str()) {
+        if let Ok(Some(profile)) = self.users.store().profile(target.as_str()).await {
             if let Some(d) = profile.displayname {
                 content["displayname"] = d.into();
             }

@@ -1783,13 +1783,134 @@ fn user_end(user_id: &str) -> Vec<u8> {
 
 /// Typed read access to the user shard's applied state.
 #[derive(Clone)]
+/// Read access to the user keyspace.
+///
+/// The keyspace is two halves, and they do not read the same way. The
+/// *global* half — the taken-names namespace, tokens, aliases, the public
+/// directory, media metadata, registration tokens, the cross-user change
+/// log — is on every node by design, so its reads are always local and
+/// stay synchronous. The *per-user* half is what will be sharded by user,
+/// so a node that does not host a given user's shard has to reach it over
+/// the Read RPC; those reads are async and dispatch through
+/// [`Self::user_get`] and friends.
+///
+/// Nothing reads across the halves. That is a property of the tables
+/// rather than a convention — no method here touches both — and it is why
+/// only half of this surface had to change.
 pub struct UserStore {
+    /// Local applied state. The global half is hosted everywhere, so this
+    /// is always the right place to read it.
     read: ReadCtx,
+    /// Set when the per-user half this store answers for is hosted
+    /// elsewhere. `None` = read it locally, which is every deployment
+    /// until the keyspace is actually split.
+    per_user: Option<std::sync::Arc<dyn saltator_shard::read::RemoteReader>>,
+}
+
+fn remote_err(e: saltator_shard::ShardError) -> StoreError {
+    StoreError::Engine(format!("remote read: {e}"))
 }
 
 impl UserStore {
     pub fn new(read: ReadCtx) -> Self {
-        Self { read }
+        Self {
+            read,
+            per_user: None,
+        }
+    }
+
+    /// A store whose per-user half is served by a remote replica. The
+    /// global half still reads locally — this node hosts it.
+    pub fn with_remote_per_user(
+        read: ReadCtx,
+        reader: std::sync::Arc<dyn saltator_shard::read::RemoteReader>,
+    ) -> Self {
+        Self {
+            read,
+            per_user: Some(reader),
+        }
+    }
+
+    // -- per-user primitives, dispatched by where that half lives -----
+
+    async fn user_get(&self, table: u8, key: &[u8]) -> StoreResult<Option<Vec<u8>>> {
+        match &self.per_user {
+            None => self.read.get(table, key),
+            Some(r) => match r
+                .read(saltator_shard::ReadOp::Get {
+                    table,
+                    key: key.to_vec(),
+                })
+                .await
+                .map_err(remote_err)?
+            {
+                saltator_shard::ReadValue::Value(v) => Ok(v),
+                other => Err(StoreError::Engine(format!("get returned {other:?}"))),
+            },
+        }
+    }
+
+    async fn user_range(
+        &self,
+        table: u8,
+        start: &[u8],
+        end: &[u8],
+    ) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        match &self.per_user {
+            None => self.read.range(table, start, end),
+            Some(r) => match r
+                .read(saltator_shard::ReadOp::Range {
+                    table,
+                    start: start.to_vec(),
+                    end: end.to_vec(),
+                })
+                .await
+                .map_err(remote_err)?
+            {
+                saltator_shard::ReadValue::Entries(e) => Ok(e),
+                other => Err(StoreError::Engine(format!("range returned {other:?}"))),
+            },
+        }
+    }
+
+    async fn user_scan(
+        &self,
+        table: u8,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+        reverse: bool,
+    ) -> StoreResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        match &self.per_user {
+            None => self.read.scan(table, start, end, limit, reverse),
+            Some(r) => match r
+                .read(saltator_shard::ReadOp::Scan {
+                    table,
+                    start: start.to_vec(),
+                    end: end.to_vec(),
+                    limit: limit.min(u32::MAX as usize) as u32,
+                    reverse,
+                })
+                .await
+                .map_err(remote_err)?
+            {
+                saltator_shard::ReadValue::Entries(e) => Ok(e),
+                other => Err(StoreError::Engine(format!("scan returned {other:?}"))),
+            },
+        }
+    }
+
+    /// Typed [`Self::user_get`].
+    async fn user_typed<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        what: &str,
+        table: u8,
+        key: &[u8],
+    ) -> StoreResult<Option<T>> {
+        Ok(match self.user_get(table, key).await? {
+            Some(b) => Some(dec(what, &b)?),
+            None => None,
+        })
     }
 
     fn get_typed<T: for<'de> serde::Deserialize<'de>>(
@@ -1804,22 +1925,26 @@ impl UserStore {
         })
     }
 
-    pub fn account(&self, user_id: &str) -> StoreResult<Option<Account>> {
-        self.get_typed("account decode", T_ACCOUNT, user_id.as_bytes())
+    pub async fn account(&self, user_id: &str) -> StoreResult<Option<Account>> {
+        self.user_typed("account decode", T_ACCOUNT, user_id.as_bytes())
+            .await
     }
 
-    /// Whether an account name is taken. The namespace, not the account
-    /// row: a name stays taken after deactivation, and under a sharded user
-    /// keyspace this is the question that can be answered without knowing
-    /// where the account itself lives.
-    pub fn username_taken(&self, user_id: &str) -> StoreResult<bool> {
+    /// Whether a name is reserved in the namespace.
+    ///
+    /// The namespace row, not the account: a name stays reserved after
+    /// deactivation, and this is the question answerable without knowing
+    /// where the account itself lives. Callers generally want
+    /// [`crate::UserServer::username_taken`], which is this plus the
+    /// fallback for a namespace the v6 backfill has not filled in yet.
+    pub fn username_reserved(&self, user_id: &str) -> StoreResult<bool> {
         Ok(self.read.get(T_USERNAME, user_id.as_bytes())?.is_some())
     }
 
     /// Whether this client transaction was already handled — durably, so
     /// the answer is the same on every node of the cluster and survives a
     /// restart of any of them.
-    pub fn txn_seen(
+    pub async fn txn_seen(
         &self,
         user_id: &str,
         device_id: &str,
@@ -1839,16 +1964,18 @@ impl UserStore {
     ///
     /// Returns at most `limit` entries plus the next start key, which is
     /// `None` on the last page.
-    pub fn accounts(&self, from: Option<&str>, limit: usize) -> StoreResult<AccountPage> {
+    pub async fn accounts(&self, from: Option<&str>, limit: usize) -> StoreResult<AccountPage> {
         // One extra row tells us whether a further page exists without a
         // second query; it is the next page's start key, not a result.
-        let rows = self.read.scan(
-            T_ACCOUNT,
-            from.unwrap_or("").as_bytes(),
-            &[],
-            limit.saturating_add(1),
-            false,
-        )?;
+        let rows = self
+            .user_scan(
+                T_ACCOUNT,
+                from.unwrap_or("").as_bytes(),
+                &[],
+                limit.saturating_add(1),
+                false,
+            )
+            .await?;
         let mut out = Vec::with_capacity(rows.len().min(limit));
         let mut next = None;
         for (i, (k, v)) in rows.into_iter().enumerate() {
@@ -1893,8 +2020,9 @@ impl UserStore {
 
     /// The room carrying this user's server notices, if one has been
     /// created.
-    pub fn notices_room(&self, user_id: &str) -> StoreResult<Option<String>> {
-        self.get_typed("notices room decode", T_NOTICES_ROOM, user_id.as_bytes())
+    pub async fn notices_room(&self, user_id: &str) -> StoreResult<Option<String>> {
+        self.user_typed("notices room decode", T_NOTICES_ROOM, user_id.as_bytes())
+            .await
     }
 
     /// Why a room is closed to joins, or `None` if it is open. On the
@@ -1936,7 +2064,7 @@ impl UserStore {
     /// Every `(auth_provider, external_id)` this account is linked to, in
     /// provider order. Unpaginated: the row count is the number of
     /// identity providers a deployment runs, not user data.
-    pub fn external_ids(&self, user_id: &str) -> StoreResult<Vec<(String, String)>> {
+    pub async fn external_ids(&self, user_id: &str) -> StoreResult<Vec<(String, String)>> {
         let start = user_key(user_id, "");
         let mut out = Vec::new();
         for (k, v) in self
@@ -1950,8 +2078,9 @@ impl UserStore {
         Ok(out)
     }
 
-    pub fn profile(&self, user_id: &str) -> StoreResult<Option<Profile>> {
-        self.get_typed("profile decode", T_PROFILE, user_id.as_bytes())
+    pub async fn profile(&self, user_id: &str) -> StoreResult<Option<Profile>> {
+        self.user_typed("profile decode", T_PROFILE, user_id.as_bytes())
+            .await
     }
 
     pub fn token(&self, token_hash: &[u8; 32]) -> StoreResult<Option<TokenEntry>> {
@@ -1975,15 +2104,19 @@ impl UserStore {
         decode_token(&bytes).map(Some)
     }
 
-    pub fn device(&self, user_id: &str, device_id: &str) -> StoreResult<Option<Device>> {
-        self.get_typed("device decode", T_DEVICE, &user_key(user_id, device_id))
+    pub async fn device(&self, user_id: &str, device_id: &str) -> StoreResult<Option<Device>> {
+        self.user_typed("device decode", T_DEVICE, &user_key(user_id, device_id))
+            .await
     }
 
     /// All devices of a user: `(device_id, device)`.
-    pub fn devices(&self, user_id: &str) -> StoreResult<Vec<(String, Device)>> {
+    pub async fn devices(&self, user_id: &str) -> StoreResult<Vec<(String, Device)>> {
         let start = user_key(user_id, "");
         let mut out = Vec::new();
-        for (k, v) in self.read.range(T_DEVICE, &start, &user_end(user_id))? {
+        for (k, v) in self
+            .user_range(T_DEVICE, &start, &user_end(user_id))
+            .await?
+        {
             let device_id = String::from_utf8(k[start.len()..].to_vec())
                 .map_err(|_| StoreError::Engine("device id not UTF-8".into()))?;
             out.push((device_id, dec("device decode", &v)?));
@@ -1993,10 +2126,13 @@ impl UserStore {
 
     /// Published E2EE identity keys for a user's devices: `(device_id, raw
     /// device_keys JSON)`, for `/keys/query`.
-    pub fn device_keys(&self, user_id: &str) -> StoreResult<Vec<(String, Vec<u8>)>> {
+    pub async fn device_keys(&self, user_id: &str) -> StoreResult<Vec<(String, Vec<u8>)>> {
         let start = user_key(user_id, "");
         let mut out = Vec::new();
-        for (k, v) in self.read.range(T_DEVICE_KEYS, &start, &user_end(user_id))? {
+        for (k, v) in self
+            .user_range(T_DEVICE_KEYS, &start, &user_end(user_id))
+            .await?
+        {
             let device_id = String::from_utf8(k[start.len()..].to_vec())
                 .map_err(|_| StoreError::Engine("device id not UTF-8".into()))?;
             out.push((device_id, v));
@@ -2006,7 +2142,7 @@ impl UserStore {
 
     /// Pending to-device events for a device at inbox seq > `since`:
     /// `(seq, raw event JSON)`, oldest first.
-    pub fn to_device_events(
+    pub async fn to_device_events(
         &self,
         user_id: &str,
         device_id: &str,
@@ -2016,7 +2152,10 @@ impl UserStore {
         let mut start = prefix.clone();
         start.extend_from_slice(&since.saturating_add(1).to_be_bytes());
         let mut out = Vec::new();
-        for (k, v) in self.read.range(T_TO_DEVICE, &start, &prefix_end(&prefix))? {
+        for (k, v) in self
+            .user_range(T_TO_DEVICE, &start, &prefix_end(&prefix))
+            .await?
+        {
             let seq: [u8; 8] = k[prefix.len()..]
                 .try_into()
                 .map_err(|_| StoreError::Engine("to-device key shape".into()))?;
@@ -2087,7 +2226,7 @@ impl UserStore {
 
     /// One-time-key counts per algorithm for a device (`/sync`'s
     /// `device_one_time_keys_count`).
-    pub fn one_time_key_counts(
+    pub async fn one_time_key_counts(
         &self,
         user_id: &str,
         device_id: &str,
@@ -2107,13 +2246,18 @@ impl UserStore {
 
     /// One cross-signing key's raw JSON (kind ∈ `master` | `self_signing`
     /// | `user_signing`).
-    pub fn cross_signing_key(&self, user_id: &str, kind: &str) -> StoreResult<Option<Vec<u8>>> {
-        self.read.get(T_CROSS_SIGNING, &user_key(user_id, kind))
+    pub async fn cross_signing_key(
+        &self,
+        user_id: &str,
+        kind: &str,
+    ) -> StoreResult<Option<Vec<u8>>> {
+        self.user_get(T_CROSS_SIGNING, &user_key(user_id, kind))
+            .await
     }
 
     /// Algorithms whose fallback key has not yet been served by a claim
     /// (`/sync`'s `device_unused_fallback_key_types`).
-    pub fn unused_fallback_algorithms(
+    pub async fn unused_fallback_algorithms(
         &self,
         user_id: &str,
         device_id: &str,
@@ -2133,7 +2277,7 @@ impl UserStore {
     }
 
     /// The latest live key-backup version, if any: `(version, meta)`.
-    pub fn latest_backup_version(
+    pub async fn latest_backup_version(
         &self,
         user_id: &str,
     ) -> StoreResult<Option<(u64, BackupVersionMeta)>> {
@@ -2156,7 +2300,7 @@ impl UserStore {
     }
 
     /// A specific live key-backup version's metadata.
-    pub fn backup_version(
+    pub async fn backup_version(
         &self,
         user_id: &str,
         version: u64,
@@ -2172,7 +2316,7 @@ impl UserStore {
 
     /// Backed-up keys under a version, optionally scoped to one room or
     /// one exact session: `(room_id, session_id, KeyBackupData JSON)`.
-    pub fn backup_keys(
+    pub async fn backup_keys(
         &self,
         user_id: &str,
         version: u64,
@@ -2181,7 +2325,7 @@ impl UserStore {
     ) -> StoreResult<Vec<(String, String, Vec<u8>)>> {
         if let (Some(room_id), Some(session_id)) = (room_id, session_id) {
             let key = backup_key_prefix(user_id, version, Some(room_id), Some(session_id));
-            return Ok(match self.read.get(T_BACKUP_KEY, &key)? {
+            return Ok(match self.user_get(T_BACKUP_KEY, &key).await? {
                 Some(v) => vec![(room_id.to_owned(), session_id.to_owned(), v)],
                 None => Vec::new(),
             });
@@ -2208,31 +2352,35 @@ impl UserStore {
     }
 
     /// All pushers of a user, as raw pusher JSON (`GET /pushers`).
-    pub fn pushers(&self, user_id: &str) -> StoreResult<Vec<Vec<u8>>> {
+    pub async fn pushers(&self, user_id: &str) -> StoreResult<Vec<Vec<u8>>> {
         let start = user_key(user_id, "");
         let mut out = Vec::new();
-        for (_, v) in self.read.range(T_PUSHER, &start, &user_end(user_id))? {
+        for (_, v) in self
+            .user_range(T_PUSHER, &start, &user_end(user_id))
+            .await?
+        {
             out.push(v);
         }
         Ok(out)
     }
 
-    pub fn account_data(
+    pub async fn account_data(
         &self,
         user_id: &str,
         room_id: &str,
         data_type: &str,
     ) -> StoreResult<Option<AccountDataEntry>> {
-        self.get_typed(
+        self.user_typed(
             "account data decode",
             T_ACCOUNT_DATA,
             &account_data_key(user_id, room_id, data_type),
         )
+        .await
     }
 
     /// All account data of a user: `(room_id, type, entry)` with
     /// `room_id` empty for global entries.
-    pub fn account_data_all(
+    pub async fn account_data_all(
         &self,
         user_id: &str,
     ) -> StoreResult<Vec<(String, String, AccountDataEntry)>> {
@@ -2256,23 +2404,31 @@ impl UserStore {
         Ok(out)
     }
 
-    pub fn filter(&self, user_id: &str, filter_id: &str) -> StoreResult<Option<Vec<u8>>> {
-        self.read.get(T_FILTER, &user_key(user_id, filter_id))
+    pub async fn filter(&self, user_id: &str, filter_id: &str) -> StoreResult<Option<Vec<u8>>> {
+        self.user_get(T_FILTER, &user_key(user_id, filter_id)).await
     }
 
-    pub fn membership(&self, user_id: &str, room_id: &str) -> StoreResult<Option<MembershipEntry>> {
-        self.get_typed(
+    pub async fn membership(
+        &self,
+        user_id: &str,
+        room_id: &str,
+    ) -> StoreResult<Option<MembershipEntry>> {
+        self.user_typed(
             "membership decode",
             T_MEMBERSHIP,
             &user_key(user_id, room_id),
         )
+        .await
     }
 
     /// All membership entries of a user: `(room_id, entry)`.
-    pub fn memberships(&self, user_id: &str) -> StoreResult<Vec<(String, MembershipEntry)>> {
+    pub async fn memberships(&self, user_id: &str) -> StoreResult<Vec<(String, MembershipEntry)>> {
         let start = user_key(user_id, "");
         let mut out = Vec::new();
-        for (k, v) in self.read.range(T_MEMBERSHIP, &start, &user_end(user_id))? {
+        for (k, v) in self
+            .user_range(T_MEMBERSHIP, &start, &user_end(user_id))
+            .await?
+        {
             let room_id = String::from_utf8(k[start.len()..].to_vec())
                 .map_err(|_| StoreError::Engine("room id not UTF-8".into()))?;
             out.push((room_id, dec("membership decode", &v)?));
@@ -2281,8 +2437,15 @@ impl UserStore {
     }
 
     /// Stripped-state events for a pending federated invite, if any.
-    pub fn invite_state(&self, user_id: &str, room_id: &str) -> StoreResult<Option<Vec<Vec<u8>>>> {
-        match self.read.get(T_INVITE_STATE, &user_key(user_id, room_id))? {
+    pub async fn invite_state(
+        &self,
+        user_id: &str,
+        room_id: &str,
+    ) -> StoreResult<Option<Vec<Vec<u8>>>> {
+        match self
+            .user_get(T_INVITE_STATE, &user_key(user_id, room_id))
+            .await?
+        {
             Some(b) => Ok(Some(dec("invite state decode", &b)?)),
             None => Ok(None),
         }

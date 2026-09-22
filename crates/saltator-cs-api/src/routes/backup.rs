@@ -72,6 +72,7 @@ pub async fn get_latest_version(State(state): State<Arc<CsState>>, auth: Auth) -
         .users
         .store()
         .latest_backup_version(auth.user_id.as_str())
+        .await
         .map_err(internal)?
         .ok_or_else(not_found)?;
     version_meta_json(version, &meta)
@@ -88,6 +89,7 @@ pub async fn get_version(
         .users
         .store()
         .backup_version(auth.user_id.as_str(), version)
+        .await
         .map_err(internal)?
         .ok_or_else(not_found)?;
     version_meta_json(version, &meta)
@@ -135,7 +137,7 @@ pub async fn delete_version(
 /// backup: writes to a stale version are 403 M_WRONG_ROOM_KEYS_VERSION
 /// (spec: clients must switch to the new backup, not keep writing the
 /// old one).
-fn current_version(
+async fn current_version(
     state: &CsState,
     auth: &Auth,
     q: &std::collections::HashMap<String, String>,
@@ -150,6 +152,7 @@ fn current_version(
             .users
             .store()
             .latest_backup_version(auth.user_id.as_str())
+            .await
             .map_err(internal)?
             .map(|(v, _)| v);
         if current != Some(version) {
@@ -219,7 +222,7 @@ async fn put_keys_impl(
     room_id: Option<&str>,
     session_id: Option<&str>,
 ) -> JsonResp {
-    let version = current_version(state, auth, q, true)?;
+    let version = current_version(state, auth, q, true).await?;
     let keys = flatten_keys(body, room_id, session_id)?;
     let (count, etag) = state
         .users
@@ -241,7 +244,7 @@ async fn delete_keys_impl(
     room_id: Option<String>,
     session_id: Option<String>,
 ) -> JsonResp {
-    let version = current_version(state, auth, q, false)?;
+    let version = current_version(state, auth, q, false).await?;
     let (count, etag) = state
         .users
         .delete_backup_keys(&auth.user_id, version, room_id, session_id)
@@ -255,17 +258,18 @@ async fn delete_keys_impl(
     ))
 }
 
-fn get_keys_impl(
+async fn get_keys_impl(
     state: &CsState,
     auth: &Auth,
     q: &std::collections::HashMap<String, String>,
     room_id: Option<&str>,
     session_id: Option<&str>,
 ) -> JsonResp {
-    let version = current_version(state, auth, q, false)?;
+    let version = current_version(state, auth, q, false).await?;
     let store = state.users.store();
     if store
         .backup_version(auth.user_id.as_str(), version)
+        .await
         .map_err(internal)?
         .is_none()
     {
@@ -273,6 +277,7 @@ fn get_keys_impl(
     }
     let rows = store
         .backup_keys(auth.user_id.as_str(), version, room_id, session_id)
+        .await
         .map_err(internal)?;
 
     // Session-level: the key itself (404 when absent).
@@ -318,7 +323,7 @@ pub async fn get_keys(
     auth: Auth,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> JsonResp {
-    get_keys_impl(&state, &auth, &q, None, None)
+    get_keys_impl(&state, &auth, &q, None, None).await
 }
 
 pub async fn delete_keys(
@@ -345,7 +350,7 @@ pub async fn get_room_keys(
     Path(room_id): Path<String>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> JsonResp {
-    get_keys_impl(&state, &auth, &q, Some(&room_id), None)
+    get_keys_impl(&state, &auth, &q, Some(&room_id), None).await
 }
 
 pub async fn delete_room_keys(
@@ -373,7 +378,7 @@ pub async fn get_session_keys(
     Path((room_id, session_id)): Path<(String, String)>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> JsonResp {
-    get_keys_impl(&state, &auth, &q, Some(&room_id), Some(&session_id))
+    get_keys_impl(&state, &auth, &q, Some(&room_id), Some(&session_id)).await
 }
 
 pub async fn delete_session_keys(

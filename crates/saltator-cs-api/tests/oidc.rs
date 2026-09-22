@@ -474,7 +474,7 @@ async fn first_sso_login_provisions_and_links() {
         .unwrap();
     assert_eq!(owner.as_deref(), Some("@alice:hs.test"));
     // And the display name came from the ID token.
-    let profile = env.users.store().profile("@alice:hs.test").unwrap();
+    let profile = env.users.store().profile("@alice:hs.test").await.unwrap();
     assert_eq!(
         profile.and_then(|p| p.displayname).as_deref(),
         Some("Alice Example")
@@ -506,6 +506,7 @@ async fn subject_link_outranks_the_username_claim() {
         env.users
             .store()
             .account("@alice-renamed:hs.test")
+            .await
             .unwrap()
             .is_none(),
         "a renamed claim must not spawn a second account"
@@ -956,6 +957,7 @@ async fn uia_fallback_refuses_an_unlinked_identity() {
         env.users
             .store()
             .account("@nobody:hs.test")
+            .await
             .unwrap()
             .is_none(),
         "the reauth path must never create an account"

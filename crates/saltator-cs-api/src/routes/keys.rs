@@ -201,11 +201,15 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body):
             _ => return Err(ApiError::bad_json("device_keys values must be lists")),
         };
         let mut per_user = Map::new();
-        let keys = store.device_keys(user_id).map_err(ApiError::internal)?;
+        let keys = store
+            .device_keys(user_id)
+            .await
+            .map_err(ApiError::internal)?;
         // Device display names ride in `unsigned.device_display_name`,
         // mirroring what we serve remote peers over federation.
         let display_names: std::collections::BTreeMap<String, String> = store
             .devices(user_id)
+            .await
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(id, d)| d.display_name.map(|n| (id, n)))
@@ -239,6 +243,7 @@ pub async fn query_keys(State(state): State<Arc<CsState>>, auth: Auth, Jb(body):
         for (kind, map) in kinds {
             if let Some(raw) = store
                 .cross_signing_key(user_id, kind)
+                .await
                 .map_err(ApiError::internal)?
             {
                 let value: Value = serde_json::from_slice(&raw).map_err(ApiError::internal)?;
@@ -282,6 +287,7 @@ pub async fn device_signing_upload(
         .users
         .store()
         .cross_signing_key(auth.user_id.as_str(), "master")
+        .await
         .map_err(ApiError::internal)?
         .is_some();
     // Appservices skip the UIA stage (spec v1.17 MUST NOT): a bridge
@@ -329,6 +335,7 @@ pub async fn device_signing_upload(
                 .users
                 .store()
                 .cross_signing_key(auth.user_id.as_str(), "master")
+                .await
                 .map_err(ApiError::internal)?
                 .and_then(|b| serde_json::from_slice(&b).ok()),
         };
@@ -470,6 +477,7 @@ pub async fn key_changes(
         .users
         .store()
         .memberships(auth.user_id.as_str())
+        .await
         .map_err(ApiError::internal)?
         .into_iter()
         .filter(|(_, m)| m.membership == "join")

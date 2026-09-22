@@ -270,6 +270,7 @@ async fn map_subject(
     let exists = users
         .store()
         .account(user_id.as_str())
+        .await
         .map_err(ApiError::internal)?
         .is_some();
     if !exists && provider.cfg.enable_registration {
@@ -315,6 +316,7 @@ async fn map_subject(
     let already_linked = users
         .store()
         .external_ids(user_id.as_str())
+        .await
         .map_err(ApiError::internal)?
         .into_iter()
         .any(|(p, _)| p == key);

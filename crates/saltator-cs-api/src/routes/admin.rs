@@ -34,7 +34,7 @@ pub async fn list_users(
     // Admin reads are logged: an operator surface should say who looked,
     // not just who changed something.
     tracing::info!(admin = %auth.user_id(), from = ?q.from, "admin: list users");
-    let list = state.admin().list_users(q.from.as_deref(), q.limit)?;
+    let list = state.admin().list_users(q.from.as_deref(), q.limit).await?;
     Ok(axum::Json(
         serde_json::to_value(list).map_err(ApiError::internal)?,
     ))
@@ -47,7 +47,7 @@ pub async fn user_detail(
     Path(user_id): Path<String>,
 ) -> Result<axum::Json<serde_json::Value>> {
     tracing::info!(admin = %auth.user_id(), target = %user_id, "admin: read user");
-    let detail = state.admin().user_detail(&user_id)?;
+    let detail = state.admin().user_detail(&user_id).await?;
     Ok(axum::Json(
         serde_json::to_value(detail).map_err(ApiError::internal)?,
     ))

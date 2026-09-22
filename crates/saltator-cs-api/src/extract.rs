@@ -167,11 +167,12 @@ impl FromRequestParts<Arc<CsState>> for Auth {
         // Appservice tokens are checked first: they live in config, not
         // the user shard.
         if let Some(reg) = state.appservices.by_token(&token) {
-            return appservice_auth(parts, state, reg.clone());
+            return appservice_auth(parts, state, reg.clone()).await;
         }
         let (user_id, device_id) = state
             .users
             .authenticate(&token)
+            .await
             .map_err(ApiError::from)?
             .ok_or_else(ApiError::unknown_token)?;
         Ok(Auth {
@@ -189,7 +190,7 @@ impl FromRequestParts<Arc<CsState>> for Auth {
 /// *existing* device of that user; absent, the AS acts as its sender
 /// through a stable synthetic device (which keeps txn scoping working —
 /// the sender deliberately has no account row, config is its identity).
-fn appservice_auth(
+async fn appservice_auth(
     parts: &Parts,
     state: &Arc<CsState>,
     reg: Arc<saltator_appservice::AppServiceRegistration>,
@@ -212,6 +213,7 @@ fn appservice_auth(
                 .users
                 .store()
                 .account(&uid)
+                .await
                 .map_err(ApiError::internal)?
                 .is_none()
             {
@@ -235,6 +237,7 @@ fn appservice_auth(
                 .users
                 .store()
                 .device(user_id.as_str(), &device_id)
+                .await
                 .map_err(ApiError::internal)?
                 .is_some();
             if !known {
@@ -341,7 +344,7 @@ impl FromRequestParts<Arc<CsState>> for AdminAuth {
             return Err(ApiError::missing_token());
         }
         let auth = Auth::from_request_parts(parts, state).await?;
-        if !state.is_admin(&auth)? {
+        if !state.is_admin(&auth).await? {
             // Deliberately the same message whether the account lacks the
             // flag or does not exist: a 403 here should not be an oracle
             // for who is an administrator.

@@ -38,6 +38,7 @@ pub async fn send_to_device(
             &scope,
             req.txn_id.as_str(),
         )
+        .await
         .map_err(crate::error::ApiError::internal)?
     {
         return Ok(Ra(send_event_to_device::v3::Response::new()));

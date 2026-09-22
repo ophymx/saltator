@@ -27,11 +27,12 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 }
 
 /// The user's rules: their stored customization, or the server defaults.
-pub(crate) fn load_ruleset(state: &CsState, user_id: &UserId) -> Result<Ruleset> {
+pub(crate) async fn load_ruleset(state: &CsState, user_id: &UserId) -> Result<Ruleset> {
     if let Some(entry) = state
         .users
         .store()
         .account_data(user_id.as_str(), "", "m.push_rules")
+        .await
         .map_err(internal)?
     {
         if let Some(global) = serde_json::from_slice::<Value>(&entry.json)
@@ -68,7 +69,7 @@ async fn lock_rules(state: &CsState, user_id: &UserId) -> tokio::sync::OwnedMute
 
 /// `GET /pushrules/`: the full ruleset.
 pub async fn get_pushrules(State(state): State<Arc<CsState>>, auth: Auth) -> JsonResp {
-    let ruleset = load_ruleset(&state, &auth.user_id)?;
+    let ruleset = load_ruleset(&state, &auth.user_id).await?;
     Ok(axum::Json(json!({ "global": ruleset })))
 }
 
@@ -94,7 +95,7 @@ pub async fn get_pushrule(
     auth: Auth,
     Path((kind, rule_id)): Path<(String, String)>,
 ) -> JsonResp {
-    let ruleset = load_ruleset(&state, &auth.user_id)?;
+    let ruleset = load_ruleset(&state, &auth.user_id).await?;
     Ok(axum::Json(find_rule(&ruleset, &kind, &rule_id)?))
 }
 
@@ -104,7 +105,7 @@ pub async fn get_pushrule_attr(
     auth: Auth,
     Path((kind, rule_id, attr)): Path<(String, String, String)>,
 ) -> JsonResp {
-    let ruleset = load_ruleset(&state, &auth.user_id)?;
+    let ruleset = load_ruleset(&state, &auth.user_id).await?;
     let rule = find_rule(&ruleset, &kind, &rule_id)?;
     match attr.as_str() {
         "enabled" | "actions" => Ok(axum::Json(json!({ &attr: rule[&attr] }))),
@@ -119,7 +120,7 @@ pub async fn delete_pushrule(
     Path((kind, rule_id)): Path<(String, String)>,
 ) -> JsonResp {
     let _guard = lock_rules(&state, &auth.user_id).await;
-    let mut ruleset = load_ruleset(&state, &auth.user_id)?;
+    let mut ruleset = load_ruleset(&state, &auth.user_id).await?;
     ruleset
         .remove(RuleKind::from(kind.as_str()), &rule_id)
         .map_err(|_| ApiError::not_found("No such push rule"))?;
@@ -180,7 +181,7 @@ pub async fn put_pushrule(
     };
 
     let _guard = lock_rules(&state, &auth.user_id).await;
-    let mut ruleset = load_ruleset(&state, &auth.user_id)?;
+    let mut ruleset = load_ruleset(&state, &auth.user_id).await?;
     ruleset
         .insert(rule, None, None)
         .map_err(|e| ApiError::invalid_param(e.to_string()))?;
@@ -197,7 +198,7 @@ pub async fn put_pushrule_attr(
 ) -> JsonResp {
     let kind = RuleKind::from(kind.as_str());
     let _guard = lock_rules(&state, &auth.user_id).await;
-    let mut ruleset = load_ruleset(&state, &auth.user_id)?;
+    let mut ruleset = load_ruleset(&state, &auth.user_id).await?;
     match attr.as_str() {
         "enabled" => {
             let enabled = body
@@ -230,6 +231,7 @@ pub async fn get_pushers(State(state): State<Arc<CsState>>, auth: Auth) -> JsonR
         .users
         .store()
         .pushers(auth.user_id.as_str())
+        .await
         .map_err(internal)?
         .iter()
         .filter_map(|b| serde_json::from_slice(b).ok())
@@ -301,6 +303,7 @@ pub(crate) async fn copy_rules_from_predecessor(
         .users
         .store()
         .account_data(user_id.as_str(), "", "m.push_rules")
+        .await
         .map_err(internal)?
         .is_none()
     {
@@ -313,7 +316,7 @@ pub(crate) async fn copy_rules_from_predecessor(
         return Ok(());
     };
     let _guard = lock_rules(state, user_id).await;
-    let mut ruleset = load_ruleset(state, user_id)?;
+    let mut ruleset = load_ruleset(state, user_id).await?;
     let copied: Vec<NewPushRule> = ruleset
         .room
         .iter()

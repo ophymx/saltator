@@ -752,6 +752,7 @@ pub async fn leave_room(
             .users
             .store()
             .membership(auth.user_id.as_str(), req.room_id.as_str())
+            .await
             .map_err(internal)?
         {
             if entry.membership == "invite" {
@@ -824,6 +825,7 @@ pub async fn forget_room(
         .users
         .store()
         .membership(auth.user_id.as_str(), req.room_id.as_str())
+        .await
         .map_err(internal)?;
     if membership.as_ref().is_some_and(|m| m.membership == "join") {
         return Err(ApiError::new(
@@ -1037,6 +1039,7 @@ pub async fn joined_rooms(
         .users
         .store()
         .memberships(auth.user_id.as_str())
+        .await
         .map_err(internal)?
         .into_iter()
         .filter(|(_, m)| m.membership == "join")

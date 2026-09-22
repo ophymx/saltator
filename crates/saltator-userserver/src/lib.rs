@@ -240,6 +240,7 @@ impl UserServer {
         let account = self
             .store()
             .account(user_id.as_str())
+            .await
             .map_err(storage_err)?
             .filter(|a| a.state.can_authenticate());
         let Some(hash) = account.and_then(|a| a.password_hash) else {
@@ -331,6 +332,7 @@ impl UserServer {
         if self
             .store()
             .account(user_id.as_str())
+            .await
             .map_err(storage_err)?
             .filter(|a| a.state.can_authenticate())
             .is_none()
@@ -350,6 +352,7 @@ impl UserServer {
         let account = self
             .store()
             .account(user_id.as_str())
+            .await
             .map_err(storage_err)?
             .filter(|a| a.state.can_authenticate());
         let Some(hash) = account.and_then(|a| a.password_hash) else {
@@ -385,7 +388,7 @@ impl UserServer {
     }
 
     /// Resolve an access token to `(user_id, device_id)`.
-    pub fn authenticate(&self, token: &str) -> Result<Option<(OwnedUserId, String)>> {
+    pub async fn authenticate(&self, token: &str) -> Result<Option<(OwnedUserId, String)>> {
         let Some((entry, state_mirrored)) = self
             .store()
             .token_compat(&token_hash(token))
@@ -418,6 +421,7 @@ impl UserServer {
             // account refuses.
             self.store()
                 .account(user_id.as_str())
+                .await
                 .map_err(storage_err)?
                 .is_some_and(|a| a.state.can_authenticate())
         };
@@ -567,9 +571,9 @@ impl UserServer {
     /// reads a table that is still empty — and "this name is free" is the
     /// one wrong answer here that costs something, because it invites a
     /// client to try to take a name somebody already has.
-    pub fn username_taken(&self, user_id: &str) -> Result<bool> {
+    pub async fn username_taken(&self, user_id: &str) -> Result<bool> {
         let store = self.store();
-        if store.username_taken(user_id).map_err(storage_err)? {
+        if store.username_reserved(user_id).map_err(storage_err)? {
             return Ok(true);
         }
         let backfilled = matches!(
@@ -579,7 +583,7 @@ impl UserServer {
         if backfilled {
             return Ok(false);
         }
-        Ok(store.account(user_id).map_err(storage_err)?.is_some())
+        Ok(store.account(user_id).await.map_err(storage_err)?.is_some())
     }
 
     /// Whether this shard's applied state is at the version

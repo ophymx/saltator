@@ -77,7 +77,7 @@ async fn sessions_lifecycle() {
     let s = s.unwrap();
     assert_eq!(s.user_id.as_str(), "@alice:hs.test");
     assert!(s.refresh_token.is_none());
-    let (uid, dev) = u.authenticate(&s.access_token).unwrap().unwrap();
+    let (uid, dev) = u.authenticate(&s.access_token).await.unwrap().unwrap();
     assert_eq!(uid, s.user_id);
     assert_eq!(dev, s.device_id);
 
@@ -113,24 +113,29 @@ async fn sessions_lifecycle() {
     let old_access = s2.access_token.clone();
     let old_refresh = s2.refresh_token.clone().unwrap();
     let s3 = u.refresh(&old_refresh).await.unwrap();
-    assert!(u.authenticate(&old_access).unwrap().is_none());
-    assert!(u.authenticate(&s3.access_token).unwrap().is_some());
+    assert!(u.authenticate(&old_access).await.unwrap().is_none());
+    assert!(u.authenticate(&s3.access_token).await.unwrap().is_some());
     assert!(matches!(
         u.refresh(&old_refresh).await,
         Err(UserError::InvalidGrant)
     ));
 
     // Devices are visible; logout of one kills exactly that session.
-    let devices = u.store().devices("@alice:hs.test").unwrap();
+    let devices = u.store().devices("@alice:hs.test").await.unwrap();
     assert_eq!(devices.len(), 2);
     u.delete_device(&s.user_id, &s.device_id).await.unwrap();
-    assert!(u.authenticate(&s.access_token).unwrap().is_none());
-    assert!(u.authenticate(&s3.access_token).unwrap().is_some());
+    assert!(u.authenticate(&s.access_token).await.unwrap().is_none());
+    assert!(u.authenticate(&s3.access_token).await.unwrap().is_some());
 
     // logout/all kills the rest.
     u.delete_all_devices(&s.user_id).await.unwrap();
-    assert!(u.authenticate(&s3.access_token).unwrap().is_none());
-    assert!(u.store().devices("@alice:hs.test").unwrap().is_empty());
+    assert!(u.authenticate(&s3.access_token).await.unwrap().is_none());
+    assert!(u
+        .store()
+        .devices("@alice:hs.test")
+        .await
+        .unwrap()
+        .is_empty());
 
     env.rooms.shutdown().await.unwrap();
     u.shutdown().await.unwrap();
@@ -178,7 +183,7 @@ async fn e2ee_key_upload_query_claim() {
     assert_eq!(counts.get("signed_curve25519"), Some(&2));
 
     // Query returns the published identity keys.
-    let dks = u.store().device_keys(uid.as_str()).unwrap();
+    let dks = u.store().device_keys(uid.as_str()).await.unwrap();
     assert_eq!(dks.len(), 1);
     assert_eq!(dks[0].0, dev);
 
@@ -249,13 +254,22 @@ async fn to_device_inbox_send_and_ack() {
     u.send_to_device(vec![msg("*", "broadcast")]).await.unwrap();
     u.send_to_device(vec![msg("NOSUCH", "lost")]).await.unwrap();
 
-    let inbox1 = u.store().to_device_events(uid.as_str(), &dev1, 0).unwrap();
-    let inbox2 = u.store().to_device_events(uid.as_str(), &dev2, 0).unwrap();
+    let inbox1 = u
+        .store()
+        .to_device_events(uid.as_str(), &dev1, 0)
+        .await
+        .unwrap();
+    let inbox2 = u
+        .store()
+        .to_device_events(uid.as_str(), &dev2, 0)
+        .await
+        .unwrap();
     assert_eq!(inbox1.len(), 2, "direct + broadcast");
     assert_eq!(inbox2.len(), 1, "broadcast only");
     assert!(u
         .store()
         .to_device_events(uid.as_str(), "NOSUCH", 0)
+        .await
         .unwrap()
         .is_empty());
 
@@ -264,6 +278,7 @@ async fn to_device_inbox_send_and_ack() {
     let after_first = u
         .store()
         .to_device_events(uid.as_str(), &dev1, inbox1[0].0)
+        .await
         .unwrap();
     assert_eq!(after_first.len(), 1);
 
@@ -272,10 +287,14 @@ async fn to_device_inbox_send_and_ack() {
     assert!(u
         .store()
         .to_device_events(uid.as_str(), &dev1, 0)
+        .await
         .unwrap()
         .is_empty());
     assert_eq!(
-        u.store().to_device_events(uid.as_str(), &dev2, 0).unwrap(),
+        u.store()
+            .to_device_events(uid.as_str(), &dev2, 0)
+            .await
+            .unwrap(),
         inbox2
     );
 
@@ -292,11 +311,16 @@ async fn to_device_inbox_send_and_ack() {
     )
     .await
     .unwrap();
-    let counts = u.store().one_time_key_counts(uid.as_str(), &dev1).unwrap();
+    let counts = u
+        .store()
+        .one_time_key_counts(uid.as_str(), &dev1)
+        .await
+        .unwrap();
     assert_eq!(counts.get("signed_curve25519"), Some(&1));
     assert!(u
         .store()
         .one_time_key_counts(uid.as_str(), &dev2)
+        .await
         .unwrap()
         .is_empty());
 
@@ -357,15 +381,22 @@ async fn device_list_log_and_device_cleanup() {
     .unwrap();
     let mark = u.shard_handle().seq().unwrap();
     u.delete_device(&uid, &dev).await.unwrap();
-    assert!(u.store().device_keys(uid.as_str()).unwrap().is_empty());
+    assert!(u
+        .store()
+        .device_keys(uid.as_str())
+        .await
+        .unwrap()
+        .is_empty());
     assert!(u
         .store()
         .one_time_key_counts(uid.as_str(), &dev)
+        .await
         .unwrap()
         .is_empty());
     assert!(u
         .store()
         .to_device_events(uid.as_str(), &dev, 0)
+        .await
         .unwrap()
         .is_empty());
     assert!(u
@@ -428,7 +459,7 @@ async fn profile_account_data_filters_aliases() {
     u.set_profile(&s.user_id, Some(Some("Bob".into())), None)
         .await
         .unwrap();
-    let p = u.store().profile("@bob:hs.test").unwrap().unwrap();
+    let p = u.store().profile("@bob:hs.test").await.unwrap().unwrap();
     assert_eq!(p.displayname.as_deref(), Some("Bob"));
     assert_eq!(p.avatar_url, None);
 
@@ -439,11 +470,12 @@ async fn profile_account_data_filters_aliases() {
     let entry = u
         .store()
         .account_data("@bob:hs.test", "", "m.example")
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(entry.json, data);
     assert!(entry.seq > 0);
-    let all = u.store().account_data_all("@bob:hs.test").unwrap();
+    let all = u.store().account_data_all("@bob:hs.test").await.unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].0, "");
     assert_eq!(all[0].1, "m.example");
@@ -451,7 +483,11 @@ async fn profile_account_data_filters_aliases() {
     let filter = serde_json::to_vec(&json!({"room": {"timeline": {"limit": 5}}})).unwrap();
     let fid = u.put_filter(&s.user_id, filter.clone()).await.unwrap();
     assert_eq!(
-        u.store().filter("@bob:hs.test", &fid).unwrap().unwrap(),
+        u.store()
+            .filter("@bob:hs.test", &fid)
+            .await
+            .unwrap()
+            .unwrap(),
         filter
     );
 
@@ -527,17 +563,20 @@ async fn membership_projection_tracks_room_shard() {
     let store = env.users.store();
     let m = store
         .membership(alice.as_str(), room_id.as_str())
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(m.membership, "join");
     let m = store
         .membership(bob.as_str(), room_id.as_str())
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(m.membership, "invite");
     assert_eq!(m.sender, alice.as_str());
     let m = store
         .membership(remote.as_str(), room_id.as_str())
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(m.membership, "invite");
@@ -554,11 +593,17 @@ async fn membership_projection_tracks_room_shard() {
         .users
         .store()
         .membership(bob.as_str(), room_id.as_str())
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(m.membership, "join");
     assert_eq!(
-        env.users.store().memberships(bob.as_str()).unwrap().len(),
+        env.users
+            .store()
+            .memberships(bob.as_str())
+            .await
+            .unwrap()
+            .len(),
         1
     );
 
@@ -593,7 +638,12 @@ async fn remote_invite_then_projected_join_becomes_join() {
     u.record_remote_invite(uid.as_str(), room, "@eve:elsewhere.test", "$inv", vec![])
         .await
         .unwrap();
-    let m = u.store().membership(uid.as_str(), room).unwrap().unwrap();
+    let m = u
+        .store()
+        .membership(uid.as_str(), room)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(m.membership, "invite");
 
     // The federated join lands via the projection path with room_seq=1 —
@@ -613,7 +663,12 @@ async fn remote_invite_then_projected_join_becomes_join() {
     .await
     .unwrap();
 
-    let m = u.store().membership(uid.as_str(), room).unwrap().unwrap();
+    let m = u
+        .store()
+        .membership(uid.as_str(), room)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         m.membership, "join",
         "projected join must overwrite the remote invite"
@@ -664,7 +719,11 @@ async fn to_device_dedupes_by_origin_and_message_id() {
         .await
         .unwrap();
 
-    let inbox = u.store().to_device_events(uid.as_str(), &dev, 0).unwrap();
+    let inbox = u
+        .store()
+        .to_device_events(uid.as_str(), &dev, 0)
+        .await
+        .unwrap();
     let bodies: Vec<String> = inbox
         .iter()
         .map(|(_, j)| {
@@ -740,11 +799,11 @@ async fn a_name_stays_taken_after_the_account_is_deactivated() {
         .await
         .unwrap();
     let alice = ruma::OwnedUserId::try_from("@alice:hs.test").unwrap();
-    assert!(u.store().username_taken(alice.as_str()).unwrap());
+    assert!(u.store().username_reserved(alice.as_str()).unwrap());
 
     u.deactivate(&alice).await.unwrap();
     assert!(
-        u.store().username_taken(alice.as_str()).unwrap(),
+        u.store().username_reserved(alice.as_str()).unwrap(),
         "deactivation must not free the name"
     );
     match u
@@ -771,13 +830,88 @@ async fn every_account_holds_its_name_in_the_namespace() {
             .await
             .unwrap();
     }
-    let (accounts, _) = u.store().accounts(None, 100).unwrap();
+    let (accounts, _) = u.store().accounts(None, 100).await.unwrap();
     assert_eq!(accounts.len(), 3, "{accounts:?}");
     for (user_id, _) in &accounts {
         assert!(
-            u.store().username_taken(user_id).unwrap(),
+            u.store().username_reserved(user_id).unwrap(),
             "{user_id} has an account but no name reserved"
         );
     }
+    env.users.shutdown().await.unwrap();
+}
+
+/// The keyspace is two halves that do not read the same way, and this pins
+/// the line between them.
+///
+/// The per-user half is what will be sharded by user, so a node that does
+/// not host a user's shard reaches it over the Read RPC. The global half —
+/// the taken-names namespace, tokens, aliases, the directory, media
+/// metadata — is on every node by design, so sending those reads over the
+/// wire would be a bug, not a fallback: it would put a network hop on data
+/// this node is already holding.
+///
+/// A store pointed at a recording reader proves both directions at once.
+#[tokio::test]
+async fn per_user_reads_go_remote_and_global_reads_do_not() {
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Recorder {
+        tables: Mutex<Vec<u8>>,
+    }
+    impl saltator_shard::read::RemoteReader for Recorder {
+        fn read(
+            &self,
+            op: saltator_shard::ReadOp,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = saltator_shard::Result<saltator_shard::ReadValue>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            if let saltator_shard::ReadOp::Get { table, .. } = op {
+                self.tables.lock().unwrap().push(table);
+            }
+            Box::pin(async { Ok(saltator_shard::ReadValue::Value(None)) })
+        }
+    }
+
+    let env = start_env().await;
+    let u = &env.users;
+    u.register("alice", Some("pw-12345678"), None, None, false, false)
+        .await
+        .unwrap();
+
+    let recorder = Arc::new(Recorder::default());
+    let store = saltator_userserver::UserStore::with_remote_per_user(
+        u.shard_handle().read_ctx(),
+        recorder.clone(),
+    );
+
+    // Per-user: answered by the reader, which is why it comes back empty
+    // even though the account exists in local state.
+    assert!(
+        store.account("@alice:hs.test").await.unwrap().is_none(),
+        "a per-user read must go to the remote half, not to local state"
+    );
+    assert_eq!(
+        recorder.tables.lock().unwrap().len(),
+        1,
+        "exactly one remote read"
+    );
+
+    // Global: answered locally, so it sees the name the registration
+    // reserved and never reaches the reader.
+    assert!(
+        store.username_reserved("@alice:hs.test").unwrap(),
+        "a global read must be served from local state"
+    );
+    assert_eq!(
+        recorder.tables.lock().unwrap().len(),
+        1,
+        "the global half must not have gone over the wire"
+    );
     env.users.shutdown().await.unwrap();
 }

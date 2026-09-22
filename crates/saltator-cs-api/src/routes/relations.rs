@@ -21,7 +21,7 @@ async fn visible_events(
     auth: &Auth,
     room_id: &str,
 ) -> Result<Vec<(u64, serde_json::Value)>> {
-    crate::routes::rooms::ensure_not_forgotten(state, auth.user_id.as_str(), room_id)?;
+    crate::routes::rooms::ensure_not_forgotten(state, auth.user_id.as_str(), room_id).await?;
     let (_, cap) = member_view(&state.rooms, room_id, auth.user_id.as_str())
         .await
         .map_err(|e| {

@@ -146,6 +146,7 @@ async fn notify_event(
             .users
             .store()
             .pushers(&user)
+            .await
             .unwrap_or_default()
             .iter()
             .filter_map(|b| serde_json::from_slice(b).ok())

@@ -134,14 +134,18 @@ pub(crate) struct DeviceSummary {
 impl Admin<'_> {
     /// One page of accounts in user-id order, starting at `from`
     /// (inclusive).
-    pub fn list_users(&self, from: Option<&str>, limit: Option<usize>) -> Result<UserList> {
+    pub async fn list_users(&self, from: Option<&str>, limit: Option<usize>) -> Result<UserList> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let store = self.users.store();
-        let (rows, next_from) = store.accounts(from, limit).map_err(ApiError::internal)?;
+        let (rows, next_from) = store
+            .accounts(from, limit)
+            .await
+            .map_err(ApiError::internal)?;
         let mut users = Vec::with_capacity(rows.len());
         for (user_id, account) in rows {
             let displayname = store
                 .profile(&user_id)
+                .await
                 .map_err(ApiError::internal)?
                 .and_then(|p| p.displayname);
             users.push(UserSummary {
@@ -160,15 +164,17 @@ impl Admin<'_> {
     ///
     /// Note this is the *account* view: an appservice sender has no
     /// account row, so it is absent here even though it can authenticate.
-    pub fn user_detail(&self, user_id: &str) -> Result<UserDetail> {
+    pub async fn user_detail(&self, user_id: &str) -> Result<UserDetail> {
         let store = self.users.store();
         let account = store
             .account(user_id)
+            .await
             .map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::not_found("Unknown user"))?;
-        let profile = store.profile(user_id).map_err(ApiError::internal)?;
+        let profile = store.profile(user_id).await.map_err(ApiError::internal)?;
         let mut devices: Vec<DeviceSummary> = store
             .devices(user_id)
+            .await
             .map_err(ApiError::internal)?
             .into_iter()
             .map(|(device_id, d)| DeviceSummary {
@@ -180,6 +186,7 @@ impl Admin<'_> {
         devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         let external_ids = store
             .external_ids(user_id)
+            .await
             .map_err(ApiError::internal)?
             .into_iter()
             .map(|(auth_provider, external_id)| ExternalIdEntry {
@@ -231,7 +238,7 @@ impl Admin<'_> {
             Self::not_self(actor, target, "lock")?;
         }
         self.users.set_locked(target, locked).await?;
-        self.user_detail(target.as_str())
+        self.user_detail(target.as_str()).await
     }
 
     /// Deactivate, optionally marking the account erased.
@@ -251,7 +258,7 @@ impl Admin<'_> {
         if erase {
             self.users.set_erased(target).await?;
         }
-        self.user_detail(target.as_str())
+        self.user_detail(target.as_str()).await
     }
 
     pub async fn set_admin(
@@ -273,7 +280,7 @@ impl Admin<'_> {
             }
         }
         self.users.set_admin(target, admin).await?;
-        self.user_detail(target.as_str())
+        self.user_detail(target.as_str()).await
     }
 
     pub async fn reset_password(
@@ -288,7 +295,7 @@ impl Admin<'_> {
         self.users
             .admin_set_password(target, new_password, logout_devices)
             .await?;
-        self.user_detail(target.as_str())
+        self.user_detail(target.as_str()).await
     }
 
     // -- registration tokens ---------------------------------------------
@@ -381,7 +388,7 @@ impl Admin<'_> {
         self.users
             .link_external_id(target, auth_provider, external_id)
             .await?;
-        self.user_detail(target.as_str())
+        self.user_detail(target.as_str()).await
     }
 
     /// Drop an account's link to one provider.
@@ -396,7 +403,7 @@ impl Admin<'_> {
     ) -> Result<UserDetail> {
         opaque_key("auth_provider", auth_provider)?;
         self.users.unlink_external_id(target, auth_provider).await?;
-        self.user_detail(target.as_str())
+        self.user_detail(target.as_str()).await
     }
 
     /// Reverse lookup: the account behind a provider's subject.
@@ -428,12 +435,12 @@ impl Admin<'_> {
     ) -> Result<UserDetail> {
         // The account has to exist first: deleting devices of an unknown
         // user otherwise reports success against nothing.
-        self.user_detail(target.as_str())?;
+        self.user_detail(target.as_str()).await?;
         match device_id {
             Some(id) => self.users.delete_device(target, id).await?,
             None => self.users.delete_all_devices(target).await?,
         }
-        self.user_detail(target.as_str())
+        self.user_detail(target.as_str()).await
     }
 }
 
@@ -503,19 +510,21 @@ mod tests {
         }
         let admin = admin(&users);
 
-        let first = admin.list_users(None, Some(2)).unwrap();
+        let first = admin.list_users(None, Some(2)).await.unwrap();
         let ids: Vec<&str> = first.users.iter().map(|u| u.user_id.as_str()).collect();
         assert_eq!(ids, ["@alice:hs.test", "@bob:hs.test"]);
         assert_eq!(first.next_from.as_deref(), Some("@carol:hs.test"));
 
         let second = admin
             .list_users(first.next_from.as_deref(), Some(2))
+            .await
             .unwrap();
         let ids: Vec<&str> = second.users.iter().map(|u| u.user_id.as_str()).collect();
         assert_eq!(ids, ["@carol:hs.test", "@dave:hs.test"]);
 
         let last = admin
             .list_users(second.next_from.as_deref(), Some(2))
+            .await
             .unwrap();
         let ids: Vec<&str> = last.users.iter().map(|u| u.user_id.as_str()).collect();
         assert_eq!(ids, ["@erin:hs.test"]);
@@ -532,7 +541,7 @@ mod tests {
         let (_dir, users) = stack().await;
         register(&users, "alice", Some("pw")).await;
         register(&users, "bob", Some("pw")).await;
-        let page = admin(&users).list_users(None, Some(2)).unwrap();
+        let page = admin(&users).list_users(None, Some(2)).await.unwrap();
         assert_eq!(page.users.len(), 2);
         assert!(page.next_from.is_none());
     }
@@ -541,7 +550,7 @@ mod tests {
     async fn detail_reports_profile_devices_and_credential() {
         let (_dir, users) = stack().await;
         register(&users, "alice", Some("pw")).await;
-        let detail = admin(&users).user_detail("@alice:hs.test").unwrap();
+        let detail = admin(&users).user_detail("@alice:hs.test").await.unwrap();
 
         assert_eq!(detail.summary.state, AccountState::Active);
         assert!(!detail.summary.admin);
@@ -557,7 +566,7 @@ mod tests {
     async fn passwordless_account_is_active_without_credential() {
         let (_dir, users) = stack().await;
         register(&users, "bridge", None).await;
-        let detail = admin(&users).user_detail("@bridge:hs.test").unwrap();
+        let detail = admin(&users).user_detail("@bridge:hs.test").await.unwrap();
         assert!(!detail.has_password);
         assert_eq!(detail.summary.state, AccountState::Active);
     }
@@ -571,17 +580,25 @@ mod tests {
 
         let admin = admin(&users);
         assert_eq!(
-            admin.user_detail("@alice:hs.test").unwrap().summary.state,
+            admin
+                .user_detail("@alice:hs.test")
+                .await
+                .unwrap()
+                .summary
+                .state,
             AccountState::Deactivated
         );
-        let page = admin.list_users(None, None).unwrap();
+        let page = admin.list_users(None, None).await.unwrap();
         assert_eq!(page.users[0].state, AccountState::Deactivated);
     }
 
     #[tokio::test]
     async fn unknown_user_is_not_found() {
         let (_dir, users) = stack().await;
-        let err = admin(&users).user_detail("@nobody:hs.test").unwrap_err();
+        let err = admin(&users)
+            .user_detail("@nobody:hs.test")
+            .await
+            .unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
     }
 
@@ -591,7 +608,10 @@ mod tests {
     async fn limit_is_clamped() {
         let (_dir, users) = stack().await;
         register(&users, "alice", Some("pw")).await;
-        let page = admin(&users).list_users(None, Some(usize::MAX)).unwrap();
+        let page = admin(&users)
+            .list_users(None, Some(usize::MAX))
+            .await
+            .unwrap();
         assert_eq!(page.users.len(), 1);
     }
 
@@ -636,6 +656,7 @@ mod tests {
         assert_eq!(
             admin(&users)
                 .user_detail(alice.as_str())
+                .await
                 .unwrap()
                 .summary
                 .state,
@@ -764,7 +785,7 @@ mod tests {
         }
         // Still active: none of the refusals half-applied.
         assert_eq!(
-            svc.user_detail(root.as_str()).unwrap().summary.state,
+            svc.user_detail(root.as_str()).await.unwrap().summary.state,
             AccountState::Active
         );
         // Granting to self is harmless and allowed.
@@ -918,7 +939,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let detail = svc.user_detail("@alice:hs.test").unwrap();
+        let detail = svc.user_detail("@alice:hs.test").await.unwrap();
         assert_eq!(detail.external_ids.len(), 1);
     }
 
@@ -944,6 +965,7 @@ mod tests {
         // The refusal is total: bob gained nothing, alice lost nothing.
         assert!(svc
             .user_detail("@bob:hs.test")
+            .await
             .unwrap()
             .external_ids
             .is_empty());
@@ -1105,6 +1127,7 @@ mod tests {
         }
         assert!(svc
             .user_detail(alice.as_str())
+            .await
             .unwrap()
             .external_ids
             .is_empty());
@@ -1115,7 +1138,7 @@ mod tests {
         let (_dir, users) = stack().await;
         register(&users, "alice", Some("pw")).await;
         let alice = uid("alice");
-        let before = admin(&users).user_detail(alice.as_str()).unwrap();
+        let before = admin(&users).user_detail(alice.as_str()).await.unwrap();
         let device = before.devices[0].device_id.clone();
 
         let after = admin(&users)

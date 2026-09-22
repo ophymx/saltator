@@ -78,6 +78,7 @@ pub async fn search(
         Some(rooms) => rooms.iter().map(|r| r.to_string()).collect(),
         None => store
             .memberships(auth.user_id.as_str())
+            .await
             .map_err(internal)?
             .into_iter()
             .filter(|(_, m)| m.membership == "join")
@@ -92,6 +93,7 @@ pub async fn search(
     for room_id in &scope {
         let joined = store
             .membership(auth.user_id.as_str(), room_id)
+            .await
             .map_err(internal)?
             .is_some_and(|m| m.membership == "join");
         if !joined {
@@ -221,7 +223,11 @@ pub async fn user_directory(
     let store = state.users.store();
     let mut visible: std::collections::BTreeSet<String> = Default::default();
     let mut rooms: Vec<String> = store.public_rooms().map_err(internal)?;
-    for (room_id, m) in store.memberships(auth.user_id.as_str()).map_err(internal)? {
+    for (room_id, m) in store
+        .memberships(auth.user_id.as_str())
+        .await
+        .map_err(internal)?
+    {
         if m.membership == "join" {
             rooms.push(room_id);
         }
@@ -239,6 +245,7 @@ pub async fn user_directory(
     for user_id in visible {
         let profile = store
             .profile(&user_id)
+            .await
             .map_err(internal)?
             .unwrap_or_default();
         let name_hit = profile
