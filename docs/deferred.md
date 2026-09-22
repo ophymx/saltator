@@ -67,12 +67,25 @@ leaving the global half on every node — which keeps the token lookup and
 the alias/directory namespaces local reads. `/sync` then touches exactly
 one user shard per user, its one cross-user read being the
 `T_KEY_CHANGE` log, which belongs with the global half for the same
-reason. The per-user read surface still has to go async and
-remote-capable the way `RoomStore` did (`Backend::{Local,Remote}`), and
-`placement::assign` has to stop applying the every-active-node floor to
-the sharded half. FedOut is its own question: it is keyed by destination
-server, and its serving surface is the delivery worker under its
-leader.
+reason.
+
+The per-user read surface is now async and remote-capable
+(`UserStore::with_remote_per_user`); the global half stayed synchronous,
+because it is hosted everywhere and a remote hop for it would be a bug
+rather than a fallback. Of the keyspace's 46 read methods, 23 crossed and
+22 did not, and none touched both halves — the boundary is a property of
+the tables, not a convention.
+
+What is left is routing and placement: a `UserShards` router keyed by
+user id, the `[cluster] user_shards` key that does not exist yet, and
+`placement::assign` no longer applying the every-active-node floor to the
+sharded half. One read needs rethinking rather than routing —
+`UserStore::accounts` scans `T_ACCOUNT` for the admin user list, which
+becomes a fan-out across shards; the taken-names namespace is the
+single-group table that could answer it instead.
+
+FedOut is its own question: it is keyed by destination server, and its
+serving surface is the delivery worker under its leader.
 
 ## A retried transaction can still duplicate, in four narrow windows
 

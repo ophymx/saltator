@@ -200,7 +200,7 @@ impl CsState {
     /// The single resolution point, deliberately: no route reads the
     /// account's `admin` flag directly, so a later token-scope or
     /// external-IdP arm lands here and nowhere else.
-    pub(crate) fn is_admin(&self, auth: &extract::Auth) -> Result<bool, ApiError> {
+    pub(crate) async fn is_admin(&self, auth: &extract::Auth) -> Result<bool, ApiError> {
         // Appservices are never administrators: an AS identity is
         // synthesized from config and has no account row at all, so there
         // is nothing to carry the flag.
@@ -214,6 +214,7 @@ impl CsState {
             .users
             .store()
             .account(auth.user_id.as_str())
+            .await
             .map_err(ApiError::internal)?
             .is_some_and(|a| a.admin))
     }

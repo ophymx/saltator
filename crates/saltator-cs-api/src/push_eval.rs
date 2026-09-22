@@ -46,7 +46,7 @@ pub(crate) async fn rule_inputs(
     user_id: &UserId,
     room_id: &str,
 ) -> Result<(ruma::push::Ruleset, PushConditionRoomCtx)> {
-    let mut ruleset = crate::routes::push::load_ruleset(state, user_id)?;
+    let mut ruleset = crate::routes::push::load_ruleset(state, user_id).await?;
     add_legacy_mention_rules(&mut ruleset, user_id);
     let member_count = room_util::joined_member_ids(&state.rooms, room_id)
         .await?
@@ -55,6 +55,7 @@ pub(crate) async fn rule_inputs(
         .users
         .store()
         .profile(user_id.as_str())
+        .await
         .ok()
         .flatten()
         .and_then(|p| p.displayname)

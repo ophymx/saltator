@@ -485,6 +485,7 @@ async fn apply_out_of_band_leave(state: &FedState, raw: &CanonicalJsonObject) ->
     let Some(entry) = users
         .store()
         .membership(target, room_id)
+        .await
         .ok()
         .flatten()
         .filter(|e| e.membership == "invite")

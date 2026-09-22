@@ -97,7 +97,7 @@ async fn send_membership_with(
         content["reason"] = reason.into();
     }
     if matches!(membership, "join" | "invite") {
-        if let Ok(Some(profile)) = state.users.store().profile(target.as_str()) {
+        if let Ok(Some(profile)) = state.users.store().profile(target.as_str()).await {
             if let Some(d) = profile.displayname {
                 content["displayname"] = d.into();
             }

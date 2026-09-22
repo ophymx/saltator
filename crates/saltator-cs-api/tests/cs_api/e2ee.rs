@@ -310,6 +310,7 @@ async fn cross_signing_subkeys_require_master_signature() {
         .users
         .store()
         .cross_signing_key("@grace:hs.test", "master")
+        .await
         .unwrap();
     assert!(stored.is_none(), "rejected upload must store nothing");
 

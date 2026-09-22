@@ -39,11 +39,12 @@ pub async fn keys_query(State(state): State<Arc<FedState>>, auth: Authenticated)
             _ => None,
         };
         let mut per_user = Map::new();
-        let keys = store.device_keys(user_id).unwrap_or_default();
+        let keys = store.device_keys(user_id).await.unwrap_or_default();
         // Device display names ride along in `unsigned.device_display_name`
         // (spec user-keys schema) so remote clients can label sessions.
         let display_names: std::collections::BTreeMap<String, String> = store
             .devices(user_id)
+            .await
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(id, d)| d.display_name.map(|n| (id, n)))
@@ -78,7 +79,7 @@ pub async fn keys_query(State(state): State<Arc<FedState>>, auth: Authenticated)
             ("master", &mut master_keys),
             ("self_signing", &mut self_signing_keys),
         ] {
-            if let Ok(Some(raw)) = store.cross_signing_key(user_id, kind) {
+            if let Ok(Some(raw)) = store.cross_signing_key(user_id, kind).await {
                 if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
                     map.insert(user_id.clone(), value);
                 }
@@ -165,12 +166,13 @@ pub async fn user_devices(
     let store = users.store();
     let named: std::collections::BTreeMap<String, Option<String>> = store
         .devices(&user_id)
+        .await
         .unwrap_or_default()
         .into_iter()
         .map(|(id, d)| (id, d.display_name))
         .collect();
     let mut devices = Vec::new();
-    for (device_id, raw) in store.device_keys(&user_id).unwrap_or_default() {
+    for (device_id, raw) in store.device_keys(&user_id).await.unwrap_or_default() {
         let Ok(keys) = serde_json::from_slice::<Value>(&raw) else {
             continue;
         };
@@ -192,7 +194,7 @@ pub async fn user_devices(
         ("master", "master_key"),
         ("self_signing", "self_signing_key"),
     ] {
-        if let Ok(Some(raw)) = store.cross_signing_key(&user_id, kind) {
+        if let Ok(Some(raw)) = store.cross_signing_key(&user_id, kind).await {
             if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
                 out[field] = value;
             }

@@ -38,7 +38,12 @@ async fn load_profile(state: &CsState, user_id: &UserId) -> Result<Profile> {
     // Unknown local users must 404 (spec); known users without profile data
     // yield the empty profile.
     let store = state.users.store();
-    if store.account(user_id.as_str()).map_err(internal)?.is_none() {
+    if store
+        .account(user_id.as_str())
+        .await
+        .map_err(internal)?
+        .is_none()
+    {
         // A miss inside an appservice's user namespace is the AS's to
         // answer: it registers the ghost while we block, then the local
         // lookup succeeds (spec §Querying).
@@ -46,13 +51,18 @@ async fn load_profile(state: &CsState, user_id: &UserId) -> Result<Profile> {
             .as_querier
             .query_user(user_id.as_str(), state.config.server_name.as_str())
             .await
-            || store.account(user_id.as_str()).map_err(internal)?.is_none()
+            || store
+                .account(user_id.as_str())
+                .await
+                .map_err(internal)?
+                .is_none()
         {
             return Err(ApiError::not_found("Unknown user"));
         }
     }
     Ok(store
         .profile(user_id.as_str())
+        .await
         .map_err(internal)?
         .unwrap_or_default())
 }
@@ -177,11 +187,11 @@ pub async fn set_avatar_url(
 /// `m.room.member` events (best-effort: a rejection in one room does not
 /// fail the profile update).
 async fn propagate_profile(state: &CsState, user_id: &UserId) {
-    let Ok(profile) = state.users.store().profile(user_id.as_str()) else {
+    let Ok(profile) = state.users.store().profile(user_id.as_str()).await else {
         return;
     };
     let profile = profile.unwrap_or_default();
-    let Ok(memberships) = state.users.store().memberships(user_id.as_str()) else {
+    let Ok(memberships) = state.users.store().memberships(user_id.as_str()).await else {
         return;
     };
     for (room_id, m) in memberships {
@@ -262,6 +272,7 @@ pub async fn get_global_account_data(
         .users
         .store()
         .account_data(auth.user_id.as_str(), "", &req.event_type.to_string())
+        .await
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("No account data of this type"))?;
     let raw = raw_from_bytes(&entry.json)?;
@@ -306,6 +317,7 @@ pub async fn get_room_account_data(
             req.room_id.as_str(),
             &req.event_type.to_string(),
         )
+        .await
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("No account data of this type"))?;
     let raw = raw_from_bytes(&entry.json)?;
@@ -345,6 +357,7 @@ pub async fn get_filter(
         .users
         .store()
         .filter(auth.user_id.as_str(), &req.filter_id)
+        .await
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("Unknown filter"))?;
     let filter: FilterDefinition = serde_json::from_slice(&json).map_err(internal)?;
@@ -368,6 +381,7 @@ pub async fn get_devices(
         .users
         .store()
         .devices(auth.user_id.as_str())
+        .await
         .map_err(internal)?
         .into_iter()
         .map(|(id, d)| to_ruma_device(id, d))
@@ -384,6 +398,7 @@ pub async fn get_device(
         .users
         .store()
         .device(auth.user_id.as_str(), req.device_id.as_str())
+        .await
         .map_err(internal)?
         .ok_or_else(|| ApiError::not_found("Unknown device"))?;
     Ok(Ra(get_device::v3::Response::new(to_ruma_device(
@@ -488,6 +503,7 @@ pub async fn change_password(
             .users
             .store()
             .devices(auth.user_id.as_str())
+            .await
             .unwrap_or_default()
             .into_iter()
             .map(|(id, _)| id)
@@ -527,6 +543,7 @@ pub async fn deactivate(
         .users
         .store()
         .devices(auth.user_id.as_str())
+        .await
         .unwrap_or_default()
         .into_iter()
         .map(|(id, _)| id)

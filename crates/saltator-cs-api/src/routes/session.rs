@@ -274,6 +274,7 @@ pub async fn register_available(
         || state
             .users
             .username_taken(user_id.as_str())
+            .await
             .map_err(ApiError::internal)?
     {
         return Err(ApiError::new(
@@ -395,6 +396,7 @@ pub async fn logout_all(
         .users
         .store()
         .devices(auth.user_id.as_str())
+        .await
         .unwrap_or_default();
     state.users.delete_all_devices(&auth.user_id).await?;
     for (device_id, _) in devices {

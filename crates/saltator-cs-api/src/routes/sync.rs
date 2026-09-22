@@ -171,7 +171,7 @@ pub async fn sync_events(
         .as_deref()
         .map(|t| parse_token_n(t, Some(state.rooms.count())))
         .transpose()?;
-    let filter = load_filter(&state, &auth, req.filter.as_ref())?;
+    let filter = load_filter(&state, &auth, req.filter.as_ref()).await?;
     let timeout = req
         .timeout
         .unwrap_or(Duration::ZERO)
@@ -192,6 +192,7 @@ pub async fn sync_events(
             .users
             .store()
             .to_device_events(auth.user_id.as_str(), &auth.device_id, 0)
+            .await
             .map_err(internal)?;
         if inbox.first().is_some_and(|(seq, _)| *seq <= s.user) {
             state
@@ -401,7 +402,11 @@ fn type_matches(types: &Option<Vec<String>>, not_types: &[String], ty: &str) -> 
     }
 }
 
-fn load_filter(state: &CsState, auth: &Auth, filter: Option<&v3::Filter>) -> Result<SyncFilter> {
+async fn load_filter(
+    state: &CsState,
+    auth: &Auth,
+    filter: Option<&v3::Filter>,
+) -> Result<SyncFilter> {
     let definition: Option<FilterDefinition> = match filter {
         None => None,
         Some(v3::Filter::FilterDefinition(def)) => Some(def.clone()),
@@ -410,6 +415,7 @@ fn load_filter(state: &CsState, auth: &Auth, filter: Option<&v3::Filter>) -> Res
                 .users
                 .store()
                 .filter(auth.user_id.as_str(), id)
+                .await
                 .map_err(internal)?
                 .ok_or_else(|| ApiError::invalid_param("Unknown filter ID"))?;
             Some(serde_json::from_slice(&json).map_err(internal)?)
@@ -459,6 +465,7 @@ async fn build_sync(
     // Invites from ignored users are suppressed (m.ignored_user_list).
     let ignored: std::collections::BTreeSet<String> = store
         .account_data(user_id, "", "m.ignored_user_list")
+        .await
         .map_err(internal)?
         .and_then(|entry| serde_json::from_slice::<serde_json::Value>(&entry.json).ok())
         .and_then(|v| {
@@ -470,7 +477,7 @@ async fn build_sync(
         .unwrap_or_default();
 
     let mut my_joined_rooms: std::collections::BTreeSet<String> = Default::default();
-    for (room_id_str, m) in store.memberships(user_id).map_err(internal)? {
+    for (room_id_str, m) in store.memberships(user_id).await.map_err(internal)? {
         let Ok(room_id) = OwnedRoomId::try_from(room_id_str.clone()) else {
             continue;
         };
@@ -554,7 +561,7 @@ async fn build_sync(
     }
 
     // Global account data.
-    for (scope, data_type, entry) in store.account_data_all(user_id).map_err(internal)? {
+    for (scope, data_type, entry) in store.account_data_all(user_id).await.map_err(internal)? {
         if !scope.is_empty() {
             continue;
         }
@@ -572,6 +579,7 @@ async fn build_sync(
     if initial
         && store
             .account_data(user_id, "", "m.push_rules")
+            .await
             .map_err(internal)?
             .is_none()
     {
@@ -586,6 +594,7 @@ async fn build_sync(
     let to_device_since = if initial { 0 } else { since.user };
     for (seq, json) in store
         .to_device_events(user_id, &auth.device_id, to_device_since)
+        .await
         .map_err(internal)?
     {
         if seq > now.user {
@@ -621,6 +630,7 @@ async fn build_sync(
     // One-time-key counts for this device; clients replenish from these.
     resp.device_one_time_keys_count = store
         .one_time_key_counts(user_id, &auth.device_id)
+        .await
         .map_err(internal)?
         .into_iter()
         .map(|(algo, n)| {
@@ -635,6 +645,7 @@ async fn build_sync(
     resp.device_unused_fallback_key_types = Some(
         store
             .unused_fallback_algorithms(user_id, &auth.device_id)
+            .await
             .map_err(internal)?
             .into_iter()
             .map(|a| a.as_str().into())
@@ -666,6 +677,7 @@ async fn build_sync(
         let visible = snap.user_id == user_id
             || store
                 .memberships(&snap.user_id)
+                .await
                 .map_err(internal)?
                 .iter()
                 .any(|(rid, m)| m.membership == "join" && my_joined_rooms.contains(rid));
@@ -886,6 +898,7 @@ async fn build_joined_room(
         .users
         .store()
         .account_data_all(auth.user_id.as_str())
+        .await
         .map_err(internal)?
     {
         if scope != room_id.as_str() {
@@ -992,6 +1005,7 @@ async fn build_invited_room(
             .users
             .store()
             .invite_state(auth.user_id.as_str(), room_id)
+            .await
             .map_err(internal)?
         {
             let mut invited = v3::InvitedRoom::new();
@@ -1045,6 +1059,7 @@ async fn build_knocked_room(
             .users
             .store()
             .invite_state(auth.user_id.as_str(), room_id)
+            .await
             .map_err(internal)?
         {
             let mut knocked = v3::KnockedRoom::new();

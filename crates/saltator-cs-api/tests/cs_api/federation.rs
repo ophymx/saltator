@@ -2034,6 +2034,7 @@ async fn inbound_invite_into_a_blocked_room_is_refused() {
     assert!(b_users
         .store()
         .invite_state("@bob:b.test", "!blocked:a.test")
+        .await
         .unwrap()
         .is_none());
 
