@@ -112,6 +112,37 @@ proposing a migration the leader asks every voter for its live binary's
 schema version over the internal RPC; any voter unreachable or behind
 means no proposal, retried on a timer.
 
+## The schema gate protects the log, not reads
+
+A migration is proposed only once every voter's binary supports the target,
+which is what stops a replica being handed a command it cannot decode. It
+says nothing about reads, and the gap between the two is a real window: a
+node restarted on the new binary serves traffic immediately, while the
+migration its data needs is still waiting for the slowest node in the
+fleet. For that window, new code is reading old data.
+
+Two shapes of this, both found by `scripts/rolling_upgrade_smoke.sh`
+rather than by reasoning:
+
+- **A record that gained a field does not decode at all.** Postcard is
+  positional, so the read fails outright rather than losing the field —
+  `TokenEntry` gaining its mirrored account state turned every
+  authenticated request on an upgraded node into a 500. The fix is a
+  tolerant read (`decode_token`) that recognises both shapes and tells the
+  caller which one it got, so the caller can fall back to what the old
+  version did.
+- **A table a read depends on is still empty.** `T_USERNAME` is backfilled
+  by its migration, so before that an upgraded node asked an empty table
+  whether a name was taken and answered "free" for names that were not.
+  The fix is to check the stored schema version and fall back until the
+  backfill has run.
+
+So the rule for a migration that changes what a read sees: the read has to
+work on both sides of it, and the fallback is removable only once the
+oldest supported version is past the step. The gate is not a substitute
+for that, and neither is the assumption that a restart and its migration
+happen together — they cannot, by design.
+
 ## A token row answers its own authentication
 
 Authenticating a request reads the token table and nothing else. The

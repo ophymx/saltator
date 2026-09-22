@@ -46,6 +46,20 @@ fn account_state(ctx: &ApplyCtx<'_>, user_id: &str) -> StoreResult<AccountState>
     Ok(account.map_or(AccountState::Deactivated, |a| a.state))
 }
 
+/// Decode a token row of either shape, reporting whether the state on it
+/// is real. Current shape first: a v4 row is one byte short of the current
+/// one and fails to decode as it (`v4_token_does_not_decode_as_v5` is what
+/// pins that), while a current row cannot be mistaken for a v4 one.
+fn decode_token(bytes: &[u8]) -> StoreResult<(TokenEntry, bool)> {
+    if let Ok(entry) = postcard::from_bytes::<TokenEntry>(bytes) {
+        return Ok((entry, true));
+    }
+    let old: TokenEntryV4 = dec("token v4 decode", bytes)?;
+    // The placeholder is never believed: the `false` is what tells the
+    // caller to ask the account instead.
+    Ok((token_v4_to_v5(old, AccountState::Active), false))
+}
+
 fn token_v4_to_v5(old: TokenEntryV4, state: AccountState) -> TokenEntry {
     TokenEntry {
         user_id: old.user_id,
@@ -1944,6 +1958,23 @@ impl UserStore {
         self.get_typed("token decode", T_TOKEN, token_hash)
     }
 
+    /// A token row, and whether the state mirrored on it can be believed.
+    ///
+    /// `false` means the row predates the mirror (user schema v4) and its
+    /// `state` is a placeholder the caller must not trust. This exists
+    /// because the schema gate protects the *log*, not reads: the migration
+    /// that rewrites these rows waits for every voter's binary, so a node
+    /// upgraded before that lands is reading rows in the older shape.
+    /// Postcard is positional, so decoding them as the current shape does
+    /// not merely lose the field — it fails outright, which would turn
+    /// every authenticated request on that node into a 500.
+    pub fn token_compat(&self, token_hash: &[u8; 32]) -> StoreResult<Option<(TokenEntry, bool)>> {
+        let Some(bytes) = self.read.get(T_TOKEN, token_hash)? else {
+            return Ok(None);
+        };
+        decode_token(&bytes).map(Some)
+    }
+
     pub fn device(&self, user_id: &str, device_id: &str) -> StoreResult<Option<Device>> {
         self.get_typed("device decode", T_DEVICE, &user_key(user_id, device_id))
     }
@@ -2400,6 +2431,30 @@ mod tests {
             postcard::from_bytes::<TokenEntry>(&blob).is_err(),
             "v4 blob must not be readable as a v5 TokenEntry"
         );
+    }
+
+    /// Both shapes read, and the older one is flagged as not answering for
+    /// itself. Without this, a node upgraded before the fleet-wide migration
+    /// lands returns 500 for every authenticated request — the schema gate
+    /// holds the migration, and holds it for reads too.
+    #[test]
+    fn a_token_row_of_either_shape_decodes_and_says_which_it_is() {
+        let v4 = TokenEntryV4 {
+            user_id: "@alice:hs.test".into(),
+            device_id: "DEV".into(),
+            kind: TokenKind::Access,
+            created_ts: 7,
+            expires_ts: None,
+        };
+        let (entry, mirrored) = decode_token(&postcard::to_stdvec(&v4).unwrap()).unwrap();
+        assert!(!mirrored, "a v4 row cannot answer for the account state");
+        assert_eq!(entry.user_id, "@alice:hs.test");
+        assert_eq!(entry.kind, TokenKind::Access);
+
+        let current = token_v4_to_v5(v4, AccountState::Locked);
+        let (entry, mirrored) = decode_token(&postcard::to_stdvec(&current).unwrap()).unwrap();
+        assert!(mirrored, "a current row answers for itself");
+        assert_eq!(entry.state, AccountState::Locked);
     }
 
     #[test]
