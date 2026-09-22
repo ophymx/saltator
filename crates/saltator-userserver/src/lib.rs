@@ -576,11 +576,10 @@ impl UserServer {
         if store.username_reserved(user_id).map_err(storage_err)? {
             return Ok(true);
         }
-        let backfilled = matches!(
-            self.shard_handle().schema_versions(),
-            Ok((stored, _)) if stored >= USERNAME_BACKFILL_VERSION
-        );
-        if backfilled {
+        if self
+            .shard_handle()
+            .schema_at_least(USERNAME_BACKFILL_VERSION)
+        {
             return Ok(false);
         }
         Ok(store.account(user_id).await.map_err(storage_err)?.is_some())
@@ -591,7 +590,7 @@ impl UserServer {
     /// mid-upgrade, where transactions stay node-local — the behaviour that
     /// predates the record, not a new failure.
     fn txn_records_available(&self) -> bool {
-        matches!(self.shard_handle().schema_versions(), Ok((stored, _)) if stored >= 4)
+        self.shard_handle().schema_at_least(4)
     }
 
     /// Mark a client transaction handled, durably and cluster-wide.

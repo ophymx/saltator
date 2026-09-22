@@ -2974,7 +2974,7 @@ impl RoomServer {
     /// mid-upgrade, where transactions stay node-local — the behaviour
     /// that predates this record, not a new failure.
     fn txn_records_available(&self) -> bool {
-        matches!(self.shard_handle().schema_versions(), Ok((stored, _)) if stored >= 2)
+        self.shard_handle().schema_at_least(2)
     }
 
     async fn propose(&self, cmd: AppendEvent, txn: Option<TxnStamp>) -> Result<Outcome> {

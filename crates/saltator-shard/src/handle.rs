@@ -117,6 +117,10 @@ pub struct ShardHandle {
     app: Arc<dyn ShardApp>,
     /// The app's declared schema version (the layout this binary speaks).
     app_schema_version: u32,
+    /// Highest stored schema version this handle has observed, shared
+    /// across clones. A latch for [`Self::schema_at_least`], never the
+    /// authority — see that method.
+    seen_schema: Arc<std::sync::atomic::AtomicU32>,
     /// Set once at startup (shared across clones); absent in single-node
     /// deployments and tests, where a non-leader propose keeps its old
     /// fail-fast behavior.
@@ -184,6 +188,7 @@ impl ShardHandle {
             changes,
             app,
             app_schema_version,
+            seen_schema: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             forwarder: Arc::new(std::sync::OnceLock::new()),
         };
 
@@ -312,6 +317,34 @@ impl ShardHandle {
                 .map_err(|e| ShardError::Storage(e.to_string()))?,
             self.app_schema_version,
         ))
+    }
+
+    /// Whether this shard's applied state has reached `target`.
+    ///
+    /// Latched, unlike [`Self::schema_versions`]: the stored version only
+    /// ever moves forward — a binary refuses to open a shard stored ahead
+    /// of it, and migrations are stepwise upward — so once a target is
+    /// satisfied it cannot stop being. A satisfied check is then an atomic
+    /// load instead of a storage read, which is the point: the gates that
+    /// decide whether a newer command form may be proposed sit on the
+    /// write path, and one of them is on every client message send.
+    ///
+    /// An unsatisfied check keeps asking, because a shard part-way through
+    /// its migrations has to notice when they land.
+    ///
+    /// Not for the migration supervisor or the voter gate. Those need the
+    /// live value — a stale answer there would either stall a migration or,
+    /// worse, claim support a replica does not have.
+    pub fn schema_at_least(&self, target: u32) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.seen_schema.load(Ordering::Relaxed) >= target {
+            return true;
+        }
+        let Ok(stored) = crate::storage::stored_schema_version(&*self.engine, self.shard) else {
+            return false;
+        };
+        self.seen_schema.fetch_max(stored, Ordering::Relaxed);
+        stored >= target
     }
 
     /// Propose one schema-migration step (`to` must be stored + 1).

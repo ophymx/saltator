@@ -351,12 +351,28 @@ async fn schema_migration_stepwise_and_replay() {
     let handle = start_app(engine.clone(), KvAppV2).await.unwrap();
     assert_eq!(handle.schema_versions().unwrap(), (1, 2));
 
+    // The latched check has to answer "not yet" repeatedly and then notice
+    // the step landing. Caching the negative would leave a shard that
+    // finished migrating still behaving as though it had not — which for
+    // the gates riding on this means newer command forms never proposed.
+    assert!(!handle.schema_at_least(2), "not migrated yet");
+    assert!(!handle.schema_at_least(2), "and still not, asked twice");
+    assert!(
+        handle.schema_at_least(1),
+        "the baseline is always satisfied"
+    );
+
     // Skipping a step is declined, not applied.
     let declined = handle.propose_migrate(3).await.unwrap();
     assert!(declined.is_err(), "skip must be declined: {declined:?}");
     // The correct step applies and stamps the marker.
     handle.propose_migrate(2).await.unwrap().unwrap();
     assert_eq!(handle.schema_versions().unwrap(), (2, 2));
+    assert!(
+        handle.schema_at_least(2),
+        "the step landed, so the gate opens"
+    );
+    assert!(!handle.schema_at_least(3), "and does not open past it");
     // Re-running the same step is now stale — declined.
     assert!(handle.propose_migrate(2).await.unwrap().is_err());
     let marker = set(&handle, "probe", b"x", false).await; // any read path
