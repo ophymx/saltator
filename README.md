@@ -7,6 +7,9 @@ database and no role configuration.
 - **[INTENTION.md](INTENTION.md)** — why this exists, the name.
 - **[spec.md](spec.md)** — the technical specification: architecture and
   the decisions behind it.
+- **[docs/deployment.md](docs/deployment.md)** — running it as a
+  cluster: certificates, founding, joining, upgrades, replacing a node,
+  backup and restore.
 - **[docs/deferred.md](docs/deferred.md)** — what is deliberately not
   built, and what would justify building it.
 - **[SECURITY.md](SECURITY.md)** — reporting a vulnerability, and what

@@ -198,6 +198,60 @@ would also convert "believed compatible" (conflict truncation as
 index-superseding appends) into "verified" — merge the findings, not
 the code.
 
+## Backup is a stopped-node copy, and restore is from one node
+
+What exists is documented in [deployment.md](deployment.md) §10: stop a
+node, copy its data dir, start it; to restore, put one backup back on
+its own node id and rebuild the other nodes empty under their old ids.
+That procedure is proven by `scripts/restore_smoke.sh`, with the
+backed-up node both leading and following. Three things are not built,
+and one finding is worth keeping.
+
+**An online backup.** The node is the only process that can open its
+RocksDB instances, so a backup without downtime has to be taken by the
+node: an admin call that checkpoints `raft/` and `db/` into a directory
+(`KvEngine::checkpoint` exists for Raft snapshots and shard transfer)
+and hard-links `media/blobs/` beside them. The ordering question is the
+whole design: the two databases are checkpointed one after the other,
+so one is ahead of the other, and the restore has to open. State first,
+then log, is the order that is known to be wrong: a log purge landing
+between the two leaves a gap between the state's last-applied index and
+the log's first retained entry that no replay can cross. Log first,
+then state, leaves the state ahead of the log, which is the shape a
+snapshot-then-purge produces anyway — but whether openraft opens that
+cleanly is the thing to prove, with a checkpoint taken under write load
+and a concurrent purge, before any of this ships. A filesystem snapshot
+is the no-code alternative and is what the guide recommends today; this
+is worth building when operators without one ask for it.
+
+**A membership reset.** The documented restore reuses the dead nodes'
+ids because the restored membership still names them, and only a quorum
+of the old configuration can change it. A restore onto different
+machines, or into a cluster of a different size, needs the restored
+node to rewrite every group's membership to itself alone before
+starting — a `saltator restore --single-voter` that walks the groups in
+`raft/` and `db/` and overwrites the stored membership and vote. Doable
+offline against the storage layout; the hazard is that it is also the
+tool that creates a second cluster from a stale copy of the first, which
+is why it should refuse to run on a data dir that has started since the
+copy was taken (a restore epoch in the metadata, stamped at startup).
+
+**A guard against the three-backups restore.** Found while writing the
+guide: restoring each node from its own backup, taken at different
+times, does not reconcile. A node restarted holding a committed vote
+for itself resumes leading in that term with no election, so the
+restored leader never learns the other logs are longer; its next
+proposal reuses a log index the followers already hold under the same
+log id with different content, they keep theirs, and the cluster is
+silently split. Raft's election is the only mechanism that chooses the
+longest log, and the resume skips it. There is no local signal that
+would let a node refuse this: each backup is internally consistent and
+its vote is genuinely the last one it cast. A guard needs cluster-wide
+state — the restore epoch above, compared across nodes at join — and
+until then the rule lives in the guide. The leader-resume behaviour is
+openraft's, is correct for the restart it exists for, and is not
+something to turn off to make restores safer.
+
 ## Scoped out by design
 
 - **Application services** — ephemeral-data push, the legacy

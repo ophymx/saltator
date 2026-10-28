@@ -408,7 +408,8 @@ group (self-contained CA; no external PKI).
   an end-to-end E2EE exchange (`docker/interop`).
 - **Cluster behaviour**: a chaos job kills a node mid-traffic in CI, and
   `scripts/*_smoke.sh` drive multi-node scenarios locally — shard moves,
-  replication-factor policy, dead-node re-placement, media placement.
+  replication-factor policy, dead-node re-placement, media placement, a
+  whole-cluster restore from one node's backup.
   These are local-only; they need more nodes than a CI runner affords.
 
 Deterministic simulation of the consensus layer (madsim-style),
